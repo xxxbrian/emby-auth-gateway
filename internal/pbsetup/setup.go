@@ -1,6 +1,7 @@
 package pbsetup
 
 import (
+	"crypto/rand"
 	"fmt"
 	"strings"
 
@@ -38,7 +39,6 @@ func NewCommand(app core.App) *cobra.Command {
 	cmd.Flags().StringVar(&opts.BackendUserAgent, "backend-user-agent", defaults.UserAgent, "User-Agent sent to the backend Emby server")
 	cmd.Flags().StringVar(&opts.BackendAuthorizationClient, "backend-authorization-client", defaults.Client, "Client value sent in X-Emby-Authorization to the backend")
 	cmd.Flags().StringVar(&opts.BackendAuthorizationDevice, "backend-authorization-device", defaults.Device, "Device value sent in X-Emby-Authorization to the backend")
-	cmd.Flags().StringVar(&opts.BackendAuthorizationDeviceID, "backend-authorization-device-id", defaults.DeviceID, "DeviceId value sent in X-Emby-Authorization to the backend")
 	cmd.Flags().StringVar(&opts.BackendAuthorizationVersion, "backend-authorization-version", defaults.Version, "Version value sent in X-Emby-Authorization to the backend")
 	return cmd
 }
@@ -53,11 +53,10 @@ type options struct {
 	BackendUsername    string
 	BackendPassword    string
 
-	BackendUserAgent             string
-	BackendAuthorizationClient   string
-	BackendAuthorizationDevice   string
-	BackendAuthorizationDeviceID string
-	BackendAuthorizationVersion  string
+	BackendUserAgent            string
+	BackendAuthorizationClient  string
+	BackendAuthorizationDevice  string
+	BackendAuthorizationVersion string
 }
 
 func (o options) validate() error {
@@ -109,10 +108,18 @@ func upsertServer(app core.App, opts options) (*core.Record, error) {
 	record.Set("name", opts.EmbyServerName)
 	record.Set("base_url", strings.TrimRight(opts.EmbyBaseURL, "/"))
 	identity := opts.backendClientIdentity().WithDefaults()
+	deviceID := strings.TrimSpace(record.GetString("backend_authorization_device_id"))
+	if deviceID == "" {
+		var err error
+		deviceID, err = newBackendDeviceID()
+		if err != nil {
+			return nil, err
+		}
+	}
 	record.Set("backend_user_agent", identity.UserAgent)
 	record.Set("backend_authorization_client", identity.Client)
 	record.Set("backend_authorization_device", identity.Device)
-	record.Set("backend_authorization_device_id", identity.DeviceID)
+	record.Set("backend_authorization_device_id", deviceID)
 	record.Set("backend_authorization_version", identity.Version)
 	record.Set("enabled", true)
 	if err := app.Save(record); err != nil {
@@ -146,9 +153,24 @@ func (o options) backendClientIdentity() gateway.BackendClientIdentity {
 		UserAgent: o.BackendUserAgent,
 		Client:    o.BackendAuthorizationClient,
 		Device:    o.BackendAuthorizationDevice,
-		DeviceID:  o.BackendAuthorizationDeviceID,
 		Version:   o.BackendAuthorizationVersion,
 	}
+}
+
+func newBackendDeviceID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08X-%04X-%04X-%04X-%012X",
+		uint32(b[0])<<24|uint32(b[1])<<16|uint32(b[2])<<8|uint32(b[3]),
+		uint16(b[4])<<8|uint16(b[5]),
+		uint16(b[6])<<8|uint16(b[7]),
+		uint16(b[8])<<8|uint16(b[9]),
+		uint64(b[10])<<40|uint64(b[11])<<32|uint64(b[12])<<24|uint64(b[13])<<16|uint64(b[14])<<8|uint64(b[15]),
+	), nil
 }
 
 func upsertGatewayUser(app core.App, opts options) (*core.Record, error) {

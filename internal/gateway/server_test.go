@@ -28,6 +28,7 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 	)
 
 	var backendURL string
+	const backendDeviceID = "11111111-2222-4333-8444-555555555555"
 	var sawControlledBackendLogin bool
 	var sawBackendAuthUserAgent bool
 	var sawBackendAuthIdentity bool
@@ -44,7 +45,7 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 				sawBackendAuthUserAgent = true
 			}
 			auth := ParseEmbyAuthHeader(r.Header.Get("X-Emby-Authorization"))
-			if auth.Client == "SenPlayer" && auth.Device == "Mac" && auth.DeviceID == "E680121A-04F6-4E47-BA8F-30E1DB01EFB6" && auth.Version == "6.1.3" {
+			if auth.Client == "SenPlayer" && auth.Device == "Mac" && auth.DeviceID == backendDeviceID && auth.Version == "6.1.3" {
 				sawBackendAuthIdentity = true
 			}
 			var body map[string]string
@@ -69,7 +70,7 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 				sawProxyUserAgent = true
 			}
 			auth := ParseEmbyAuthHeader(r.Header.Get("X-Emby-Authorization"))
-			if auth.Client == "SenPlayer" && auth.Device == "Mac" && auth.DeviceID == "E680121A-04F6-4E47-BA8F-30E1DB01EFB6" && auth.Version == "6.1.3" && auth.UserID == backendUserID && auth.Token == backendToken {
+			if auth.Client == "SenPlayer" && auth.Device == "Mac" && auth.DeviceID == backendDeviceID && auth.Version == "6.1.3" && auth.UserID == backendUserID && auth.Token == backendToken {
 				sawProxyIdentity = true
 			}
 			if r.Header.Get("X-Emby-Token") == backendToken {
@@ -147,7 +148,7 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 			Username:       "shared",
 			Password:       "backend-pass",
 			Enabled:        true,
-			ClientIdentity: DefaultBackendClientIdentity(),
+			ClientIdentity: backendIdentityForTest(backendDeviceID),
 		},
 	}
 
@@ -1394,6 +1395,12 @@ func testStore(backendBaseURL string) *MemoryStore {
 		},
 	}
 	return store
+}
+
+func backendIdentityForTest(deviceID string) BackendClientIdentity {
+	identity := DefaultBackendClientIdentity()
+	identity.DeviceID = deviceID
+	return identity
 }
 
 func testSession(backendBaseURL string) *Session {

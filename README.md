@@ -36,7 +36,7 @@ Backend client identity defaults written by `setup` into `emby_servers` records:
 | `backend_user_agent` | `SenPlayer/6.1.3` |
 | `backend_authorization_client` | `SenPlayer` |
 | `backend_authorization_device` | `Mac` |
-| `backend_authorization_device_id` | `E680121A-04F6-4E47-BA8F-30E1DB01EFB6` |
+| `backend_authorization_device_id` | Generated once by `setup` and saved as a UUID |
 | `backend_authorization_version` | `6.1.3` |
 
 ## Local Compose
@@ -102,9 +102,10 @@ The backend client identity flags are optional because they default to the SenPl
   --backend-user-agent 'SenPlayer/6.1.3' \
   --backend-authorization-client SenPlayer \
   --backend-authorization-device Mac \
-  --backend-authorization-device-id E680121A-04F6-4E47-BA8F-30E1DB01EFB6 \
   --backend-authorization-version 6.1.3
 ```
+
+`setup` generates `backend_authorization_device_id` once per `emby_servers` record and preserves it on later updates. Administrators can still view or edit the saved value in the PocketBase Admin UI.
 
 Docker Compose example:
 

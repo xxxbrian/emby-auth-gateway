@@ -363,6 +363,9 @@ func (s *Store) SaveSession(ctx context.Context, session *gateway.Session) error
 		return err
 	}
 	identity := session.BackendIdentity.WithDefaults()
+	if strings.TrimSpace(identity.DeviceID) == "" {
+		identity.DeviceID = gateway.StableBackendDeviceID(session.BackendServerID)
+	}
 	record := core.NewRecord(collection)
 	record.Set("gateway_token_hash", session.GatewayTokenHash)
 	record.Set("gateway_user", session.GatewayUserID)
@@ -400,6 +403,16 @@ func (s *Store) FindSessionByTokenHash(ctx context.Context, tokenHash string) (*
 		t := record.GetDateTime("revoked_at").Time()
 		revokedAt = &t
 	}
+	identity := gateway.BackendClientIdentity{
+		UserAgent: record.GetString("backend_user_agent"),
+		Client:    record.GetString("backend_authorization_client"),
+		Device:    record.GetString("backend_authorization_device"),
+		DeviceID:  record.GetString("backend_authorization_device_id"),
+		Version:   record.GetString("backend_authorization_version"),
+	}.WithDefaults()
+	if strings.TrimSpace(identity.DeviceID) == "" {
+		identity.DeviceID = gateway.StableBackendDeviceID(record.GetString("backend_server_id"))
+	}
 	return &gateway.Session{
 		GatewayTokenHash: record.GetString("gateway_token_hash"),
 		GatewayUserID:    record.GetString("gateway_user"),
@@ -411,21 +424,15 @@ func (s *Store) FindSessionByTokenHash(ctx context.Context, tokenHash string) (*
 		BackendUserID:    record.GetString("backend_user_id"),
 		BackendUsername:  record.GetString("backend_username"),
 		BackendToken:     record.GetString("backend_token"),
-		BackendIdentity: gateway.BackendClientIdentity{
-			UserAgent: record.GetString("backend_user_agent"),
-			Client:    record.GetString("backend_authorization_client"),
-			Device:    record.GetString("backend_authorization_device"),
-			DeviceID:  record.GetString("backend_authorization_device_id"),
-			Version:   record.GetString("backend_authorization_version"),
-		}.WithDefaults(),
-		Client:    record.GetString("client"),
-		Device:    record.GetString("device"),
-		DeviceID:  record.GetString("device_id"),
-		Version:   record.GetString("version"),
-		RemoteIP:  record.GetString("remote_ip"),
-		CreatedAt: createdAt,
-		ExpiresAt: expiresAt,
-		RevokedAt: revokedAt,
+		BackendIdentity:  identity,
+		Client:           record.GetString("client"),
+		Device:           record.GetString("device"),
+		DeviceID:         record.GetString("device_id"),
+		Version:          record.GetString("version"),
+		RemoteIP:         record.GetString("remote_ip"),
+		CreatedAt:        createdAt,
+		ExpiresAt:        expiresAt,
+		RevokedAt:        revokedAt,
 	}, nil
 }
 
@@ -458,20 +465,24 @@ func (s *Store) backendAccountFromRecord(record *core.Record) (*gateway.BackendA
 	if err != nil {
 		return nil, gateway.ErrNotFound
 	}
+	identity := gateway.BackendClientIdentity{
+		UserAgent: server.GetString("backend_user_agent"),
+		Client:    server.GetString("backend_authorization_client"),
+		Device:    server.GetString("backend_authorization_device"),
+		DeviceID:  server.GetString("backend_authorization_device_id"),
+		Version:   server.GetString("backend_authorization_version"),
+	}.WithDefaults()
+	if strings.TrimSpace(identity.DeviceID) == "" {
+		identity.DeviceID = gateway.StableBackendDeviceID(server.Id)
+	}
 	return &gateway.BackendAccount{
-		ID:       record.Id,
-		ServerID: serverID,
-		BaseURL:  server.GetString("base_url"),
-		Username: record.GetString("backend_username"),
-		Password: record.GetString("backend_password"),
-		Enabled:  record.GetBool("enabled") && server.GetBool("enabled"),
-		ClientIdentity: gateway.BackendClientIdentity{
-			UserAgent: server.GetString("backend_user_agent"),
-			Client:    server.GetString("backend_authorization_client"),
-			Device:    server.GetString("backend_authorization_device"),
-			DeviceID:  server.GetString("backend_authorization_device_id"),
-			Version:   server.GetString("backend_authorization_version"),
-		}.WithDefaults(),
+		ID:             record.Id,
+		ServerID:       serverID,
+		BaseURL:        server.GetString("base_url"),
+		Username:       record.GetString("backend_username"),
+		Password:       record.GetString("backend_password"),
+		Enabled:        record.GetBool("enabled") && server.GetBool("enabled"),
+		ClientIdentity: identity,
 	}, nil
 }
 

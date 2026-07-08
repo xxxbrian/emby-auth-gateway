@@ -124,7 +124,7 @@ func createTestBackendAccount(t *testing.T, app core.App) string {
 	server.Set("backend_user_agent", identity.UserAgent)
 	server.Set("backend_authorization_client", identity.Client)
 	server.Set("backend_authorization_device", identity.Device)
-	server.Set("backend_authorization_device_id", identity.DeviceID)
+	server.Set("backend_authorization_device_id", gateway.StableBackendDeviceID("test-server"))
 	server.Set("backend_authorization_version", identity.Version)
 	server.Set("enabled", true)
 	if err := app.Save(server); err != nil {
@@ -168,7 +168,7 @@ func createGatewaySession(t *testing.T, app core.App, userID, accountID, tokenHa
 	record.Set("backend_user_agent", identity.UserAgent)
 	record.Set("backend_authorization_client", identity.Client)
 	record.Set("backend_authorization_device", identity.Device)
-	record.Set("backend_authorization_device_id", identity.DeviceID)
+	record.Set("backend_authorization_device_id", gateway.StableBackendDeviceID("test-session"))
 	record.Set("backend_authorization_version", identity.Version)
 	record.Set("expires_at", expiresAt)
 	if revokedAt != nil {

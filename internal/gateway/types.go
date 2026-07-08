@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"crypto/sha1"
+	"fmt"
 	"net/http"
 	"sort"
 	"strings"
@@ -194,7 +196,6 @@ func DefaultBackendClientIdentity() BackendClientIdentity {
 		UserAgent: defaultBackendUserAgent,
 		Client:    defaultBackendAuthorizationClient,
 		Device:    defaultBackendAuthorizationDevice,
-		DeviceID:  defaultBackendAuthorizationDeviceID,
 		Version:   defaultBackendAuthorizationVersion,
 	}
 }
@@ -210,13 +211,23 @@ func (i BackendClientIdentity) WithDefaults() BackendClientIdentity {
 	if strings.TrimSpace(i.Device) == "" {
 		i.Device = defaults.Device
 	}
-	if strings.TrimSpace(i.DeviceID) == "" {
-		i.DeviceID = defaults.DeviceID
-	}
 	if strings.TrimSpace(i.Version) == "" {
 		i.Version = defaults.Version
 	}
 	return i
+}
+
+func StableBackendDeviceID(seed string) string {
+	sum := sha1.Sum([]byte(seed))
+	sum[6] = (sum[6] & 0x0f) | 0x50
+	sum[8] = (sum[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08X-%04X-%04X-%04X-%012X",
+		uint32(sum[0])<<24|uint32(sum[1])<<16|uint32(sum[2])<<8|uint32(sum[3]),
+		uint16(sum[4])<<8|uint16(sum[5]),
+		uint16(sum[6])<<8|uint16(sum[7]),
+		uint16(sum[8])<<8|uint16(sum[9]),
+		uint64(sum[10])<<40|uint64(sum[11])<<32|uint64(sum[12])<<24|uint64(sum[13])<<16|uint64(sum[14])<<8|uint64(sum[15]),
+	)
 }
 
 type UserMapping struct {
