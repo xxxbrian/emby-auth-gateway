@@ -1,0 +1,31 @@
+services:
+  gateway:
+    build: .
+    ports:
+      - "${GATEWAY_PORT:-8090}:8090"
+    environment:
+      GATEWAY_SECRET_KEY: "${GATEWAY_SECRET_KEY:?set GATEWAY_SECRET_KEY in your environment or .env}"
+      GATEWAY_PUBLIC_URL: "${GATEWAY_PUBLIC_URL:-http://localhost:${GATEWAY_PORT:-8090}${GATEWAY_BASE_PATH:-/emby}}"
+      GATEWAY_BASE_PATH: "${GATEWAY_BASE_PATH:-/emby}"
+      GATEWAY_SERVER_ID: "${GATEWAY_SERVER_ID:-emby-auth-gateway-dev}"
+    command: ["serve", "--http=0.0.0.0:8090"]
+    volumes:
+      - gateway_pb_data:/app/pb_data
+    depends_on:
+      - emby
+
+  emby:
+    image: emby/embyserver:latest
+    ports:
+      - "${EMBY_PORT:-8096}:8096"
+    environment:
+      UID: "${EMBY_UID:-1000}"
+      GID: "${EMBY_GID:-1000}"
+      GIDLIST: "${EMBY_GIDLIST:-1000}"
+    volumes:
+      - emby_config:/config
+      - ${EMBY_MEDIA_DIR:-./tmp/emby-media}:/mnt/share1
+
+volumes:
+  gateway_pb_data:
+  emby_config:

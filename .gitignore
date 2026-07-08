@@ -1,7 +1,11 @@
-plan.md
 .opencode/
+.env
+.env.*
+!.env.example
 pb_data/
 tmp/
+bin/
+dist/
 *.db
 *.sqlite
 *.sqlite3
