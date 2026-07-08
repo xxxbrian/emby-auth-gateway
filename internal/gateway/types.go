@@ -191,11 +191,11 @@ type BackendClientIdentity struct {
 
 func DefaultBackendClientIdentity() BackendClientIdentity {
 	return BackendClientIdentity{
-		UserAgent: "SenPlayer/6.1.3",
-		Client:    "SenPlayer",
-		Device:    "Mac",
-		DeviceID:  "E680121A-04F6-4E47-BA8F-30E1DB01EFB6",
-		Version:   "6.1.3",
+		UserAgent: defaultBackendUserAgent,
+		Client:    defaultBackendAuthorizationClient,
+		Device:    defaultBackendAuthorizationDevice,
+		DeviceID:  defaultBackendAuthorizationDeviceID,
+		Version:   defaultBackendAuthorizationVersion,
 	}
 }
 
