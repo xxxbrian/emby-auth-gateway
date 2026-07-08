@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,9 +34,12 @@ func main() {
 	app.OnServe().BindFunc(func(e *core.ServeEvent) error {
 		basePath := normalizeGatewayBasePath(envDefault("GATEWAY_BASE_PATH", "/emby"))
 		gw := gateway.NewServer(gateway.Config{
-			PublicBaseURL:   strings.TrimRight(os.Getenv("GATEWAY_PUBLIC_URL"), "/"),
-			GatewayBasePath: basePath,
-			GatewayServerID: envDefault("GATEWAY_SERVER_ID", "emby-auth-gateway"),
+			PublicBaseURL:            strings.TrimRight(os.Getenv("GATEWAY_PUBLIC_URL"), "/"),
+			GatewayBasePath:          basePath,
+			GatewayServerID:          envDefault("GATEWAY_SERVER_ID", "emby-auth-gateway"),
+			MinResumePct:             envFloatDefault("GATEWAY_MIN_RESUME_PCT", 0),
+			MaxResumePct:             envFloatDefault("GATEWAY_MAX_RESUME_PCT", 0),
+			MinResumeDurationSeconds: envFloatDefault("GATEWAY_MIN_RESUME_DURATION_SECONDS", 0),
 		}, pbstore.New(e.App))
 
 		wildcardPath := basePath + "/{path...}"
@@ -114,6 +118,18 @@ func envDefault(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func envFloatDefault(name string, fallback float64) float64 {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }
 
 func normalizeGatewayBasePath(value string) string {
