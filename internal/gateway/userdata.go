@@ -172,7 +172,7 @@ func (s *Server) writeResumeItems(w http.ResponseWriter, r *http.Request, sessio
 		return
 	}
 	resumable := true
-	states, err := s.store.ListPlaybackStates(r.Context(), session.GatewayUserID, PlaybackStateFilter{Resumable: &resumable})
+	states, err := s.store.ListPlaybackStates(r.Context(), session.GatewayUserID, PlaybackStateFilter{Resumable: &resumable, IncludeOrphaned: true})
 	if err != nil {
 		http.Error(w, "resume unavailable", http.StatusInternalServerError)
 		return

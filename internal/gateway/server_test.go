@@ -1020,6 +1020,38 @@ func TestResumeMediaTypeFilterDoesNotOrphanFilteredItems(t *testing.T) {
 	}
 }
 
+func TestResumeRepairsPreviouslyOrphanedState(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/emby/Users/backend-user/Items" {
+			t.Fatalf("unexpected backend request %s", r.URL.String())
+		}
+		writeTestJSON(w, map[string]any{"Items": []any{
+			map[string]any{"Id": "episode-1", "Name": "Episode 1", "Type": "Episode", "MediaType": "Video", "UserData": map[string]any{}},
+		}})
+	}))
+	defer backend.Close()
+
+	store := NewMemoryStore()
+	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	orphanedAt := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "episode-1", PlaybackPositionTicks: 1200, OrphanedAt: &orphanedAt})
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Users/gateway-user/Items/Resume?api_key=gateway-token&MediaTypes=Video", nil))
+	defer resp.Body.Close()
+	var body map[string]any
+	decodeJSON(t, resp.Body, &body)
+	items := body["Items"].([]any)
+	if len(items) != 1 || items[0].(map[string]any)["Id"] != "episode-1" {
+		t.Fatalf("resume items = %#v, want repaired episode-1", items)
+	}
+	state, err := store.FindPlaybackState(context.Background(), "u1", "episode-1")
+	if err != nil || state.OrphanedAt != nil || state.LastSeenAt == nil {
+		t.Fatalf("orphaned state was not repaired: %#v err=%v", state, err)
+	}
+}
+
 func TestResumeDoesNotOrphanItemsBeyondResolutionBatchLimit(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ids := splitFilterValues([]string{r.URL.Query().Get("Ids")})
