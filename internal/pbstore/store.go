@@ -16,6 +16,8 @@ type Store struct {
 	app core.App
 }
 
+const playbackStateItemIDBatchLimit = 50
+
 func New(app core.App) *Store {
 	return &Store{app: app}
 }
@@ -171,6 +173,24 @@ func (s *Store) ListPlaybackStatesByItemIDs(ctx context.Context, gatewayUserID s
 	if len(itemIDs) == 0 {
 		return map[string]*gateway.PlaybackState{}, nil
 	}
+	states := map[string]*gateway.PlaybackState{}
+	for start := 0; start < len(itemIDs); start += playbackStateItemIDBatchLimit {
+		end := start + playbackStateItemIDBatchLimit
+		if end > len(itemIDs) {
+			end = len(itemIDs)
+		}
+		batchStates, err := s.listPlaybackStatesByItemIDBatch(ctx, gatewayUserID, itemIDs[start:end])
+		if err != nil {
+			return nil, err
+		}
+		for id, state := range batchStates {
+			states[id] = state
+		}
+	}
+	return states, nil
+}
+
+func (s *Store) listPlaybackStatesByItemIDBatch(ctx context.Context, gatewayUserID string, itemIDs []string) (map[string]*gateway.PlaybackState, error) {
 	filterParts := make([]string, 0, len(itemIDs))
 	params := dbx.Params{"gatewayUserID": gatewayUserID}
 	for i, itemID := range itemIDs {

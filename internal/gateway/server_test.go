@@ -782,6 +782,25 @@ func TestStoppedPlaybackUsesEmbyTicksForResumeThresholds(t *testing.T) {
 	if state.Played || state.PlaybackPositionTicks != 3*60*embyTicksPerSecond || state.PlayCount != 0 || state.LastPlayedDate != nil {
 		t.Fatalf("10%% into a 30 minute video should remain resumable: %#v", state)
 	}
+
+	unknownRuntime := &PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "movie-2", PlaybackPositionTicks: 1000}
+	applyStoppedPlaybackState(unknownRuntime, now, false)
+	if unknownRuntime.Played || unknownRuntime.PlaybackPositionTicks != 1000 || unknownRuntime.PlayCount != 0 {
+		t.Fatalf("unknown runtime should keep resume position instead of completing: %#v", unknownRuntime)
+	}
+}
+
+func TestPlaybackDetailsParsesNumericStrings(t *testing.T) {
+	details, ok := playbackDetailsFromJSON(map[string]any{
+		"ItemId":                "item-1",
+		"PlaybackPositionTicks": "12345",
+		"RunTimeTicks":          "100000",
+		"PlayedPercentage":      "12.5",
+		"Item":                  map[string]any{"Id": "item-1", "RunTimeTicks": "100000"},
+	})
+	if !ok || !details.HasPositionTicks || details.PositionTicks != 12345 || !details.HasRunTimeTicks || details.RunTimeTicks != 100000 || details.PlayedPercentage == nil || *details.PlayedPercentage != 12.5 {
+		t.Fatalf("numeric strings were not parsed: %#v ok=%v", details, ok)
+	}
 }
 
 func TestUserDataVirtualizationIsGatewayUserScoped(t *testing.T) {
@@ -1052,12 +1071,47 @@ func TestResumeRepairsPreviouslyOrphanedState(t *testing.T) {
 	}
 }
 
+func TestResumeResolutionIgnoresCollectionFiltersForOrphanDecision(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("ParentId") != "" || r.URL.Query().Get("IsPlayed") != "" {
+			t.Fatalf("resolution request should not forward collection filters: %s", r.URL.RawQuery)
+		}
+		writeTestJSON(w, map[string]any{"Items": []any{
+			map[string]any{"Id": "movie-1", "Name": "Movie", "Type": "Movie", "MediaType": "Video", "UserData": map[string]any{}},
+		}})
+	}))
+	defer backend.Close()
+
+	store := NewMemoryStore()
+	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "movie-1", PlaybackPositionTicks: 1200})
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Users/gateway-user/Items/Resume?api_key=gateway-token&ParentId=wrong-parent&IsPlayed=false", nil))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("resume status = %d", resp.StatusCode)
+	}
+	var body map[string]any
+	decodeJSON(t, resp.Body, &body)
+	if len(body["Items"].([]any)) != 0 {
+		t.Fatalf("parent filter should exclude item without orphaning it: %#v", body)
+	}
+	state, err := store.FindPlaybackState(context.Background(), "u1", "movie-1")
+	if err != nil || state.OrphanedAt != nil {
+		t.Fatalf("collection filter should not orphan existing state: %#v err=%v", state, err)
+	}
+}
+
 func TestResumeDoesNotOrphanItemsBeyondResolutionBatchLimit(t *testing.T) {
+	var requestSizes []int
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ids := splitFilterValues([]string{r.URL.Query().Get("Ids")})
-		if len(ids) != personalIDBatchLimit {
-			t.Fatalf("resolved ids = %d, want %d", len(ids), personalIDBatchLimit)
+		if len(ids) == 0 || len(ids) > personalIDBatchLimit {
+			t.Fatalf("resolved ids = %d, want 1..%d", len(ids), personalIDBatchLimit)
 		}
+		requestSizes = append(requestSizes, len(ids))
 		items := make([]any, 0, len(ids))
 		for _, id := range ids {
 			items = append(items, map[string]any{"Id": id, "Name": id, "Type": "Movie", "MediaType": "Video", "UserData": map[string]any{}})
@@ -1080,6 +1134,9 @@ func TestResumeDoesNotOrphanItemsBeyondResolutionBatchLimit(t *testing.T) {
 	state, err := store.FindPlaybackState(context.Background(), "u1", "item-200")
 	if err != nil || state.OrphanedAt != nil {
 		t.Fatalf("unrequested item should not be orphaned: %#v err=%v", state, err)
+	}
+	if len(requestSizes) != 2 || requestSizes[0] != personalIDBatchLimit || requestSizes[1] != 1 {
+		t.Fatalf("batch sizes = %v, want [200 1]", requestSizes)
 	}
 }
 
@@ -1222,10 +1279,42 @@ func TestPersonalFiltersTranslateToBackendIDSets(t *testing.T) {
 	}
 }
 
+func TestPersonalFiltersApplyToNonUserItemLists(t *testing.T) {
+	var sawIDs string
+	var sawFilters string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/emby/Shows/show-1/Episodes" {
+			t.Fatalf("unexpected backend request %s", r.URL.String())
+		}
+		sawIDs = r.URL.Query().Get("Ids")
+		sawFilters = r.URL.Query().Get("Filters")
+		writeTestJSON(w, map[string]any{"Items": []any{map[string]any{"Id": sawIDs, "Type": "Episode", "UserData": map[string]any{}}}, "TotalRecordCount": 1})
+	}))
+	defer backend.Close()
+
+	store := NewMemoryStore()
+	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "ep-played", Played: true})
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Shows/show-1/Episodes?api_key=gateway-token&UserId=gateway-user&Filters=IsPlayed", nil))
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("filtered episodes status = %d", resp.StatusCode)
+	}
+	if sawIDs != "ep-played" || sawFilters != "" {
+		t.Fatalf("backend query Ids=%q Filters=%q, want ep-played/no personal filter", sawIDs, sawFilters)
+	}
+}
+
 func TestNextUpUsesGatewaySeriesState(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/emby/Shows/show-1/Episodes" {
 			t.Fatalf("unexpected backend request %s", r.URL.String())
+		}
+		if r.URL.Query().Get("Limit") != "" || r.URL.Query().Get("StartIndex") != "" {
+			t.Fatalf("next up episode lookup should not forward pagination: %s", r.URL.RawQuery)
 		}
 		writeTestJSON(w, map[string]any{"Items": []any{
 			map[string]any{"Id": "ep-1", "Name": "Episode 1", "Type": "Episode", "SeriesId": "show-1", "ParentIndexNumber": 1, "IndexNumber": 1, "UserData": map[string]any{}},
@@ -1241,7 +1330,7 @@ func TestNextUpUsesGatewaySeriesState(t *testing.T) {
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
-	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Shows/NextUp?api_key=gateway-token", nil))
+	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Shows/NextUp?api_key=gateway-token&Limit=1", nil))
 	defer resp.Body.Close()
 	var body map[string]any
 	decodeJSON(t, resp.Body, &body)
@@ -1265,7 +1354,8 @@ func TestDisplayPreferencesAndSessionsAreUserScoped(t *testing.T) {
 
 	store := NewMemoryStore()
 	session := testSession(backend.URL + "/emby")
-	session.DeviceID = "device-1"
+	session.DeviceID = "client-device"
+	session.BackendIdentity = backendIdentityForTest("device-1")
 	store.Sessions[HashToken("gateway-token")] = session
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()

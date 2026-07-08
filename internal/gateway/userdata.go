@@ -36,7 +36,7 @@ func (s *Server) handlePersonalDataRequest(w http.ResponseWriter, r *http.Reques
 	case isSessionsPath(rel):
 		s.writeFilteredSessions(w, r, rel, session, gatewayToken)
 		return true
-	case isItemsPath(rel) && queryHasPersonalFilter(r.URL.Query()):
+	case shouldLocalizePersonalFilter(rel, r.URL.Query()):
 		s.writePersonalFilteredItems(w, r, rel, session, gatewayToken)
 		return true
 	default:
@@ -244,7 +244,7 @@ func (s *Server) writeFilteredSessions(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 	rewritten := s.rewriteProxyJSONValue(r.Context(), value, session, gatewayToken, s.gatewayBaseForRequest(r))
-	deviceID := session.DeviceID
+	deviceID := session.BackendIdentity.WithDefaults().DeviceID
 	if deviceID == "" {
 		writeJSON(w, status, []any{})
 		return
@@ -264,8 +264,9 @@ func (s *Server) writeNextUpItems(w http.ResponseWriter, r *http.Request, sessio
 	series := recentlyActiveSeries(states)
 	playedByID := playbackStateSet(filterStates(states, func(state PlaybackState) bool { return state.Played }))
 	items := make([]any, 0, len(series))
+	episodeQuery := queryForIDResolution(r.URL.Query())
 	for _, seriesID := range series {
-		episodeValue, status, err := s.fetchBackendJSON(r.Context(), r, "/Shows/"+seriesID+"/Episodes", r.URL.RawQuery, session, gatewayToken)
+		episodeValue, status, err := s.fetchBackendJSON(r.Context(), r, "/Shows/"+seriesID+"/Episodes", episodeQuery.Encode(), session, gatewayToken)
 		if err != nil || status < 200 || status >= 300 {
 			continue
 		}
@@ -399,45 +400,51 @@ func (s *Server) resolveItemsByID(ctx context.Context, r *http.Request, session 
 	}
 	requestQuery := cloneQuery(r.URL.Query())
 	q := queryForIDResolution(requestQuery)
-	resolvedIDs := limitStrings(ids, personalIDBatchLimit)
-	q.Set("Ids", strings.Join(resolvedIDs, ","))
-	value, status, err := s.fetchBackendJSON(ctx, r, "/Users/"+session.SyntheticUserID+"/Items", q.Encode(), session, gatewayToken)
-	if err != nil || status < 200 || status >= 300 {
-		return []any{}
-	}
-	items := extractItems(value)
-	byID := map[string]map[string]any{}
-	for _, item := range items {
-		if id, _ := stringField(item, "Id"); id != "" {
-			byID[id] = item
-		}
-	}
-	out := make([]any, 0, len(resolvedIDs))
+	out := make([]any, 0, len(ids))
 	now := time.Now().UTC()
-	for _, id := range resolvedIDs {
-		item, ok := byID[id]
-		state := s.stateForItem(ctx, session, id)
-		if !ok {
-			state.OrphanedAt = &now
+	for start := 0; start < len(ids); start += personalIDBatchLimit {
+		end := start + personalIDBatchLimit
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batchIDs := ids[start:end]
+		q.Set("Ids", strings.Join(batchIDs, ","))
+		value, status, err := s.fetchBackendJSON(ctx, r, "/Users/"+session.SyntheticUserID+"/Items", q.Encode(), session, gatewayToken)
+		if err != nil || status < 200 || status >= 300 {
+			continue
+		}
+		items := extractItems(value)
+		byID := map[string]map[string]any{}
+		for _, item := range items {
+			if id, _ := stringField(item, "Id"); id != "" {
+				byID[id] = item
+			}
+		}
+		for _, id := range batchIDs {
+			item, ok := byID[id]
+			state := s.stateForItem(ctx, session, id)
+			if !ok {
+				state.OrphanedAt = &now
+				_ = s.store.SavePlaybackState(ctx, *state)
+				continue
+			}
+			if !itemMatchesResolutionQuery(item, requestQuery) {
+				continue
+			}
+			fingerprint := itemFingerprint(item)
+			if state.Fingerprint != "" && fingerprint != "" && !fingerprintsCompatible(state.Fingerprint, fingerprint) {
+				state.OrphanedAt = &now
+				_ = s.store.SavePlaybackState(ctx, *state)
+				continue
+			}
+			state.OrphanedAt = nil
+			state.LastSeenAt = &now
+			mergeItemMetadata(state, item)
 			_ = s.store.SavePlaybackState(ctx, *state)
-			continue
-		}
-		if !itemMatchesResolutionQuery(item, requestQuery) {
-			continue
-		}
-		fingerprint := itemFingerprint(item)
-		if state.Fingerprint != "" && fingerprint != "" && !fingerprintsCompatible(state.Fingerprint, fingerprint) {
-			state.OrphanedAt = &now
-			_ = s.store.SavePlaybackState(ctx, *state)
-			continue
-		}
-		state.OrphanedAt = nil
-		state.LastSeenAt = &now
-		mergeItemMetadata(state, item)
-		_ = s.store.SavePlaybackState(ctx, *state)
-		rewritten := s.rewriteProxyJSONValue(ctx, item, session, gatewayToken, s.gatewayBaseForRequest(r))
-		if m, ok := rewritten.(map[string]any); ok {
-			out = append(out, m)
+			rewritten := s.rewriteProxyJSONValue(ctx, item, session, gatewayToken, s.gatewayBaseForRequest(r))
+			if m, ok := rewritten.(map[string]any); ok {
+				out = append(out, m)
+			}
 		}
 	}
 	return out
@@ -445,10 +452,21 @@ func (s *Server) resolveItemsByID(ctx context.Context, r *http.Request, session 
 
 func queryForIDResolution(q url.Values) url.Values {
 	copy := cloneQuery(q)
-	for _, name := range []string{"StartIndex", "Limit", "MediaTypes", "IncludeItemTypes", "ExcludeItemTypes"} {
-		copy.Del(name)
+	for name := range copy {
+		if !isIDResolutionProjectionParam(name) {
+			copy.Del(name)
+		}
 	}
 	return copy
+}
+
+func isIDResolutionProjectionParam(name string) bool {
+	switch strings.ToLower(name) {
+	case "fields", "enableimagetypes", "imagetypelimit", "enableimages", "enableuserdata", "enableuserdatas", "enabletotalrecordcount":
+		return true
+	default:
+		return false
+	}
 }
 
 func itemMatchesResolutionQuery(item map[string]any, q url.Values) bool {
@@ -467,6 +485,18 @@ func itemMatchesResolutionQuery(item map[string]any, q url.Values) bool {
 	if excludeTypes := lowerSet(splitFilterValues(q["ExcludeItemTypes"])); len(excludeTypes) > 0 {
 		itemType, _ := stringField(item, "Type")
 		if excludeTypes[strings.ToLower(itemType)] {
+			return false
+		}
+	}
+	if parentID := strings.TrimSpace(q.Get("ParentId")); parentID != "" {
+		itemParentID, _ := stringField(item, "ParentId")
+		if itemParentID != parentID {
+			return false
+		}
+	}
+	if seriesID := strings.TrimSpace(q.Get("SeriesId")); seriesID != "" {
+		itemSeriesID, _ := stringField(item, "SeriesId")
+		if itemSeriesID != seriesID {
 			return false
 		}
 	}
@@ -760,6 +790,17 @@ func isLatestItemsPath(rel string) bool {
 func isItemsPath(rel string) bool {
 	parts := strings.Split(strings.Trim(rel, "/"), "/")
 	return len(parts) == 3 && strings.EqualFold(parts[0], "Users") && strings.EqualFold(parts[2], "Items")
+}
+
+func shouldLocalizePersonalFilter(rel string, q url.Values) bool {
+	if !queryHasPersonalFilter(q) {
+		return false
+	}
+	methodLikePath := strings.Trim(rel, "/")
+	if methodLikePath == "" {
+		return false
+	}
+	return true
 }
 
 func isNextUpPath(rel string) bool {

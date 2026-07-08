@@ -13,6 +13,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -748,8 +749,6 @@ func applyStoppedPlaybackState(state *PlaybackState, now time.Time, wasPlayed bo
 		case durationSeconds < minResumeDurationSeconds:
 			completed = true
 		}
-	} else if !completed && runtime == 0 && position > 0 {
-		completed = true
 	}
 	if !completed && state.PlayedPercentage != nil && *state.PlayedPercentage >= maxResumePct {
 		completed = true
@@ -1335,6 +1334,9 @@ func int64Field(obj map[string]any, name string) (int64, bool) {
 		return x, true
 	case int:
 		return int64(x), true
+	case string:
+		n, err := strconv.ParseInt(strings.TrimSpace(x), 10, 64)
+		return n, err == nil
 	default:
 		return 0, false
 	}
@@ -1355,6 +1357,9 @@ func float64Field(obj map[string]any, name string) (float64, bool) {
 		return float64(x), true
 	case int:
 		return float64(x), true
+	case string:
+		n, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
+		return n, err == nil
 	default:
 		return 0, false
 	}

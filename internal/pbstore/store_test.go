@@ -3,6 +3,7 @@ package pbstore
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -174,6 +175,31 @@ func TestPlaybackStateBatchLookupSkipsOrphanedRecords(t *testing.T) {
 	}
 	if len(states) != 0 {
 		t.Fatalf("orphaned state should be skipped: %#v", states)
+	}
+}
+
+func TestPlaybackStateBatchLookupChunksLargeIDLists(t *testing.T) {
+	app := newTestApp(t)
+	store := New(app)
+	userID := createGatewayUser(t, app, "alice", "gateway-user")
+	for i := 0; i < playbackStateItemIDBatchLimit+1; i++ {
+		id := "item-" + strconv.Itoa(i)
+		if err := store.SavePlaybackState(context.Background(), gateway.PlaybackState{GatewayUserID: userID, SyntheticUserID: "gateway-user", ItemID: id, PlaybackPositionTicks: int64(i + 1)}); err != nil {
+			t.Fatalf("save playback state: %v", err)
+		}
+	}
+	ids := make([]string, 0, playbackStateItemIDBatchLimit+1)
+	for i := 0; i < playbackStateItemIDBatchLimit+1; i++ {
+		ids = append(ids, "item-"+strconv.Itoa(i))
+	}
+	states, err := store.ListPlaybackStatesByItemIDs(context.Background(), userID, ids)
+	if err != nil {
+		t.Fatalf("batch lookup playback states: %v", err)
+	}
+	lastID := "item-" + strconv.Itoa(playbackStateItemIDBatchLimit)
+	last := states[lastID]
+	if len(states) != playbackStateItemIDBatchLimit+1 || last == nil || last.PlaybackPositionTicks != int64(playbackStateItemIDBatchLimit+1) {
+		t.Fatalf("unexpected chunked states len=%d last=%#v", len(states), last)
 	}
 }
 
