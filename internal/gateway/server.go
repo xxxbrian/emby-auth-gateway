@@ -23,6 +23,7 @@ const gatewayVersion = "0.0.0"
 
 const (
 	backendAuthTimeout         = 15 * time.Second
+	defaultBackendUserAgent    = "Emby for Android/3.4.20"
 	proxyResponseHeaderTimeout = 30 * time.Second
 	proxyIdleConnTimeout       = 90 * time.Second
 	loginFailureLimit          = 5
@@ -122,7 +123,7 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	auth := firstAuthHeader(r)
-	backendResult, err := s.authenticateBackend(ctx, mapping.BackendAccount, auth)
+	backendResult, err := s.authenticateBackend(ctx, mapping.BackendAccount, auth, r.UserAgent())
 	if err != nil {
 		http.Error(w, "backend authentication failed", http.StatusBadGateway)
 		return
@@ -200,7 +201,7 @@ func parseAuthenticateBody(w http.ResponseWriter, r *http.Request) (authenticate
 	return form, json.Unmarshal(body, &form)
 }
 
-func (s *Server) authenticateBackend(ctx context.Context, account BackendAccount, auth AuthHeader) (*backendAuthResult, error) {
+func (s *Server) authenticateBackend(ctx context.Context, account BackendAccount, auth AuthHeader, userAgent string) (*backendAuthResult, error) {
 	u, err := backendURL(account.BaseURL, "/Users/AuthenticateByName")
 	if err != nil {
 		return nil, err
@@ -217,6 +218,10 @@ func (s *Server) authenticateBackend(ctx context.Context, account BackendAccount
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if strings.TrimSpace(userAgent) == "" {
+		userAgent = defaultBackendUserAgent
+	}
+	req.Header.Set("User-Agent", userAgent)
 	auth.UserID = ""
 	auth.Token = ""
 	if auth.Scheme == "" {

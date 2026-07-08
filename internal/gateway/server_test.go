@@ -28,6 +28,7 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 
 	var backendURL string
 	var sawControlledBackendLogin bool
+	var sawBackendAuthUserAgent bool
 	var sawBackendTokenInRequest bool
 	var sawBackendUserInPath bool
 	var sawBackendTokenFromAPIKey bool
@@ -35,6 +36,9 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/emby/Users/AuthenticateByName":
+			if r.UserAgent() == "Emby for Android/3.4.20" {
+				sawBackendAuthUserAgent = true
+			}
 			var body map[string]string
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatalf("decode backend auth body: %v", err)
@@ -141,7 +145,8 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 	loginBody := `{"Username":"alice","Pw":"alice-pass"}`
 	loginReq, _ := http.NewRequest(http.MethodPost, gw.URL+"/emby/Users/AuthenticateByName", strings.NewReader(loginBody))
 	loginReq.Header.Set("Content-Type", "application/json")
-	loginReq.Header.Set("X-Emby-Authorization", `Emby Client="Test", Device="curl", DeviceId="dev-1", Version="1"`)
+	loginReq.Header.Set("User-Agent", "Emby for Android/3.4.20")
+	loginReq.Header.Set("X-Emby-Authorization", `Emby Client="Emby for Android", Device="Android Phone", DeviceId="android-client-dev-1", Version="3.4.20"`)
 	loginResp := do(t, loginReq)
 	defer loginResp.Body.Close()
 	if loginResp.StatusCode != http.StatusOK {
@@ -156,6 +161,9 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 	}
 	if !sawControlledBackendLogin {
 		t.Fatal("backend did not receive controlled backend account credentials")
+	}
+	if !sawBackendAuthUserAgent {
+		t.Fatal("backend authentication did not receive client user agent")
 	}
 	if strings.Contains(mustJSON(t, login), backendToken) || strings.Contains(mustJSON(t, login), backendUserID) {
 		t.Fatalf("login leaked backend token or user id: %s", mustJSON(t, login))
