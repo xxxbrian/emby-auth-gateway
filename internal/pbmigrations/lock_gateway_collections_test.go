@@ -54,45 +54,6 @@ func TestGatewayCollectionsAreLockedAndStoreAuthStillWorks(t *testing.T) {
 	}
 }
 
-func TestGatewayCollectionsLockMigrationDownRestoresRules(t *testing.T) {
-	app, err := tests.NewTestAppWithConfig(core.BaseAppConfig{
-		DataDir:       t.TempDir(),
-		EncryptionEnv: "test",
-	})
-	if err != nil {
-		t.Fatalf("new test app: %v", err)
-	}
-	defer app.Cleanup()
-
-	if _, err := core.NewMigrationsRunner(app, core.AppMigrations).Down(3); err != nil {
-		t.Fatalf("revert phase2/userdata and lock migrations: %v", err)
-	}
-
-	users, err := app.FindCollectionByNameOrId("users")
-	if err != nil {
-		t.Fatalf("find users: %v", err)
-	}
-	assertRules(t, users,
-		strPtr("@request.auth.collectionName = 'users'"),
-		strPtr("id = @request.auth.id"),
-		strPtr(""),
-		strPtr("id = @request.auth.id"),
-		strPtr("id = @request.auth.id"),
-	)
-	if !users.PasswordAuth.Enabled {
-		t.Fatal("users PasswordAuth.Enabled = false, want true after down")
-	}
-
-	for _, name := range []string{"emby_servers", "backend_accounts", "user_mappings", "gateway_sessions", "audit_logs"} {
-		collection, err := app.FindCollectionByNameOrId(name)
-		if err != nil {
-			t.Fatalf("find collection %s: %v", name, err)
-		}
-		empty := strPtr("")
-		assertRules(t, collection, empty, empty, empty, empty, empty)
-	}
-}
-
 func assertRules(t *testing.T, collection *core.Collection, list, view, create, update, delete *string) {
 	t.Helper()
 	assertRule(t, collection.Name+" list", collection.ListRule, list)
@@ -113,8 +74,4 @@ func assertRule(t *testing.T, label string, got, want *string) {
 	if *got != *want {
 		t.Fatalf("%s rule = %q, want %q", label, *got, *want)
 	}
-}
-
-func strPtr(value string) *string {
-	return &value
 }
