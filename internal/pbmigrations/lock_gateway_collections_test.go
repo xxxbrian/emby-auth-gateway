@@ -47,6 +47,8 @@ func TestGatewayCollectionsAreLockedAndStoreAuthStillWorks(t *testing.T) {
 		"backend_authorization_device_id",
 		"backend_authorization_version",
 	}, []string{"backend_token_encrypted"})
+	assertTextFieldsOptional(t, app, "emby_servers", backendIdentityFieldNames)
+	assertTextFieldsOptional(t, app, "gateway_sessions", backendIdentityFieldNames)
 
 	users, err := app.FindCollectionByNameOrId("users")
 	if err != nil {
@@ -68,6 +70,23 @@ func TestGatewayCollectionsAreLockedAndStoreAuthStillWorks(t *testing.T) {
 	}
 	if user.Username != "alice" || user.SyntheticUserID != "gateway-user" {
 		t.Fatalf("unexpected authenticated user: %#v", user)
+	}
+}
+
+func assertTextFieldsOptional(t *testing.T, app core.App, collectionName string, fieldNames []string) {
+	t.Helper()
+	collection, err := app.FindCollectionByNameOrId(collectionName)
+	if err != nil {
+		t.Fatalf("find collection %s: %v", collectionName, err)
+	}
+	for _, name := range fieldNames {
+		field, ok := collection.Fields.GetByName(name).(*core.TextField)
+		if !ok {
+			t.Fatalf("collection %s field %s is %T, want *core.TextField", collectionName, name, collection.Fields.GetByName(name))
+		}
+		if field.Required {
+			t.Fatalf("collection %s field %s is required, want optional", collectionName, name)
+		}
 	}
 }
 

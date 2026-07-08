@@ -76,6 +76,38 @@ func TestCleanupGatewaySessionsKeepsOnlyRecentActiveOrRevokedSessions(t *testing
 	}
 }
 
+func TestBackendIdentityDefaultsArePersistedOnServerCreate(t *testing.T) {
+	app, err := tests.NewTestAppWithConfig(core.BaseAppConfig{
+		DataDir:       t.TempDir(),
+		EncryptionEnv: "test",
+	})
+	if err != nil {
+		t.Fatalf("new test app: %v", err)
+	}
+	defer app.Cleanup()
+	registerBackendIdentityDefaults(app)
+
+	servers, err := app.FindCollectionByNameOrId("emby_servers")
+	if err != nil {
+		t.Fatalf("find emby_servers: %v", err)
+	}
+	record := core.NewRecord(servers)
+	record.Set("name", "server")
+	record.Set("base_url", "https://emby.example.com")
+	record.Set("enabled", true)
+	if err := app.Save(record); err != nil {
+		t.Fatalf("save server: %v", err)
+	}
+
+	defaults := gateway.DefaultBackendClientIdentity()
+	if record.GetString("backend_user_agent") != defaults.UserAgent || record.GetString("backend_authorization_client") != defaults.Client || record.GetString("backend_authorization_device") != defaults.Device || record.GetString("backend_authorization_version") != defaults.Version {
+		t.Fatalf("backend identity defaults not persisted: %#v", record.FieldsData())
+	}
+	if record.GetString("backend_authorization_device_id") != gateway.StableBackendDeviceID(record.Id) {
+		t.Fatalf("backend device id = %q, want stable id from record id", record.GetString("backend_authorization_device_id"))
+	}
+}
+
 func createTestUser(t *testing.T, app core.App) string {
 	t.Helper()
 	users, err := app.FindCollectionByNameOrId("users")

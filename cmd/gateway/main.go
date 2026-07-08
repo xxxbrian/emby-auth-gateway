@@ -21,6 +21,7 @@ func main() {
 	app := pocketbase.New()
 	migratecmd.MustRegister(app, app.RootCmd, migratecmd.Config{})
 	app.RootCmd.AddCommand(pbsetup.NewCommand(app))
+	registerBackendIdentityDefaults(app)
 
 	app.OnBootstrap().BindFunc(func(e *core.BootstrapEvent) error {
 		if err := e.Next(); err != nil {
@@ -74,6 +75,32 @@ func cleanupPlaybackEvents(app core.App, now time.Time) error {
 	cutoff := now.UTC().Add(-6 * time.Hour)
 	_, err := app.DB().NewQuery("delete from playback_events where occurred_at < {:cutoff}").Bind(map[string]any{"cutoff": cutoff}).Execute()
 	return err
+}
+
+func registerBackendIdentityDefaults(app core.App) {
+	app.OnRecordCreateExecute("emby_servers").BindFunc(func(e *core.RecordEvent) error {
+		identity := gateway.BackendClientIdentity{
+			UserAgent: e.Record.GetString("backend_user_agent"),
+			Client:    e.Record.GetString("backend_authorization_client"),
+			Device:    e.Record.GetString("backend_authorization_device"),
+			DeviceID:  e.Record.GetString("backend_authorization_device_id"),
+			Version:   e.Record.GetString("backend_authorization_version"),
+		}.WithDefaults()
+		if strings.TrimSpace(identity.DeviceID) == "" {
+			seed := e.Record.Id
+			if strings.TrimSpace(seed) == "" {
+				seed = e.Record.GetString("name")
+			}
+			identity.DeviceID = gateway.StableBackendDeviceID(seed)
+		}
+
+		e.Record.Set("backend_user_agent", identity.UserAgent)
+		e.Record.Set("backend_authorization_client", identity.Client)
+		e.Record.Set("backend_authorization_device", identity.Device)
+		e.Record.Set("backend_authorization_device_id", identity.DeviceID)
+		e.Record.Set("backend_authorization_version", identity.Version)
+		return e.Next()
+	})
 }
 
 func cleanupGatewaySessions(app core.App, now time.Time) error {

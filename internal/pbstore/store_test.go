@@ -261,6 +261,49 @@ func TestBackendAccountAndSessionUsePlainCredentialsAndClientIdentity(t *testing
 	}
 }
 
+func TestBackendServerIdentityFieldsAreOptionalAndDefaulted(t *testing.T) {
+	app := newTestApp(t)
+	store := New(app)
+
+	servers, err := app.FindCollectionByNameOrId("emby_servers")
+	if err != nil {
+		t.Fatalf("find emby_servers: %v", err)
+	}
+	server := core.NewRecord(servers)
+	server.Set("name", "server")
+	server.Set("base_url", "https://emby.example.com")
+	server.Set("enabled", true)
+	if err := app.Save(server); err != nil {
+		t.Fatalf("save server with empty identity fields: %v", err)
+	}
+
+	accounts, err := app.FindCollectionByNameOrId("backend_accounts")
+	if err != nil {
+		t.Fatalf("find backend_accounts: %v", err)
+	}
+	accountRecord := core.NewRecord(accounts)
+	accountRecord.Set("server", server.Id)
+	accountRecord.Set("name", "backend")
+	accountRecord.Set("backend_username", "real-alice")
+	accountRecord.Set("backend_password", "backend-pass")
+	accountRecord.Set("enabled", true)
+	if err := app.Save(accountRecord); err != nil {
+		t.Fatalf("save backend account: %v", err)
+	}
+
+	account, err := store.DefaultBackend(context.Background())
+	if err != nil {
+		t.Fatalf("default backend: %v", err)
+	}
+	defaults := gateway.DefaultBackendClientIdentity()
+	if account.ClientIdentity.UserAgent != defaults.UserAgent || account.ClientIdentity.Client != defaults.Client || account.ClientIdentity.Device != defaults.Device || account.ClientIdentity.Version != defaults.Version {
+		t.Fatalf("backend identity defaults not applied: %#v", account.ClientIdentity)
+	}
+	if account.ClientIdentity.DeviceID != gateway.StableBackendDeviceID(server.Id) {
+		t.Fatalf("backend identity device id = %q, want stable default", account.ClientIdentity.DeviceID)
+	}
+}
+
 func newTestApp(t *testing.T) core.App {
 	t.Helper()
 	app, err := tests.NewTestAppWithConfig(core.BaseAppConfig{
