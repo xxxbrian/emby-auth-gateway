@@ -792,14 +792,17 @@ func (s *Server) rewriteProxyJSONValue(ctx context.Context, v any, session *Sess
 func (s *Server) overlayUserData(ctx context.Context, v any, session *Session, cache map[string]*PlaybackState) {
 	switch x := v.(type) {
 	case map[string]any:
-		if userData, ok := mapField(x, "UserData"); ok {
-			if itemID, ok := stringField(x, "Id"); ok {
-				state := s.cachedPlaybackState(ctx, session.GatewayUserID, itemID, cache)
-				if state == nil {
-					state = &PlaybackState{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, ItemID: itemID}
-				}
-				applyPlaybackStateToUserData(userData, state)
+		if itemID, ok := stringField(x, "Id"); ok && isItemLikeJSON(x) {
+			userData, ok := mapField(x, "UserData")
+			if !ok {
+				userData = map[string]any{}
+				x["UserData"] = userData
 			}
+			state := s.cachedPlaybackState(ctx, session.GatewayUserID, itemID, cache)
+			if state == nil {
+				state = &PlaybackState{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, ItemID: itemID}
+			}
+			applyPlaybackStateToUserData(userData, state)
 		}
 		for _, child := range x {
 			s.overlayUserData(ctx, child, session, cache)
@@ -809,6 +812,18 @@ func (s *Server) overlayUserData(ctx context.Context, v any, session *Session, c
 			s.overlayUserData(ctx, child, session, cache)
 		}
 	}
+}
+
+func isItemLikeJSON(obj map[string]any) bool {
+	if _, ok := field(obj, "UserData"); ok {
+		return true
+	}
+	for _, name := range []string{"Type", "MediaType", "Name", "RunTimeTicks", "IndexNumber", "ParentIndexNumber", "SeriesId", "SeasonId"} {
+		if _, ok := field(obj, name); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) cachedPlaybackState(ctx context.Context, gatewayUserID, itemID string, cache map[string]*PlaybackState) *PlaybackState {
@@ -840,6 +855,14 @@ func applyPlaybackStateToUserData(userData map[string]any, state *PlaybackState)
 	}
 	userData["PlayCount"] = state.PlayCount
 	userData["IsFavorite"] = state.IsFavorite
+	userData["ItemId"] = state.ItemID
+	userData["Key"] = state.ItemID
+	userData["Rating"] = nil
+	if state.Played {
+		userData["UnplayedItemCount"] = 0
+	} else {
+		userData["UnplayedItemCount"] = nil
+	}
 	if state.Likes != nil {
 		userData["Likes"] = *state.Likes
 	} else {
@@ -943,7 +966,7 @@ func copyResponseHeaders(dst, src http.Header, session *Session, gatewayToken, p
 
 func copyRequestHeaders(dst, src http.Header) {
 	for k, vals := range src {
-		if isHopHeader(k) || strings.EqualFold(k, "Content-Length") {
+		if isHopHeader(k) || strings.EqualFold(k, "Content-Length") || strings.EqualFold(k, "Accept-Encoding") {
 			continue
 		}
 		for _, val := range vals {

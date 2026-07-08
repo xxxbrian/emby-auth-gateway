@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bufio"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -792,6 +793,45 @@ func TestUserDataVirtualizationIsGatewayUserScoped(t *testing.T) {
 	}
 	if u3["Played"] != false || int(u3["PlaybackPositionTicks"].(float64)) != 0 || u3["PlayedPercentage"] != nil || int(u3["PlayCount"].(float64)) != 0 || u3["LastPlayedDate"] != nil {
 		t.Fatalf("missing state should not leak backend user data: %#v", u3)
+	}
+}
+
+func TestCompressedJSONUserDataIsVirtualized(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			t.Fatalf("backend did not receive gzip-capable request")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Encoding", "gzip")
+		gz := gzip.NewWriter(w)
+		defer gz.Close()
+		_ = json.NewEncoder(gz).Encode(map[string]any{
+			"Items": []any{
+				map[string]any{"Id": "episode-1", "Name": "Episode 1", "Type": "Episode", "UserData": map[string]any{"Played": true, "PlaybackPositionTicks": float64(9999), "PlayedPercentage": float64(99), "PlayCount": float64(9), "IsFavorite": false, "UnplayedItemCount": float64(12)}},
+			},
+		})
+	}))
+	defer backend.Close()
+
+	store := NewMemoryStore()
+	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "episode-1", IsFavorite: true})
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	req := mustRequest(t, http.MethodGet, gw.URL+"/emby/Shows/show-1/Episodes?api_key=gateway-token", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	resp := do(t, req)
+	defer resp.Body.Close()
+	if resp.Header.Get("Content-Encoding") == "gzip" {
+		t.Fatal("gateway returned compressed JSON before rewriting")
+	}
+	var body map[string]any
+	decodeJSON(t, resp.Body, &body)
+	items := body["Items"].([]any)
+	userData := items[0].(map[string]any)["UserData"].(map[string]any)
+	if userData["Played"] != false || int(userData["PlaybackPositionTicks"].(float64)) != 0 || userData["PlayedPercentage"] != nil || int(userData["PlayCount"].(float64)) != 0 || userData["IsFavorite"] != true || userData["UnplayedItemCount"] != nil {
+		t.Fatalf("compressed JSON UserData was not virtualized: %#v", userData)
 	}
 }
 
