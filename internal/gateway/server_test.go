@@ -835,6 +835,47 @@ func TestCompressedJSONUserDataIsVirtualized(t *testing.T) {
 	}
 }
 
+func TestProxyUserDataOverlayUsesBatchLookup(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeTestJSON(w, map[string]any{
+			"Items": []any{
+				map[string]any{"Id": "episode-1", "Name": "Episode 1", "Type": "Episode", "UserData": map[string]any{}},
+				map[string]any{"Id": "episode-2", "Name": "Episode 2", "Type": "Episode", "UserData": map[string]any{}},
+				map[string]any{"Id": "episode-1", "Name": "Episode 1 duplicate", "Type": "Episode", "UserData": map[string]any{}},
+			},
+		})
+	}))
+	defer backend.Close()
+
+	base := NewMemoryStore()
+	store := &countingPlaybackStore{MemoryStore: base}
+	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "episode-1", PlaybackPositionTicks: 1200})
+	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "episode-2", IsFavorite: true})
+	gateway := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gateway.Close()
+
+	resp := do(t, mustRequest(t, http.MethodGet, gateway.URL+"/emby/Shows/show-1/Episodes?api_key=gateway-token", nil))
+	defer resp.Body.Close()
+	var body map[string]any
+	decodeJSON(t, resp.Body, &body)
+	items := body["Items"].([]any)
+	firstUserData := items[0].(map[string]any)["UserData"].(map[string]any)
+	secondUserData := items[1].(map[string]any)["UserData"].(map[string]any)
+	if int(firstUserData["PlaybackPositionTicks"].(float64)) != 1200 || secondUserData["IsFavorite"] != true {
+		t.Fatalf("UserData was not overlaid from batched states: first=%#v second=%#v", firstUserData, secondUserData)
+	}
+	if store.singleLookups != 0 {
+		t.Fatalf("FindPlaybackState calls = %d, want 0", store.singleLookups)
+	}
+	if store.batchLookups != 1 {
+		t.Fatalf("ListPlaybackStatesByItemIDs calls = %d, want 1", store.batchLookups)
+	}
+	if got := strings.Join(store.batchItemIDs, ","); got != "episode-1,episode-2" {
+		t.Fatalf("batched item ids = %q, want episode-1,episode-2", got)
+	}
+}
+
 func TestResumeUsesGatewayStateAndResolvesExistingItems(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/emby/Users/backend-user/Items" {
@@ -1248,6 +1289,24 @@ type failingSaveStore struct {
 
 func (f *failingSaveStore) SaveSession(ctx context.Context, session *Session) error {
 	return errors.New("save failed")
+}
+
+type countingPlaybackStore struct {
+	*MemoryStore
+	singleLookups int
+	batchLookups  int
+	batchItemIDs  []string
+}
+
+func (c *countingPlaybackStore) FindPlaybackState(ctx context.Context, gatewayUserID, itemID string) (*PlaybackState, error) {
+	c.singleLookups++
+	return c.MemoryStore.FindPlaybackState(ctx, gatewayUserID, itemID)
+}
+
+func (c *countingPlaybackStore) ListPlaybackStatesByItemIDs(ctx context.Context, gatewayUserID string, itemIDs []string) (map[string]*PlaybackState, error) {
+	c.batchLookups++
+	c.batchItemIDs = append([]string(nil), itemIDs...)
+	return c.MemoryStore.ListPlaybackStatesByItemIDs(ctx, gatewayUserID, itemIDs)
 }
 
 func hasAuditEvent(store *MemoryStore, event string) bool {

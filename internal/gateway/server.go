@@ -784,12 +784,42 @@ func (s *Server) rewriteProxyJSONValue(ctx context.Context, v any, session *Sess
 	if session == nil {
 		return rewritten
 	}
-	cache := map[string]*PlaybackState{}
-	s.overlayUserData(ctx, rewritten, session, cache)
+	itemIDs := collectUserDataItemIDs(rewritten)
+	states, err := s.store.ListPlaybackStatesByItemIDs(ctx, session.GatewayUserID, itemIDs)
+	if err != nil {
+		states = map[string]*PlaybackState{}
+	}
+	s.overlayUserData(rewritten, session, states)
 	return rewritten
 }
 
-func (s *Server) overlayUserData(ctx context.Context, v any, session *Session, cache map[string]*PlaybackState) {
+func collectUserDataItemIDs(v any) []string {
+	seen := map[string]struct{}{}
+	var itemIDs []string
+	var walk func(any)
+	walk = func(value any) {
+		switch x := value.(type) {
+		case map[string]any:
+			if itemID, ok := stringField(x, "Id"); ok && isItemLikeJSON(x) {
+				if _, exists := seen[itemID]; !exists {
+					seen[itemID] = struct{}{}
+					itemIDs = append(itemIDs, itemID)
+				}
+			}
+			for _, child := range x {
+				walk(child)
+			}
+		case []any:
+			for _, child := range x {
+				walk(child)
+			}
+		}
+	}
+	walk(v)
+	return itemIDs
+}
+
+func (s *Server) overlayUserData(v any, session *Session, states map[string]*PlaybackState) {
 	switch x := v.(type) {
 	case map[string]any:
 		if itemID, ok := stringField(x, "Id"); ok && isItemLikeJSON(x) {
@@ -798,18 +828,18 @@ func (s *Server) overlayUserData(ctx context.Context, v any, session *Session, c
 				userData = map[string]any{}
 				x["UserData"] = userData
 			}
-			state := s.cachedPlaybackState(ctx, session.GatewayUserID, itemID, cache)
+			state := states[itemID]
 			if state == nil {
 				state = &PlaybackState{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, ItemID: itemID}
 			}
 			applyPlaybackStateToUserData(userData, state)
 		}
 		for _, child := range x {
-			s.overlayUserData(ctx, child, session, cache)
+			s.overlayUserData(child, session, states)
 		}
 	case []any:
 		for _, child := range x {
-			s.overlayUserData(ctx, child, session, cache)
+			s.overlayUserData(child, session, states)
 		}
 	}
 }
@@ -824,20 +854,6 @@ func isItemLikeJSON(obj map[string]any) bool {
 		}
 	}
 	return false
-}
-
-func (s *Server) cachedPlaybackState(ctx context.Context, gatewayUserID, itemID string, cache map[string]*PlaybackState) *PlaybackState {
-	key := playbackStateKey(gatewayUserID, itemID)
-	if state, ok := cache[key]; ok {
-		return state
-	}
-	state, err := s.store.FindPlaybackState(ctx, gatewayUserID, itemID)
-	if err != nil || state == nil {
-		cache[key] = nil
-		return nil
-	}
-	cache[key] = state
-	return state
 }
 
 func applyPlaybackStateToUserData(userData map[string]any, state *PlaybackState) {

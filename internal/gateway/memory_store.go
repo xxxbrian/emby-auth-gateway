@@ -139,6 +139,24 @@ func (m *MemoryStore) FindPlaybackState(ctx context.Context, gatewayUserID, item
 	return &copyState, nil
 }
 
+func (m *MemoryStore) ListPlaybackStatesByItemIDs(ctx context.Context, gatewayUserID string, itemIDs []string) (map[string]*PlaybackState, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	states := make(map[string]*PlaybackState, len(itemIDs))
+	for _, itemID := range itemIDs {
+		if itemID == "" {
+			continue
+		}
+		state, ok := m.PlaybackStates[playbackStateKey(gatewayUserID, itemID)]
+		if !ok {
+			continue
+		}
+		copyState := *state
+		states[itemID] = &copyState
+	}
+	return states, nil
+}
+
 func (m *MemoryStore) SavePlaybackState(ctx context.Context, state PlaybackState) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

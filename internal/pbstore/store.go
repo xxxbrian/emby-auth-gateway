@@ -2,6 +2,8 @@ package pbstore
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 
 	"emby-auth-gateway/internal/gateway"
@@ -164,6 +166,42 @@ func (s *Store) FindPlaybackState(ctx context.Context, gatewayUserID, itemID str
 		return nil, gateway.ErrNotFound
 	}
 	return playbackStateFromRecord(records[0]), nil
+}
+
+func (s *Store) ListPlaybackStatesByItemIDs(ctx context.Context, gatewayUserID string, itemIDs []string) (map[string]*gateway.PlaybackState, error) {
+	if len(itemIDs) == 0 {
+		return map[string]*gateway.PlaybackState{}, nil
+	}
+	filterParts := make([]string, 0, len(itemIDs))
+	params := dbx.Params{"gatewayUserID": gatewayUserID}
+	for i, itemID := range itemIDs {
+		if itemID == "" {
+			continue
+		}
+		name := fmt.Sprintf("itemID%d", i)
+		filterParts = append(filterParts, "item_id = {:"+name+"}")
+		params[name] = itemID
+	}
+	if len(filterParts) == 0 {
+		return map[string]*gateway.PlaybackState{}, nil
+	}
+	records, err := s.app.FindRecordsByFilter(
+		"user_item_data",
+		"gateway_user = {:gatewayUserID} && ("+strings.Join(filterParts, " || ")+")",
+		"",
+		0,
+		0,
+		params,
+	)
+	if err != nil {
+		return nil, err
+	}
+	states := make(map[string]*gateway.PlaybackState, len(records))
+	for _, record := range records {
+		state := playbackStateFromRecord(record)
+		states[state.ItemID] = state
+	}
+	return states, nil
 }
 
 func (s *Store) ListPlaybackStates(ctx context.Context, gatewayUserID string, filter gateway.PlaybackStateFilter) ([]gateway.PlaybackState, error) {
