@@ -8,14 +8,15 @@ import (
 )
 
 type MemoryStore struct {
-	mu             sync.RWMutex
-	Users          map[string]MemoryUser
-	Mappings       map[string]UserMapping
-	Sessions       map[string]*Session
-	AuditLogs      []AuditLog
-	PathPolicies   []PathPolicy
-	PlaybackEvents []PlaybackEvent
-	PlaybackStates map[string]*PlaybackState
+	mu                 sync.RWMutex
+	Users              map[string]MemoryUser
+	Mappings           map[string]UserMapping
+	Sessions           map[string]*Session
+	AuditLogs          []AuditLog
+	PathPolicies       []PathPolicy
+	PlaybackEvents     []PlaybackEvent
+	PlaybackStates     map[string]*PlaybackState
+	DisplayPreferences map[string]*DisplayPreference
 }
 
 type MemoryUser struct {
@@ -25,10 +26,11 @@ type MemoryUser struct {
 
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		Users:          map[string]MemoryUser{},
-		Mappings:       map[string]UserMapping{},
-		Sessions:       map[string]*Session{},
-		PlaybackStates: map[string]*PlaybackState{},
+		Users:              map[string]MemoryUser{},
+		Mappings:           map[string]UserMapping{},
+		Sessions:           map[string]*Session{},
+		PlaybackStates:     map[string]*PlaybackState{},
+		DisplayPreferences: map[string]*DisplayPreference{},
 	}
 }
 
@@ -151,6 +153,63 @@ func (m *MemoryStore) SavePlaybackState(ctx context.Context, state PlaybackState
 	return nil
 }
 
+func (m *MemoryStore) ListPlaybackStates(ctx context.Context, gatewayUserID string, filter PlaybackStateFilter) ([]PlaybackState, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	states := make([]PlaybackState, 0, len(m.PlaybackStates))
+	for _, state := range m.PlaybackStates {
+		if state.GatewayUserID != gatewayUserID {
+			continue
+		}
+		if !filter.IncludeOrphaned && state.OrphanedAt != nil {
+			continue
+		}
+		if filter.Played != nil && state.Played != *filter.Played {
+			continue
+		}
+		if filter.Favorite != nil && state.IsFavorite != *filter.Favorite {
+			continue
+		}
+		if filter.Resumable != nil {
+			resumable := state.PlaybackPositionTicks > 0 && !state.Played
+			if resumable != *filter.Resumable {
+				continue
+			}
+		}
+		if filter.SeriesID != "" && state.SeriesID != filter.SeriesID {
+			continue
+		}
+		copyState := *state
+		states = append(states, copyState)
+	}
+	return states, nil
+}
+
+func (m *MemoryStore) FindDisplayPreference(ctx context.Context, gatewayUserID, preferenceID, client string) (*DisplayPreference, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	preference, ok := m.DisplayPreferences[displayPreferenceKey(gatewayUserID, preferenceID, client)]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	copyPreference := *preference
+	return &copyPreference, nil
+}
+
+func (m *MemoryStore) SaveDisplayPreference(ctx context.Context, preference DisplayPreference) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.DisplayPreferences == nil {
+		m.DisplayPreferences = map[string]*DisplayPreference{}
+	}
+	if preference.UpdatedAt.IsZero() {
+		preference.UpdatedAt = time.Now().UTC()
+	}
+	copyPreference := preference
+	m.DisplayPreferences[displayPreferenceKey(preference.GatewayUserID, preference.PreferenceID, preference.Client)] = &copyPreference
+	return nil
+}
+
 func (m *MemoryStore) SaveSession(ctx context.Context, session *Session) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -183,6 +242,10 @@ func (m *MemoryStore) RevokeSession(ctx context.Context, tokenHash string) error
 
 func playbackStateKey(gatewayUserID, itemID string) string {
 	return gatewayUserID + "\x00" + itemID
+}
+
+func displayPreferenceKey(gatewayUserID, preferenceID, client string) string {
+	return gatewayUserID + "\x00" + preferenceID + "\x00" + client
 }
 
 func methodMatches(policyMethod, requestMethod string) bool {

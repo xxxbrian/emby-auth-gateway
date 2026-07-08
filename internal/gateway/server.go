@@ -375,6 +375,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 	if !ok {
 		return
 	}
+	if s.handlePersonalDataRequest(w, r, rel, session, gatewayToken) {
+		return
+	}
 	proxyURL, err := s.proxyURL(session, rel, r.URL.RawQuery, gatewayToken)
 	if err != nil {
 		s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "proxy_backend_unavailable", Message: "backend url unavailable", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
@@ -617,6 +620,27 @@ func (s *Server) recordPlaybackRequest(r *http.Request, rel string, session *Ses
 		state = &PlaybackState{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, ItemID: details.ItemID}
 	}
 	state.SyntheticUserID = session.SyntheticUserID
+	if details.ItemName != "" {
+		state.ItemName = details.ItemName
+	}
+	if details.ItemType != "" {
+		state.ItemType = details.ItemType
+	}
+	if details.SeriesID != "" {
+		state.SeriesID = details.SeriesID
+	}
+	if details.SeriesName != "" {
+		state.SeriesName = details.SeriesName
+	}
+	if details.HasIndexNumber {
+		state.IndexNumber = details.IndexNumber
+	}
+	if details.HasParentIndexNumber {
+		state.ParentIndexNumber = details.ParentIndexNumber
+	}
+	if details.Fingerprint != "" {
+		state.Fingerprint = details.Fingerprint
+	}
 	if details.HasPositionTicks {
 		state.PlaybackPositionTicks = details.PositionTicks
 	}
@@ -642,11 +666,20 @@ func (s *Server) recordPlaybackRequest(r *http.Request, rel string, session *Ses
 }
 
 type playbackDetails struct {
-	ItemID           string
-	PositionTicks    int64
-	HasPositionTicks bool
-	Played           *bool
-	PlayedPercentage *float64
+	ItemID               string
+	PositionTicks        int64
+	HasPositionTicks     bool
+	Played               *bool
+	PlayedPercentage     *float64
+	ItemName             string
+	ItemType             string
+	SeriesID             string
+	SeriesName           string
+	IndexNumber          int
+	ParentIndexNumber    int
+	HasIndexNumber       bool
+	HasParentIndexNumber bool
+	Fingerprint          string
 }
 
 func playbackDetailsFromJSON(v any) (playbackDetails, bool) {
@@ -659,6 +692,21 @@ func playbackDetailsFromJSON(v any) (playbackDetails, bool) {
 		details.ItemID = itemID
 	} else if item, ok := mapField(obj, "Item"); ok {
 		details.ItemID, _ = stringField(item, "Id")
+	}
+	if item, ok := mapField(obj, "Item"); ok {
+		details.ItemName, _ = stringField(item, "Name")
+		details.ItemType, _ = stringField(item, "Type")
+		details.SeriesID, _ = stringField(item, "SeriesId")
+		details.SeriesName, _ = stringField(item, "SeriesName")
+		if v, ok := int64Field(item, "IndexNumber"); ok {
+			details.IndexNumber = int(v)
+			details.HasIndexNumber = true
+		}
+		if v, ok := int64Field(item, "ParentIndexNumber"); ok {
+			details.ParentIndexNumber = int(v)
+			details.HasParentIndexNumber = true
+		}
+		details.Fingerprint = itemFingerprint(item)
 	}
 	if ticks, ok := int64Field(obj, "PositionTicks"); ok {
 		details.PositionTicks = ticks
@@ -791,6 +839,12 @@ func applyPlaybackStateToUserData(userData map[string]any, state *PlaybackState)
 		userData["LastPlayedDate"] = nil
 	}
 	userData["PlayCount"] = state.PlayCount
+	userData["IsFavorite"] = state.IsFavorite
+	if state.Likes != nil {
+		userData["Likes"] = *state.Likes
+	} else {
+		userData["Likes"] = nil
+	}
 }
 
 func rewriteJSONValue(v any, session *Session, gatewayToken, publicGatewayBase, gatewayServerID string) any {

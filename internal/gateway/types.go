@@ -26,7 +26,10 @@ type Store interface {
 	CheckPathPolicy(ctx context.Context, method, relativePath string) (PathPolicyDecision, error)
 	RecordPlaybackEvent(ctx context.Context, event PlaybackEvent) error
 	FindPlaybackState(ctx context.Context, gatewayUserID, itemID string) (*PlaybackState, error)
+	ListPlaybackStates(ctx context.Context, gatewayUserID string, filter PlaybackStateFilter) ([]PlaybackState, error)
 	SavePlaybackState(ctx context.Context, state PlaybackState) error
+	FindDisplayPreference(ctx context.Context, gatewayUserID, preferenceID, client string) (*DisplayPreference, error)
+	SaveDisplayPreference(ctx context.Context, preference DisplayPreference) error
 	SaveSession(ctx context.Context, session *Session) error
 	FindSessionByTokenHash(ctx context.Context, tokenHash string) (*Session, error)
 	RevokeSession(ctx context.Context, tokenHash string) error
@@ -84,12 +87,41 @@ type PlaybackState struct {
 	GatewayUserID         string
 	SyntheticUserID       string
 	ItemID                string
+	ItemName              string
+	ItemType              string
+	SeriesID              string
+	SeriesName            string
+	IndexNumber           int
+	ParentIndexNumber     int
 	PlaybackPositionTicks int64
 	Played                bool
 	PlayedPercentage      *float64
 	LastPlayedDate        *time.Time
 	PlayCount             int
+	IsFavorite            bool
+	Likes                 *bool
+	Fingerprint           string
+	OrphanedAt            *time.Time
+	LastSeenAt            *time.Time
 	UpdatedAt             time.Time
+}
+
+type PlaybackStateFilter struct {
+	Played          *bool
+	Favorite        *bool
+	Resumable       *bool
+	SeriesID        string
+	IncludeOrphaned bool
+}
+
+type DisplayPreference struct {
+	ID              string
+	GatewayUserID   string
+	SyntheticUserID string
+	PreferenceID    string
+	Client          string
+	PayloadJSON     string
+	UpdatedAt       time.Time
 }
 
 func DecidePathPolicy(policies []PathPolicy, method, path string) PathPolicyDecision {

@@ -45,7 +45,7 @@ func init() {
 				)
 				collection.PasswordAuth.Enabled = true
 				collection.PasswordAuth.IdentityFields = []string{"username"}
-			case "playback_events", "playback_states", "path_policies":
+			case "playback_events", "playback_states", "user_item_data", "display_preferences", "path_policies":
 				setCollectionRules(collection, nil, nil, nil, nil, nil)
 			default:
 				empty := types.Pointer("")
@@ -60,12 +60,12 @@ func init() {
 }
 
 func gatewayCollectionNames() []string {
-	return []string{"gateway_users", "emby_servers", "backend_accounts", "user_mappings", "gateway_sessions", "audit_logs", "playback_events", "playback_states", "path_policies"}
+	return []string{"gateway_users", "emby_servers", "backend_accounts", "user_mappings", "gateway_sessions", "audit_logs", "playback_events", "playback_states", "user_item_data", "display_preferences", "path_policies"}
 }
 
 func isPhase2Collection(name string) bool {
 	switch name {
-	case "playback_events", "playback_states", "path_policies":
+	case "playback_events", "playback_states", "user_item_data", "display_preferences", "path_policies":
 		return true
 	default:
 		return false

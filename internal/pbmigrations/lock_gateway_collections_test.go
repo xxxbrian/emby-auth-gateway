@@ -64,8 +64,8 @@ func TestGatewayCollectionsLockMigrationDownRestoresRules(t *testing.T) {
 	}
 	defer app.Cleanup()
 
-	if _, err := core.NewMigrationsRunner(app, core.AppMigrations).Down(2); err != nil {
-		t.Fatalf("revert phase2 and lock migrations: %v", err)
+	if _, err := core.NewMigrationsRunner(app, core.AppMigrations).Down(3); err != nil {
+		t.Fatalf("revert phase2/userdata and lock migrations: %v", err)
 	}
 
 	users, err := app.FindCollectionByNameOrId("gateway_users")

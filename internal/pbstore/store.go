@@ -150,7 +150,7 @@ func (s *Store) RecordPlaybackEvent(ctx context.Context, event gateway.PlaybackE
 
 func (s *Store) FindPlaybackState(ctx context.Context, gatewayUserID, itemID string) (*gateway.PlaybackState, error) {
 	records, err := s.app.FindRecordsByFilter(
-		"playback_states",
+		"user_item_data",
 		"gateway_user = {:gatewayUserID} && item_id = {:itemID}",
 		"",
 		1,
@@ -166,9 +166,47 @@ func (s *Store) FindPlaybackState(ctx context.Context, gatewayUserID, itemID str
 	return playbackStateFromRecord(records[0]), nil
 }
 
+func (s *Store) ListPlaybackStates(ctx context.Context, gatewayUserID string, filter gateway.PlaybackStateFilter) ([]gateway.PlaybackState, error) {
+	records, err := s.app.FindRecordsByFilter(
+		"user_item_data",
+		"gateway_user = {:gatewayUserID}",
+		"-updated",
+		0,
+		0,
+		dbx.Params{"gatewayUserID": gatewayUserID},
+	)
+	if err != nil {
+		return nil, err
+	}
+	states := make([]gateway.PlaybackState, 0, len(records))
+	for _, record := range records {
+		state := playbackStateFromRecord(record)
+		if !filter.IncludeOrphaned && state.OrphanedAt != nil {
+			continue
+		}
+		if filter.Played != nil && state.Played != *filter.Played {
+			continue
+		}
+		if filter.Favorite != nil && state.IsFavorite != *filter.Favorite {
+			continue
+		}
+		if filter.Resumable != nil {
+			resumable := state.PlaybackPositionTicks > 0 && !state.Played
+			if resumable != *filter.Resumable {
+				continue
+			}
+		}
+		if filter.SeriesID != "" && state.SeriesID != filter.SeriesID {
+			continue
+		}
+		states = append(states, *state)
+	}
+	return states, nil
+}
+
 func (s *Store) SavePlaybackState(ctx context.Context, state gateway.PlaybackState) error {
 	records, err := s.app.FindRecordsByFilter(
-		"playback_states",
+		"user_item_data",
 		"gateway_user = {:gatewayUserID} && item_id = {:itemID}",
 		"",
 		1,
@@ -182,7 +220,7 @@ func (s *Store) SavePlaybackState(ctx context.Context, state gateway.PlaybackSta
 	if len(records) > 0 {
 		record = records[0]
 	} else {
-		collection, err := s.app.FindCollectionByNameOrId("playback_states")
+		collection, err := s.app.FindCollectionByNameOrId("user_item_data")
 		if err != nil {
 			return err
 		}
@@ -191,15 +229,94 @@ func (s *Store) SavePlaybackState(ctx context.Context, state gateway.PlaybackSta
 		record.Set("item_id", state.ItemID)
 	}
 	record.Set("synthetic_user_id", state.SyntheticUserID)
+	record.Set("item_name", state.ItemName)
+	record.Set("item_type", state.ItemType)
+	record.Set("series_id", state.SeriesID)
+	record.Set("series_name", state.SeriesName)
+	record.Set("index_number", state.IndexNumber)
+	record.Set("parent_index_number", state.ParentIndexNumber)
 	record.Set("played", state.Played)
 	record.Set("playback_position_ticks", state.PlaybackPositionTicks)
 	if state.PlayedPercentage != nil {
 		record.Set("played_percentage", *state.PlayedPercentage)
+		record.Set("played_percentage_set", true)
+	} else {
+		record.Set("played_percentage", nil)
+		record.Set("played_percentage_set", false)
 	}
 	if state.LastPlayedDate != nil {
 		record.Set("last_played_date", *state.LastPlayedDate)
+	} else {
+		record.Set("last_played_date", nil)
 	}
 	record.Set("play_count", state.PlayCount)
+	record.Set("is_favorite", state.IsFavorite)
+	if state.Likes != nil {
+		record.Set("likes", *state.Likes)
+		record.Set("likes_set", true)
+	} else {
+		record.Set("likes", false)
+		record.Set("likes_set", false)
+	}
+	record.Set("fingerprint", state.Fingerprint)
+	if state.OrphanedAt != nil {
+		record.Set("orphaned_at", *state.OrphanedAt)
+	} else {
+		record.Set("orphaned_at", nil)
+	}
+	if state.LastSeenAt != nil {
+		record.Set("last_seen_at", *state.LastSeenAt)
+	} else {
+		record.Set("last_seen_at", nil)
+	}
+	return s.app.Save(record)
+}
+
+func (s *Store) FindDisplayPreference(ctx context.Context, gatewayUserID, preferenceID, client string) (*gateway.DisplayPreference, error) {
+	records, err := s.app.FindRecordsByFilter(
+		"display_preferences",
+		"gateway_user = {:gatewayUserID} && preference_id = {:preferenceID} && client = {:client}",
+		"",
+		1,
+		0,
+		dbx.Params{"gatewayUserID": gatewayUserID, "preferenceID": preferenceID, "client": client},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(records) == 0 {
+		return nil, gateway.ErrNotFound
+	}
+	return displayPreferenceFromRecord(records[0]), nil
+}
+
+func (s *Store) SaveDisplayPreference(ctx context.Context, preference gateway.DisplayPreference) error {
+	records, err := s.app.FindRecordsByFilter(
+		"display_preferences",
+		"gateway_user = {:gatewayUserID} && preference_id = {:preferenceID} && client = {:client}",
+		"",
+		1,
+		0,
+		dbx.Params{"gatewayUserID": preference.GatewayUserID, "preferenceID": preference.PreferenceID, "client": preference.Client},
+	)
+	if err != nil {
+		return err
+	}
+	var record *core.Record
+	if len(records) > 0 {
+		record = records[0]
+	} else {
+		collection, err := s.app.FindCollectionByNameOrId("display_preferences")
+		if err != nil {
+			return err
+		}
+		record = core.NewRecord(collection)
+		record.Set("gateway_user", preference.GatewayUserID)
+		record.Set("preference_id", preference.PreferenceID)
+		record.Set("client", preference.Client)
+	}
+	record.Set("synthetic_user_id", preference.SyntheticUserID)
+	record.Set("payload_json", preference.PayloadJSON)
 	return s.app.Save(record)
 }
 
@@ -334,24 +451,66 @@ func (s *Store) enabledPathPolicies() ([]gateway.PathPolicy, error) {
 }
 
 func playbackStateFromRecord(record *core.Record) *gateway.PlaybackState {
-	percentage := record.GetFloat("played_percentage")
 	updatedAt := record.GetDateTime("updated").Time()
+	var percentage *float64
+	if record.GetBool("played_percentage_set") {
+		v := record.GetFloat("played_percentage")
+		percentage = &v
+	}
 	var lastPlayedDate *time.Time
 	if !record.GetDateTime("last_played_date").IsZero() {
 		t := record.GetDateTime("last_played_date").Time()
 		lastPlayedDate = &t
+	}
+	var likes *bool
+	if record.GetBool("likes_set") {
+		v := record.GetBool("likes")
+		likes = &v
+	}
+	var orphanedAt *time.Time
+	if !record.GetDateTime("orphaned_at").IsZero() {
+		t := record.GetDateTime("orphaned_at").Time()
+		orphanedAt = &t
+	}
+	var lastSeenAt *time.Time
+	if !record.GetDateTime("last_seen_at").IsZero() {
+		t := record.GetDateTime("last_seen_at").Time()
+		lastSeenAt = &t
 	}
 	return &gateway.PlaybackState{
 		ID:                    record.Id,
 		GatewayUserID:         record.GetString("gateway_user"),
 		SyntheticUserID:       record.GetString("synthetic_user_id"),
 		ItemID:                record.GetString("item_id"),
+		ItemName:              record.GetString("item_name"),
+		ItemType:              record.GetString("item_type"),
+		SeriesID:              record.GetString("series_id"),
+		SeriesName:            record.GetString("series_name"),
+		IndexNumber:           record.GetInt("index_number"),
+		ParentIndexNumber:     record.GetInt("parent_index_number"),
 		PlaybackPositionTicks: int64(record.GetFloat("playback_position_ticks")),
 		Played:                record.GetBool("played"),
-		PlayedPercentage:      &percentage,
+		PlayedPercentage:      percentage,
 		LastPlayedDate:        lastPlayedDate,
 		PlayCount:             record.GetInt("play_count"),
+		IsFavorite:            record.GetBool("is_favorite"),
+		Likes:                 likes,
+		Fingerprint:           record.GetString("fingerprint"),
+		OrphanedAt:            orphanedAt,
+		LastSeenAt:            lastSeenAt,
 		UpdatedAt:             updatedAt,
+	}
+}
+
+func displayPreferenceFromRecord(record *core.Record) *gateway.DisplayPreference {
+	return &gateway.DisplayPreference{
+		ID:              record.Id,
+		GatewayUserID:   record.GetString("gateway_user"),
+		SyntheticUserID: record.GetString("synthetic_user_id"),
+		PreferenceID:    record.GetString("preference_id"),
+		Client:          record.GetString("client"),
+		PayloadJSON:     record.GetString("payload_json"),
+		UpdatedAt:       record.GetDateTime("updated").Time(),
 	}
 }
 

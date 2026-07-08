@@ -69,12 +69,59 @@ func TestPlaybackStateIsScopedByGatewayUserAndItem(t *testing.T) {
 	if err := store.SavePlaybackState(context.Background(), gateway.PlaybackState{GatewayUserID: u1, SyntheticUserID: "gateway-user-1", ItemID: "item-1", PlaybackPositionTicks: 9900, PlayedPercentage: &pctUpdated, Played: true, PlayCount: 2}); err != nil {
 		t.Fatalf("update u1 playback state: %v", err)
 	}
-	records, err := app.FindRecordsByFilter("playback_states", "gateway_user = {:gatewayUserID} && item_id = 'item-1'", "", 0, 0, dbx.Params{"gatewayUserID": u1})
+	records, err := app.FindRecordsByFilter("user_item_data", "gateway_user = {:gatewayUserID} && item_id = 'item-1'", "", 0, 0, dbx.Params{"gatewayUserID": u1})
 	if err != nil {
 		t.Fatalf("query u1 playback states: %v", err)
 	}
 	if len(records) != 1 {
 		t.Fatalf("u1 playback state records = %d, want 1", len(records))
+	}
+}
+
+func TestUserItemDataFieldsAndDisplayPreferencesArePersisted(t *testing.T) {
+	app := newTestApp(t)
+	store := New(app, nil)
+	userID := createGatewayUser(t, app, "alice", "gateway-user")
+	likes := true
+	lastSeen := time.Date(2026, 7, 8, 13, 0, 0, 0, time.UTC)
+
+	if err := store.SavePlaybackState(context.Background(), gateway.PlaybackState{
+		GatewayUserID:         userID,
+		SyntheticUserID:       "gateway-user",
+		ItemID:                "episode-1",
+		ItemName:              "Episode 1",
+		ItemType:              "Episode",
+		SeriesID:              "series-1",
+		SeriesName:            "Show",
+		IndexNumber:           1,
+		ParentIndexNumber:     1,
+		PlaybackPositionTicks: 500,
+		IsFavorite:            true,
+		Likes:                 &likes,
+		Fingerprint:           "type=Episode|name=Episode 1|seriesId=series-1",
+		LastSeenAt:            &lastSeen,
+	}); err != nil {
+		t.Fatalf("save user item data: %v", err)
+	}
+
+	favorite := true
+	states, err := store.ListPlaybackStates(context.Background(), userID, gateway.PlaybackStateFilter{Favorite: &favorite})
+	if err != nil {
+		t.Fatalf("list favorite states: %v", err)
+	}
+	if len(states) != 1 || states[0].ItemName != "Episode 1" || states[0].SeriesID != "series-1" || states[0].Likes == nil || !*states[0].Likes || states[0].LastSeenAt == nil {
+		t.Fatalf("unexpected user item data: %#v", states)
+	}
+
+	if err := store.SaveDisplayPreference(context.Background(), gateway.DisplayPreference{GatewayUserID: userID, SyntheticUserID: "gateway-user", PreferenceID: "home", Client: "web", PayloadJSON: `{"SortBy":"DateCreated"}`}); err != nil {
+		t.Fatalf("save display preference: %v", err)
+	}
+	preference, err := store.FindDisplayPreference(context.Background(), userID, "home", "web")
+	if err != nil {
+		t.Fatalf("find display preference: %v", err)
+	}
+	if preference.PayloadJSON != `{"SortBy":"DateCreated"}` || preference.SyntheticUserID != "gateway-user" {
+		t.Fatalf("unexpected display preference: %#v", preference)
 	}
 }
 
