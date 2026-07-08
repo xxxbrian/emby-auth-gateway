@@ -1,4 +1,4 @@
-module emby-auth-gateway
+module github.com/xxxbrian/emby-auth-gateway
 
 go 1.26.4
 

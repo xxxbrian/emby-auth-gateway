@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"emby-auth-gateway/internal/pbstore"
+	"github.com/xxxbrian/emby-auth-gateway/internal/pbstore"
 
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tests"

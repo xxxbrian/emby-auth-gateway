@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"emby-auth-gateway/internal/gateway"
+	"github.com/xxxbrian/emby-auth-gateway/internal/gateway"
 
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/spf13/cobra"

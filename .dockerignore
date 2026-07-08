@@ -1,0 +1,14 @@
+.git
+.github
+.opencode
+.env
+.env.*
+!.env.example
+pb_data
+tmp
+bin
+dist
+coverage.out
+*.db
+*.sqlite
+*.sqlite3

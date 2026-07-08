@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"emby-auth-gateway/internal/gateway"
+	"github.com/xxxbrian/emby-auth-gateway/internal/gateway"
 
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"

@@ -4,8 +4,8 @@ import (
 	"regexp"
 	"testing"
 
-	"emby-auth-gateway/internal/gateway"
-	_ "emby-auth-gateway/internal/pbmigrations"
+	"github.com/xxxbrian/emby-auth-gateway/internal/gateway"
+	_ "github.com/xxxbrian/emby-auth-gateway/internal/pbmigrations"
 
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tests"

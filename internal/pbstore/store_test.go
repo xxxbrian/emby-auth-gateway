@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"emby-auth-gateway/internal/gateway"
-	_ "emby-auth-gateway/internal/pbmigrations"
+	"github.com/xxxbrian/emby-auth-gateway/internal/gateway"
+	_ "github.com/xxxbrian/emby-auth-gateway/internal/pbmigrations"
 
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"

@@ -6,11 +6,11 @@ import (
 	"strings"
 	"time"
 
-	"emby-auth-gateway/internal/gateway"
-	"emby-auth-gateway/internal/pbsetup"
-	"emby-auth-gateway/internal/pbstore"
+	"github.com/xxxbrian/emby-auth-gateway/internal/gateway"
+	"github.com/xxxbrian/emby-auth-gateway/internal/pbsetup"
+	"github.com/xxxbrian/emby-auth-gateway/internal/pbstore"
 
-	_ "emby-auth-gateway/internal/pbmigrations"
+	_ "github.com/xxxbrian/emby-auth-gateway/internal/pbmigrations"
 
 	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/core"

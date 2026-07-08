@@ -144,6 +144,19 @@ Run with the local Emby development container:
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build gateway emby
 ```
 
+## Releases
+
+Release Docker images are published to GitHub Container Registry:
+
+```sh
+docker pull ghcr.io/xxxbrian/emby-auth-gateway:0.3.0
+docker pull ghcr.io/xxxbrian/emby-auth-gateway:latest
+```
+
+Images are built for `linux/amd64` and `linux/arm64`. GitHub Releases also include Linux and macOS binary archives plus `checksums.txt`.
+
+Publishing a GitHub Release automatically builds the Docker image and release binaries. The release workflow can also be run manually for an existing tag, with an option to control whether the image is tagged as `latest`.
+
 ## Verification
 
 Anonymous public server info should be available through the gateway. The examples below use the default gateway base path:
