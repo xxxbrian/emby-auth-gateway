@@ -203,6 +203,37 @@ func TestPlaybackStateBatchLookupChunksLargeIDLists(t *testing.T) {
 	}
 }
 
+func TestItemChildCountsAreScopedByBackendAccount(t *testing.T) {
+	app := newTestApp(t)
+	store := New(app)
+	ctx := context.Background()
+
+	if err := store.SaveItemChildCount(ctx, gateway.ItemChildCount{BackendAccountID: "account-1", ItemID: "show-1", ChildCount: 12}); err != nil {
+		t.Fatalf("save child count: %v", err)
+	}
+	if err := store.SaveItemChildCount(ctx, gateway.ItemChildCount{BackendAccountID: "account-2", ItemID: "show-1", ChildCount: 99}); err != nil {
+		t.Fatalf("save second child count: %v", err)
+	}
+	if err := store.SaveItemChildCount(ctx, gateway.ItemChildCount{BackendAccountID: "account-1", ItemID: "show-1", ChildCount: 13}); err != nil {
+		t.Fatalf("update child count: %v", err)
+	}
+
+	counts, err := store.ListItemChildCounts(ctx, "account-1", []string{"show-1", "missing"})
+	if err != nil {
+		t.Fatalf("list child counts: %v", err)
+	}
+	if len(counts) != 1 || counts["show-1"].ChildCount != 13 {
+		t.Fatalf("unexpected account-1 counts: %#v", counts)
+	}
+	counts, err = store.ListItemChildCounts(ctx, "account-2", []string{"show-1"})
+	if err != nil {
+		t.Fatalf("list account-2 child counts: %v", err)
+	}
+	if counts["show-1"].ChildCount != 99 {
+		t.Fatalf("unexpected account-2 counts: %#v", counts)
+	}
+}
+
 func TestPathPolicyDefaultAllowAndDeny(t *testing.T) {
 	app := newTestApp(t)
 	store := New(app)
