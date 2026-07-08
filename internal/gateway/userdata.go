@@ -36,6 +36,9 @@ func (s *Server) handlePersonalDataRequest(w http.ResponseWriter, r *http.Reques
 	case isSessionsPath(rel):
 		s.writeFilteredSessions(w, r, rel, session, gatewayToken)
 		return true
+	case queryHasPersonalFilter(r.URL.Query()) && !isAllowedPersonalItemListPath(rel) && !isClearlyNonItemEndpoint(rel):
+		http.Error(w, "unsupported personal filter path", http.StatusBadRequest)
+		return true
 	case shouldLocalizePersonalFilter(rel, r.URL.Query()):
 		s.writePersonalFilteredItems(w, r, rel, session, gatewayToken)
 		return true
@@ -193,28 +196,21 @@ func (s *Server) writePersonalFilteredItems(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	q := cloneQuery(r.URL.Query())
-	positiveIDs, hasPositive, excludeIDs, err := s.personalFilterIDs(r.Context(), session.GatewayUserID, q)
-	if err != nil {
-		http.Error(w, "items unavailable", http.StatusInternalServerError)
+	pq := parsePersonalQuery(rel, r.URL.Query())
+	if pq.hasPositive() {
+		s.writePositivePersonalItems(w, r, rel, session, gatewayToken, pq)
 		return
 	}
-	if hasPositive && len(positiveIDs) == 0 {
-		writeJSON(w, http.StatusOK, map[string]any{"Items": []any{}, "TotalRecordCount": 0, "StartIndex": intQuery(q, "StartIndex", 0)})
+	if pq.hasOnlyNegative() {
+		s.writeNegativePersonalItems(w, r, rel, session, gatewayToken, pq)
 		return
 	}
-	if hasPositive {
-		q.Set("Ids", strings.Join(limitStrings(positiveIDs, personalIDBatchLimit), ","))
-	}
-	if len(excludeIDs) > 0 {
-		q.Set("ExcludeItemIds", strings.Join(limitStrings(excludeIDs, personalIDBatchLimit), ","))
-	}
-	value, status, err := s.fetchBackendJSON(r.Context(), r, rel, q.Encode(), session, gatewayToken)
+	value, status, err := s.fetchBackendJSON(r.Context(), r, rel, pq.backend.Encode(), session, gatewayToken)
 	if err != nil {
 		http.Error(w, "backend unavailable", http.StatusBadGateway)
 		return
 	}
-	writeJSON(w, status, s.rewriteProxyJSONValue(r.Context(), value, session, gatewayToken, s.gatewayBaseForRequest(r)))
+	writeJSON(w, status, s.rewriteProxyJSONValueForRequest(r.Context(), r, value, session, gatewayToken, s.gatewayBaseForRequest(r)))
 }
 
 func (s *Server) writeLatestItems(w http.ResponseWriter, r *http.Request, rel string, session *Session, gatewayToken string) {
@@ -222,19 +218,49 @@ func (s *Server) writeLatestItems(w http.ResponseWriter, r *http.Request, rel st
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	value, status, err := s.fetchBackendJSON(r.Context(), r, rel, r.URL.RawQuery, session, gatewayToken)
-	if err != nil {
-		http.Error(w, "backend unavailable", http.StatusBadGateway)
-		return
+	q := cloneQuery(r.URL.Query())
+	limit := intQuery(q, "Limit", 0)
+	if limit <= 0 {
+		limit = 20
 	}
-	rewritten := s.rewriteProxyJSONValue(r.Context(), value, session, gatewayToken, s.gatewayBaseForRequest(r))
+	if limit > latestBackfillLimit {
+		limit = latestBackfillLimit
+	}
 	played := true
 	states, _ := s.store.ListPlaybackStates(r.Context(), session.GatewayUserID, PlaybackStateFilter{Played: &played})
 	playedSet := playbackStateSet(states)
-	writeJSON(w, status, filterItemsValue(rewritten, func(item map[string]any) bool {
-		id, _ := stringField(item, "Id")
-		return id == "" || !playedSet[id]
-	}))
+	requestLimit := limit
+	status := http.StatusOK
+	items := []any{}
+	for requestLimit <= latestBackfillLimit {
+		q.Set("Limit", strconv.Itoa(requestLimit))
+		value, backendStatus, err := s.fetchBackendJSON(r.Context(), r, rel, q.Encode(), session, gatewayToken)
+		if err != nil {
+			http.Error(w, "backend unavailable", http.StatusBadGateway)
+			return
+		}
+		status = backendStatus
+		extracted := extractItems(value)
+		learnChildCountsFromItems(r.Context(), s.store, session, extracted)
+		kept := make([]any, 0, limit)
+		for _, item := range extracted {
+			id, _ := stringField(item, "Id")
+			if id != "" && playedSet[id] {
+				continue
+			}
+			rewritten := s.rewriteProxyJSONValueForRequest(r.Context(), r, item, session, gatewayToken, s.gatewayBaseForRequest(r))
+			kept = append(kept, rewritten)
+			if len(kept) >= limit {
+				break
+			}
+		}
+		items = kept
+		if len(items) >= limit || len(extracted) < requestLimit {
+			break
+		}
+		requestLimit *= 3
+	}
+	writeJSON(w, status, items)
 }
 
 func (s *Server) writeFilteredSessions(w http.ResponseWriter, r *http.Request, rel string, session *Session, gatewayToken string) {
@@ -243,7 +269,7 @@ func (s *Server) writeFilteredSessions(w http.ResponseWriter, r *http.Request, r
 		http.Error(w, "backend unavailable", http.StatusBadGateway)
 		return
 	}
-	rewritten := s.rewriteProxyJSONValue(r.Context(), value, session, gatewayToken, s.gatewayBaseForRequest(r))
+	rewritten := s.rewriteProxyJSONValueForRequest(r.Context(), r, value, session, gatewayToken, s.gatewayBaseForRequest(r))
 	deviceID := session.BackendIdentity.WithDefaults().DeviceID
 	if deviceID == "" {
 		writeJSON(w, status, []any{})
@@ -262,6 +288,13 @@ func (s *Server) writeNextUpItems(w http.ResponseWriter, r *http.Request, sessio
 		return
 	}
 	series := recentlyActiveSeries(states)
+	if seriesID := strings.TrimSpace(r.URL.Query().Get("SeriesId")); seriesID != "" {
+		series = []string{seriesID}
+	}
+	maxSeries := intQuery(r.URL.Query(), "Limit", 20) + 20
+	if maxSeries > 0 && len(series) > maxSeries {
+		series = series[:maxSeries]
+	}
 	playedByID := playbackStateSet(filterStates(states, func(state PlaybackState) bool { return state.Played }))
 	items := make([]any, 0, len(series))
 	episodeQuery := queryForIDResolution(r.URL.Query())
@@ -271,6 +304,9 @@ func (s *Server) writeNextUpItems(w http.ResponseWriter, r *http.Request, sessio
 			continue
 		}
 		episodes := extractItems(episodeValue)
+		if len(episodes) > 0 {
+			_ = s.store.SaveItemChildCount(r.Context(), ItemChildCount{BackendAccountID: session.BackendAccountID, ItemID: seriesID, ChildCount: len(episodes)})
+		}
 		sort.SliceStable(episodes, func(i, j int) bool {
 			return episodeOrderLess(episodes[i], episodes[j])
 		})
@@ -280,7 +316,7 @@ func (s *Server) writeNextUpItems(w http.ResponseWriter, r *http.Request, sessio
 			if id == "" || playedByID[id] || !episodeAfter(episode, last) {
 				continue
 			}
-			rewritten := s.rewriteProxyJSONValue(r.Context(), episode, session, gatewayToken, s.gatewayBaseForRequest(r))
+			rewritten := s.rewriteProxyJSONValueForRequest(r.Context(), r, episode, session, gatewayToken, s.gatewayBaseForRequest(r))
 			if item, ok := rewritten.(map[string]any); ok {
 				items = append(items, item)
 			}
@@ -441,7 +477,7 @@ func (s *Server) resolveItemsByID(ctx context.Context, r *http.Request, session 
 			state.LastSeenAt = &now
 			mergeItemMetadata(state, item)
 			_ = s.store.SavePlaybackState(ctx, *state)
-			rewritten := s.rewriteProxyJSONValue(ctx, item, session, gatewayToken, s.gatewayBaseForRequest(r))
+			rewritten := s.rewriteProxyJSONValueForRequest(ctx, r, item, session, gatewayToken, s.gatewayBaseForRequest(r))
 			if m, ok := rewritten.(map[string]any); ok {
 				out = append(out, m)
 			}
@@ -793,14 +829,7 @@ func isItemsPath(rel string) bool {
 }
 
 func shouldLocalizePersonalFilter(rel string, q url.Values) bool {
-	if !queryHasPersonalFilter(q) {
-		return false
-	}
-	methodLikePath := strings.Trim(rel, "/")
-	if methodLikePath == "" {
-		return false
-	}
-	return true
+	return queryHasPersonalFilter(q) && isAllowedPersonalItemListPath(rel)
 }
 
 func isNextUpPath(rel string) bool {
