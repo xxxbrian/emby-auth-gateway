@@ -67,6 +67,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if !s.pathPolicyAllows(w, r, rel) {
+		return
+	}
 
 	switch {
 	case r.Method == http.MethodPost && equalPath(rel, "/Users/AuthenticateByName"):
@@ -94,6 +97,7 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 	}
 	key := loginFailureKey(form.Username, r)
 	if s.logins.blocked(key, time.Now()) {
+		s.auditLoginFailure(r.Context(), r, form.Username, "login blocked", http.StatusUnauthorized)
 		http.Error(w, "failed to authenticate", http.StatusUnauthorized)
 		return
 	}
@@ -103,6 +107,7 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 		password = form.Password
 	}
 	if form.Username == "" || password == "" {
+		s.auditLoginFailure(r.Context(), r, form.Username, "missing credentials", http.StatusBadRequest)
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -111,6 +116,7 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 	user, err := s.store.AuthenticateGatewayUser(ctx, form.Username, password)
 	if err != nil || user == nil || !user.Enabled {
 		s.logins.recordFailure(key, time.Now())
+		s.auditLoginFailure(ctx, r, form.Username, "invalid credentials", http.StatusUnauthorized)
 		http.Error(w, "failed to authenticate", http.StatusUnauthorized)
 		return
 	}
@@ -118,6 +124,7 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 	mapping, err := s.store.FindMappingByGatewayUserID(ctx, user.ID)
 	if err != nil || mapping == nil || !mapping.Enabled || !mapping.BackendAccount.Enabled {
 		s.logins.recordFailure(key, time.Now())
+		s.audit(ctx, AuditLog{GatewayUserID: user.ID, SyntheticUserID: user.SyntheticUserID, Event: "mapping_unavailable", Message: "mapping unavailable", RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusUnauthorized})
 		http.Error(w, "failed to authenticate", http.StatusUnauthorized)
 		return
 	}
@@ -125,6 +132,7 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 	auth := firstAuthHeader(r)
 	backendResult, err := s.authenticateBackend(ctx, mapping.BackendAccount, auth, r.UserAgent())
 	if err != nil {
+		s.audit(ctx, AuditLog{GatewayUserID: user.ID, SyntheticUserID: user.SyntheticUserID, Event: "backend_auth_failure", Message: "backend authentication failed", RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusBadGateway})
 		http.Error(w, "backend authentication failed", http.StatusBadGateway)
 		return
 	}
@@ -157,9 +165,11 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt:        now.Add(defaultSessionTTL),
 	}
 	if err := s.store.SaveSession(ctx, session); err != nil {
+		s.audit(ctx, AuditLog{GatewayUserID: user.ID, SyntheticUserID: user.SyntheticUserID, Event: "session_save_failure", Message: "session save failed", RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusInternalServerError})
 		http.Error(w, "session save failed", http.StatusInternalServerError)
 		return
 	}
+	s.audit(ctx, AuditLog{GatewayUserID: user.ID, SyntheticUserID: user.SyntheticUserID, Event: "login_success", Message: "login succeeded", RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusOK})
 
 	rewritten := rewriteJSONValue(backendResult.Raw, session, token, s.gatewayBaseForRequest(r), s.cfg.GatewayServerID)
 	if obj, ok := rewritten.(map[string]any); ok {
@@ -275,13 +285,18 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, rel string
 	token := ExtractToken(r)
 	session, ok := s.activeSession(w, r, token)
 	if !ok {
+		s.audit(r.Context(), AuditLog{Event: "logout_failure", Message: "session unavailable", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusUnauthorized})
 		return
 	}
-	_ = s.forwardLogout(r.Context(), r, rel, session, token)
+	if err := s.forwardLogout(r.Context(), r, rel, session, token); err != nil {
+		s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "logout_failure", Message: "backend logout failed", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
+	}
 	if err := s.store.RevokeSession(r.Context(), HashToken(token)); err != nil {
+		s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "logout_failure", Message: "session revoke failed", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusInternalServerError})
 		http.Error(w, "session revoke failed", http.StatusInternalServerError)
 		return
 	}
+	s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "logout_success", Message: "logout succeeded", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusOK})
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -360,15 +375,21 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 	if !ok {
 		return
 	}
-
 	proxyURL, err := s.proxyURL(session, rel, r.URL.RawQuery, gatewayToken)
 	if err != nil {
+		s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "proxy_backend_unavailable", Message: "backend url unavailable", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
 		http.Error(w, "bad backend url", http.StatusBadGateway)
 		return
 	}
 	if isUpgradeRequest(r) {
-		s.handleUpgradeProxy(w, r, proxyURL, session, gatewayToken)
+		s.handleUpgradeProxy(w, r, proxyURL, session, gatewayToken, rel)
 		return
+	}
+	if isPlaybackRequest(r.Method, rel) {
+		if err := s.recordPlaybackRequest(r, rel, session); err != nil {
+			http.Error(w, "bad request body", http.StatusBadRequest)
+			return
+		}
 	}
 
 	body, err := s.rewriteRequestBody(r, session, gatewayToken)
@@ -390,15 +411,16 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 
 	resp, err := s.proxyClient.Do(req)
 	if err != nil {
+		s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "proxy_backend_unavailable", Message: "backend unavailable", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
 		http.Error(w, "backend unavailable", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
-	s.writeProxyResponse(w, resp, session, gatewayToken, s.gatewayBaseForRequest(r))
+	s.writeProxyResponse(w, r, rel, resp, session, gatewayToken, s.gatewayBaseForRequest(r))
 }
 
-func (s *Server) handleUpgradeProxy(w http.ResponseWriter, r *http.Request, proxyURL *url.URL, session *Session, gatewayToken string) {
+func (s *Server) handleUpgradeProxy(w http.ResponseWriter, r *http.Request, proxyURL *url.URL, session *Session, gatewayToken, rel string) {
 	proxy := &httputil.ReverseProxy{
 		Transport: s.proxyClient.Transport,
 		Director: func(req *http.Request) {
@@ -407,6 +429,7 @@ func (s *Server) handleUpgradeProxy(w http.ResponseWriter, r *http.Request, prox
 			s.rewriteRequestHeaders(req.Header, session, gatewayToken)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "proxy_backend_unavailable", Message: "backend unavailable", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
 			http.Error(w, "backend unavailable", http.StatusBadGateway)
 		},
 	}
@@ -424,6 +447,50 @@ func (s *Server) activeSession(w http.ResponseWriter, r *http.Request, token str
 		return nil, false
 	}
 	return session, true
+}
+
+func (s *Server) pathPolicyAllows(w http.ResponseWriter, r *http.Request, rel string) bool {
+	decision, err := s.store.CheckPathPolicy(r.Context(), r.Method, rel)
+	if err != nil {
+		s.audit(r.Context(), s.auditForRequest(r, rel, "path_policy_error", "path policy check failed", http.StatusInternalServerError))
+		http.Error(w, "path policy unavailable", http.StatusInternalServerError)
+		return false
+	}
+	if !decision.Allowed {
+		s.audit(r.Context(), s.auditForRequest(r, rel, "path_denied", "path policy denied request", http.StatusForbidden))
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return false
+	}
+	return true
+}
+
+func (s *Server) auditForRequest(r *http.Request, rel, event, message string, status int) AuditLog {
+	entry := AuditLog{Event: event, Message: message, RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: status}
+	if token := ExtractToken(r); token != "" {
+		if session, err := s.store.FindSessionByTokenHash(r.Context(), HashToken(token)); err == nil && session != nil {
+			entry.GatewayUserID = session.GatewayUserID
+			entry.SyntheticUserID = session.SyntheticUserID
+		}
+	}
+	return entry
+}
+
+func (s *Server) auditLoginFailure(ctx context.Context, r *http.Request, username, message string, status int) {
+	entry := AuditLog{Event: "login_failure", Message: message, RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: status}
+	if strings.TrimSpace(username) != "" {
+		if user, err := s.store.FindGatewayUserByUsername(ctx, username); err == nil && user != nil {
+			entry.GatewayUserID = user.ID
+			entry.SyntheticUserID = user.SyntheticUserID
+		}
+	}
+	s.audit(ctx, entry)
+}
+
+func (s *Server) audit(ctx context.Context, entry AuditLog) {
+	if entry.CreatedAt.IsZero() {
+		entry.CreatedAt = time.Now().UTC()
+	}
+	_ = s.store.RecordAudit(ctx, entry)
 }
 
 func (s *Server) proxyURL(session *Session, rel, rawQuery, gatewayToken string) (*url.URL, error) {
@@ -494,12 +561,139 @@ func (s *Server) rewriteRequestBody(r *http.Request, session *Session, gatewayTo
 	return strings.NewReader(text), nil
 }
 
-func (s *Server) writeProxyResponse(w http.ResponseWriter, resp *http.Response, session *Session, gatewayToken, publicGatewayBase string) {
+func isPlaybackRequest(method, rel string) bool {
+	if method != http.MethodPost {
+		return false
+	}
+	switch {
+	case equalPath(rel, "/Sessions/Playing"):
+		return true
+	case equalPath(rel, "/Sessions/Playing/Progress"):
+		return true
+	case equalPath(rel, "/Sessions/Playing/Stopped"):
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) recordPlaybackRequest(r *http.Request, rel string, session *Session) error {
+	if r.Body == nil {
+		return nil
+	}
+	if ct := r.Header.Get("Content-Type"); ct != "" && !isJSONContentType(ct) {
+		return nil
+	}
+	data, err := io.ReadAll(http.MaxBytesReader(nilResponseWriter{}, r.Body, 10<<20))
+	r.Body = io.NopCloser(bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var body any
+	if err := decoder.Decode(&body); err != nil {
+		return nil
+	}
+	details, ok := playbackDetailsFromJSON(body)
+	if !ok || details.ItemID == "" {
+		return nil
+	}
+	now := time.Now().UTC()
+	eventName := playbackEventName(rel)
+	_ = s.store.RecordPlaybackEvent(r.Context(), PlaybackEvent{
+		GatewayUserID:    session.GatewayUserID,
+		SyntheticUserID:  session.SyntheticUserID,
+		ItemID:           details.ItemID,
+		Event:            eventName,
+		PositionTicks:    details.PositionTicks,
+		Played:           details.Played,
+		PlayedPercentage: details.PlayedPercentage,
+		RemoteIP:         remoteIP(r),
+		CreatedAt:        now,
+	})
+	state, err := s.store.FindPlaybackState(r.Context(), session.GatewayUserID, details.ItemID)
+	if err != nil || state == nil {
+		state = &PlaybackState{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, ItemID: details.ItemID}
+	}
+	state.SyntheticUserID = session.SyntheticUserID
+	if details.HasPositionTicks {
+		state.PlaybackPositionTicks = details.PositionTicks
+	}
+	if details.PlayedPercentage != nil {
+		percentage := *details.PlayedPercentage
+		state.PlayedPercentage = &percentage
+	}
+	if details.Played != nil {
+		state.Played = *details.Played
+	}
+	if eventName == "stopped" {
+		lastPlayed := now
+		state.LastPlayedDate = &lastPlayed
+		completed := state.Played || (details.PlayedPercentage != nil && *details.PlayedPercentage >= 90)
+		if completed {
+			state.Played = true
+			state.PlayCount++
+		}
+	}
+	state.UpdatedAt = now
+	_ = s.store.SavePlaybackState(r.Context(), *state)
+	return nil
+}
+
+type playbackDetails struct {
+	ItemID           string
+	PositionTicks    int64
+	HasPositionTicks bool
+	Played           *bool
+	PlayedPercentage *float64
+}
+
+func playbackDetailsFromJSON(v any) (playbackDetails, bool) {
+	obj, ok := v.(map[string]any)
+	if !ok {
+		return playbackDetails{}, false
+	}
+	details := playbackDetails{}
+	if itemID, ok := stringField(obj, "ItemId"); ok {
+		details.ItemID = itemID
+	} else if item, ok := mapField(obj, "Item"); ok {
+		details.ItemID, _ = stringField(item, "Id")
+	}
+	if ticks, ok := int64Field(obj, "PositionTicks"); ok {
+		details.PositionTicks = ticks
+		details.HasPositionTicks = true
+	} else if ticks, ok := int64Field(obj, "PlaybackPositionTicks"); ok {
+		details.PositionTicks = ticks
+		details.HasPositionTicks = true
+	}
+	if played, ok := boolField(obj, "Played"); ok {
+		details.Played = &played
+	}
+	if percentage, ok := float64Field(obj, "PlayedPercentage"); ok {
+		details.PlayedPercentage = &percentage
+	}
+	return details, details.ItemID != ""
+}
+
+func playbackEventName(rel string) string {
+	switch {
+	case equalPath(rel, "/Sessions/Playing/Progress"):
+		return "progress"
+	case equalPath(rel, "/Sessions/Playing/Stopped"):
+		return "stopped"
+	default:
+		return "playing"
+	}
+}
+
+func (s *Server) writeProxyResponse(w http.ResponseWriter, r *http.Request, rel string, resp *http.Response, session *Session, gatewayToken, publicGatewayBase string) {
 	copyResponseHeaders(w.Header(), resp.Header, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
 	ct := resp.Header.Get("Content-Type")
 	if isM3U8ContentType(ct) || strings.HasSuffix(strings.ToLower(resp.Request.URL.Path), ".m3u8") {
 		data, err := readLimited(resp.Body, proxyM3U8Limit)
 		if err != nil {
+			s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "proxy_read_failed", Message: "backend response read failed", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
 			http.Error(w, "response read failed", http.StatusBadGateway)
 			return
 		}
@@ -518,13 +712,14 @@ func (s *Server) writeProxyResponse(w http.ResponseWriter, resp *http.Response, 
 	if isJSONContentType(ct) {
 		data, err := readLimited(resp.Body, proxyJSONLimit)
 		if err != nil {
+			s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "proxy_read_failed", Message: "backend response read failed", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
 			http.Error(w, "response read failed", http.StatusBadGateway)
 			return
 		}
 		var value any
 		if err := json.Unmarshal(data, &value); err == nil {
 			w.Header().Del("Content-Length")
-			writeJSON(w, resp.StatusCode, rewriteJSONValue(value, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID))
+			writeJSON(w, resp.StatusCode, s.rewriteProxyJSONValue(r.Context(), value, session, gatewayToken, publicGatewayBase))
 			return
 		}
 		w.WriteHeader(resp.StatusCode)
@@ -534,6 +729,68 @@ func (s *Server) writeProxyResponse(w http.ResponseWriter, resp *http.Response, 
 
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+func (s *Server) rewriteProxyJSONValue(ctx context.Context, v any, session *Session, gatewayToken, publicGatewayBase string) any {
+	rewritten := rewriteJSONValue(v, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
+	if session == nil {
+		return rewritten
+	}
+	cache := map[string]*PlaybackState{}
+	s.overlayUserData(ctx, rewritten, session, cache)
+	return rewritten
+}
+
+func (s *Server) overlayUserData(ctx context.Context, v any, session *Session, cache map[string]*PlaybackState) {
+	switch x := v.(type) {
+	case map[string]any:
+		if userData, ok := mapField(x, "UserData"); ok {
+			if itemID, ok := stringField(x, "Id"); ok {
+				state := s.cachedPlaybackState(ctx, session.GatewayUserID, itemID, cache)
+				if state == nil {
+					state = &PlaybackState{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, ItemID: itemID}
+				}
+				applyPlaybackStateToUserData(userData, state)
+			}
+		}
+		for _, child := range x {
+			s.overlayUserData(ctx, child, session, cache)
+		}
+	case []any:
+		for _, child := range x {
+			s.overlayUserData(ctx, child, session, cache)
+		}
+	}
+}
+
+func (s *Server) cachedPlaybackState(ctx context.Context, gatewayUserID, itemID string, cache map[string]*PlaybackState) *PlaybackState {
+	key := playbackStateKey(gatewayUserID, itemID)
+	if state, ok := cache[key]; ok {
+		return state
+	}
+	state, err := s.store.FindPlaybackState(ctx, gatewayUserID, itemID)
+	if err != nil || state == nil {
+		cache[key] = nil
+		return nil
+	}
+	cache[key] = state
+	return state
+}
+
+func applyPlaybackStateToUserData(userData map[string]any, state *PlaybackState) {
+	userData["Played"] = state.Played
+	userData["PlaybackPositionTicks"] = state.PlaybackPositionTicks
+	if state.PlayedPercentage != nil {
+		userData["PlayedPercentage"] = *state.PlayedPercentage
+	} else {
+		userData["PlayedPercentage"] = nil
+	}
+	if state.LastPlayedDate != nil {
+		userData["LastPlayedDate"] = state.LastPlayedDate.UTC().Format(time.RFC3339)
+	} else {
+		userData["LastPlayedDate"] = nil
+	}
+	userData["PlayCount"] = state.PlayCount
 }
 
 func rewriteJSONValue(v any, session *Session, gatewayToken, publicGatewayBase, gatewayServerID string) any {
@@ -781,6 +1038,82 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 
 func equalPath(a, b string) bool {
 	return strings.EqualFold(strings.TrimRight(a, "/"), strings.TrimRight(b, "/"))
+}
+
+func stringField(obj map[string]any, name string) (string, bool) {
+	value, ok := field(obj, name)
+	if !ok {
+		return "", false
+	}
+	s, ok := value.(string)
+	return s, ok && s != ""
+}
+
+func mapField(obj map[string]any, name string) (map[string]any, bool) {
+	value, ok := field(obj, name)
+	if !ok {
+		return nil, false
+	}
+	m, ok := value.(map[string]any)
+	return m, ok
+}
+
+func boolField(obj map[string]any, name string) (bool, bool) {
+	value, ok := field(obj, name)
+	if !ok {
+		return false, false
+	}
+	b, ok := value.(bool)
+	return b, ok
+}
+
+func int64Field(obj map[string]any, name string) (int64, bool) {
+	value, ok := field(obj, name)
+	if !ok {
+		return 0, false
+	}
+	switch x := value.(type) {
+	case json.Number:
+		n, err := x.Int64()
+		return n, err == nil
+	case float64:
+		return int64(x), true
+	case int64:
+		return x, true
+	case int:
+		return int64(x), true
+	default:
+		return 0, false
+	}
+}
+
+func float64Field(obj map[string]any, name string) (float64, bool) {
+	value, ok := field(obj, name)
+	if !ok {
+		return 0, false
+	}
+	switch x := value.(type) {
+	case json.Number:
+		n, err := x.Float64()
+		return n, err == nil
+	case float64:
+		return x, true
+	case int64:
+		return float64(x), true
+	case int:
+		return float64(x), true
+	default:
+		return 0, false
+	}
+}
+
+func field(obj map[string]any, name string) (any, bool) {
+	for key, value := range obj {
+		if strings.EqualFold(key, name) {
+			return value, true
+		}
+	}
+	return nil, false
 }
 
 func isSingleUserPath(rel string) bool {

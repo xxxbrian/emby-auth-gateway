@@ -2,15 +2,20 @@ package gateway
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 )
 
 type MemoryStore struct {
-	mu       sync.RWMutex
-	Users    map[string]MemoryUser
-	Mappings map[string]UserMapping
-	Sessions map[string]*Session
+	mu             sync.RWMutex
+	Users          map[string]MemoryUser
+	Mappings       map[string]UserMapping
+	Sessions       map[string]*Session
+	AuditLogs      []AuditLog
+	PathPolicies   []PathPolicy
+	PlaybackEvents []PlaybackEvent
+	PlaybackStates map[string]*PlaybackState
 }
 
 type MemoryUser struct {
@@ -20,9 +25,10 @@ type MemoryUser struct {
 
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		Users:    map[string]MemoryUser{},
-		Mappings: map[string]UserMapping{},
-		Sessions: map[string]*Session{},
+		Users:          map[string]MemoryUser{},
+		Mappings:       map[string]UserMapping{},
+		Sessions:       map[string]*Session{},
+		PlaybackStates: map[string]*PlaybackState{},
 	}
 }
 
@@ -36,6 +42,18 @@ func (m *MemoryStore) AuthenticateGatewayUser(ctx context.Context, username, pas
 		}
 	}
 	return nil, ErrInvalidCredentials
+}
+
+func (m *MemoryStore) FindGatewayUserByUsername(ctx context.Context, username string) (*GatewayUser, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, user := range m.Users {
+		if user.Username == username {
+			u := user.GatewayUser
+			return &u, nil
+		}
+	}
+	return nil, ErrNotFound
 }
 
 func (m *MemoryStore) ListPublicUsers(ctx context.Context) ([]GatewayUser, error) {
@@ -79,6 +97,60 @@ func (m *MemoryStore) DefaultBackend(ctx context.Context) (*BackendAccount, erro
 	return nil, ErrNotFound
 }
 
+func (m *MemoryStore) RecordAudit(ctx context.Context, entry AuditLog) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if entry.CreatedAt.IsZero() {
+		entry.CreatedAt = time.Now().UTC()
+	}
+	m.AuditLogs = append(m.AuditLogs, entry)
+	return nil
+}
+
+func (m *MemoryStore) CheckPathPolicy(ctx context.Context, method, relativePath string) (PathPolicyDecision, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return DecidePathPolicy(m.PathPolicies, method, relativePath), nil
+}
+
+func (m *MemoryStore) RecordPlaybackEvent(ctx context.Context, event PlaybackEvent) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if event.CreatedAt.IsZero() {
+		event.CreatedAt = time.Now().UTC()
+	}
+	m.PlaybackEvents = append(m.PlaybackEvents, event)
+	return nil
+}
+
+func (m *MemoryStore) FindPlaybackState(ctx context.Context, gatewayUserID, itemID string) (*PlaybackState, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.PlaybackStates == nil {
+		return nil, ErrNotFound
+	}
+	state, ok := m.PlaybackStates[playbackStateKey(gatewayUserID, itemID)]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	copyState := *state
+	return &copyState, nil
+}
+
+func (m *MemoryStore) SavePlaybackState(ctx context.Context, state PlaybackState) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.PlaybackStates == nil {
+		m.PlaybackStates = map[string]*PlaybackState{}
+	}
+	if state.UpdatedAt.IsZero() {
+		state.UpdatedAt = time.Now().UTC()
+	}
+	copyState := state
+	m.PlaybackStates[playbackStateKey(state.GatewayUserID, state.ItemID)] = &copyState
+	return nil
+}
+
 func (m *MemoryStore) SaveSession(ctx context.Context, session *Session) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -107,4 +179,24 @@ func (m *MemoryStore) RevokeSession(ctx context.Context, tokenHash string) error
 		return nil
 	}
 	return ErrNotFound
+}
+
+func playbackStateKey(gatewayUserID, itemID string) string {
+	return gatewayUserID + "\x00" + itemID
+}
+
+func methodMatches(policyMethod, requestMethod string) bool {
+	policyMethod = strings.TrimSpace(policyMethod)
+	return policyMethod == "" || policyMethod == "*" || strings.EqualFold(policyMethod, requestMethod)
+}
+
+func pathMatches(policyPath, requestPath string) bool {
+	policyPath = strings.TrimSpace(policyPath)
+	if policyPath == "" || policyPath == "*" {
+		return true
+	}
+	if strings.HasSuffix(policyPath, "*") {
+		return strings.HasPrefix(strings.ToLower(requestPath), strings.ToLower(strings.TrimSuffix(policyPath, "*")))
+	}
+	return equalPath(policyPath, requestPath)
 }

@@ -11,6 +11,9 @@ func init() {
 		for _, name := range gatewayCollectionNames() {
 			collection, err := app.FindCollectionByNameOrId(name)
 			if err != nil {
+				if isPhase2Collection(name) {
+					continue
+				}
 				return err
 			}
 			setCollectionRules(collection, nil, nil, nil, nil, nil)
@@ -26,6 +29,9 @@ func init() {
 		for _, name := range gatewayCollectionNames() {
 			collection, err := app.FindCollectionByNameOrId(name)
 			if err != nil {
+				if isPhase2Collection(name) {
+					continue
+				}
 				return err
 			}
 			switch collection.Name {
@@ -39,6 +45,8 @@ func init() {
 				)
 				collection.PasswordAuth.Enabled = true
 				collection.PasswordAuth.IdentityFields = []string{"username"}
+			case "playback_events", "playback_states", "path_policies":
+				setCollectionRules(collection, nil, nil, nil, nil, nil)
 			default:
 				empty := types.Pointer("")
 				setCollectionRules(collection, empty, empty, empty, empty, empty)
@@ -52,7 +60,16 @@ func init() {
 }
 
 func gatewayCollectionNames() []string {
-	return []string{"gateway_users", "emby_servers", "backend_accounts", "user_mappings", "gateway_sessions", "audit_logs"}
+	return []string{"gateway_users", "emby_servers", "backend_accounts", "user_mappings", "gateway_sessions", "audit_logs", "playback_events", "playback_states", "path_policies"}
+}
+
+func isPhase2Collection(name string) bool {
+	switch name {
+	case "playback_events", "playback_states", "path_policies":
+		return true
+	default:
+		return false
+	}
 }
 
 func setCollectionRules(collection *core.Collection, list, view, create, update, delete *string) {

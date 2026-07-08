@@ -498,6 +498,303 @@ func TestSuccessfulLoginClearsFailureCount(t *testing.T) {
 	}
 }
 
+func TestAuditLogsForAuthAndLogout(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/emby/Users/AuthenticateByName":
+			writeTestJSON(w, map[string]any{
+				"AccessToken": "backend-token",
+				"ServerId":    "backend-server",
+				"User": map[string]any{
+					"Id":   "backend-user",
+					"Name": "shared",
+				},
+			})
+		case "/emby/Sessions/Logout":
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected backend request %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer backend.Close()
+
+	store := testStore(backend.URL + "/emby")
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	badResp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice","Pw":"bad"}`))
+	_ = badResp.Body.Close()
+	if badResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("bad login status = %d, want 401", badResp.StatusCode)
+	}
+	if len(store.AuditLogs) == 0 || store.AuditLogs[len(store.AuditLogs)-1].GatewayUserID != "u1" || store.AuditLogs[len(store.AuditLogs)-1].SyntheticUserID != "gateway-user" {
+		t.Fatalf("bad login audit was not associated with gateway user: %#v", store.AuditLogs)
+	}
+
+	loginResp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice","Pw":"alice-pass"}`))
+	defer loginResp.Body.Close()
+	if loginResp.StatusCode != http.StatusOK {
+		t.Fatalf("login status = %d, want 200", loginResp.StatusCode)
+	}
+	var login map[string]any
+	decodeJSON(t, loginResp.Body, &login)
+	gatewayToken, _ := login["AccessToken"].(string)
+
+	logoutReq := mustRequest(t, http.MethodPost, gw.URL+"/emby/Sessions/Logout", nil)
+	logoutReq.Header.Set("X-Emby-Token", gatewayToken)
+	logoutResp := do(t, logoutReq)
+	_ = logoutResp.Body.Close()
+	if logoutResp.StatusCode != http.StatusOK {
+		t.Fatalf("logout status = %d, want 200", logoutResp.StatusCode)
+	}
+
+	for _, event := range []string{"login_failure", "login_success", "logout_success"} {
+		if !hasAuditEvent(store, event) {
+			t.Fatalf("missing audit event %q in %#v", event, store.AuditLogs)
+		}
+	}
+	auditJSON := mustJSON(t, store.AuditLogs)
+	for _, secret := range []string{"alice-pass", "backend-token", gatewayToken} {
+		if secret != "" && strings.Contains(auditJSON, secret) {
+			t.Fatalf("audit log leaked secret %q: %s", secret, auditJSON)
+		}
+	}
+}
+
+func TestAuditLogsForAuthDependencyFailures(t *testing.T) {
+	t.Run("mapping unavailable", func(t *testing.T) {
+		store := testStore("http://127.0.0.1/emby")
+		store.Mappings["u1"] = UserMapping{Enabled: false}
+		gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+		defer gw.Close()
+
+		resp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice","Pw":"alice-pass"}`))
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("login status = %d, want 401", resp.StatusCode)
+		}
+		if !hasAuditEvent(store, "mapping_unavailable") {
+			t.Fatalf("missing mapping_unavailable audit in %#v", store.AuditLogs)
+		}
+	})
+
+	t.Run("backend auth failure", func(t *testing.T) {
+		backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "backend failed", http.StatusUnauthorized)
+		}))
+		defer backend.Close()
+		store := testStore(backend.URL + "/emby")
+		gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+		defer gw.Close()
+
+		resp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice","Pw":"alice-pass"}`))
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Fatalf("login status = %d, want 502", resp.StatusCode)
+		}
+		if !hasAuditEvent(store, "backend_auth_failure") {
+			t.Fatalf("missing backend_auth_failure audit in %#v", store.AuditLogs)
+		}
+	})
+
+	t.Run("session save failure", func(t *testing.T) {
+		backend := testAuthBackend(t)
+		defer backend.Close()
+		store := &failingSaveStore{MemoryStore: testStore(backend.URL + "/emby")}
+		gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+		defer gw.Close()
+
+		resp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice","Pw":"alice-pass"}`))
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("login status = %d, want 500", resp.StatusCode)
+		}
+		if !hasAuditEvent(store.MemoryStore, "session_save_failure") {
+			t.Fatalf("missing session_save_failure audit in %#v", store.AuditLogs)
+		}
+	})
+}
+
+func TestLoginFailureAuditAssociatesExistingUser(t *testing.T) {
+	backend := testAuthBackend(t)
+	defer backend.Close()
+	store := testStore(backend.URL + "/emby")
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	missingResp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice"}`))
+	_ = missingResp.Body.Close()
+	if missingResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("missing password status = %d, want 400", missingResp.StatusCode)
+	}
+	last := store.AuditLogs[len(store.AuditLogs)-1]
+	if last.Event != "login_failure" || last.GatewayUserID != "u1" || last.SyntheticUserID != "gateway-user" {
+		t.Fatalf("missing credentials audit not associated with gateway user: %#v", last)
+	}
+
+	for i := 0; i < loginFailureLimit; i++ {
+		resp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice","Pw":"bad"}`))
+		_ = resp.Body.Close()
+	}
+	blockedResp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice","Pw":"alice-pass"}`))
+	_ = blockedResp.Body.Close()
+	if blockedResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("blocked login status = %d, want 401", blockedResp.StatusCode)
+	}
+	last = store.AuditLogs[len(store.AuditLogs)-1]
+	if last.Event != "login_failure" || last.Message != "login blocked" || last.GatewayUserID != "u1" || last.SyntheticUserID != "gateway-user" {
+		t.Fatalf("blocked audit not associated with gateway user: %#v", last)
+	}
+}
+
+func TestPathPolicyDenyAndDefaultAllow(t *testing.T) {
+	var openHits int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/emby/Items/Open":
+			openHits++
+			writeTestJSON(w, map[string]any{"ok": true})
+		case "/emby/Items/Secret":
+			t.Fatal("denied path reached backend")
+		default:
+			t.Fatalf("unexpected backend request %s", r.URL.Path)
+		}
+	}))
+	defer backend.Close()
+
+	store := NewMemoryStore()
+	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	store.PathPolicies = []PathPolicy{{Method: http.MethodGet, Path: "/Items/Secret", Action: "deny", Enabled: true}}
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	openResp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Items/Open?api_key=gateway-token", nil))
+	_ = openResp.Body.Close()
+	if openResp.StatusCode != http.StatusOK || openHits != 1 {
+		t.Fatalf("default allow status = %d hits = %d, want 200/1", openResp.StatusCode, openHits)
+	}
+
+	deniedResp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Items/Secret?api_key=gateway-token", nil))
+	_ = deniedResp.Body.Close()
+	if deniedResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("denied status = %d, want 403", deniedResp.StatusCode)
+	}
+	if !hasAuditEvent(store, "path_denied") {
+		t.Fatalf("missing path_denied audit in %#v", store.AuditLogs)
+	}
+
+	store.PathPolicies = append(store.PathPolicies, PathPolicy{Method: http.MethodGet, Path: "/Users/Public", Action: "deny", Enabled: true})
+	usersResp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Users/Public", nil))
+	_ = usersResp.Body.Close()
+	if usersResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("special handler denied status = %d, want 403", usersResp.StatusCode)
+	}
+}
+
+func TestPlaybackEventsAndStateAreRecordedAndForwarded(t *testing.T) {
+	const gatewayToken = "gateway-token"
+	var forwarded []string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		forwarded = append(forwarded, r.URL.Path+":"+string(body))
+		if strings.Contains(string(body), "gateway-user") || !strings.Contains(string(body), "backend-user") {
+			t.Fatalf("playback body was not mapped to backend user: %s", string(body))
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer backend.Close()
+
+	store := NewMemoryStore()
+	store.Sessions[HashToken(gatewayToken)] = testSession(backend.URL + "/emby")
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	requests := []struct {
+		path string
+		body string
+	}{
+		{"/Sessions/Playing", `{"Item":{"Id":"item-1"},"UserId":"gateway-user","PositionTicks":100}`},
+		{"/Sessions/Playing/Progress", `{"ItemId":"item-1","UserId":"gateway-user","PlaybackPositionTicks":250,"PlayedPercentage":50.5}`},
+		{"/Sessions/Playing/Stopped", `{"ItemId":"item-1","UserId":"gateway-user","PositionTicks":500,"Played":true,"PlayedPercentage":95}`},
+	}
+	for _, req := range requests {
+		httpReq := mustRequest(t, http.MethodPost, gw.URL+"/emby"+req.path+"?api_key="+gatewayToken, strings.NewReader(req.body))
+		httpReq.Header.Set("Content-Type", "application/json")
+		resp := do(t, httpReq)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("%s status = %d, want 204", req.path, resp.StatusCode)
+		}
+	}
+	if len(forwarded) != 3 || len(store.PlaybackEvents) != 3 {
+		t.Fatalf("forwarded=%d events=%d, want 3/3", len(forwarded), len(store.PlaybackEvents))
+	}
+	state, err := store.FindPlaybackState(context.Background(), "u1", "item-1")
+	if err != nil {
+		t.Fatalf("find playback state: %v", err)
+	}
+	if !state.Played || state.PlayCount != 1 || state.PlaybackPositionTicks != 500 || state.PlayedPercentage == nil || *state.PlayedPercentage != 95 || state.LastPlayedDate == nil {
+		t.Fatalf("unexpected playback state: %#v", state)
+	}
+	if _, err := store.FindSessionByTokenHash(context.Background(), HashToken(gatewayToken)); err != nil {
+		t.Fatalf("session missing after playback: %v", err)
+	}
+	playbackJSON := mustJSON(t, store.PlaybackEvents)
+	if strings.Contains(playbackJSON, gatewayToken) || strings.Contains(playbackJSON, "backend-token") || strings.Contains(playbackJSON, "alice-pass") {
+		t.Fatalf("playback event leaked secret: %s", playbackJSON)
+	}
+}
+
+func TestUserDataVirtualizationIsGatewayUserScoped(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeTestJSON(w, map[string]any{
+			"Item": map[string]any{
+				"Id":       "item-1",
+				"UserData": map[string]any{"Played": true, "PlaybackPositionTicks": float64(9999), "PlayedPercentage": float64(99), "PlayCount": float64(9)},
+			},
+			"Items": []any{
+				map[string]any{"Id": "item-1", "UserData": map[string]any{"Played": true, "PlaybackPositionTicks": float64(9999), "PlayedPercentage": float64(99), "PlayCount": float64(9)}},
+			},
+		})
+	}))
+	defer backend.Close()
+
+	store := NewMemoryStore()
+	store.Sessions[HashToken("token-u1")] = testSession(backend.URL + "/emby")
+	u2Session := *testSession(backend.URL + "/emby")
+	u2Session.GatewayTokenHash = HashToken("token-u2")
+	u2Session.GatewayUserID = "u2"
+	u2Session.GatewayUsername = "bob"
+	u2Session.SyntheticUserID = "gateway-user-2"
+	store.Sessions[u2Session.GatewayTokenHash] = &u2Session
+	u3Session := *testSession(backend.URL + "/emby")
+	u3Session.GatewayTokenHash = HashToken("token-u3")
+	u3Session.GatewayUserID = "u3"
+	u3Session.GatewayUsername = "charlie"
+	u3Session.SyntheticUserID = "gateway-user-3"
+	store.Sessions[u3Session.GatewayTokenHash] = &u3Session
+	pct1 := 42.5
+	pct2 := 88.25
+	lastPlayed := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", ItemID: "item-1", PlaybackPositionTicks: 4200, PlayedPercentage: &pct1, Played: false, PlayCount: 1})
+	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u2", ItemID: "item-1", PlaybackPositionTicks: 8800, PlayedPercentage: &pct2, Played: true, LastPlayedDate: &lastPlayed, PlayCount: 3})
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	u1 := fetchUserData(t, gw.URL+"/emby/Items/item-1?api_key=token-u1")
+	u2 := fetchUserData(t, gw.URL+"/emby/Items/item-1?api_key=token-u2")
+	u3 := fetchUserData(t, gw.URL+"/emby/Items/item-1?api_key=token-u3")
+	if u1["Played"] != false || int(u1["PlaybackPositionTicks"].(float64)) != 4200 || u1["PlayedPercentage"].(float64) != pct1 || int(u1["PlayCount"].(float64)) != 1 {
+		t.Fatalf("unexpected u1 user data: %#v", u1)
+	}
+	if u2["Played"] != true || int(u2["PlaybackPositionTicks"].(float64)) != 8800 || u2["PlayedPercentage"].(float64) != pct2 || int(u2["PlayCount"].(float64)) != 3 || u2["LastPlayedDate"] == "" {
+		t.Fatalf("unexpected u2 user data: %#v", u2)
+	}
+	if u3["Played"] != false || int(u3["PlaybackPositionTicks"].(float64)) != 0 || u3["PlayedPercentage"] != nil || int(u3["PlayCount"].(float64)) != 0 || u3["LastPlayedDate"] != nil {
+		t.Fatalf("missing state should not leak backend user data: %#v", u3)
+	}
+}
+
 func TestLoginFailureRateLimitIsRemoteIPScoped(t *testing.T) {
 	backend := testAuthBackend(t)
 	defer backend.Close()
@@ -613,6 +910,25 @@ func TestOversizedJSONDoesNotPassTruncatedBody(t *testing.T) {
 	if strings.Contains(string(body), "backend-token") || strings.Contains(string(body), strings.Repeat("x", 128)) {
 		t.Fatalf("oversized json body included backend/truncated content")
 	}
+	if !hasAuditEvent(store, "proxy_read_failed") {
+		t.Fatalf("missing proxy_read_failed audit in %#v", store.AuditLogs)
+	}
+}
+
+func TestProxyBackendUnavailableIsAudited(t *testing.T) {
+	store := NewMemoryStore()
+	store.Sessions[HashToken("gateway-token")] = testSession("http://127.0.0.1:1/emby")
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/System/Info?api_key=gateway-token", nil))
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("proxy status = %d, want 502", resp.StatusCode)
+	}
+	if !hasAuditEvent(store, "proxy_backend_unavailable") {
+		t.Fatalf("missing proxy_backend_unavailable audit in %#v", store.AuditLogs)
+	}
 }
 
 func TestOctetStreamM3U8IsRewritten(t *testing.T) {
@@ -689,6 +1005,57 @@ type failingRevokeStore struct {
 
 func (f *failingRevokeStore) RevokeSession(ctx context.Context, tokenHash string) error {
 	return errors.New("revoke failed")
+}
+
+type failingSaveStore struct {
+	*MemoryStore
+}
+
+func (f *failingSaveStore) SaveSession(ctx context.Context, session *Session) error {
+	return errors.New("save failed")
+}
+
+func hasAuditEvent(store *MemoryStore, event string) bool {
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	for _, entry := range store.AuditLogs {
+		if entry.Event == event {
+			return true
+		}
+	}
+	return false
+}
+
+func fetchUserData(t *testing.T, url string) map[string]any {
+	t.Helper()
+	resp := do(t, mustRequest(t, http.MethodGet, url, nil))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("user data response status = %d, want 200", resp.StatusCode)
+	}
+	var body map[string]any
+	decodeJSON(t, resp.Body, &body)
+	item, ok := body["Item"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing Item in %#v", body)
+	}
+	userData, ok := item["UserData"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing UserData in %#v", item)
+	}
+	items, ok := body["Items"].([]any)
+	if !ok || len(items) != 1 {
+		t.Fatalf("missing Items in %#v", body)
+	}
+	listItem, ok := items[0].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected Items[0] in %#v", items[0])
+	}
+	listUserData, ok := listItem["UserData"].(map[string]any)
+	if !ok || listUserData["PlaybackPositionTicks"] != userData["PlaybackPositionTicks"] {
+		t.Fatalf("nested list UserData was not virtualized: item=%#v list=%#v", userData, listUserData)
+	}
+	return userData
 }
 
 func testStore(backendBaseURL string) *MemoryStore {

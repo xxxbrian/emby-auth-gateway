@@ -30,6 +30,14 @@ func (s *Store) AuthenticateGatewayUser(ctx context.Context, username, password 
 	return userFromRecord(record), nil
 }
 
+func (s *Store) FindGatewayUserByUsername(ctx context.Context, username string) (*gateway.GatewayUser, error) {
+	record, err := s.app.FindFirstRecordByData("gateway_users", "username", username)
+	if err != nil {
+		return nil, gateway.ErrNotFound
+	}
+	return userFromRecord(record), nil
+}
+
 func (s *Store) ListPublicUsers(ctx context.Context) ([]gateway.GatewayUser, error) {
 	records, err := s.app.FindAllRecords("gateway_users", dbx.HashExp{"enabled": true})
 	if err != nil {
@@ -84,6 +92,115 @@ func (s *Store) DefaultBackend(ctx context.Context) (*gateway.BackendAccount, er
 		return nil, gateway.ErrNotFound
 	}
 	return s.backendAccountFromRecord(records[0])
+}
+
+func (s *Store) RecordAudit(ctx context.Context, entry gateway.AuditLog) error {
+	collection, err := s.app.FindCollectionByNameOrId("audit_logs")
+	if err != nil {
+		return err
+	}
+	record := core.NewRecord(collection)
+	if entry.GatewayUserID != "" {
+		record.Set("gateway_user", entry.GatewayUserID)
+	}
+	record.Set("synthetic_user_id", entry.SyntheticUserID)
+	record.Set("event", entry.Event)
+	record.Set("message", entry.Message)
+	record.Set("remote_ip", entry.RemoteIP)
+	record.Set("method", entry.Method)
+	record.Set("path", entry.Path)
+	record.Set("status", entry.Status)
+	return s.app.Save(record)
+}
+
+func (s *Store) CheckPathPolicy(ctx context.Context, method, relativePath string) (gateway.PathPolicyDecision, error) {
+	policies, err := s.enabledPathPolicies()
+	if err != nil {
+		return gateway.PathPolicyDecision{}, err
+	}
+	return gateway.DecidePathPolicy(policies, method, relativePath), nil
+}
+
+func (s *Store) RecordPlaybackEvent(ctx context.Context, event gateway.PlaybackEvent) error {
+	collection, err := s.app.FindCollectionByNameOrId("playback_events")
+	if err != nil {
+		return err
+	}
+	record := core.NewRecord(collection)
+	record.Set("gateway_user", event.GatewayUserID)
+	record.Set("synthetic_user_id", event.SyntheticUserID)
+	record.Set("item_id", event.ItemID)
+	record.Set("item_name", event.ItemName)
+	record.Set("event", event.Event)
+	record.Set("playback_position_ticks", event.PositionTicks)
+	if event.Played != nil {
+		record.Set("played", *event.Played)
+	}
+	if event.PlayedPercentage != nil {
+		record.Set("played_percentage", *event.PlayedPercentage)
+	}
+	record.Set("remote_ip", event.RemoteIP)
+	if !event.CreatedAt.IsZero() {
+		record.Set("occurred_at", event.CreatedAt)
+	} else {
+		record.Set("occurred_at", time.Now().UTC())
+	}
+	return s.app.Save(record)
+}
+
+func (s *Store) FindPlaybackState(ctx context.Context, gatewayUserID, itemID string) (*gateway.PlaybackState, error) {
+	records, err := s.app.FindRecordsByFilter(
+		"playback_states",
+		"gateway_user = {:gatewayUserID} && item_id = {:itemID}",
+		"",
+		1,
+		0,
+		dbx.Params{"gatewayUserID": gatewayUserID, "itemID": itemID},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(records) == 0 {
+		return nil, gateway.ErrNotFound
+	}
+	return playbackStateFromRecord(records[0]), nil
+}
+
+func (s *Store) SavePlaybackState(ctx context.Context, state gateway.PlaybackState) error {
+	records, err := s.app.FindRecordsByFilter(
+		"playback_states",
+		"gateway_user = {:gatewayUserID} && item_id = {:itemID}",
+		"",
+		1,
+		0,
+		dbx.Params{"gatewayUserID": state.GatewayUserID, "itemID": state.ItemID},
+	)
+	if err != nil {
+		return err
+	}
+	var record *core.Record
+	if len(records) > 0 {
+		record = records[0]
+	} else {
+		collection, err := s.app.FindCollectionByNameOrId("playback_states")
+		if err != nil {
+			return err
+		}
+		record = core.NewRecord(collection)
+		record.Set("gateway_user", state.GatewayUserID)
+		record.Set("item_id", state.ItemID)
+	}
+	record.Set("synthetic_user_id", state.SyntheticUserID)
+	record.Set("played", state.Played)
+	record.Set("playback_position_ticks", state.PlaybackPositionTicks)
+	if state.PlayedPercentage != nil {
+		record.Set("played_percentage", *state.PlayedPercentage)
+	}
+	if state.LastPlayedDate != nil {
+		record.Set("last_played_date", *state.LastPlayedDate)
+	}
+	record.Set("play_count", state.PlayCount)
+	return s.app.Save(record)
 }
 
 func (s *Store) SaveSession(ctx context.Context, session *gateway.Session) error {
@@ -194,6 +311,48 @@ func (s *Store) backendAccountFromRecord(record *core.Record) (*gateway.BackendA
 		Password: password,
 		Enabled:  record.GetBool("enabled") && server.GetBool("enabled"),
 	}, nil
+}
+
+func (s *Store) enabledPathPolicies() ([]gateway.PathPolicy, error) {
+	records, err := s.app.FindRecordsByFilter("path_policies", "enabled = true", "", 0, 0)
+	if err != nil {
+		return nil, err
+	}
+	policies := make([]gateway.PathPolicy, 0, len(records))
+	for _, record := range records {
+		policies = append(policies, gateway.PathPolicy{
+			ID:       record.Id,
+			Method:   record.GetString("method"),
+			Path:     record.GetString("path"),
+			Action:   record.GetString("action"),
+			Reason:   record.GetString("reason"),
+			Priority: record.GetInt("priority"),
+			Enabled:  record.GetBool("enabled"),
+		})
+	}
+	return policies, nil
+}
+
+func playbackStateFromRecord(record *core.Record) *gateway.PlaybackState {
+	percentage := record.GetFloat("played_percentage")
+	updatedAt := record.GetDateTime("updated").Time()
+	var lastPlayedDate *time.Time
+	if !record.GetDateTime("last_played_date").IsZero() {
+		t := record.GetDateTime("last_played_date").Time()
+		lastPlayedDate = &t
+	}
+	return &gateway.PlaybackState{
+		ID:                    record.Id,
+		GatewayUserID:         record.GetString("gateway_user"),
+		SyntheticUserID:       record.GetString("synthetic_user_id"),
+		ItemID:                record.GetString("item_id"),
+		PlaybackPositionTicks: int64(record.GetFloat("playback_position_ticks")),
+		Played:                record.GetBool("played"),
+		PlayedPercentage:      &percentage,
+		LastPlayedDate:        lastPlayedDate,
+		PlayCount:             record.GetInt("play_count"),
+		UpdatedAt:             updatedAt,
+	}
 }
 
 func userFromRecord(record *core.Record) *gateway.GatewayUser {

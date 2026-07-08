@@ -3,6 +3,8 @@ package gateway
 import (
 	"context"
 	"net/http"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -15,13 +17,118 @@ type Config struct {
 
 type Store interface {
 	AuthenticateGatewayUser(ctx context.Context, username, password string) (*GatewayUser, error)
+	FindGatewayUserByUsername(ctx context.Context, username string) (*GatewayUser, error)
 	ListPublicUsers(ctx context.Context) ([]GatewayUser, error)
 	FindUserBySyntheticID(ctx context.Context, syntheticID string) (*GatewayUser, error)
 	FindMappingByGatewayUserID(ctx context.Context, gatewayUserID string) (*UserMapping, error)
 	DefaultBackend(ctx context.Context) (*BackendAccount, error)
+	RecordAudit(ctx context.Context, entry AuditLog) error
+	CheckPathPolicy(ctx context.Context, method, relativePath string) (PathPolicyDecision, error)
+	RecordPlaybackEvent(ctx context.Context, event PlaybackEvent) error
+	FindPlaybackState(ctx context.Context, gatewayUserID, itemID string) (*PlaybackState, error)
+	SavePlaybackState(ctx context.Context, state PlaybackState) error
 	SaveSession(ctx context.Context, session *Session) error
 	FindSessionByTokenHash(ctx context.Context, tokenHash string) (*Session, error)
 	RevokeSession(ctx context.Context, tokenHash string) error
+}
+
+type AuditLog struct {
+	ID              string
+	GatewayUserID   string
+	SyntheticUserID string
+	Event           string
+	Message         string
+	RemoteIP        string
+	Method          string
+	Path            string
+	Status          int
+	CreatedAt       time.Time
+}
+
+type PathPolicy struct {
+	ID       string
+	Method   string
+	Path     string
+	Action   string
+	Reason   string
+	Priority int
+	Enabled  bool
+}
+
+func (p PathPolicy) Deny() bool {
+	return strings.EqualFold(p.Action, "deny")
+}
+
+type PathPolicyDecision struct {
+	Allowed  bool
+	Action   string
+	PolicyID string
+}
+
+type PlaybackEvent struct {
+	ID               string
+	GatewayUserID    string
+	SyntheticUserID  string
+	ItemID           string
+	ItemName         string
+	Event            string
+	PositionTicks    int64
+	Played           *bool
+	PlayedPercentage *float64
+	RemoteIP         string
+	CreatedAt        time.Time
+}
+
+type PlaybackState struct {
+	ID                    string
+	GatewayUserID         string
+	SyntheticUserID       string
+	ItemID                string
+	PlaybackPositionTicks int64
+	Played                bool
+	PlayedPercentage      *float64
+	LastPlayedDate        *time.Time
+	PlayCount             int
+	UpdatedAt             time.Time
+}
+
+func DecidePathPolicy(policies []PathPolicy, method, path string) PathPolicyDecision {
+	policy, ok := FirstMatchingPathPolicy(policies, method, path)
+	if !ok {
+		return PathPolicyDecision{Allowed: true, Action: "allow"}
+	}
+	if policy.Deny() {
+		return PathPolicyDecision{Allowed: false, Action: "deny", PolicyID: policy.ID}
+	}
+	return PathPolicyDecision{Allowed: true, Action: "allow", PolicyID: policy.ID}
+}
+
+func FirstMatchingPathPolicy(policies []PathPolicy, method, path string) (PathPolicy, bool) {
+	matched := make([]PathPolicy, 0, len(policies))
+	for _, policy := range policies {
+		if policy.Enabled && methodMatches(policy.Method, method) && pathMatches(policy.Path, path) {
+			matched = append(matched, policy)
+		}
+	}
+	if len(matched) == 0 {
+		return PathPolicy{}, false
+	}
+	sort.SliceStable(matched, func(i, j int) bool {
+		if matched[i].Action != matched[j].Action {
+			return strings.EqualFold(matched[i].Action, "deny")
+		}
+		if matched[i].Priority != matched[j].Priority {
+			return matched[i].Priority > matched[j].Priority
+		}
+		if matched[i].Method != matched[j].Method {
+			return matched[i].Method < matched[j].Method
+		}
+		if matched[i].Path != matched[j].Path {
+			return matched[i].Path < matched[j].Path
+		}
+		return matched[i].ID < matched[j].ID
+	})
+	return matched[0], true
 }
 
 type GatewayUser struct {
