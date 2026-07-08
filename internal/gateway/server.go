@@ -23,7 +23,6 @@ const gatewayVersion = "0.0.0"
 
 const (
 	backendAuthTimeout         = 15 * time.Second
-	defaultBackendUserAgent    = "Emby for Android/3.4.20"
 	proxyResponseHeaderTimeout = 30 * time.Second
 	proxyIdleConnTimeout       = 90 * time.Second
 	loginFailureLimit          = 5
@@ -129,8 +128,8 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	auth := firstAuthHeader(r)
-	backendResult, err := s.authenticateBackend(ctx, mapping.BackendAccount, auth, r.UserAgent())
+	clientAuth := firstAuthHeader(r)
+	backendResult, err := s.authenticateBackend(ctx, mapping.BackendAccount)
 	if err != nil {
 		s.audit(ctx, AuditLog{GatewayUserID: user.ID, SyntheticUserID: user.SyntheticUserID, Event: "backend_auth_failure", Message: "backend authentication failed", RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusBadGateway})
 		http.Error(w, "backend authentication failed", http.StatusBadGateway)
@@ -156,10 +155,11 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 		BackendUserID:    backendResult.UserID,
 		BackendUsername:  backendResult.Username,
 		BackendToken:     backendResult.AccessToken,
-		Client:           auth.Client,
-		Device:           auth.Device,
-		DeviceID:         auth.DeviceID,
-		Version:          auth.Version,
+		BackendIdentity:  mapping.BackendAccount.ClientIdentity.WithDefaults(),
+		Client:           clientAuth.Client,
+		Device:           clientAuth.Device,
+		DeviceID:         clientAuth.DeviceID,
+		Version:          clientAuth.Version,
 		RemoteIP:         remoteIP(r),
 		CreatedAt:        now,
 		ExpiresAt:        now.Add(defaultSessionTTL),
@@ -211,7 +211,7 @@ func parseAuthenticateBody(w http.ResponseWriter, r *http.Request) (authenticate
 	return form, json.Unmarshal(body, &form)
 }
 
-func (s *Server) authenticateBackend(ctx context.Context, account BackendAccount, auth AuthHeader, userAgent string) (*backendAuthResult, error) {
+func (s *Server) authenticateBackend(ctx context.Context, account BackendAccount) (*backendAuthResult, error) {
 	u, err := backendURL(account.BaseURL, "/Users/AuthenticateByName")
 	if err != nil {
 		return nil, err
@@ -228,16 +228,9 @@ func (s *Server) authenticateBackend(ctx context.Context, account BackendAccount
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if strings.TrimSpace(userAgent) == "" {
-		userAgent = defaultBackendUserAgent
-	}
-	req.Header.Set("User-Agent", userAgent)
-	auth.UserID = ""
-	auth.Token = ""
-	if auth.Scheme == "" {
-		auth.Scheme = "Emby"
-	}
-	req.Header.Set("X-Emby-Authorization", auth.String())
+	identity := account.ClientIdentity.WithDefaults()
+	req.Header.Set("User-Agent", identity.UserAgent)
+	req.Header.Set("X-Emby-Authorization", backendAuthHeader(identity, "", "").String())
 
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -534,17 +527,26 @@ func (s *Server) rewriteRequestHeaders(h http.Header, session *Session, gatewayT
 	if h.Get("X-Emby-Token") == "" {
 		h.Set("X-Emby-Token", session.BackendToken)
 	}
-	for _, name := range []string{"X-Emby-Authorization", "Authorization"} {
-		if v := h.Get(name); v != "" {
-			auth := ParseEmbyAuthHeader(v)
-			if auth.Token == gatewayToken || auth.Token == "" {
-				auth.Token = session.BackendToken
-			}
-			if auth.UserID == session.SyntheticUserID || auth.UserID == "" {
-				auth.UserID = session.BackendUserID
-			}
-			h.Set(name, auth.String())
-		}
+	identity := session.BackendIdentity.WithDefaults()
+	h.Set("User-Agent", identity.UserAgent)
+	auth := backendAuthHeader(identity, session.BackendUserID, session.BackendToken).String()
+	h.Set("X-Emby-Authorization", auth)
+	if h.Get("Authorization") != "" {
+		h.Set("Authorization", auth)
+	}
+}
+
+func backendAuthHeader(identity BackendClientIdentity, userID, token string) AuthHeader {
+	identity = identity.WithDefaults()
+	return AuthHeader{
+		Scheme:   "Emby",
+		UserID:   userID,
+		Client:   identity.Client,
+		Device:   identity.Device,
+		DeviceID: identity.DeviceID,
+		Version:  identity.Version,
+		Token:    token,
+		Fields:   map[string]string{},
 	}
 }
 

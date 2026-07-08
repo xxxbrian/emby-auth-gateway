@@ -28,7 +28,7 @@ func TestRevokeSessionMissingReturnsErrNotFound(t *testing.T) {
 		t.Fatalf("find gateway_sessions collection: %v", err)
 	}
 
-	err = New(app, nil).RevokeSession(context.Background(), "missing-token-hash")
+	err = New(app).RevokeSession(context.Background(), "missing-token-hash")
 	if !errors.Is(err, gateway.ErrNotFound) {
 		t.Fatalf("RevokeSession error = %v, want ErrNotFound", err)
 	}
@@ -36,7 +36,7 @@ func TestRevokeSessionMissingReturnsErrNotFound(t *testing.T) {
 
 func TestPlaybackStateIsScopedByGatewayUserAndItem(t *testing.T) {
 	app := newTestApp(t)
-	store := New(app, nil)
+	store := New(app)
 	u1 := createGatewayUser(t, app, "alice", "gateway-user-1")
 	u2 := createGatewayUser(t, app, "bob", "gateway-user-2")
 	pct1 := 42.5
@@ -80,7 +80,7 @@ func TestPlaybackStateIsScopedByGatewayUserAndItem(t *testing.T) {
 
 func TestUserItemDataFieldsAndDisplayPreferencesArePersisted(t *testing.T) {
 	app := newTestApp(t)
-	store := New(app, nil)
+	store := New(app)
 	userID := createGatewayUser(t, app, "alice", "gateway-user")
 	likes := true
 	lastSeen := time.Date(2026, 7, 8, 13, 0, 0, 0, time.UTC)
@@ -127,7 +127,7 @@ func TestUserItemDataFieldsAndDisplayPreferencesArePersisted(t *testing.T) {
 
 func TestPathPolicyDefaultAllowAndDeny(t *testing.T) {
 	app := newTestApp(t)
-	store := New(app, nil)
+	store := New(app)
 
 	decision, err := store.CheckPathPolicy(context.Background(), "GET", "/Videos/1")
 	if err != nil {
@@ -179,7 +179,7 @@ func TestPathPolicyDefaultAllowAndDeny(t *testing.T) {
 
 func TestAuditAndPlaybackEventAreWritable(t *testing.T) {
 	app := newTestApp(t)
-	store := New(app, nil)
+	store := New(app)
 	userID := createGatewayUser(t, app, "alice", "gateway-user")
 	pct := 12.5
 
@@ -209,6 +209,58 @@ func TestAuditAndPlaybackEventAreWritable(t *testing.T) {
 	}
 }
 
+func TestBackendAccountAndSessionUsePlainCredentialsAndClientIdentity(t *testing.T) {
+	app := newTestApp(t)
+	store := New(app)
+	userID := createGatewayUser(t, app, "alice", "gateway-user")
+	accountID := createBackendAccount(t, app)
+
+	account, err := store.DefaultBackend(context.Background())
+	if err != nil {
+		t.Fatalf("default backend: %v", err)
+	}
+	if account.ID != accountID || account.Password != "backend-pass" {
+		t.Fatalf("unexpected backend account credentials: %#v", account)
+	}
+	if account.ClientIdentity.UserAgent != "Custom/1.0" || account.ClientIdentity.Client != "Custom" || account.ClientIdentity.Device != "Desktop" || account.ClientIdentity.DeviceID != "device-1" || account.ClientIdentity.Version != "1.0" {
+		t.Fatalf("unexpected backend identity: %#v", account.ClientIdentity)
+	}
+
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	session := &gateway.Session{
+		GatewayTokenHash: "hash",
+		GatewayUserID:    userID,
+		GatewayUsername:  "alice",
+		SyntheticUserID:  "gateway-user",
+		BackendAccountID: accountID,
+		BackendServerID:  "server",
+		BackendBaseURL:   "https://emby.example.com",
+		BackendUserID:    "backend-user",
+		BackendUsername:  "real-alice",
+		BackendToken:     "backend-token",
+		BackendIdentity:  account.ClientIdentity,
+		ExpiresAt:        now.Add(time.Hour),
+	}
+	if err := store.SaveSession(context.Background(), session); err != nil {
+		t.Fatalf("save session: %v", err)
+	}
+	saved, err := app.FindFirstRecordByData("gateway_sessions", "gateway_token_hash", "hash")
+	if err != nil {
+		t.Fatalf("find raw session: %v", err)
+	}
+	if saved.GetString("backend_token") != "backend-token" {
+		t.Fatalf("stored backend_token = %q, want plaintext backend-token", saved.GetString("backend_token"))
+	}
+
+	found, err := store.FindSessionByTokenHash(context.Background(), "hash")
+	if err != nil {
+		t.Fatalf("find session: %v", err)
+	}
+	if found.BackendToken != "backend-token" || found.BackendIdentity.UserAgent != "Custom/1.0" || found.BackendIdentity.Client != "Custom" || found.BackendIdentity.Device != "Desktop" || found.BackendIdentity.DeviceID != "device-1" || found.BackendIdentity.Version != "1.0" {
+		t.Fatalf("unexpected found session: %#v", found)
+	}
+}
+
 func newTestApp(t *testing.T) core.App {
 	t.Helper()
 	app, err := tests.NewTestAppWithConfig(core.BaseAppConfig{
@@ -220,6 +272,41 @@ func newTestApp(t *testing.T) core.App {
 	}
 	t.Cleanup(app.Cleanup)
 	return app
+}
+
+func createBackendAccount(t *testing.T, app core.App) string {
+	t.Helper()
+	servers, err := app.FindCollectionByNameOrId("emby_servers")
+	if err != nil {
+		t.Fatalf("find emby_servers: %v", err)
+	}
+	server := core.NewRecord(servers)
+	server.Set("name", "server")
+	server.Set("base_url", "https://emby.example.com")
+	server.Set("backend_user_agent", "Custom/1.0")
+	server.Set("backend_authorization_client", "Custom")
+	server.Set("backend_authorization_device", "Desktop")
+	server.Set("backend_authorization_device_id", "device-1")
+	server.Set("backend_authorization_version", "1.0")
+	server.Set("enabled", true)
+	if err := app.Save(server); err != nil {
+		t.Fatalf("save server: %v", err)
+	}
+
+	accounts, err := app.FindCollectionByNameOrId("backend_accounts")
+	if err != nil {
+		t.Fatalf("find backend_accounts: %v", err)
+	}
+	account := core.NewRecord(accounts)
+	account.Set("server", server.Id)
+	account.Set("name", "backend")
+	account.Set("backend_username", "real-alice")
+	account.Set("backend_password", "backend-pass")
+	account.Set("enabled", true)
+	if err := app.Save(account); err != nil {
+		t.Fatalf("save account: %v", err)
+	}
+	return account.Id
 }
 
 func createGatewayUser(t *testing.T, app core.App, username, syntheticUserID string) string {

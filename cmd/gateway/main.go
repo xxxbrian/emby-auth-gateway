@@ -30,16 +30,12 @@ func main() {
 	})
 
 	app.OnServe().BindFunc(func(e *core.ServeEvent) error {
-		cipher, err := gateway.NewCipher(requiredEnv("GATEWAY_SECRET_KEY"))
-		if err != nil {
-			return err
-		}
 		basePath := normalizeGatewayBasePath(envDefault("GATEWAY_BASE_PATH", "/emby"))
 		gw := gateway.NewServer(gateway.Config{
 			PublicBaseURL:   strings.TrimRight(os.Getenv("GATEWAY_PUBLIC_URL"), "/"),
 			GatewayBasePath: basePath,
 			GatewayServerID: envDefault("GATEWAY_SERVER_ID", "emby-auth-gateway"),
-		}, pbstore.New(e.App, cipher))
+		}, pbstore.New(e.App))
 
 		wildcardPath := basePath + "/{path...}"
 		if basePath == "/" {
@@ -105,12 +101,4 @@ func normalizeGatewayBasePath(value string) string {
 		return trimmed
 	}
 	return "/"
-}
-
-func requiredEnv(name string) string {
-	value := strings.TrimSpace(os.Getenv(name))
-	if value == "" {
-		log.Fatalf("%s is required", name)
-	}
-	return value
 }

@@ -30,6 +30,9 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 	var backendURL string
 	var sawControlledBackendLogin bool
 	var sawBackendAuthUserAgent bool
+	var sawBackendAuthIdentity bool
+	var sawProxyUserAgent bool
+	var sawProxyIdentity bool
 	var sawBackendTokenInRequest bool
 	var sawBackendUserInPath bool
 	var sawBackendTokenFromAPIKey bool
@@ -37,8 +40,12 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/emby/Users/AuthenticateByName":
-			if r.UserAgent() == "Emby for Android/3.4.20" {
+			if r.UserAgent() == "SenPlayer/6.1.3" {
 				sawBackendAuthUserAgent = true
+			}
+			auth := ParseEmbyAuthHeader(r.Header.Get("X-Emby-Authorization"))
+			if auth.Client == "SenPlayer" && auth.Device == "Mac" && auth.DeviceID == "E680121A-04F6-4E47-BA8F-30E1DB01EFB6" && auth.Version == "6.1.3" {
+				sawBackendAuthIdentity = true
 			}
 			var body map[string]string
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -58,6 +65,13 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 			})
 
 		case r.Method == http.MethodGet && r.URL.Path == "/emby/System/Info":
+			if r.UserAgent() == "SenPlayer/6.1.3" {
+				sawProxyUserAgent = true
+			}
+			auth := ParseEmbyAuthHeader(r.Header.Get("X-Emby-Authorization"))
+			if auth.Client == "SenPlayer" && auth.Device == "Mac" && auth.DeviceID == "E680121A-04F6-4E47-BA8F-30E1DB01EFB6" && auth.Version == "6.1.3" && auth.UserID == backendUserID && auth.Token == backendToken {
+				sawProxyIdentity = true
+			}
 			if r.Header.Get("X-Emby-Token") == backendToken {
 				sawBackendTokenInRequest = true
 			}
@@ -127,12 +141,13 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 		BackendAccountID: "b1",
 		Enabled:          true,
 		BackendAccount: BackendAccount{
-			ID:       "b1",
-			ServerID: "s1",
-			BaseURL:  backend.URL + "/emby",
-			Username: "shared",
-			Password: "backend-pass",
-			Enabled:  true,
+			ID:             "b1",
+			ServerID:       "s1",
+			BaseURL:        backend.URL + "/emby",
+			Username:       "shared",
+			Password:       "backend-pass",
+			Enabled:        true,
+			ClientIdentity: DefaultBackendClientIdentity(),
 		},
 	}
 
@@ -146,8 +161,8 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 	loginBody := `{"Username":"alice","Pw":"alice-pass"}`
 	loginReq, _ := http.NewRequest(http.MethodPost, gw.URL+"/emby/Users/AuthenticateByName", strings.NewReader(loginBody))
 	loginReq.Header.Set("Content-Type", "application/json")
-	loginReq.Header.Set("User-Agent", "Emby for Android/3.4.20")
-	loginReq.Header.Set("X-Emby-Authorization", `Emby Client="Emby for Android", Device="Android Phone", DeviceId="android-client-dev-1", Version="3.4.20"`)
+	loginReq.Header.Set("User-Agent", "DifferentClient/1.0")
+	loginReq.Header.Set("X-Emby-Authorization", `Emby Client="Different", Device="Phone", DeviceId="client-device", Version="1.0"`)
 	loginResp := do(t, loginReq)
 	defer loginResp.Body.Close()
 	if loginResp.StatusCode != http.StatusOK {
@@ -164,7 +179,10 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 		t.Fatal("backend did not receive controlled backend account credentials")
 	}
 	if !sawBackendAuthUserAgent {
-		t.Fatal("backend authentication did not receive client user agent")
+		t.Fatal("backend authentication did not receive configured user agent")
+	}
+	if !sawBackendAuthIdentity {
+		t.Fatal("backend authentication did not receive configured authorization identity")
 	}
 	if strings.Contains(mustJSON(t, login), backendToken) || strings.Contains(mustJSON(t, login), backendUserID) {
 		t.Fatalf("login leaked backend token or user id: %s", mustJSON(t, login))
@@ -183,6 +201,9 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 	systemJSON := mustJSON(t, system)
 	if !sawBackendTokenInRequest {
 		t.Fatal("backend did not receive mapped token")
+	}
+	if !sawProxyUserAgent || !sawProxyIdentity {
+		t.Fatal("backend proxy request did not receive configured identity")
 	}
 	if strings.Contains(systemJSON, backend.URL) || strings.Contains(systemJSON, backendServerID) {
 		t.Fatalf("system info leaked backend details: %s", systemJSON)

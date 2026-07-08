@@ -31,6 +31,23 @@ func TestGatewayCollectionsAreLockedAndStoreAuthStillWorks(t *testing.T) {
 		}
 	}
 
+	assertFields(t, app, "emby_servers", []string{
+		"backend_user_agent",
+		"backend_authorization_client",
+		"backend_authorization_device",
+		"backend_authorization_device_id",
+		"backend_authorization_version",
+	}, nil)
+	assertFields(t, app, "backend_accounts", []string{"backend_password"}, []string{"backend_password_encrypted"})
+	assertFields(t, app, "gateway_sessions", []string{
+		"backend_token",
+		"backend_user_agent",
+		"backend_authorization_client",
+		"backend_authorization_device",
+		"backend_authorization_device_id",
+		"backend_authorization_version",
+	}, []string{"backend_token_encrypted"})
+
 	users, err := app.FindCollectionByNameOrId("users")
 	if err != nil {
 		t.Fatalf("find users: %v", err)
@@ -45,12 +62,30 @@ func TestGatewayCollectionsAreLockedAndStoreAuthStillWorks(t *testing.T) {
 		t.Fatalf("save user: %v", err)
 	}
 
-	user, err := pbstore.New(app, nil).AuthenticateGatewayUser(context.Background(), "alice", "alice-pass")
+	user, err := pbstore.New(app).AuthenticateGatewayUser(context.Background(), "alice", "alice-pass")
 	if err != nil {
 		t.Fatalf("authenticate gateway user: %v", err)
 	}
 	if user.Username != "alice" || user.SyntheticUserID != "gateway-user" {
 		t.Fatalf("unexpected authenticated user: %#v", user)
+	}
+}
+
+func assertFields(t *testing.T, app core.App, collectionName string, wantPresent, wantAbsent []string) {
+	t.Helper()
+	collection, err := app.FindCollectionByNameOrId(collectionName)
+	if err != nil {
+		t.Fatalf("find collection %s: %v", collectionName, err)
+	}
+	for _, name := range wantPresent {
+		if collection.Fields.GetByName(name) == nil {
+			t.Fatalf("collection %s missing field %s", collectionName, name)
+		}
+	}
+	for _, name := range wantAbsent {
+		if collection.Fields.GetByName(name) != nil {
+			t.Fatalf("collection %s still has field %s", collectionName, name)
+		}
 	}
 }
 

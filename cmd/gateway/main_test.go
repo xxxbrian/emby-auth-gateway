@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"emby-auth-gateway/internal/gateway"
 	_ "emby-auth-gateway/internal/pbmigrations"
 
 	"github.com/pocketbase/pocketbase/core"
@@ -119,6 +120,12 @@ func createTestBackendAccount(t *testing.T, app core.App) string {
 	server := core.NewRecord(servers)
 	server.Set("name", "test")
 	server.Set("base_url", "http://127.0.0.1:8096/emby")
+	identity := gateway.DefaultBackendClientIdentity()
+	server.Set("backend_user_agent", identity.UserAgent)
+	server.Set("backend_authorization_client", identity.Client)
+	server.Set("backend_authorization_device", identity.Device)
+	server.Set("backend_authorization_device_id", identity.DeviceID)
+	server.Set("backend_authorization_version", identity.Version)
 	server.Set("enabled", true)
 	if err := app.Save(server); err != nil {
 		t.Fatalf("save server: %v", err)
@@ -132,7 +139,7 @@ func createTestBackendAccount(t *testing.T, app core.App) string {
 	account.Set("server", server.Id)
 	account.Set("name", "backend")
 	account.Set("backend_username", "shared")
-	account.Set("backend_password_encrypted", "encrypted")
+	account.Set("backend_password", "password")
 	account.Set("enabled", true)
 	if err := app.Save(account); err != nil {
 		t.Fatalf("save account: %v", err)
@@ -156,7 +163,13 @@ func createGatewaySession(t *testing.T, app core.App, userID, accountID, tokenHa
 	record.Set("backend_base_url", "http://127.0.0.1:8096/emby")
 	record.Set("backend_user_id", "backend-user")
 	record.Set("backend_username", "shared")
-	record.Set("backend_token_encrypted", "encrypted")
+	record.Set("backend_token", "backend-token")
+	identity := gateway.DefaultBackendClientIdentity()
+	record.Set("backend_user_agent", identity.UserAgent)
+	record.Set("backend_authorization_client", identity.Client)
+	record.Set("backend_authorization_device", identity.Device)
+	record.Set("backend_authorization_device_id", identity.DeviceID)
+	record.Set("backend_authorization_version", identity.Version)
 	record.Set("expires_at", expiresAt)
 	if revokedAt != nil {
 		record.Set("revoked_at", *revokedAt)

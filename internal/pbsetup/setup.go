@@ -2,7 +2,6 @@ package pbsetup
 
 import (
 	"fmt"
-	"os"
 	"strings"
 
 	"emby-auth-gateway/internal/gateway"
@@ -20,16 +19,13 @@ func NewCommand(app core.App) *cobra.Command {
 			if err := opts.validate(); err != nil {
 				return err
 			}
-			cipher, err := gateway.NewCipher(os.Getenv("GATEWAY_SECRET_KEY"))
-			if err != nil {
-				return fmt.Errorf("GATEWAY_SECRET_KEY is required: %w", err)
-			}
 			if err := app.Bootstrap(); err != nil {
 				return err
 			}
-			return run(app, cipher, opts)
+			return run(app, opts)
 		},
 	}
+	defaults := gateway.DefaultBackendClientIdentity()
 
 	cmd.Flags().StringVar(&opts.GatewayUsername, "gateway-username", "", "Gateway username exposed to Emby clients")
 	cmd.Flags().StringVar(&opts.GatewayPassword, "gateway-password", "", "Gateway user password")
@@ -39,6 +35,11 @@ func NewCommand(app core.App) *cobra.Command {
 	cmd.Flags().StringVar(&opts.BackendAccountName, "backend-account-name", "default", "Backend account display name")
 	cmd.Flags().StringVar(&opts.BackendUsername, "backend-username", "", "Controlled real Emby username")
 	cmd.Flags().StringVar(&opts.BackendPassword, "backend-password", "", "Controlled real Emby password")
+	cmd.Flags().StringVar(&opts.BackendUserAgent, "backend-user-agent", defaults.UserAgent, "User-Agent sent to the backend Emby server")
+	cmd.Flags().StringVar(&opts.BackendAuthorizationClient, "backend-authorization-client", defaults.Client, "Client value sent in X-Emby-Authorization to the backend")
+	cmd.Flags().StringVar(&opts.BackendAuthorizationDevice, "backend-authorization-device", defaults.Device, "Device value sent in X-Emby-Authorization to the backend")
+	cmd.Flags().StringVar(&opts.BackendAuthorizationDeviceID, "backend-authorization-device-id", defaults.DeviceID, "DeviceId value sent in X-Emby-Authorization to the backend")
+	cmd.Flags().StringVar(&opts.BackendAuthorizationVersion, "backend-authorization-version", defaults.Version, "Version value sent in X-Emby-Authorization to the backend")
 	return cmd
 }
 
@@ -51,6 +52,12 @@ type options struct {
 	BackendAccountName string
 	BackendUsername    string
 	BackendPassword    string
+
+	BackendUserAgent             string
+	BackendAuthorizationClient   string
+	BackendAuthorizationDevice   string
+	BackendAuthorizationDeviceID string
+	BackendAuthorizationVersion  string
 }
 
 func (o options) validate() error {
@@ -70,12 +77,12 @@ func (o options) validate() error {
 	return nil
 }
 
-func run(app core.App, cipher *gateway.Cipher, opts options) error {
+func run(app core.App, opts options) error {
 	server, err := upsertServer(app, opts)
 	if err != nil {
 		return err
 	}
-	account, err := upsertBackendAccount(app, cipher, server.Id, opts)
+	account, err := upsertBackendAccount(app, server.Id, opts)
 	if err != nil {
 		return err
 	}
@@ -101,6 +108,12 @@ func upsertServer(app core.App, opts options) (*core.Record, error) {
 	}
 	record.Set("name", opts.EmbyServerName)
 	record.Set("base_url", strings.TrimRight(opts.EmbyBaseURL, "/"))
+	identity := opts.backendClientIdentity().WithDefaults()
+	record.Set("backend_user_agent", identity.UserAgent)
+	record.Set("backend_authorization_client", identity.Client)
+	record.Set("backend_authorization_device", identity.Device)
+	record.Set("backend_authorization_device_id", identity.DeviceID)
+	record.Set("backend_authorization_version", identity.Version)
 	record.Set("enabled", true)
 	if err := app.Save(record); err != nil {
 		return nil, err
@@ -108,7 +121,7 @@ func upsertServer(app core.App, opts options) (*core.Record, error) {
 	return record, nil
 }
 
-func upsertBackendAccount(app core.App, cipher *gateway.Cipher, serverID string, opts options) (*core.Record, error) {
+func upsertBackendAccount(app core.App, serverID string, opts options) (*core.Record, error) {
 	record, err := app.FindFirstRecordByData("backend_accounts", "name", opts.BackendAccountName)
 	if err != nil {
 		collection, findErr := app.FindCollectionByNameOrId("backend_accounts")
@@ -117,19 +130,25 @@ func upsertBackendAccount(app core.App, cipher *gateway.Cipher, serverID string,
 		}
 		record = core.NewRecord(collection)
 	}
-	encryptedPassword, err := cipher.Encrypt(opts.BackendPassword)
-	if err != nil {
-		return nil, err
-	}
 	record.Set("server", serverID)
 	record.Set("name", opts.BackendAccountName)
 	record.Set("backend_username", opts.BackendUsername)
-	record.Set("backend_password_encrypted", encryptedPassword)
+	record.Set("backend_password", opts.BackendPassword)
 	record.Set("enabled", true)
 	if err := app.Save(record); err != nil {
 		return nil, err
 	}
 	return record, nil
+}
+
+func (o options) backendClientIdentity() gateway.BackendClientIdentity {
+	return gateway.BackendClientIdentity{
+		UserAgent: o.BackendUserAgent,
+		Client:    o.BackendAuthorizationClient,
+		Device:    o.BackendAuthorizationDevice,
+		DeviceID:  o.BackendAuthorizationDeviceID,
+		Version:   o.BackendAuthorizationVersion,
+	}
 }
 
 func upsertGatewayUser(app core.App, opts options) (*core.Record, error) {

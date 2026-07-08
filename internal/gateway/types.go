@@ -172,12 +172,51 @@ type GatewayUser struct {
 }
 
 type BackendAccount struct {
-	ID       string
-	ServerID string
-	BaseURL  string
-	Username string
-	Password string
-	Enabled  bool
+	ID             string
+	ServerID       string
+	BaseURL        string
+	Username       string
+	Password       string
+	Enabled        bool
+	ClientIdentity BackendClientIdentity
+}
+
+type BackendClientIdentity struct {
+	UserAgent string
+	Client    string
+	Device    string
+	DeviceID  string
+	Version   string
+}
+
+func DefaultBackendClientIdentity() BackendClientIdentity {
+	return BackendClientIdentity{
+		UserAgent: "SenPlayer/6.1.3",
+		Client:    "SenPlayer",
+		Device:    "Mac",
+		DeviceID:  "E680121A-04F6-4E47-BA8F-30E1DB01EFB6",
+		Version:   "6.1.3",
+	}
+}
+
+func (i BackendClientIdentity) WithDefaults() BackendClientIdentity {
+	defaults := DefaultBackendClientIdentity()
+	if strings.TrimSpace(i.UserAgent) == "" {
+		i.UserAgent = defaults.UserAgent
+	}
+	if strings.TrimSpace(i.Client) == "" {
+		i.Client = defaults.Client
+	}
+	if strings.TrimSpace(i.Device) == "" {
+		i.Device = defaults.Device
+	}
+	if strings.TrimSpace(i.DeviceID) == "" {
+		i.DeviceID = defaults.DeviceID
+	}
+	if strings.TrimSpace(i.Version) == "" {
+		i.Version = defaults.Version
+	}
+	return i
 }
 
 type UserMapping struct {
@@ -199,6 +238,7 @@ type Session struct {
 	BackendUserID    string
 	BackendUsername  string
 	BackendToken     string
+	BackendIdentity  BackendClientIdentity
 	Client           string
 	Device           string
 	DeviceID         string
