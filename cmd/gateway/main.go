@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"emby-auth-gateway/internal/gateway"
+	"emby-auth-gateway/internal/pbsetup"
 	"emby-auth-gateway/internal/pbstore"
 
 	_ "emby-auth-gateway/internal/pbmigrations"
@@ -19,6 +20,7 @@ import (
 func main() {
 	app := pocketbase.New()
 	migratecmd.MustRegister(app, app.RootCmd, migratecmd.Config{})
+	app.RootCmd.AddCommand(pbsetup.NewCommand(app))
 
 	app.OnBootstrap().BindFunc(func(e *core.BootstrapEvent) error {
 		if err := e.Next(); err != nil {

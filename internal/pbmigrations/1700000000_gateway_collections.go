@@ -14,10 +14,13 @@ func init() {
 		users.CreateRule = types.Pointer("")
 		users.UpdateRule = types.Pointer("id = @request.auth.id")
 		users.DeleteRule = types.Pointer("id = @request.auth.id")
+		users.PasswordAuth.IdentityFields = []string{"username"}
+		users.Fields.Add(&core.TextField{Name: "username", Required: true, Max: 255})
 		users.Fields.Add(&core.TextField{Name: "synthetic_user_id", Required: true, Max: 80})
 		users.Fields.Add(&core.BoolField{Name: "enabled"})
 		users.Fields.Add(&core.AutodateField{Name: "created", OnCreate: true})
 		users.Fields.Add(&core.AutodateField{Name: "updated", OnCreate: true, OnUpdate: true})
+		users.AddIndex("idx_gateway_users_username", true, "username", "")
 		users.AddIndex("idx_gateway_users_synthetic", true, "synthetic_user_id", "")
 		if err := app.Save(users); err != nil {
 			return err
