@@ -4,7 +4,7 @@ import "time"
 
 const (
 	defaultSessionTTL = 30 * 24 * time.Hour
-	gatewayVersion    = "0.3.2"
+	gatewayVersion    = "0.3.3"
 
 	backendAuthTimeout         = 15 * time.Second
 	proxyResponseHeaderTimeout = 30 * time.Second
