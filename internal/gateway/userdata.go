@@ -17,7 +17,7 @@ func (s *Server) handlePersonalDataRequest(w http.ResponseWriter, r *http.Reques
 	if s.handleDisplayPreferences(w, r, rel, session) {
 		return true
 	}
-	if s.handlePersonalStateWrite(w, r, rel, session) {
+	if s.handlePersonalStateWrite(w, r, rel, session, gatewayToken) {
 		return true
 	}
 	if r.Method != http.MethodGet {
@@ -44,7 +44,7 @@ func (s *Server) handlePersonalDataRequest(w http.ResponseWriter, r *http.Reques
 	}
 }
 
-func (s *Server) handlePersonalStateWrite(w http.ResponseWriter, r *http.Request, rel string, session *Session) bool {
+func (s *Server) handlePersonalStateWrite(w http.ResponseWriter, r *http.Request, rel string, session *Session, gatewayToken string) bool {
 	parts := strings.Split(strings.Trim(rel, "/"), "/")
 	if len(parts) < 4 || !strings.EqualFold(parts[0], "Users") {
 		return false
@@ -57,6 +57,7 @@ func (s *Server) handlePersonalStateWrite(w http.ResponseWriter, r *http.Request
 	writeState := func(itemID string, update func(*PlaybackState)) {
 		state := s.stateForItem(r.Context(), session, itemID)
 		update(state)
+		s.enrichPlaybackStateMetadata(r.Context(), r, session, gatewayToken, state)
 		state.UpdatedAt = now
 		if err := s.store.SavePlaybackState(r.Context(), *state); err != nil {
 			http.Error(w, "user data unavailable", http.StatusInternalServerError)
@@ -181,6 +182,7 @@ func (s *Server) writeResumeItems(w http.ResponseWriter, r *http.Request, sessio
 	})
 	ids := playbackStateIDs(states)
 	items := s.resolveItemsByID(r.Context(), r, session, gatewayToken, ids)
+	items = groupResumeItems(items)
 	total := len(items)
 	items = pageItems(items, r.URL.Query())
 	writeJSON(w, http.StatusOK, map[string]any{"Items": items, "TotalRecordCount": total, "StartIndex": intQuery(r.URL.Query(), "StartIndex", 0)})
@@ -291,9 +293,6 @@ func (s *Server) writeNextUpItems(w http.ResponseWriter, r *http.Request, sessio
 
 func (s *Server) personalFilterIDs(ctx context.Context, gatewayUserID string, q url.Values) ([]string, bool, []string, error) {
 	filters := splitFilterValues(q["Filters"])
-	if len(filters) == 0 {
-		return nil, false, nil, nil
-	}
 	remaining := make([]string, 0, len(filters))
 	var positive map[string]bool
 	hasPositive := false
@@ -347,6 +346,21 @@ func (s *Server) personalFilterIDs(ctx context.Context, gatewayUserID string, q 
 			remaining = append(remaining, filter)
 		}
 	}
+	if err := applyBoolPersonalFilter(ctx, s.store, gatewayUserID, q, "IsPlayed", func(value bool) PlaybackStateFilter {
+		return PlaybackStateFilter{Played: &value}
+	}, intersectPositive, exclude); err != nil {
+		return nil, false, nil, err
+	}
+	if err := applyBoolPersonalFilter(ctx, s.store, gatewayUserID, q, "IsFavorite", func(value bool) PlaybackStateFilter {
+		return PlaybackStateFilter{Favorite: &value}
+	}, intersectPositive, exclude); err != nil {
+		return nil, false, nil, err
+	}
+	if err := applyBoolPersonalFilter(ctx, s.store, gatewayUserID, q, "IsResumable", func(value bool) PlaybackStateFilter {
+		return PlaybackStateFilter{Resumable: &value}
+	}, intersectPositive, exclude); err != nil {
+		return nil, false, nil, err
+	}
 	q.Del("Filters")
 	if len(remaining) > 0 {
 		q.Set("Filters", strings.Join(remaining, ","))
@@ -354,14 +368,39 @@ func (s *Server) personalFilterIDs(ctx context.Context, gatewayUserID string, q 
 	return sortedSetKeys(positive), hasPositive, sortedSetKeys(exclude), nil
 }
 
+func applyBoolPersonalFilter(ctx context.Context, store Store, gatewayUserID string, q url.Values, name string, filterFor func(bool) PlaybackStateFilter, intersectPositive func([]PlaybackState), exclude map[string]bool) error {
+	raw := q.Get(name)
+	if raw == "" {
+		return nil
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		q.Del(name)
+		return nil
+	}
+	states, err := store.ListPlaybackStates(ctx, gatewayUserID, filterFor(true))
+	if err != nil {
+		return err
+	}
+	if value {
+		intersectPositive(states)
+	} else {
+		for _, state := range states {
+			exclude[state.ItemID] = true
+		}
+	}
+	q.Del(name)
+	return nil
+}
+
 func (s *Server) resolveItemsByID(ctx context.Context, r *http.Request, session *Session, gatewayToken string, ids []string) []any {
 	if len(ids) == 0 {
 		return []any{}
 	}
-	q := cloneQuery(r.URL.Query())
-	q.Del("StartIndex")
-	q.Del("Limit")
-	q.Set("Ids", strings.Join(limitStrings(ids, personalIDBatchLimit), ","))
+	requestQuery := cloneQuery(r.URL.Query())
+	q := queryForIDResolution(requestQuery)
+	resolvedIDs := limitStrings(ids, personalIDBatchLimit)
+	q.Set("Ids", strings.Join(resolvedIDs, ","))
 	value, status, err := s.fetchBackendJSON(ctx, r, "/Users/"+session.SyntheticUserID+"/Items", q.Encode(), session, gatewayToken)
 	if err != nil || status < 200 || status >= 300 {
 		return []any{}
@@ -373,14 +412,17 @@ func (s *Server) resolveItemsByID(ctx context.Context, r *http.Request, session 
 			byID[id] = item
 		}
 	}
-	out := make([]any, 0, len(ids))
+	out := make([]any, 0, len(resolvedIDs))
 	now := time.Now().UTC()
-	for _, id := range ids {
+	for _, id := range resolvedIDs {
 		item, ok := byID[id]
 		state := s.stateForItem(ctx, session, id)
 		if !ok {
 			state.OrphanedAt = &now
 			_ = s.store.SavePlaybackState(ctx, *state)
+			continue
+		}
+		if !itemMatchesResolutionQuery(item, requestQuery) {
 			continue
 		}
 		fingerprint := itemFingerprint(item)
@@ -399,6 +441,46 @@ func (s *Server) resolveItemsByID(ctx context.Context, r *http.Request, session 
 		}
 	}
 	return out
+}
+
+func queryForIDResolution(q url.Values) url.Values {
+	copy := cloneQuery(q)
+	for _, name := range []string{"StartIndex", "Limit", "MediaTypes", "IncludeItemTypes", "ExcludeItemTypes"} {
+		copy.Del(name)
+	}
+	return copy
+}
+
+func itemMatchesResolutionQuery(item map[string]any, q url.Values) bool {
+	if mediaTypes := lowerSet(splitFilterValues(q["MediaTypes"])); len(mediaTypes) > 0 {
+		mediaType, _ := stringField(item, "MediaType")
+		if !mediaTypes[strings.ToLower(mediaType)] {
+			return false
+		}
+	}
+	if includeTypes := lowerSet(splitFilterValues(q["IncludeItemTypes"])); len(includeTypes) > 0 {
+		itemType, _ := stringField(item, "Type")
+		if !includeTypes[strings.ToLower(itemType)] {
+			return false
+		}
+	}
+	if excludeTypes := lowerSet(splitFilterValues(q["ExcludeItemTypes"])); len(excludeTypes) > 0 {
+		itemType, _ := stringField(item, "Type")
+		if excludeTypes[strings.ToLower(itemType)] {
+			return false
+		}
+	}
+	return true
+}
+
+func lowerSet(values []string) map[string]bool {
+	set := map[string]bool{}
+	for _, value := range values {
+		if value != "" {
+			set[strings.ToLower(value)] = true
+		}
+	}
+	return set
 }
 
 func (s *Server) fetchBackendJSON(ctx context.Context, r *http.Request, rel, rawQuery string, session *Session, gatewayToken string) (any, int, error) {
@@ -436,6 +518,24 @@ func (s *Server) stateForItem(ctx context.Context, session *Session, itemID stri
 		return state
 	}
 	return &PlaybackState{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, ItemID: itemID}
+}
+
+func (s *Server) enrichPlaybackStateMetadata(ctx context.Context, r *http.Request, session *Session, gatewayToken string, state *PlaybackState) {
+	if state == nil || state.ItemID == "" {
+		return
+	}
+	value, status, err := s.fetchBackendJSON(ctx, r, "/Users/"+session.SyntheticUserID+"/Items/"+state.ItemID, "", session, gatewayToken)
+	if err != nil || status < 200 || status >= 300 {
+		return
+	}
+	item, ok := value.(map[string]any)
+	if !ok {
+		return
+	}
+	mergeItemMetadata(state, item)
+	now := time.Now().UTC()
+	state.OrphanedAt = nil
+	state.LastSeenAt = &now
 }
 
 func applyUserDataBodyToState(body map[string]any, state *PlaybackState, now time.Time) {
@@ -490,7 +590,7 @@ func readJSONBody(r *http.Request, limit int64) (map[string]any, error) {
 
 func userDataDTO(state *PlaybackState) map[string]any {
 	data := map[string]any{}
-	applyPlaybackStateToUserData(data, state)
+	applyPlaybackStateToUserData(data, state, nil, nil)
 	return data
 }
 
@@ -570,11 +670,17 @@ func mergeItemMetadata(state *PlaybackState, item map[string]any) {
 	if v, ok := stringField(item, "SeriesName"); ok {
 		state.SeriesName = v
 	}
+	if v, ok := stringField(item, "SeasonId"); ok {
+		state.SeasonID = v
+	}
 	if v, ok := int64Field(item, "IndexNumber"); ok {
 		state.IndexNumber = int(v)
 	}
 	if v, ok := int64Field(item, "ParentIndexNumber"); ok {
 		state.ParentIndexNumber = int(v)
+	}
+	if v, ok := int64Field(item, "RunTimeTicks"); ok {
+		state.RunTimeTicks = v
 	}
 	state.Fingerprint = itemFingerprint(item)
 }
@@ -603,6 +709,9 @@ func splitFilterValues(values []string) []string {
 }
 
 func queryHasPersonalFilter(q url.Values) bool {
+	if q.Get("IsPlayed") != "" || q.Get("IsFavorite") != "" || q.Get("IsResumable") != "" {
+		return true
+	}
 	for _, filter := range splitFilterValues(q["Filters"]) {
 		switch strings.ToLower(filter) {
 		case "isplayed", "isunplayed", "isresumable", "isfavorite":
@@ -647,6 +756,34 @@ func pathUserMatches(requestPath, gatewayBasePath, syntheticUserID string) bool 
 	base := strings.TrimRight(gatewayBasePath, "/")
 	rel := strings.TrimPrefix(requestPath, base)
 	return relUserMatches(rel, syntheticUserID)
+}
+
+func groupResumeItems(items []any) []any {
+	grouped := make([]any, 0, len(items))
+	seenSeries := map[string]bool{}
+	for _, item := range items {
+		m, ok := item.(map[string]any)
+		if ok {
+			if seriesID, _ := stringField(m, "SeriesId"); seriesID != "" {
+				if seenSeries[seriesID] {
+					continue
+				}
+				seenSeries[seriesID] = true
+			} else if seriesID, _ := stringField(m, "SeriesID"); seriesID != "" {
+				if seenSeries[seriesID] {
+					continue
+				}
+				seenSeries[seriesID] = true
+			}
+		} else if state, ok := item.(PlaybackState); ok && state.SeriesID != "" {
+			if seenSeries[state.SeriesID] {
+				continue
+			}
+			seenSeries[state.SeriesID] = true
+		}
+		grouped = append(grouped, item)
+	}
+	return grouped
 }
 
 func playbackStateIDs(states []PlaybackState) []string {

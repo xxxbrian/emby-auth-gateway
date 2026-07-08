@@ -29,6 +29,7 @@ type Store interface {
 	RecordPlaybackEvent(ctx context.Context, event PlaybackEvent) error
 	FindPlaybackState(ctx context.Context, gatewayUserID, itemID string) (*PlaybackState, error)
 	ListPlaybackStatesByItemIDs(ctx context.Context, gatewayUserID string, itemIDs []string) (map[string]*PlaybackState, error)
+	ListPlaybackAggregates(ctx context.Context, gatewayUserID string, seriesIDs, seasonIDs []string) (PlaybackAggregates, error)
 	ListPlaybackStates(ctx context.Context, gatewayUserID string, filter PlaybackStateFilter) ([]PlaybackState, error)
 	SavePlaybackState(ctx context.Context, state PlaybackState) error
 	FindDisplayPreference(ctx context.Context, gatewayUserID, preferenceID, client string) (*DisplayPreference, error)
@@ -94,8 +95,10 @@ type PlaybackState struct {
 	ItemType              string
 	SeriesID              string
 	SeriesName            string
+	SeasonID              string
 	IndexNumber           int
 	ParentIndexNumber     int
+	RunTimeTicks          int64
 	PlaybackPositionTicks int64
 	Played                bool
 	PlayedPercentage      *float64
@@ -114,7 +117,20 @@ type PlaybackStateFilter struct {
 	Favorite        *bool
 	Resumable       *bool
 	SeriesID        string
+	SeasonID        string
 	IncludeOrphaned bool
+}
+
+type PlaybackAggregate struct {
+	PlayedCount      int
+	KnownItemCount   int
+	LastPlayedDate   *time.Time
+	LastActivityDate *time.Time
+}
+
+type PlaybackAggregates struct {
+	Series  map[string]PlaybackAggregate
+	Seasons map[string]PlaybackAggregate
 }
 
 type DisplayPreference struct {

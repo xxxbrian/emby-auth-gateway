@@ -93,8 +93,10 @@ func TestUserItemDataFieldsAndDisplayPreferencesArePersisted(t *testing.T) {
 		ItemType:              "Episode",
 		SeriesID:              "series-1",
 		SeriesName:            "Show",
+		SeasonID:              "season-1",
 		IndexNumber:           1,
 		ParentIndexNumber:     1,
+		RunTimeTicks:          1000,
 		PlaybackPositionTicks: 500,
 		IsFavorite:            true,
 		Likes:                 &likes,
@@ -109,7 +111,7 @@ func TestUserItemDataFieldsAndDisplayPreferencesArePersisted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list favorite states: %v", err)
 	}
-	if len(states) != 1 || states[0].ItemName != "Episode 1" || states[0].SeriesID != "series-1" || states[0].Likes == nil || !*states[0].Likes || states[0].LastSeenAt == nil {
+	if len(states) != 1 || states[0].ItemName != "Episode 1" || states[0].SeriesID != "series-1" || states[0].SeasonID != "season-1" || states[0].RunTimeTicks != 1000 || states[0].Likes == nil || !*states[0].Likes || states[0].LastSeenAt == nil {
 		t.Fatalf("unexpected user item data: %#v", states)
 	}
 
@@ -122,6 +124,56 @@ func TestUserItemDataFieldsAndDisplayPreferencesArePersisted(t *testing.T) {
 	}
 	if preference.PayloadJSON != `{"SortBy":"DateCreated"}` || preference.SyntheticUserID != "gateway-user" {
 		t.Fatalf("unexpected display preference: %#v", preference)
+	}
+}
+
+func TestPlaybackAggregatesAreScopedBySeriesAndSeason(t *testing.T) {
+	app := newTestApp(t)
+	store := New(app)
+	userID := createGatewayUser(t, app, "alice", "gateway-user")
+	otherUserID := createGatewayUser(t, app, "bob", "gateway-user-2")
+	lastPlayed := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+
+	states := []gateway.PlaybackState{
+		{GatewayUserID: userID, SyntheticUserID: "gateway-user", ItemID: "ep-1", SeriesID: "series-1", SeasonID: "season-1", Played: true, LastPlayedDate: &lastPlayed},
+		{GatewayUserID: userID, SyntheticUserID: "gateway-user", ItemID: "ep-2", SeriesID: "series-1", SeasonID: "season-1", Played: false},
+		{GatewayUserID: userID, SyntheticUserID: "gateway-user", ItemID: "ep-3", SeriesID: "series-1", SeasonID: "season-2", Played: true},
+		{GatewayUserID: otherUserID, SyntheticUserID: "gateway-user-2", ItemID: "ep-4", SeriesID: "series-1", SeasonID: "season-1", Played: true},
+	}
+	for _, state := range states {
+		if err := store.SavePlaybackState(context.Background(), state); err != nil {
+			t.Fatalf("save playback state: %v", err)
+		}
+	}
+
+	aggregates, err := store.ListPlaybackAggregates(context.Background(), userID, []string{"series-1"}, []string{"season-1"})
+	if err != nil {
+		t.Fatalf("list playback aggregates: %v", err)
+	}
+	series := aggregates.Series["series-1"]
+	season := aggregates.Seasons["season-1"]
+	if series.KnownItemCount != 3 || series.PlayedCount != 2 || series.LastPlayedDate == nil {
+		t.Fatalf("unexpected series aggregate: %#v", series)
+	}
+	if season.KnownItemCount != 2 || season.PlayedCount != 1 || season.LastPlayedDate == nil {
+		t.Fatalf("unexpected season aggregate: %#v", season)
+	}
+}
+
+func TestPlaybackStateBatchLookupSkipsOrphanedRecords(t *testing.T) {
+	app := newTestApp(t)
+	store := New(app)
+	userID := createGatewayUser(t, app, "alice", "gateway-user")
+	orphanedAt := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	if err := store.SavePlaybackState(context.Background(), gateway.PlaybackState{GatewayUserID: userID, SyntheticUserID: "gateway-user", ItemID: "episode-1", PlaybackPositionTicks: 1000, OrphanedAt: &orphanedAt}); err != nil {
+		t.Fatalf("save orphaned playback state: %v", err)
+	}
+	states, err := store.ListPlaybackStatesByItemIDs(context.Background(), userID, []string{"episode-1"})
+	if err != nil {
+		t.Fatalf("batch lookup playback state: %v", err)
+	}
+	if len(states) != 0 {
+		t.Fatalf("orphaned state should be skipped: %#v", states)
 	}
 }
 

@@ -151,10 +151,66 @@ func (m *MemoryStore) ListPlaybackStatesByItemIDs(ctx context.Context, gatewayUs
 		if !ok {
 			continue
 		}
+		if state.OrphanedAt != nil {
+			continue
+		}
 		copyState := *state
 		states[itemID] = &copyState
 	}
 	return states, nil
+}
+
+func (m *MemoryStore) ListPlaybackAggregates(ctx context.Context, gatewayUserID string, seriesIDs, seasonIDs []string) (PlaybackAggregates, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	aggregates := PlaybackAggregates{Series: map[string]PlaybackAggregate{}, Seasons: map[string]PlaybackAggregate{}}
+	seriesSet := playbackIDSet(seriesIDs)
+	seasonSet := playbackIDSet(seasonIDs)
+	if len(seriesSet) == 0 && len(seasonSet) == 0 {
+		return aggregates, nil
+	}
+	for _, state := range m.PlaybackStates {
+		if state.GatewayUserID != gatewayUserID || state.OrphanedAt != nil {
+			continue
+		}
+		if seriesSet[state.SeriesID] {
+			aggregates.Series[state.SeriesID] = addMemoryPlaybackAggregate(aggregates.Series[state.SeriesID], *state)
+		}
+		if seasonSet[state.SeasonID] {
+			aggregates.Seasons[state.SeasonID] = addMemoryPlaybackAggregate(aggregates.Seasons[state.SeasonID], *state)
+		}
+	}
+	return aggregates, nil
+}
+
+func playbackIDSet(ids []string) map[string]bool {
+	set := map[string]bool{}
+	for _, id := range ids {
+		if id != "" {
+			set[id] = true
+		}
+	}
+	return set
+}
+
+func addMemoryPlaybackAggregate(aggregate PlaybackAggregate, state PlaybackState) PlaybackAggregate {
+	aggregate.KnownItemCount++
+	if state.Played {
+		aggregate.PlayedCount++
+	}
+	if state.LastPlayedDate != nil && (aggregate.LastPlayedDate == nil || state.LastPlayedDate.After(*aggregate.LastPlayedDate)) {
+		t := *state.LastPlayedDate
+		aggregate.LastPlayedDate = &t
+	}
+	activity := state.UpdatedAt
+	if state.LastPlayedDate != nil && state.LastPlayedDate.After(activity) {
+		activity = *state.LastPlayedDate
+	}
+	if !activity.IsZero() && (aggregate.LastActivityDate == nil || activity.After(*aggregate.LastActivityDate)) {
+		t := activity
+		aggregate.LastActivityDate = &t
+	}
+	return aggregate
 }
 
 func (m *MemoryStore) SavePlaybackState(ctx context.Context, state PlaybackState) error {
@@ -195,6 +251,9 @@ func (m *MemoryStore) ListPlaybackStates(ctx context.Context, gatewayUserID stri
 			}
 		}
 		if filter.SeriesID != "" && state.SeriesID != filter.SeriesID {
+			continue
+		}
+		if filter.SeasonID != "" && state.SeasonID != filter.SeasonID {
 			continue
 		}
 		copyState := *state

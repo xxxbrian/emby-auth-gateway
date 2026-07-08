@@ -369,7 +369,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 		return
 	}
 	if isPlaybackRequest(r.Method, rel) {
-		if err := s.recordPlaybackRequest(r, rel, session); err != nil {
+		if err := s.recordPlaybackRequest(r, rel, session, gatewayToken); err != nil {
 			http.Error(w, "bad request body", http.StatusBadRequest)
 			return
 		}
@@ -569,7 +569,7 @@ func isPlaybackRequest(method, rel string) bool {
 	}
 }
 
-func (s *Server) recordPlaybackRequest(r *http.Request, rel string, session *Session) error {
+func (s *Server) recordPlaybackRequest(r *http.Request, rel string, session *Session, gatewayToken string) error {
 	if r.Body == nil {
 		return nil
 	}
@@ -621,11 +621,17 @@ func (s *Server) recordPlaybackRequest(r *http.Request, rel string, session *Ses
 	if details.SeriesName != "" {
 		state.SeriesName = details.SeriesName
 	}
+	if details.SeasonID != "" {
+		state.SeasonID = details.SeasonID
+	}
 	if details.HasIndexNumber {
 		state.IndexNumber = details.IndexNumber
 	}
 	if details.HasParentIndexNumber {
 		state.ParentIndexNumber = details.ParentIndexNumber
+	}
+	if details.HasRunTimeTicks {
+		state.RunTimeTicks = details.RunTimeTicks
 	}
 	if details.Fingerprint != "" {
 		state.Fingerprint = details.Fingerprint
@@ -637,17 +643,15 @@ func (s *Server) recordPlaybackRequest(r *http.Request, rel string, session *Ses
 		percentage := *details.PlayedPercentage
 		state.PlayedPercentage = &percentage
 	}
+	wasPlayed := state.Played
 	if details.Played != nil {
 		state.Played = *details.Played
 	}
 	if eventName == "stopped" {
-		lastPlayed := now
-		state.LastPlayedDate = &lastPlayed
-		completed := state.Played || (details.PlayedPercentage != nil && *details.PlayedPercentage >= 90)
-		if completed {
-			state.Played = true
-			state.PlayCount++
+		if state.RunTimeTicks <= 0 {
+			s.enrichPlaybackStateMetadata(r.Context(), r, session, gatewayToken, state)
 		}
+		applyStoppedPlaybackState(state, now, wasPlayed)
 	}
 	state.UpdatedAt = now
 	_ = s.store.SavePlaybackState(r.Context(), *state)
@@ -664,10 +668,13 @@ type playbackDetails struct {
 	ItemType             string
 	SeriesID             string
 	SeriesName           string
+	SeasonID             string
 	IndexNumber          int
 	ParentIndexNumber    int
+	RunTimeTicks         int64
 	HasIndexNumber       bool
 	HasParentIndexNumber bool
+	HasRunTimeTicks      bool
 	Fingerprint          string
 }
 
@@ -687,6 +694,7 @@ func playbackDetailsFromJSON(v any) (playbackDetails, bool) {
 		details.ItemType, _ = stringField(item, "Type")
 		details.SeriesID, _ = stringField(item, "SeriesId")
 		details.SeriesName, _ = stringField(item, "SeriesName")
+		details.SeasonID, _ = stringField(item, "SeasonId")
 		if v, ok := int64Field(item, "IndexNumber"); ok {
 			details.IndexNumber = int(v)
 			details.HasIndexNumber = true
@@ -694,6 +702,10 @@ func playbackDetailsFromJSON(v any) (playbackDetails, bool) {
 		if v, ok := int64Field(item, "ParentIndexNumber"); ok {
 			details.ParentIndexNumber = int(v)
 			details.HasParentIndexNumber = true
+		}
+		if v, ok := int64Field(item, "RunTimeTicks"); ok {
+			details.RunTimeTicks = v
+			details.HasRunTimeTicks = true
 		}
 		details.Fingerprint = itemFingerprint(item)
 	}
@@ -704,6 +716,10 @@ func playbackDetailsFromJSON(v any) (playbackDetails, bool) {
 		details.PositionTicks = ticks
 		details.HasPositionTicks = true
 	}
+	if ticks, ok := int64Field(obj, "RunTimeTicks"); ok && !details.HasRunTimeTicks {
+		details.RunTimeTicks = ticks
+		details.HasRunTimeTicks = true
+	}
 	if played, ok := boolField(obj, "Played"); ok {
 		details.Played = &played
 	}
@@ -711,6 +727,45 @@ func playbackDetailsFromJSON(v any) (playbackDetails, bool) {
 		details.PlayedPercentage = &percentage
 	}
 	return details, details.ItemID != ""
+}
+
+func applyStoppedPlaybackState(state *PlaybackState, now time.Time, wasPlayed bool) {
+	lastPlayed := now
+	state.LastPlayedDate = &lastPlayed
+	completed := state.Played
+	position := state.PlaybackPositionTicks
+	if position < 0 {
+		position = 0
+	}
+	runtime := state.RunTimeTicks
+	if !completed && runtime > 0 && position > 0 {
+		percentage := (float64(position) / float64(runtime)) * 100
+		durationSeconds := float64(runtime) / float64(embyTicksPerSecond)
+		switch {
+		case percentage < minResumePct:
+			position = 0
+			state.PlayedPercentage = nil
+		case percentage > maxResumePct || position >= runtime-embyTicksPerSecond:
+			completed = true
+		case durationSeconds < minResumeDurationSeconds:
+			completed = true
+		}
+	} else if !completed && runtime == 0 && position > 0 {
+		completed = true
+	}
+	if !completed && state.PlayedPercentage != nil && *state.PlayedPercentage >= maxResumePct {
+		completed = true
+	}
+	if completed {
+		state.Played = true
+		state.PlaybackPositionTicks = 0
+		state.PlayedPercentage = floatPtr(100)
+		if !wasPlayed {
+			state.PlayCount++
+		}
+		return
+	}
+	state.PlaybackPositionTicks = position
 }
 
 func playbackEventName(rel string) string {
@@ -778,7 +833,12 @@ func (s *Server) rewriteProxyJSONValue(ctx context.Context, v any, session *Sess
 	if err != nil {
 		states = map[string]*PlaybackState{}
 	}
-	s.overlayUserData(rewritten, session, states)
+	seriesIDs, seasonIDs := collectAggregateItemIDs(rewritten)
+	aggregates, err := s.store.ListPlaybackAggregates(ctx, session.GatewayUserID, seriesIDs, seasonIDs)
+	if err != nil {
+		aggregates = PlaybackAggregates{Series: map[string]PlaybackAggregate{}, Seasons: map[string]PlaybackAggregate{}}
+	}
+	s.overlayUserData(rewritten, session, states, aggregates)
 	return rewritten
 }
 
@@ -808,7 +868,43 @@ func collectUserDataItemIDs(v any) []string {
 	return itemIDs
 }
 
-func (s *Server) overlayUserData(v any, session *Session, states map[string]*PlaybackState) {
+func collectAggregateItemIDs(v any) ([]string, []string) {
+	seriesSeen := map[string]struct{}{}
+	seasonSeen := map[string]struct{}{}
+	var seriesIDs []string
+	var seasonIDs []string
+	var walk func(any)
+	walk = func(value any) {
+		switch x := value.(type) {
+		case map[string]any:
+			itemID, hasID := stringField(x, "Id")
+			itemType, _ := stringField(x, "Type")
+			if hasID && strings.EqualFold(itemType, "Series") {
+				if _, exists := seriesSeen[itemID]; !exists {
+					seriesSeen[itemID] = struct{}{}
+					seriesIDs = append(seriesIDs, itemID)
+				}
+			}
+			if hasID && strings.EqualFold(itemType, "Season") {
+				if _, exists := seasonSeen[itemID]; !exists {
+					seasonSeen[itemID] = struct{}{}
+					seasonIDs = append(seasonIDs, itemID)
+				}
+			}
+			for _, child := range x {
+				walk(child)
+			}
+		case []any:
+			for _, child := range x {
+				walk(child)
+			}
+		}
+	}
+	walk(v)
+	return seriesIDs, seasonIDs
+}
+
+func (s *Server) overlayUserData(v any, session *Session, states map[string]*PlaybackState, aggregates PlaybackAggregates) {
 	switch x := v.(type) {
 	case map[string]any:
 		if itemID, ok := stringField(x, "Id"); ok && isItemLikeJSON(x) {
@@ -821,14 +917,14 @@ func (s *Server) overlayUserData(v any, session *Session, states map[string]*Pla
 			if state == nil {
 				state = &PlaybackState{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, ItemID: itemID}
 			}
-			applyPlaybackStateToUserData(userData, state)
+			applyPlaybackStateToUserData(userData, state, x, aggregateForItem(x, itemID, aggregates))
 		}
 		for _, child := range x {
-			s.overlayUserData(child, session, states)
+			s.overlayUserData(child, session, states, aggregates)
 		}
 	case []any:
 		for _, child := range x {
-			s.overlayUserData(child, session, states)
+			s.overlayUserData(child, session, states, aggregates)
 		}
 	}
 }
@@ -845,10 +941,14 @@ func isItemLikeJSON(obj map[string]any) bool {
 	return false
 }
 
-func applyPlaybackStateToUserData(userData map[string]any, state *PlaybackState) {
+func applyPlaybackStateToUserData(userData map[string]any, state *PlaybackState, item map[string]any, aggregate *PlaybackAggregate) {
 	userData["Played"] = state.Played
 	userData["PlaybackPositionTicks"] = state.PlaybackPositionTicks
-	if state.PlayedPercentage != nil {
+	if state.Played {
+		userData["PlayedPercentage"] = 100.0
+	} else if percentage, ok := playedPercentageForItem(state, item); ok {
+		userData["PlayedPercentage"] = percentage
+	} else if state.PlayedPercentage != nil {
 		userData["PlayedPercentage"] = *state.PlayedPercentage
 	} else {
 		userData["PlayedPercentage"] = nil
@@ -868,11 +968,82 @@ func applyPlaybackStateToUserData(userData map[string]any, state *PlaybackState)
 	} else {
 		userData["UnplayedItemCount"] = nil
 	}
+	applyAggregateUserData(userData, item, aggregate)
 	if state.Likes != nil {
 		userData["Likes"] = *state.Likes
 	} else {
 		userData["Likes"] = nil
 	}
+}
+
+func aggregateForItem(item map[string]any, itemID string, aggregates PlaybackAggregates) *PlaybackAggregate {
+	itemType, _ := stringField(item, "Type")
+	if strings.EqualFold(itemType, "Series") {
+		if aggregate, ok := aggregates.Series[itemID]; ok {
+			return &aggregate
+		}
+	}
+	if strings.EqualFold(itemType, "Season") {
+		if aggregate, ok := aggregates.Seasons[itemID]; ok {
+			return &aggregate
+		}
+	}
+	return nil
+}
+
+func applyAggregateUserData(userData map[string]any, item map[string]any, aggregate *PlaybackAggregate) {
+	if aggregate == nil {
+		return
+	}
+	total := itemChildCount(item)
+	if total <= 0 {
+		total = aggregate.KnownItemCount
+	}
+	if total <= 0 {
+		return
+	}
+	played := aggregate.PlayedCount
+	if played > total {
+		played = total
+	}
+	unplayed := total - played
+	userData["UnplayedItemCount"] = unplayed
+	userData["Played"] = played >= total
+	if played > 0 {
+		userData["PlayedPercentage"] = (float64(played) / float64(total)) * 100
+	} else {
+		userData["PlayedPercentage"] = nil
+	}
+	if aggregate.LastPlayedDate != nil {
+		userData["LastPlayedDate"] = aggregate.LastPlayedDate.UTC().Format(time.RFC3339)
+	}
+}
+
+func playedPercentageForItem(state *PlaybackState, item map[string]any) (float64, bool) {
+	runtime := state.RunTimeTicks
+	if ticks, ok := int64Field(item, "RunTimeTicks"); ok && ticks > 0 {
+		runtime = ticks
+	}
+	if runtime <= 0 || state.PlaybackPositionTicks <= 0 {
+		return 0, false
+	}
+	percentage := (float64(state.PlaybackPositionTicks) / float64(runtime)) * 100
+	if percentage < 0 {
+		percentage = 0
+	}
+	if percentage > 100 {
+		percentage = 100
+	}
+	return percentage, true
+}
+
+func itemChildCount(item map[string]any) int {
+	for _, name := range []string{"RecursiveItemCount", "ChildCount", "Count"} {
+		if value, ok := int64Field(item, name); ok && value > 0 {
+			return int(value)
+		}
+	}
+	return 0
 }
 
 func rewriteJSONValue(v any, session *Session, gatewayToken, publicGatewayBase, gatewayServerID string) any {

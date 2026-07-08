@@ -198,9 +198,45 @@ func (s *Store) ListPlaybackStatesByItemIDs(ctx context.Context, gatewayUserID s
 	states := make(map[string]*gateway.PlaybackState, len(records))
 	for _, record := range records {
 		state := playbackStateFromRecord(record)
+		if state.OrphanedAt != nil {
+			continue
+		}
 		states[state.ItemID] = state
 	}
 	return states, nil
+}
+
+func (s *Store) ListPlaybackAggregates(ctx context.Context, gatewayUserID string, seriesIDs, seasonIDs []string) (gateway.PlaybackAggregates, error) {
+	aggregates := gateway.PlaybackAggregates{Series: map[string]gateway.PlaybackAggregate{}, Seasons: map[string]gateway.PlaybackAggregate{}}
+	seriesSet := stringSet(seriesIDs)
+	seasonSet := stringSet(seasonIDs)
+	if len(seriesSet) == 0 && len(seasonSet) == 0 {
+		return aggregates, nil
+	}
+	records, err := s.app.FindRecordsByFilter(
+		"user_item_data",
+		"gateway_user = {:gatewayUserID}",
+		"",
+		0,
+		0,
+		dbx.Params{"gatewayUserID": gatewayUserID},
+	)
+	if err != nil {
+		return aggregates, err
+	}
+	for _, record := range records {
+		state := playbackStateFromRecord(record)
+		if state.OrphanedAt != nil {
+			continue
+		}
+		if seriesSet[state.SeriesID] {
+			aggregates.Series[state.SeriesID] = addPlaybackAggregate(aggregates.Series[state.SeriesID], *state)
+		}
+		if seasonSet[state.SeasonID] {
+			aggregates.Seasons[state.SeasonID] = addPlaybackAggregate(aggregates.Seasons[state.SeasonID], *state)
+		}
+	}
+	return aggregates, nil
 }
 
 func (s *Store) ListPlaybackStates(ctx context.Context, gatewayUserID string, filter gateway.PlaybackStateFilter) ([]gateway.PlaybackState, error) {
@@ -234,6 +270,9 @@ func (s *Store) ListPlaybackStates(ctx context.Context, gatewayUserID string, fi
 			}
 		}
 		if filter.SeriesID != "" && state.SeriesID != filter.SeriesID {
+			continue
+		}
+		if filter.SeasonID != "" && state.SeasonID != filter.SeasonID {
 			continue
 		}
 		states = append(states, *state)
@@ -270,8 +309,10 @@ func (s *Store) SavePlaybackState(ctx context.Context, state gateway.PlaybackSta
 	record.Set("item_type", state.ItemType)
 	record.Set("series_id", state.SeriesID)
 	record.Set("series_name", state.SeriesName)
+	record.Set("season_id", state.SeasonID)
 	record.Set("index_number", state.IndexNumber)
 	record.Set("parent_index_number", state.ParentIndexNumber)
+	record.Set("run_time_ticks", state.RunTimeTicks)
 	record.Set("played", state.Played)
 	record.Set("playback_position_ticks", state.PlaybackPositionTicks)
 	if state.PlayedPercentage != nil {
@@ -355,6 +396,36 @@ func (s *Store) SaveDisplayPreference(ctx context.Context, preference gateway.Di
 	record.Set("synthetic_user_id", preference.SyntheticUserID)
 	record.Set("payload_json", preference.PayloadJSON)
 	return s.app.Save(record)
+}
+
+func stringSet(values []string) map[string]bool {
+	set := map[string]bool{}
+	for _, value := range values {
+		if value != "" {
+			set[value] = true
+		}
+	}
+	return set
+}
+
+func addPlaybackAggregate(aggregate gateway.PlaybackAggregate, state gateway.PlaybackState) gateway.PlaybackAggregate {
+	aggregate.KnownItemCount++
+	if state.Played {
+		aggregate.PlayedCount++
+	}
+	if state.LastPlayedDate != nil && (aggregate.LastPlayedDate == nil || state.LastPlayedDate.After(*aggregate.LastPlayedDate)) {
+		t := *state.LastPlayedDate
+		aggregate.LastPlayedDate = &t
+	}
+	activity := state.UpdatedAt
+	if state.LastPlayedDate != nil && state.LastPlayedDate.After(activity) {
+		activity = *state.LastPlayedDate
+	}
+	if !activity.IsZero() && (aggregate.LastActivityDate == nil || activity.After(*aggregate.LastActivityDate)) {
+		t := activity
+		aggregate.LastActivityDate = &t
+	}
+	return aggregate
 }
 
 func (s *Store) SaveSession(ctx context.Context, session *gateway.Session) error {
@@ -542,8 +613,10 @@ func playbackStateFromRecord(record *core.Record) *gateway.PlaybackState {
 		ItemType:              record.GetString("item_type"),
 		SeriesID:              record.GetString("series_id"),
 		SeriesName:            record.GetString("series_name"),
+		SeasonID:              record.GetString("season_id"),
 		IndexNumber:           record.GetInt("index_number"),
 		ParentIndexNumber:     record.GetInt("parent_index_number"),
+		RunTimeTicks:          int64(record.GetFloat("run_time_ticks")),
 		PlaybackPositionTicks: int64(record.GetFloat("playback_position_ticks")),
 		Played:                record.GetBool("played"),
 		PlayedPercentage:      percentage,
