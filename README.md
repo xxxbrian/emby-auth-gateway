@@ -15,33 +15,43 @@ PocketBase superusers are administrators. They can use the PocketBase Admin UI a
 
 Gateway environment variables:
 
-- `GATEWAY_SECRET_KEY` is required. It is used to derive the encryption key for backend passwords and backend tokens stored in PocketBase. Use a long random value and keep it stable for an existing `pb_data` directory.
-- `GATEWAY_PUBLIC_URL` is recommended. Set it to the externally reachable gateway Emby base URL, for example `https://media.example.com/emby` when `GATEWAY_BASE_PATH=/emby`. Response URL rewriting uses this value.
-- `GATEWAY_BASE_PATH` configures the path where Emby-compatible gateway routes are served. It defaults to `/emby`.
-- `GATEWAY_SERVER_ID` defaults to `emby-auth-gateway`. Clients see this synthetic server id instead of the backend Emby server id.
+| Name | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `GATEWAY_SECRET_KEY` | Yes | None | Derives the encryption key for backend passwords and backend tokens stored in PocketBase. Use a long random value and keep it stable for an existing `pb_data`; losing or changing it makes existing encrypted gateway data unreadable. |
+| `GATEWAY_PUBLIC_URL` | No, but set it in production | Request host/proxy headers | Externally reachable gateway Emby base URL, including `GATEWAY_BASE_PATH`, for example `https://media.example.com/emby`. Without it, URL rewriting follows the inbound request host, which can produce unusable `127.0.0.1` URLs behind some proxies. |
+| `GATEWAY_BASE_PATH` | No | `/emby` | Path where Emby-compatible gateway routes are served. |
+| `GATEWAY_SERVER_ID` | No | `emby-auth-gateway` | Synthetic server id returned to clients instead of the backend Emby server id. |
 
 PocketBase runtime flags you will commonly use:
 
-- `--dir` selects the PocketBase data directory. The default is `pb_data` under the working directory.
-- `--http` selects the listen address for `serve`, for example `0.0.0.0:8090` in containers.
-- `--encryptionEnv` can point PocketBase app settings encryption at a 32-character environment variable if you use PocketBase encrypted settings.
+| Flag | Notes |
+| --- | --- |
+| `--http` | Listen address for `serve`, for example `0.0.0.0:8090` in containers. |
+| `--dir` | PocketBase data directory. The default is `pb_data` under the working directory. |
+| `--encryptionEnv` | Optional PocketBase app settings encryption environment variable. This is separate from `GATEWAY_SECRET_KEY`. |
 
 ## Local Compose
 
-Copy `.env.example` to your own local `.env` and replace `GATEWAY_SECRET_KEY` with a generated secret. The sample compose file starts a real Emby container and builds the gateway image from this repository.
+Copy `.env.example` to your own local `.env` and replace `GATEWAY_SECRET_KEY` with a generated secret. The base compose file starts only the gateway; add `docker-compose.dev.yml` when you want the local Emby container.
 
 ```sh
-docker compose up --build
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
 Open Emby at `http://localhost:8096` and complete its first-run setup. Create the real backend Emby user that the gateway should control, then configure the gateway records with the setup command below.
 
 ## Administrator Setup
 
+Build the gateway first when running outside Compose:
+
+```sh
+go build -o ./bin/gateway ./cmd/gateway
+```
+
 Create a PocketBase superuser for the gateway instance:
 
 ```sh
-GATEWAY_SECRET_KEY="$GATEWAY_SECRET_KEY" go run ./cmd/gateway superuser create admin@example.com 'replace-with-a-strong-password'
+GATEWAY_SECRET_KEY="$GATEWAY_SECRET_KEY" ./bin/gateway superuser create admin@example.com 'replace-with-a-strong-password'
 ```
 
 For Docker Compose:
@@ -56,10 +66,10 @@ The PocketBase Admin UI is available at `http://localhost:8090/_/` when the gate
 
 Use `setup` to create or update the Emby server record, controlled backend account, gateway user, and mapping in one command.
 
-Local Go run example:
+Local binary example:
 
 ```sh
-GATEWAY_SECRET_KEY="$GATEWAY_SECRET_KEY" go run ./cmd/gateway setup \
+GATEWAY_SECRET_KEY="$GATEWAY_SECRET_KEY" ./bin/gateway setup \
   --gateway-username alice \
   --gateway-password 'gateway-client-password' \
   --synthetic-user-id gateway-alice-001 \
@@ -93,13 +103,19 @@ GATEWAY_BASE_PATH="${GATEWAY_BASE_PATH:-/emby}"
 GATEWAY_SECRET_KEY="$GATEWAY_SECRET_KEY" \
 GATEWAY_BASE_PATH="$GATEWAY_BASE_PATH" \
 GATEWAY_PUBLIC_URL="http://localhost:8090$GATEWAY_BASE_PATH" \
-go run ./cmd/gateway serve --http=127.0.0.1:8090
+./bin/gateway serve --http=127.0.0.1:8090
 ```
 
 Run with Compose:
 
 ```sh
-docker compose up --build gateway emby
+docker compose up --build gateway
+```
+
+Run with the local Emby development container:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build gateway emby
 ```
 
 ## Verification
