@@ -104,6 +104,7 @@ func (m *MemoryStore) RevokeSession(ctx context.Context, tokenHash string) error
 	if session, ok := m.Sessions[tokenHash]; ok {
 		now := time.Now().UTC()
 		session.RevokedAt = &now
+		return nil
 	}
-	return nil
+	return ErrNotFound
 }

@@ -2,15 +2,21 @@ package gateway
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
+
+var testHTTPClient = &http.Client{Timeout: 5 * time.Second}
 
 func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 	const (
@@ -53,9 +59,10 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 			writeTestJSON(w, map[string]any{
 				"Id":              backendServerID,
 				"ServerName":      "Real Emby",
-				"LocalAddress":    backendURL + "/emby",
-				"WanAddress":      backendURL + "/emby",
-				"RemoteAddresses": []string{backendURL + "/emby"},
+				"LocalAddress":    "http://backend-lan:8096/emby",
+				"WanAddress":      "http://backend-wan:8096/emby",
+				"RemoteAddresses": []string{"http://backend-remote:8096/emby"},
+				"LocalAddresses":  []string{"http://backend-local:8096/emby"},
 			})
 
 		case r.Method == http.MethodGet && r.URL.Path == "/emby/Users/"+backendUserID+"/Items":
@@ -173,6 +180,17 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 	}
 	if !strings.Contains(systemJSON, "https://media.example.com/emby") {
 		t.Fatalf("system info did not include gateway url: %s", systemJSON)
+	}
+	for _, field := range []string{"LocalAddress", "WanAddress"} {
+		if system[field] != "https://media.example.com/emby" {
+			t.Fatalf("%s was not rewritten to gateway address: %#v", field, system[field])
+		}
+	}
+	for _, field := range []string{"RemoteAddresses", "LocalAddresses"} {
+		values, ok := system[field].([]any)
+		if !ok || len(values) != 1 || values[0] != "https://media.example.com/emby" {
+			t.Fatalf("%s was not rewritten to gateway address: %#v", field, system[field])
+		}
 	}
 
 	itemsURL := gw.URL + "/emby/Users/" + syntheticUserID + "/Items?api_key=" + gatewayToken + "&UserId=" + syntheticUserID
@@ -330,6 +348,405 @@ func TestGatewayWebSocketUpgradeProxy(t *testing.T) {
 	}
 }
 
+func TestAnonymousPublicInfoAndPing(t *testing.T) {
+	gw := httptest.NewServer(NewServer(Config{
+		PublicBaseURL:   "https://media.example.com",
+		GatewayBasePath: "/emby",
+		GatewayServerID: "gateway-server-id",
+	}, NewMemoryStore()))
+	defer gw.Close()
+
+	infoResp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/System/Info/Public", nil))
+	defer infoResp.Body.Close()
+	if infoResp.StatusCode != http.StatusOK {
+		t.Fatalf("public info status %d", infoResp.StatusCode)
+	}
+	var info map[string]any
+	decodeJSON(t, infoResp.Body, &info)
+	body := mustJSON(t, info)
+	if strings.Contains(body, "backend") || info["Id"] != "gateway-server-id" || info["ServerId"] != "gateway-server-id" {
+		t.Fatalf("public info leaked backend details or missed gateway id: %s", body)
+	}
+	if info["LocalAddress"] != "https://media.example.com/emby" || info["WanAddress"] != "https://media.example.com/emby" {
+		t.Fatalf("public info did not use gateway addresses: %s", body)
+	}
+
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		pingResp := do(t, mustRequest(t, method, gw.URL+"/emby/System/Ping", nil))
+		_ = pingResp.Body.Close()
+		if pingResp.StatusCode != http.StatusOK {
+			t.Fatalf("%s ping status %d", method, pingResp.StatusCode)
+		}
+	}
+}
+
+func TestAuthenticateByNameAcceptsFormBody(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/emby/Users/AuthenticateByName" {
+			t.Fatalf("unexpected backend request %s %s", r.Method, r.URL.String())
+		}
+		writeTestJSON(w, map[string]any{
+			"AccessToken": "backend-token",
+			"ServerId":    "backend-server",
+			"User": map[string]any{
+				"Id":   "backend-user",
+				"Name": "shared",
+			},
+		})
+	}))
+	defer backend.Close()
+
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, testStore(backend.URL+"/emby")))
+	defer gw.Close()
+
+	form := url.Values{}
+	form.Set("Username", "alice")
+	form.Set("Password", "alice-pass")
+	req := mustRequest(t, http.MethodPost, gw.URL+"/emby/Users/AuthenticateByName", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp := do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("form login status %d: %s", resp.StatusCode, string(body))
+	}
+}
+
+func TestAuthenticateByNameAcceptsJSONPasswordField(t *testing.T) {
+	backend := testAuthBackend(t)
+	defer backend.Close()
+
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, testStore(backend.URL+"/emby")))
+	defer gw.Close()
+
+	req := mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice","Password":"alice-pass"}`)
+	resp := do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("json Password login status %d: %s", resp.StatusCode, string(body))
+	}
+}
+
+func TestLoginFailureRateLimitAndMappingStatus(t *testing.T) {
+	store := testStore("http://127.0.0.1/emby")
+	store.Mappings["u1"] = UserMapping{Enabled: false}
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	validBody := `{"Username":"alice","Pw":"alice-pass"}`
+	resp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", validBody))
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("disabled mapping status = %d, want 401", resp.StatusCode)
+	}
+
+	for i := 0; i < loginFailureLimit-1; i++ {
+		resp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice","Pw":"bad"}`))
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("bad login %d status = %d, want 401", i, resp.StatusCode)
+		}
+	}
+	resp = do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", validBody))
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("rate limited login status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestSuccessfulLoginClearsFailureCount(t *testing.T) {
+	backend := testAuthBackend(t)
+	defer backend.Close()
+
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, testStore(backend.URL+"/emby")))
+	defer gw.Close()
+
+	loginURL := gw.URL + "/emby/Users/AuthenticateByName"
+	for i := 0; i < loginFailureLimit-1; i++ {
+		resp := do(t, mustJSONLoginRequest(t, loginURL, `{"Username":"alice","Pw":"bad"}`))
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("bad login %d status = %d, want 401", i, resp.StatusCode)
+		}
+	}
+
+	resp := do(t, mustJSONLoginRequest(t, loginURL, `{"Username":"alice","Pw":"alice-pass"}`))
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("successful login status = %d, want 200", resp.StatusCode)
+	}
+
+	resp = do(t, mustJSONLoginRequest(t, loginURL, `{"Username":"alice","Pw":"bad"}`))
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("post-success bad login status = %d, want 401", resp.StatusCode)
+	}
+
+	resp = do(t, mustJSONLoginRequest(t, loginURL, `{"Username":"alice","Pw":"alice-pass"}`))
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("post-clear successful login status = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestLoginFailureRateLimitIsRemoteIPScoped(t *testing.T) {
+	backend := testAuthBackend(t)
+	defer backend.Close()
+
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, testStore(backend.URL+"/emby")))
+	defer gw.Close()
+
+	loginURL := gw.URL + "/emby/Users/AuthenticateByName"
+	for i := 0; i < loginFailureLimit; i++ {
+		req := mustJSONLoginRequest(t, loginURL, `{"Username":"alice","Pw":"bad"}`)
+		req.Header.Set("X-Forwarded-For", "203.0.113.10")
+		resp := do(t, req)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("bad login %d status = %d, want 401", i, resp.StatusCode)
+		}
+	}
+
+	blockedReq := mustJSONLoginRequest(t, loginURL, `{"Username":"alice","Pw":"alice-pass"}`)
+	blockedReq.Header.Set("X-Forwarded-For", "203.0.113.10")
+	blockedResp := do(t, blockedReq)
+	_ = blockedResp.Body.Close()
+	if blockedResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("blocked IP login status = %d, want 401", blockedResp.StatusCode)
+	}
+
+	isolatedReq := mustJSONLoginRequest(t, loginURL, `{"Username":"alice","Pw":"alice-pass"}`)
+	isolatedReq.Header.Set("X-Forwarded-For", "203.0.113.11")
+	isolatedResp := do(t, isolatedReq)
+	_ = isolatedResp.Body.Close()
+	if isolatedResp.StatusCode != http.StatusOK {
+		t.Fatalf("different IP login status = %d, want 200", isolatedResp.StatusCode)
+	}
+}
+
+func TestConcurrentFailedLoginsDoNotCrash(t *testing.T) {
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, testStore("http://127.0.0.1/emby")))
+	defer gw.Close()
+
+	const attempts = 64
+	var wg sync.WaitGroup
+	errs := make(chan error, attempts)
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req, err := http.NewRequest(http.MethodPost, gw.URL+"/emby/Users/AuthenticateByName", strings.NewReader(`{"Username":"alice","Pw":"bad"}`))
+			if err != nil {
+				errs <- err
+				return
+			}
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := testHTTPClient.Do(req)
+			if err != nil {
+				errs <- err
+				return
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusUnauthorized {
+				errs <- errors.New("concurrent bad login returned non-401 status")
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestLogoutReturnsErrorWhenRevokeFails(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	store := &failingRevokeStore{MemoryStore: NewMemoryStore()}
+	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	req := mustRequest(t, http.MethodPost, gw.URL+"/emby/Sessions/Logout", nil)
+	req.Header.Set("X-Emby-Token", "gateway-token")
+	resp := do(t, req)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("logout status = %d, want 500", resp.StatusCode)
+	}
+}
+
+func TestOversizedJSONDoesNotPassTruncatedBody(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"leak":"backend-token","padding":"` + strings.Repeat("x", proxyJSONLimit) + `"}`))
+	}))
+	defer backend.Close()
+
+	store := NewMemoryStore()
+	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	req := mustRequest(t, http.MethodGet, gw.URL+"/emby/large?api_key=gateway-token", nil)
+	resp := do(t, req)
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("oversized json status = %d, want 502", resp.StatusCode)
+	}
+	if strings.Contains(string(body), "backend-token") || strings.Contains(string(body), strings.Repeat("x", 128)) {
+		t.Fatalf("oversized json body included backend/truncated content")
+	}
+}
+
+func TestOctetStreamM3U8IsRewritten(t *testing.T) {
+	var backendURL string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte("#EXTM3U\n" + backendURL + "/emby/seg.ts?api_key=backend-token\n"))
+	}))
+	defer backend.Close()
+	backendURL = backend.URL
+
+	store := NewMemoryStore()
+	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	gw := httptest.NewServer(NewServer(Config{PublicBaseURL: "https://media.example.com", GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/master.m3u8?api_key=gateway-token", nil))
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	text := string(body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("m3u8 status = %d", resp.StatusCode)
+	}
+	if strings.Contains(text, backend.URL) || strings.Contains(text, "backend-token") {
+		t.Fatalf("m3u8 leaked backend details: %s", text)
+	}
+	if !strings.Contains(text, "https://media.example.com/emby/seg.ts?api_key=gateway-token") {
+		t.Fatalf("m3u8 was not rewritten: %s", text)
+	}
+}
+
+func TestOversizedM3U8DoesNotPassTruncatedBody(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		_, _ = w.Write([]byte("#EXTM3U\nbackend-token\n" + strings.Repeat("x", proxyM3U8Limit)))
+	}))
+	defer backend.Close()
+
+	store := NewMemoryStore()
+	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/large.m3u8?api_key=gateway-token", nil))
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("oversized m3u8 status = %d, want 502", resp.StatusCode)
+	}
+	if strings.Contains(string(body), "backend-token") || strings.Contains(string(body), strings.Repeat("x", 128)) {
+		t.Fatalf("oversized m3u8 body included backend/truncated content")
+	}
+}
+
+func TestGatewayBasePathCanBeChanged(t *testing.T) {
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/media"}, NewMemoryStore()))
+	defer gw.Close()
+
+	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/media/System/Ping", nil))
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("custom base path ping status = %d", resp.StatusCode)
+	}
+	resp = do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/System/Ping", nil))
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("old base path status = %d, want 404", resp.StatusCode)
+	}
+}
+
+type failingRevokeStore struct {
+	*MemoryStore
+}
+
+func (f *failingRevokeStore) RevokeSession(ctx context.Context, tokenHash string) error {
+	return errors.New("revoke failed")
+}
+
+func testStore(backendBaseURL string) *MemoryStore {
+	store := NewMemoryStore()
+	store.Users["u1"] = MemoryUser{
+		GatewayUser: GatewayUser{ID: "u1", Username: "alice", SyntheticUserID: "gateway-user", Enabled: true},
+		Password:    "alice-pass",
+	}
+	store.Mappings["u1"] = UserMapping{
+		ID:               "m1",
+		GatewayUserID:    "u1",
+		BackendAccountID: "b1",
+		Enabled:          true,
+		BackendAccount: BackendAccount{
+			ID:       "b1",
+			ServerID: "s1",
+			BaseURL:  backendBaseURL,
+			Username: "shared",
+			Password: "backend-pass",
+			Enabled:  true,
+		},
+	}
+	return store
+}
+
+func testSession(backendBaseURL string) *Session {
+	return &Session{
+		GatewayTokenHash: HashToken("gateway-token"),
+		GatewayUserID:    "u1",
+		GatewayUsername:  "alice",
+		SyntheticUserID:  "gateway-user",
+		BackendAccountID: "b1",
+		BackendServerID:  "backend-server",
+		BackendBaseURL:   backendBaseURL,
+		BackendUserID:    "backend-user",
+		BackendUsername:  "shared",
+		BackendToken:     "backend-token",
+		CreatedAt:        time.Now().UTC(),
+		ExpiresAt:        time.Now().UTC().Add(time.Hour),
+	}
+}
+
+func testAuthBackend(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/emby/Users/AuthenticateByName" {
+			t.Fatalf("unexpected backend request %s %s", r.Method, r.URL.String())
+		}
+		writeTestJSON(w, map[string]any{
+			"AccessToken": "backend-token",
+			"ServerId":    "backend-server",
+			"User": map[string]any{
+				"Id":   "backend-user",
+				"Name": "shared",
+			},
+		})
+	}))
+}
+
+func mustJSONLoginRequest(t *testing.T, url, body string) *http.Request {
+	t.Helper()
+	req := mustRequest(t, http.MethodPost, url, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	return req
+}
+
 func writeTestJSON(w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(value)
@@ -337,7 +754,7 @@ func writeTestJSON(w http.ResponseWriter, value any) {
 
 func do(t *testing.T, req *http.Request) *http.Response {
 	t.Helper()
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := testHTTPClient.Do(req)
 	if err != nil {
 		t.Fatalf("do request: %v", err)
 	}

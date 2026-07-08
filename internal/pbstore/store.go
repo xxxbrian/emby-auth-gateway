@@ -156,7 +156,7 @@ func (s *Store) FindSessionByTokenHash(ctx context.Context, tokenHash string) (*
 func (s *Store) RevokeSession(ctx context.Context, tokenHash string) error {
 	record, err := s.app.FindFirstRecordByData("gateway_sessions", "gateway_token_hash", tokenHash)
 	if err != nil {
-		return nil
+		return gateway.ErrNotFound
 	}
 	record.Set("revoked_at", time.Now().UTC())
 	return s.app.Save(record)

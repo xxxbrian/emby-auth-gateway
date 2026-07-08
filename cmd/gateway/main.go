@@ -2,7 +2,6 @@ package main
 
 import (
 	"log"
-	"net/http"
 	"os"
 	"strings"
 
@@ -34,18 +33,23 @@ func main() {
 		if err != nil {
 			return err
 		}
+		basePath := normalizeGatewayBasePath(envDefault("GATEWAY_BASE_PATH", "/emby"))
 		gw := gateway.NewServer(gateway.Config{
 			PublicBaseURL:   strings.TrimRight(os.Getenv("GATEWAY_PUBLIC_URL"), "/"),
-			GatewayBasePath: envDefault("GATEWAY_BASE_PATH", "/emby"),
+			GatewayBasePath: basePath,
 			GatewayServerID: envDefault("GATEWAY_SERVER_ID", "emby-auth-gateway"),
-			HTTPClient:      http.DefaultClient,
 		}, pbstore.New(e.App, cipher))
 
-		e.Router.Any("/emby/{path...}", func(re *core.RequestEvent) error {
+		wildcardPath := basePath + "/{path...}"
+		if basePath == "/" {
+			wildcardPath = "/{path...}"
+		}
+
+		e.Router.Any(wildcardPath, func(re *core.RequestEvent) error {
 			gw.ServeHTTP(re.Response, re.Request)
 			return nil
 		})
-		e.Router.Any("/emby", func(re *core.RequestEvent) error {
+		e.Router.Any(basePath, func(re *core.RequestEvent) error {
 			gw.ServeHTTP(re.Response, re.Request)
 			return nil
 		})
@@ -63,6 +67,20 @@ func envDefault(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func normalizeGatewayBasePath(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "/emby"
+	}
+	if !strings.HasPrefix(value, "/") {
+		value = "/" + value
+	}
+	if trimmed := strings.TrimRight(value, "/"); trimmed != "" {
+		return trimmed
+	}
+	return "/"
 }
 
 func requiredEnv(name string) string {

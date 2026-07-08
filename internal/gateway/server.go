@@ -14,15 +14,29 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"sync"
 	"time"
 )
 
 const defaultSessionTTL = 30 * 24 * time.Hour
+const gatewayVersion = "0.0.0"
+
+const (
+	backendAuthTimeout         = 15 * time.Second
+	proxyResponseHeaderTimeout = 30 * time.Second
+	proxyIdleConnTimeout       = 90 * time.Second
+	loginFailureLimit          = 5
+	loginFailureBlockDuration  = time.Minute
+	proxyJSONLimit             = 20 << 20
+	proxyM3U8Limit             = 20 << 20
+)
 
 type Server struct {
-	cfg    Config
-	store  Store
-	client *http.Client
+	cfg         Config
+	store       Store
+	client      *http.Client
+	proxyClient *http.Client
+	logins      *loginFailureLimiter
 }
 
 func NewServer(cfg Config, store Store) *Server {
@@ -37,9 +51,13 @@ func NewServer(cfg Config, store Store) *Server {
 	}
 	client := cfg.HTTPClient
 	if client == nil {
-		client = http.DefaultClient
+		client = &http.Client{Timeout: backendAuthTimeout}
 	}
-	return &Server{cfg: cfg, store: store, client: client}
+	proxyClient := cfg.HTTPClient
+	if proxyClient == nil {
+		proxyClient = &http.Client{Transport: defaultProxyTransport()}
+	}
+	return &Server{cfg: cfg, store: store, client: client, proxyClient: proxyClient, logins: newLoginFailureLimiter()}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -52,6 +70,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodPost && equalPath(rel, "/Users/AuthenticateByName"):
 		s.handleAuthenticate(w, r)
+	case r.Method == http.MethodGet && equalPath(rel, "/System/Info/Public"):
+		s.handlePublicSystemInfo(w, r)
+	case (r.Method == http.MethodGet || r.Method == http.MethodPost) && equalPath(rel, "/System/Ping"):
+		s.handlePing(w, r)
 	case r.Method == http.MethodPost && equalPath(rel, "/Sessions/Logout"):
 		s.handleLogout(w, r, rel)
 	case r.Method == http.MethodGet && equalPath(rel, "/Users/Public"):
@@ -64,20 +86,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
-	var form struct {
-		Username string `json:"Username"`
-		Pw       string `json:"Pw"`
-		Password string `json:"Password"`
-	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 2<<20))
+	form, err := parseAuthenticateBody(w, r)
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if err := json.Unmarshal(body, &form); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
+	key := loginFailureKey(form.Username, r)
+	if s.logins.blocked(key, time.Now()) {
+		http.Error(w, "failed to authenticate", http.StatusUnauthorized)
 		return
 	}
+
 	password := form.Pw
 	if password == "" {
 		password = form.Password
@@ -90,13 +109,15 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	user, err := s.store.AuthenticateGatewayUser(ctx, form.Username, password)
 	if err != nil || user == nil || !user.Enabled {
+		s.logins.recordFailure(key, time.Now())
 		http.Error(w, "failed to authenticate", http.StatusUnauthorized)
 		return
 	}
 
 	mapping, err := s.store.FindMappingByGatewayUserID(ctx, user.ID)
 	if err != nil || mapping == nil || !mapping.Enabled || !mapping.BackendAccount.Enabled {
-		http.Error(w, "mapping unavailable", http.StatusForbidden)
+		s.logins.recordFailure(key, time.Now())
+		http.Error(w, "failed to authenticate", http.StatusUnauthorized)
 		return
 	}
 
@@ -106,6 +127,8 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "backend authentication failed", http.StatusBadGateway)
 		return
 	}
+
+	s.logins.clear(key)
 
 	token, tokenHash, err := NewOpaqueToken()
 	if err != nil {
@@ -137,7 +160,7 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rewritten := rewriteJSONValue(backendResult.Raw, session, token, s.publicGatewayBase(), s.cfg.GatewayServerID)
+	rewritten := rewriteJSONValue(backendResult.Raw, session, token, s.gatewayBaseForRequest(r), s.cfg.GatewayServerID)
 	if obj, ok := rewritten.(map[string]any); ok {
 		obj["AccessToken"] = token
 		obj["ServerId"] = s.cfg.GatewayServerID
@@ -149,6 +172,32 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, rewritten)
+}
+
+type authenticateForm struct {
+	Username string `json:"Username"`
+	Pw       string `json:"Pw"`
+	Password string `json:"Password"`
+}
+
+func parseAuthenticateBody(w http.ResponseWriter, r *http.Request) (authenticateForm, error) {
+	var form authenticateForm
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 2<<20))
+	if err != nil {
+		return form, err
+	}
+	ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if ct == "application/x-www-form-urlencoded" {
+		values, err := url.ParseQuery(string(body))
+		if err != nil {
+			return form, err
+		}
+		form.Username = values.Get("Username")
+		form.Pw = values.Get("Pw")
+		form.Password = values.Get("Password")
+		return form, nil
+	}
+	return form, json.Unmarshal(body, &form)
 }
 
 func (s *Server) authenticateBackend(ctx context.Context, account BackendAccount, auth AuthHeader) (*backendAuthResult, error) {
@@ -224,7 +273,10 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, rel string
 		return
 	}
 	_ = s.forwardLogout(r.Context(), r, rel, session, token)
-	_ = s.store.RevokeSession(r.Context(), HashToken(token))
+	if err := s.store.RevokeSession(r.Context(), HashToken(token)); err != nil {
+		http.Error(w, "session revoke failed", http.StatusInternalServerError)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -261,6 +313,26 @@ func (s *Server) handlePublicUsers(w http.ResponseWriter, r *http.Request) {
 		items = append(items, userDTO(user, s.cfg.GatewayServerID))
 	}
 	writeJSON(w, http.StatusOK, items)
+}
+
+func (s *Server) handlePublicSystemInfo(w http.ResponseWriter, r *http.Request) {
+	base := s.gatewayBaseForRequest(r)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"Id":              s.cfg.GatewayServerID,
+		"ServerId":        s.cfg.GatewayServerID,
+		"ServerName":      "Emby Gateway",
+		"Version":         gatewayVersion,
+		"LocalAddress":    base,
+		"WanAddress":      base,
+		"RemoteAddresses": []string{base},
+		"LocalAddresses":  []string{base},
+	})
+}
+
+func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("Emby Server is running"))
 }
 
 func (s *Server) handleUser(w http.ResponseWriter, r *http.Request, rel string) {
@@ -311,18 +383,19 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 	s.rewriteRequestHeaders(req.Header, session, gatewayToken)
 	req.Host = proxyURL.Host
 
-	resp, err := s.client.Do(req)
+	resp, err := s.proxyClient.Do(req)
 	if err != nil {
 		http.Error(w, "backend unavailable", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
-	s.writeProxyResponse(w, resp, session, gatewayToken)
+	s.writeProxyResponse(w, resp, session, gatewayToken, s.gatewayBaseForRequest(r))
 }
 
 func (s *Server) handleUpgradeProxy(w http.ResponseWriter, r *http.Request, proxyURL *url.URL, session *Session, gatewayToken string) {
 	proxy := &httputil.ReverseProxy{
+		Transport: s.proxyClient.Transport,
 		Director: func(req *http.Request) {
 			req.URL = proxyURL
 			req.Host = proxyURL.Host
@@ -416,9 +489,21 @@ func (s *Server) rewriteRequestBody(r *http.Request, session *Session, gatewayTo
 	return strings.NewReader(text), nil
 }
 
-func (s *Server) writeProxyResponse(w http.ResponseWriter, resp *http.Response, session *Session, gatewayToken string) {
-	copyResponseHeaders(w.Header(), resp.Header, session, gatewayToken, s.publicGatewayBase(), s.cfg.GatewayServerID)
+func (s *Server) writeProxyResponse(w http.ResponseWriter, resp *http.Response, session *Session, gatewayToken, publicGatewayBase string) {
+	copyResponseHeaders(w.Header(), resp.Header, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
 	ct := resp.Header.Get("Content-Type")
+	if isM3U8ContentType(ct) || strings.HasSuffix(strings.ToLower(resp.Request.URL.Path), ".m3u8") {
+		data, err := readLimited(resp.Body, proxyM3U8Limit)
+		if err != nil {
+			http.Error(w, "response read failed", http.StatusBadGateway)
+			return
+		}
+		w.Header().Del("Content-Length")
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(rewriteM3U8(data, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID))
+		return
+	}
+
 	if isStreamingContentType(ct) {
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
@@ -426,7 +511,7 @@ func (s *Server) writeProxyResponse(w http.ResponseWriter, resp *http.Response, 
 	}
 
 	if isJSONContentType(ct) {
-		data, err := io.ReadAll(io.LimitReader(resp.Body, 20<<20))
+		data, err := readLimited(resp.Body, proxyJSONLimit)
 		if err != nil {
 			http.Error(w, "response read failed", http.StatusBadGateway)
 			return
@@ -434,23 +519,11 @@ func (s *Server) writeProxyResponse(w http.ResponseWriter, resp *http.Response, 
 		var value any
 		if err := json.Unmarshal(data, &value); err == nil {
 			w.Header().Del("Content-Length")
-			writeJSON(w, resp.StatusCode, rewriteJSONValue(value, session, gatewayToken, s.publicGatewayBase(), s.cfg.GatewayServerID))
+			writeJSON(w, resp.StatusCode, rewriteJSONValue(value, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID))
 			return
 		}
 		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(rewriteBytes(data, session, gatewayToken, s.publicGatewayBase(), s.cfg.GatewayServerID))
-		return
-	}
-
-	if isM3U8ContentType(ct) || strings.HasSuffix(strings.ToLower(resp.Request.URL.Path), ".m3u8") {
-		data, err := io.ReadAll(io.LimitReader(resp.Body, 20<<20))
-		if err != nil {
-			http.Error(w, "response read failed", http.StatusBadGateway)
-			return
-		}
-		w.Header().Del("Content-Length")
-		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(rewriteM3U8(data, session, gatewayToken, s.publicGatewayBase(), s.cfg.GatewayServerID))
+		_, _ = w.Write(rewriteBytes(data, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID))
 		return
 	}
 
@@ -485,6 +558,20 @@ func rewriteJSONValue(v any, session *Session, gatewayToken, publicGatewayBase, 
 						out[k] = gatewayServerID
 					}
 				}
+			}
+		}
+		if publicGatewayBase != "" {
+			if _, ok := out["LocalAddress"]; ok {
+				out["LocalAddress"] = publicGatewayBase
+			}
+			if _, ok := out["WanAddress"]; ok {
+				out["WanAddress"] = publicGatewayBase
+			}
+			if _, ok := out["RemoteAddresses"]; ok {
+				out["RemoteAddresses"] = []string{publicGatewayBase}
+			}
+			if _, ok := out["LocalAddresses"]; ok {
+				out["LocalAddresses"] = []string{publicGatewayBase}
 			}
 		}
 		return out
@@ -638,6 +725,28 @@ func (s *Server) publicGatewayBase() string {
 	return base + pathPart
 }
 
+func (s *Server) gatewayBaseForRequest(r *http.Request) string {
+	if strings.TrimSpace(s.cfg.PublicBaseURL) != "" {
+		return s.publicGatewayBase()
+	}
+	host := r.Header.Get("X-Forwarded-Host")
+	if host == "" {
+		host = r.Host
+	}
+	if host == "" {
+		return s.publicGatewayBase()
+	}
+	scheme := r.Header.Get("X-Forwarded-Proto")
+	if scheme == "" {
+		if r.TLS != nil {
+			scheme = "https"
+		} else {
+			scheme = "http"
+		}
+	}
+	return strings.TrimRight(scheme+"://"+host, "/") + strings.TrimRight(s.cfg.GatewayBasePath, "/")
+}
+
 func firstAuthHeader(r *http.Request) AuthHeader {
 	for _, name := range []string{"X-Emby-Authorization", "Authorization"} {
 		if value := r.Header.Get(name); value != "" {
@@ -696,6 +805,79 @@ func contentLength(r io.Reader) int64 {
 		return int64(br.Len())
 	}
 	return -1
+}
+
+func readLimited(r io.Reader, limit int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("response body exceeds %d bytes", limit)
+	}
+	return data, nil
+}
+
+func defaultProxyTransport() *http.Transport {
+	return &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       proxyIdleConnTimeout,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: proxyResponseHeaderTimeout,
+	}
+}
+
+type loginFailureLimiter struct {
+	mu      sync.Mutex
+	entries map[string]loginFailureEntry
+}
+
+type loginFailureEntry struct {
+	count       int
+	blockedTill time.Time
+}
+
+func newLoginFailureLimiter() *loginFailureLimiter {
+	return &loginFailureLimiter{entries: map[string]loginFailureEntry{}}
+}
+
+func (l *loginFailureLimiter) blocked(key string, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	entry, ok := l.entries[key]
+	if !ok || entry.blockedTill.IsZero() {
+		return false
+	}
+	if now.Before(entry.blockedTill) {
+		return true
+	}
+	delete(l.entries, key)
+	return false
+}
+
+func (l *loginFailureLimiter) recordFailure(key string, now time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	entry := l.entries[key]
+	entry.count++
+	if entry.count >= loginFailureLimit {
+		entry.blockedTill = now.Add(loginFailureBlockDuration)
+	}
+	l.entries[key] = entry
+}
+
+func (l *loginFailureLimiter) clear(key string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.entries, key)
+}
+
+func loginFailureKey(username string, r *http.Request) string {
+	return strings.ToLower(strings.TrimSpace(username)) + "\x00" + remoteIP(r)
 }
 
 type nilResponseWriter struct{}
