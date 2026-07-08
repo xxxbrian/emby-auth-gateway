@@ -26,14 +26,14 @@ func TestGatewayCollectionsAreLockedAndStoreAuthStillWorks(t *testing.T) {
 			t.Fatalf("find collection %s: %v", name, err)
 		}
 		assertRules(t, collection, nil, nil, nil, nil, nil)
-		if name == "gateway_users" && collection.PasswordAuth.Enabled {
-			t.Fatal("gateway_users PasswordAuth.Enabled = true, want false")
+		if name == "users" && collection.PasswordAuth.Enabled {
+			t.Fatal("users PasswordAuth.Enabled = true, want false")
 		}
 	}
 
-	users, err := app.FindCollectionByNameOrId("gateway_users")
+	users, err := app.FindCollectionByNameOrId("users")
 	if err != nil {
-		t.Fatalf("find gateway_users: %v", err)
+		t.Fatalf("find users: %v", err)
 	}
 	record := core.NewRecord(users)
 	record.Set("username", "alice")
@@ -68,19 +68,19 @@ func TestGatewayCollectionsLockMigrationDownRestoresRules(t *testing.T) {
 		t.Fatalf("revert phase2/userdata and lock migrations: %v", err)
 	}
 
-	users, err := app.FindCollectionByNameOrId("gateway_users")
+	users, err := app.FindCollectionByNameOrId("users")
 	if err != nil {
-		t.Fatalf("find gateway_users: %v", err)
+		t.Fatalf("find users: %v", err)
 	}
 	assertRules(t, users,
-		strPtr("@request.auth.collectionName = 'gateway_users'"),
+		strPtr("@request.auth.collectionName = 'users'"),
 		strPtr("id = @request.auth.id"),
 		strPtr(""),
 		strPtr("id = @request.auth.id"),
 		strPtr("id = @request.auth.id"),
 	)
 	if !users.PasswordAuth.Enabled {
-		t.Fatal("gateway_users PasswordAuth.Enabled = false, want true after down")
+		t.Fatal("users PasswordAuth.Enabled = false, want true after down")
 	}
 
 	for _, name := range []string{"emby_servers", "backend_accounts", "user_mappings", "gateway_sessions", "audit_logs"} {

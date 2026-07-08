@@ -224,9 +224,9 @@ func newTestApp(t *testing.T) core.App {
 
 func createGatewayUser(t *testing.T, app core.App, username, syntheticUserID string) string {
 	t.Helper()
-	users, err := app.FindCollectionByNameOrId("gateway_users")
+	users, err := app.FindCollectionByNameOrId("users")
 	if err != nil {
-		t.Fatalf("find gateway_users: %v", err)
+		t.Fatalf("find users: %v", err)
 	}
 	record := core.NewRecord(users)
 	record.Set("username", username)

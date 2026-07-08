@@ -20,7 +20,7 @@ func New(app core.App, cipher *gateway.Cipher) *Store {
 }
 
 func (s *Store) AuthenticateGatewayUser(ctx context.Context, username, password string) (*gateway.GatewayUser, error) {
-	record, err := s.app.FindFirstRecordByData("gateway_users", "username", username)
+	record, err := s.app.FindFirstRecordByData("users", "username", username)
 	if err != nil {
 		return nil, gateway.ErrInvalidCredentials
 	}
@@ -31,7 +31,7 @@ func (s *Store) AuthenticateGatewayUser(ctx context.Context, username, password 
 }
 
 func (s *Store) FindGatewayUserByUsername(ctx context.Context, username string) (*gateway.GatewayUser, error) {
-	record, err := s.app.FindFirstRecordByData("gateway_users", "username", username)
+	record, err := s.app.FindFirstRecordByData("users", "username", username)
 	if err != nil {
 		return nil, gateway.ErrNotFound
 	}
@@ -39,7 +39,7 @@ func (s *Store) FindGatewayUserByUsername(ctx context.Context, username string) 
 }
 
 func (s *Store) ListPublicUsers(ctx context.Context) ([]gateway.GatewayUser, error) {
-	records, err := s.app.FindAllRecords("gateway_users", dbx.HashExp{"enabled": true})
+	records, err := s.app.FindAllRecords("users", dbx.HashExp{"enabled": true})
 	if err != nil {
 		return nil, err
 	}
@@ -51,7 +51,7 @@ func (s *Store) ListPublicUsers(ctx context.Context) ([]gateway.GatewayUser, err
 }
 
 func (s *Store) FindUserBySyntheticID(ctx context.Context, syntheticID string) (*gateway.GatewayUser, error) {
-	record, err := s.app.FindFirstRecordByData("gateway_users", "synthetic_user_id", syntheticID)
+	record, err := s.app.FindFirstRecordByData("users", "synthetic_user_id", syntheticID)
 	if err != nil {
 		return nil, gateway.ErrNotFound
 	}

@@ -8,8 +8,11 @@ import (
 
 func init() {
 	migrations.Register(func(app core.App) error {
-		users := core.NewAuthCollection("gateway_users")
-		users.ListRule = types.Pointer("@request.auth.collectionName = 'gateway_users'")
+		users, err := app.FindCollectionByNameOrId("users")
+		if err != nil {
+			return err
+		}
+		users.ListRule = types.Pointer("@request.auth.collectionName = 'users'")
 		users.ViewRule = types.Pointer("id = @request.auth.id")
 		users.CreateRule = types.Pointer("")
 		users.UpdateRule = types.Pointer("id = @request.auth.id")
@@ -18,10 +21,8 @@ func init() {
 		users.Fields.Add(&core.TextField{Name: "username", Required: true, Max: 255})
 		users.Fields.Add(&core.TextField{Name: "synthetic_user_id", Required: true, Max: 80})
 		users.Fields.Add(&core.BoolField{Name: "enabled"})
-		users.Fields.Add(&core.AutodateField{Name: "created", OnCreate: true})
-		users.Fields.Add(&core.AutodateField{Name: "updated", OnCreate: true, OnUpdate: true})
-		users.AddIndex("idx_gateway_users_username", true, "username", "")
-		users.AddIndex("idx_gateway_users_synthetic", true, "synthetic_user_id", "")
+		users.AddIndex("idx_users_username", true, "username", "")
+		users.AddIndex("idx_users_synthetic", true, "synthetic_user_id", "")
 		if err := app.Save(users); err != nil {
 			return err
 		}
@@ -119,12 +120,23 @@ func init() {
 		audit.Fields.Add(&core.AutodateField{Name: "created", OnCreate: true})
 		return app.Save(audit)
 	}, func(app core.App) error {
-		for _, name := range []string{"audit_logs", "gateway_sessions", "user_mappings", "backend_accounts", "emby_servers", "gateway_users"} {
+		for _, name := range []string{"audit_logs", "gateway_sessions", "user_mappings", "backend_accounts", "emby_servers"} {
 			collection, err := app.FindCollectionByNameOrId(name)
 			if err == nil {
 				if err := app.Delete(collection); err != nil {
 					return err
 				}
+			}
+		}
+		users, err := app.FindCollectionByNameOrId("users")
+		if err == nil {
+			users.Fields.RemoveByName("username")
+			users.Fields.RemoveByName("synthetic_user_id")
+			users.Fields.RemoveByName("enabled")
+			users.RemoveIndex("idx_users_username")
+			users.RemoveIndex("idx_users_synthetic")
+			if err := app.Save(users); err != nil {
+				return err
 			}
 		}
 		return nil

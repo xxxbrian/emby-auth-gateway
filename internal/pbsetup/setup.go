@@ -133,9 +133,9 @@ func upsertBackendAccount(app core.App, cipher *gateway.Cipher, serverID string,
 }
 
 func upsertGatewayUser(app core.App, opts options) (*core.Record, error) {
-	record, err := app.FindFirstRecordByData("gateway_users", "username", opts.GatewayUsername)
+	record, err := app.FindFirstRecordByData("users", "username", opts.GatewayUsername)
 	if err != nil {
-		collection, findErr := app.FindCollectionByNameOrId("gateway_users")
+		collection, findErr := app.FindCollectionByNameOrId("users")
 		if findErr != nil {
 			return nil, findErr
 		}

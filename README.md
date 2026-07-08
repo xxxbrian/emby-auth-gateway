@@ -9,7 +9,7 @@ Emby Auth Gateway is a PocketBase-backed reverse proxy for Emby clients. Clients
 - The gateway exposes Emby-compatible endpoints for clients and proxies authenticated requests to the real Emby server.
 - The real Emby server remains private to the gateway network in the recommended deployment shape.
 
-PocketBase superusers are administrators. They can use the PocketBase Admin UI and API to manage collections and operational data. Records in `gateway_users` are not administrators; they are ordinary Emby client users that can authenticate through the gateway only.
+PocketBase superusers are administrators. They can use the PocketBase Admin UI and API to manage collections and operational data. Records in `users` are not administrators; they are ordinary Emby client users that can authenticate through the gateway only.
 
 ## Configuration
 
@@ -114,7 +114,7 @@ curl -i "http://localhost:8090$GATEWAY_BASE_PATH/System/Info/Public"
 PocketBase internal gateway collections should not be anonymously readable:
 
 ```sh
-curl -i http://localhost:8090/api/collections/gateway_users/records
+curl -i http://localhost:8090/api/collections/users/records
 curl -i http://localhost:8090/api/collections/emby_servers/records
 curl -i http://localhost:8090/api/collections/backend_accounts/records
 curl -i http://localhost:8090/api/collections/user_mappings/records
@@ -156,8 +156,8 @@ Useful smoke variables:
 
 ## Security Notes
 
-- Keep PocketBase internal collections locked down. `gateway_users`, `emby_servers`, `backend_accounts`, `user_mappings`, `gateway_sessions`, and `audit_logs` should not be anonymously readable or writable. PocketBase superusers bypass collection rules and are the intended administrators.
-- Gateway users are client identities only. Ordinary `gateway_users` records cannot access the PocketBase API and must not be used as an administrator boundary.
+- Keep PocketBase internal collections locked down. `users`, `emby_servers`, `backend_accounts`, `user_mappings`, `gateway_sessions`, and `audit_logs` should not be anonymously readable or writable. PocketBase superusers bypass collection rules and are the intended administrators.
+- Gateway users are client identities only. Ordinary `users` records cannot access the PocketBase API and must not be used as an administrator boundary.
 - Gateway tokens are stored only as SHA-256 hashes.
 - Backend Emby passwords and backend Emby session tokens are encrypted at rest using `GATEWAY_SECRET_KEY`.
 - Do not expose the real Emby backend directly to untrusted clients when testing gateway isolation.
@@ -166,7 +166,7 @@ Useful smoke variables:
 ## Troubleshooting
 
 - `GATEWAY_SECRET_KEY is required`: set the environment variable for `serve`, `setup`, and any command that touches encrypted gateway data.
-- Login returns `401`: verify the gateway username and password created by `setup`, confirm the `gateway_users` record is enabled, and confirm `user_mappings`, `backend_accounts`, and `emby_servers` records exist and are enabled.
+- Login returns `401`: verify the gateway username and password created by `setup`, confirm the `users` record is enabled, and confirm `user_mappings`, `backend_accounts`, and `emby_servers` records exist and are enabled.
 - Login returns `502 backend authentication failed`: verify `--emby-url`, backend username, backend password, and network reachability from the gateway to Emby. In Compose, the backend URL should be `http://emby:8096/emby`.
 - Proxied requests return `401`: the gateway token may be missing, expired, revoked, or sent under an unsupported header/query name. Supported inputs include `X-Emby-Token`, `X-MediaBrowser-Token`, Emby authorization headers, `api_key`, `access_token`, and `token`.
 - URLs in Emby responses point at the backend: set `GATEWAY_PUBLIC_URL` to the public gateway base URL including the configured `GATEWAY_BASE_PATH`.

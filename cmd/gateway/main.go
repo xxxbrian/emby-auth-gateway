@@ -4,6 +4,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"emby-auth-gateway/internal/gateway"
 	"emby-auth-gateway/internal/pbsetup"
@@ -54,12 +55,26 @@ func main() {
 			return nil
 		})
 
+		if err := e.App.Cron().Add("gatewayPlaybackEventCleanup", "@hourly", func() {
+			if err := cleanupPlaybackEvents(e.App, time.Now().UTC()); err != nil {
+				e.App.Logger().Warn("Failed to cleanup playback events", "error", err)
+			}
+		}); err != nil {
+			return err
+		}
+
 		return e.Next()
 	})
 
 	if err := app.Start(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func cleanupPlaybackEvents(app core.App, now time.Time) error {
+	cutoff := now.UTC().Add(-6 * time.Hour)
+	_, err := app.DB().NewQuery("delete from playback_events where occurred_at < {:cutoff}").Bind(map[string]any{"cutoff": cutoff}).Execute()
+	return err
 }
 
 func envDefault(name, fallback string) string {

@@ -7,7 +7,7 @@ import (
 
 func init() {
 	migrations.Register(func(app core.App) error {
-		users, err := app.FindCollectionByNameOrId("gateway_users")
+		users, err := app.FindCollectionByNameOrId("users")
 		if err != nil {
 			return err
 		}
@@ -41,23 +41,6 @@ func init() {
 			return err
 		}
 
-		playbackStates := core.NewBaseCollection("playback_states")
-		setCollectionRules(playbackStates, nil, nil, nil, nil, nil)
-		playbackStates.Fields.Add(&core.RelationField{Name: "gateway_user", CollectionId: users.Id, Required: true, MaxSelect: 1})
-		playbackStates.Fields.Add(&core.TextField{Name: "synthetic_user_id", Max: 80})
-		playbackStates.Fields.Add(&core.TextField{Name: "item_id", Required: true, Max: 80})
-		playbackStates.Fields.Add(&core.BoolField{Name: "played"})
-		playbackStates.Fields.Add(&core.NumberField{Name: "playback_position_ticks", OnlyInt: true})
-		playbackStates.Fields.Add(&core.NumberField{Name: "played_percentage"})
-		playbackStates.Fields.Add(&core.DateField{Name: "last_played_date"})
-		playbackStates.Fields.Add(&core.NumberField{Name: "play_count", OnlyInt: true})
-		playbackStates.Fields.Add(&core.AutodateField{Name: "created", OnCreate: true})
-		playbackStates.Fields.Add(&core.AutodateField{Name: "updated", OnCreate: true, OnUpdate: true})
-		playbackStates.AddIndex("idx_playback_states_gateway_item", true, "gateway_user, item_id", "")
-		if err := app.Save(playbackStates); err != nil {
-			return err
-		}
-
 		pathPolicies := core.NewBaseCollection("path_policies")
 		setCollectionRules(pathPolicies, nil, nil, nil, nil, nil)
 		pathPolicies.Fields.Add(&core.TextField{Name: "method", Required: true, Max: 32})
@@ -71,7 +54,7 @@ func init() {
 		pathPolicies.AddIndex("idx_path_policies_enabled_priority", false, "enabled, priority", "")
 		return app.Save(pathPolicies)
 	}, func(app core.App) error {
-		for _, name := range []string{"path_policies", "playback_states", "playback_events"} {
+		for _, name := range []string{"path_policies", "playback_events"} {
 			collection, err := app.FindCollectionByNameOrId(name)
 			if err == nil {
 				if err := app.Delete(collection); err != nil {

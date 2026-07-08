@@ -7,7 +7,7 @@ import (
 
 func init() {
 	migrations.Register(func(app core.App) error {
-		users, err := app.FindCollectionByNameOrId("gateway_users")
+		users, err := app.FindCollectionByNameOrId("users")
 		if err != nil {
 			return err
 		}
@@ -43,10 +43,6 @@ func init() {
 			return err
 		}
 
-		if err := copyPlaybackStatesToUserItemData(app, userItemData); err != nil {
-			return err
-		}
-
 		displayPreferences := core.NewBaseCollection("display_preferences")
 		setCollectionRules(displayPreferences, nil, nil, nil, nil, nil)
 		displayPreferences.Fields.Add(&core.RelationField{Name: "gateway_user", CollectionId: users.Id, Required: true, MaxSelect: 1})
@@ -69,29 +65,4 @@ func init() {
 		}
 		return nil
 	})
-}
-
-func copyPlaybackStatesToUserItemData(app core.App, userItemData *core.Collection) error {
-	playbackStates, err := app.FindAllRecords("playback_states")
-	if err != nil {
-		return nil
-	}
-	for _, state := range playbackStates {
-		record := core.NewRecord(userItemData)
-		record.Set("gateway_user", state.GetString("gateway_user"))
-		record.Set("synthetic_user_id", state.GetString("synthetic_user_id"))
-		record.Set("item_id", state.GetString("item_id"))
-		record.Set("played", state.GetBool("played"))
-		record.Set("playback_position_ticks", state.GetFloat("playback_position_ticks"))
-		record.Set("played_percentage", state.GetFloat("played_percentage"))
-		record.Set("played_percentage_set", true)
-		if !state.GetDateTime("last_played_date").IsZero() {
-			record.Set("last_played_date", state.GetDateTime("last_played_date").Time())
-		}
-		record.Set("play_count", state.GetInt("play_count"))
-		if err := app.Save(record); err != nil {
-			return err
-		}
-	}
-	return nil
 }
