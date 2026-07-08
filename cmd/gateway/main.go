@@ -59,6 +59,9 @@ func main() {
 			if err := cleanupPlaybackEvents(e.App, time.Now().UTC()); err != nil {
 				e.App.Logger().Warn("Failed to cleanup playback events", "error", err)
 			}
+			if err := cleanupGatewaySessions(e.App, time.Now().UTC()); err != nil {
+				e.App.Logger().Warn("Failed to cleanup gateway sessions", "error", err)
+			}
 		}); err != nil {
 			return err
 		}
@@ -74,6 +77,12 @@ func main() {
 func cleanupPlaybackEvents(app core.App, now time.Time) error {
 	cutoff := now.UTC().Add(-6 * time.Hour)
 	_, err := app.DB().NewQuery("delete from playback_events where occurred_at < {:cutoff}").Bind(map[string]any{"cutoff": cutoff}).Execute()
+	return err
+}
+
+func cleanupGatewaySessions(app core.App, now time.Time) error {
+	cutoff := now.UTC().Add(-7 * 24 * time.Hour)
+	_, err := app.DB().NewQuery("delete from gateway_sessions where expires_at < {:cutoff} or (revoked_at is not null and revoked_at != '' and revoked_at < {:cutoff})").Bind(map[string]any{"cutoff": cutoff}).Execute()
 	return err
 }
 

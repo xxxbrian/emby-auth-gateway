@@ -38,6 +38,43 @@ func TestCleanupPlaybackEventsKeepsOnlyRecentEvents(t *testing.T) {
 	}
 }
 
+func TestCleanupGatewaySessionsKeepsOnlyRecentActiveOrRevokedSessions(t *testing.T) {
+	app, err := tests.NewTestAppWithConfig(core.BaseAppConfig{
+		DataDir:       t.TempDir(),
+		EncryptionEnv: "test",
+	})
+	if err != nil {
+		t.Fatalf("new test app: %v", err)
+	}
+	defer app.Cleanup()
+
+	userID := createTestUser(t, app)
+	accountID := createTestBackendAccount(t, app)
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	createGatewaySession(t, app, userID, accountID, "expired-old", now.Add(-8*24*time.Hour), nil)
+	revokedOld := now.Add(-8 * 24 * time.Hour)
+	createGatewaySession(t, app, userID, accountID, "revoked-old", now.Add(24*time.Hour), &revokedOld)
+	revokedRecent := now.Add(-6 * 24 * time.Hour)
+	createGatewaySession(t, app, userID, accountID, "revoked-recent", now.Add(24*time.Hour), &revokedRecent)
+	createGatewaySession(t, app, userID, accountID, "active", now.Add(24*time.Hour), nil)
+
+	if err := cleanupGatewaySessions(app, now); err != nil {
+		t.Fatalf("cleanup gateway sessions: %v", err)
+	}
+
+	records, err := app.FindAllRecords("gateway_sessions")
+	if err != nil {
+		t.Fatalf("query gateway sessions: %v", err)
+	}
+	remaining := map[string]bool{}
+	for _, record := range records {
+		remaining[record.GetString("gateway_token_hash")] = true
+	}
+	if len(remaining) != 2 || !remaining["revoked-recent"] || !remaining["active"] {
+		t.Fatalf("remaining gateway sessions = %#v, want revoked-recent and active", remaining)
+	}
+}
+
 func createTestUser(t *testing.T, app core.App) string {
 	t.Helper()
 	users, err := app.FindCollectionByNameOrId("users")
@@ -70,5 +107,61 @@ func createPlaybackEvent(t *testing.T, app core.App, userID, itemID string, occu
 	record.Set("occurred_at", occurredAt)
 	if err := app.Save(record); err != nil {
 		t.Fatalf("save playback event: %v", err)
+	}
+}
+
+func createTestBackendAccount(t *testing.T, app core.App) string {
+	t.Helper()
+	servers, err := app.FindCollectionByNameOrId("emby_servers")
+	if err != nil {
+		t.Fatalf("find emby_servers: %v", err)
+	}
+	server := core.NewRecord(servers)
+	server.Set("name", "test")
+	server.Set("base_url", "http://127.0.0.1:8096/emby")
+	server.Set("enabled", true)
+	if err := app.Save(server); err != nil {
+		t.Fatalf("save server: %v", err)
+	}
+
+	accounts, err := app.FindCollectionByNameOrId("backend_accounts")
+	if err != nil {
+		t.Fatalf("find backend_accounts: %v", err)
+	}
+	account := core.NewRecord(accounts)
+	account.Set("server", server.Id)
+	account.Set("name", "backend")
+	account.Set("backend_username", "shared")
+	account.Set("backend_password_encrypted", "encrypted")
+	account.Set("enabled", true)
+	if err := app.Save(account); err != nil {
+		t.Fatalf("save account: %v", err)
+	}
+	return account.Id
+}
+
+func createGatewaySession(t *testing.T, app core.App, userID, accountID, tokenHash string, expiresAt time.Time, revokedAt *time.Time) {
+	t.Helper()
+	sessions, err := app.FindCollectionByNameOrId("gateway_sessions")
+	if err != nil {
+		t.Fatalf("find gateway_sessions: %v", err)
+	}
+	record := core.NewRecord(sessions)
+	record.Set("gateway_token_hash", tokenHash)
+	record.Set("gateway_user", userID)
+	record.Set("gateway_username", "alice")
+	record.Set("synthetic_user_id", "gateway-user")
+	record.Set("backend_account", accountID)
+	record.Set("backend_server_id", "server")
+	record.Set("backend_base_url", "http://127.0.0.1:8096/emby")
+	record.Set("backend_user_id", "backend-user")
+	record.Set("backend_username", "shared")
+	record.Set("backend_token_encrypted", "encrypted")
+	record.Set("expires_at", expiresAt)
+	if revokedAt != nil {
+		record.Set("revoked_at", *revokedAt)
+	}
+	if err := app.Save(record); err != nil {
+		t.Fatalf("save gateway session: %v", err)
 	}
 }
