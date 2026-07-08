@@ -18,16 +18,6 @@ import (
 	"time"
 )
 
-const (
-	backendAuthTimeout         = 15 * time.Second
-	proxyResponseHeaderTimeout = 30 * time.Second
-	proxyIdleConnTimeout       = 90 * time.Second
-	loginFailureLimit          = 5
-	loginFailureBlockDuration  = time.Minute
-	proxyJSONLimit             = 20 << 20
-	proxyM3U8Limit             = 20 << 20
-)
-
 type Server struct {
 	cfg         Config
 	store       Store

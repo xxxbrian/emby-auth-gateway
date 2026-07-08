@@ -13,8 +13,6 @@ import (
 	"time"
 )
 
-const personalIDBatchLimit = 200
-
 func (s *Server) handlePersonalDataRequest(w http.ResponseWriter, r *http.Request, rel string, session *Session, gatewayToken string) bool {
 	if s.handleDisplayPreferences(w, r, rel, session) {
 		return true
