@@ -37,6 +37,15 @@ func NewServer(cfg Config, store Store) *Server {
 	if cfg.GatewayServerID == "" {
 		cfg.GatewayServerID = "emby-auth-gateway"
 	}
+	if cfg.MinResumePct <= 0 {
+		cfg.MinResumePct = defaultMinResumePct
+	}
+	if cfg.MaxResumePct <= 0 {
+		cfg.MaxResumePct = defaultMaxResumePct
+	}
+	if cfg.MinResumeDurationSeconds <= 0 {
+		cfg.MinResumeDurationSeconds = defaultMinResumeDurationSeconds
+	}
 	client := cfg.HTTPClient
 	if client == nil {
 		client = &http.Client{Timeout: backendAuthTimeout}
@@ -571,24 +580,16 @@ func isPlaybackRequest(method, rel string) bool {
 }
 
 func (s *Server) recordPlaybackRequest(r *http.Request, rel string, session *Session, gatewayToken string) error {
-	if r.Body == nil {
-		return nil
+	var data []byte
+	if r.Body != nil {
+		var err error
+		data, err = io.ReadAll(http.MaxBytesReader(nilResponseWriter{}, r.Body, 10<<20))
+		r.Body = io.NopCloser(bytes.NewReader(data))
+		if err != nil {
+			return err
+		}
 	}
-	if ct := r.Header.Get("Content-Type"); ct != "" && !isJSONContentType(ct) {
-		return nil
-	}
-	data, err := io.ReadAll(http.MaxBytesReader(nilResponseWriter{}, r.Body, 10<<20))
-	r.Body = io.NopCloser(bytes.NewReader(data))
-	if err != nil {
-		return err
-	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	var body any
-	if err := decoder.Decode(&body); err != nil {
-		return nil
-	}
-	details, ok := playbackDetailsFromJSON(body)
+	details, ok := playbackDetailsFromRequest(r, data)
 	if !ok || details.ItemID == "" {
 		return nil
 	}
@@ -652,11 +653,69 @@ func (s *Server) recordPlaybackRequest(r *http.Request, rel string, session *Ses
 		if state.RunTimeTicks <= 0 {
 			s.enrichPlaybackStateMetadata(r.Context(), r, session, gatewayToken, state)
 		}
-		applyStoppedPlaybackState(state, now, wasPlayed)
+		applyStoppedPlaybackState(state, now, wasPlayed, s.resumePolicyForState(state))
 	}
 	state.UpdatedAt = now
 	_ = s.store.SavePlaybackState(r.Context(), *state)
 	return nil
+}
+
+func playbackDetailsFromRequest(r *http.Request, data []byte) (playbackDetails, bool) {
+	ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if len(bytes.TrimSpace(data)) > 0 {
+		if ct == "application/x-www-form-urlencoded" {
+			values, err := url.ParseQuery(string(data))
+			if err == nil {
+				merged := cloneQuery(r.URL.Query())
+				for key, vals := range values {
+					merged[key] = append([]string(nil), vals...)
+				}
+				return playbackDetailsFromValues(merged)
+			}
+		}
+		if ct == "" || isJSONContentType(ct) || looksLikeJSON(data) {
+			decoder := json.NewDecoder(bytes.NewReader(data))
+			decoder.UseNumber()
+			var body any
+			if err := decoder.Decode(&body); err == nil {
+				if details, ok := playbackDetailsFromJSON(body); ok {
+					return mergePlaybackDetails(details, r.URL.Query()), true
+				}
+				if details, ok := playbackDetailsFromValues(r.URL.Query()); ok {
+					if bodyDetails, bodyOK := playbackDetailsFromJSON(body); bodyOK || bodyDetails.HasPositionTicks || bodyDetails.HasRunTimeTicks || bodyDetails.Played != nil || bodyDetails.PlayedPercentage != nil {
+						return mergePlaybackDetails(bodyDetails, r.URL.Query()), true
+					}
+					return details, true
+				}
+			}
+		}
+	}
+	return playbackDetailsFromValues(r.URL.Query())
+}
+
+func mergePlaybackDetails(details playbackDetails, values url.Values) playbackDetails {
+	queryDetails, ok := playbackDetailsFromValues(values)
+	if !ok {
+		return details
+	}
+	if details.ItemID == "" {
+		details.ItemID = queryDetails.ItemID
+	}
+	if !details.HasPositionTicks && queryDetails.HasPositionTicks {
+		details.PositionTicks = queryDetails.PositionTicks
+		details.HasPositionTicks = true
+	}
+	if !details.HasRunTimeTicks && queryDetails.HasRunTimeTicks {
+		details.RunTimeTicks = queryDetails.RunTimeTicks
+		details.HasRunTimeTicks = true
+	}
+	if details.Played == nil && queryDetails.Played != nil {
+		details.Played = queryDetails.Played
+	}
+	if details.PlayedPercentage == nil && queryDetails.PlayedPercentage != nil {
+		details.PlayedPercentage = queryDetails.PlayedPercentage
+	}
+	return details
 }
 
 type playbackDetails struct {
@@ -730,7 +789,80 @@ func playbackDetailsFromJSON(v any) (playbackDetails, bool) {
 	return details, details.ItemID != ""
 }
 
-func applyStoppedPlaybackState(state *PlaybackState, now time.Time, wasPlayed bool) {
+func playbackDetailsFromValues(values url.Values) (playbackDetails, bool) {
+	details := playbackDetails{}
+	details.ItemID = firstValue(values, "ItemId", "ItemID", "Item.Id", "Id")
+	if ticks, ok := int64Value(values, "PositionTicks", "PlaybackPositionTicks"); ok {
+		details.PositionTicks = ticks
+		details.HasPositionTicks = true
+	}
+	if ticks, ok := int64Value(values, "RunTimeTicks"); ok {
+		details.RunTimeTicks = ticks
+		details.HasRunTimeTicks = true
+	}
+	if played, ok := boolValue(values, "Played"); ok {
+		details.Played = &played
+	}
+	if percentage, ok := float64Value(values, "PlayedPercentage"); ok {
+		details.PlayedPercentage = &percentage
+	}
+	return details, details.ItemID != ""
+}
+
+func firstValue(values url.Values, names ...string) string {
+	for _, name := range names {
+		if value := strings.TrimSpace(values.Get(name)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func int64Value(values url.Values, names ...string) (int64, bool) {
+	for _, name := range names {
+		if raw := strings.TrimSpace(values.Get(name)); raw != "" {
+			v, err := strconv.ParseInt(raw, 10, 64)
+			return v, err == nil
+		}
+	}
+	return 0, false
+}
+
+func float64Value(values url.Values, names ...string) (float64, bool) {
+	for _, name := range names {
+		if raw := strings.TrimSpace(values.Get(name)); raw != "" {
+			v, err := strconv.ParseFloat(raw, 64)
+			return v, err == nil
+		}
+	}
+	return 0, false
+}
+
+func boolValue(values url.Values, names ...string) (bool, bool) {
+	for _, name := range names {
+		if raw := strings.TrimSpace(values.Get(name)); raw != "" {
+			v, err := strconv.ParseBool(raw)
+			return v, err == nil
+		}
+	}
+	return false, false
+}
+
+type resumePolicy struct {
+	MinPct             float64
+	MaxPct             float64
+	MinDurationSeconds float64
+}
+
+func (s *Server) resumePolicyForState(state *PlaybackState) resumePolicy {
+	policy := resumePolicy{MinPct: s.cfg.MinResumePct, MaxPct: s.cfg.MaxResumePct, MinDurationSeconds: s.cfg.MinResumeDurationSeconds}
+	if state != nil && (strings.EqualFold(state.ItemType, "AudioBook") || strings.EqualFold(state.ItemType, "Book")) {
+		policy.MinDurationSeconds = 0
+	}
+	return policy
+}
+
+func applyStoppedPlaybackState(state *PlaybackState, now time.Time, wasPlayed bool, policy resumePolicy) {
 	completed := state.Played
 	position := state.PlaybackPositionTicks
 	if position < 0 {
@@ -741,16 +873,16 @@ func applyStoppedPlaybackState(state *PlaybackState, now time.Time, wasPlayed bo
 		percentage := (float64(position) / float64(runtime)) * 100
 		durationSeconds := float64(runtime) / float64(embyTicksPerSecond)
 		switch {
-		case percentage < minResumePct:
+		case percentage < policy.MinPct:
 			position = 0
 			state.PlayedPercentage = nil
-		case percentage > maxResumePct || position >= runtime-embyTicksPerSecond:
+		case percentage > policy.MaxPct || position >= runtime-embyTicksPerSecond:
 			completed = true
-		case durationSeconds < minResumeDurationSeconds:
+		case policy.MinDurationSeconds > 0 && durationSeconds < policy.MinDurationSeconds:
 			completed = true
 		}
 	}
-	if !completed && state.PlayedPercentage != nil && *state.PlayedPercentage >= maxResumePct {
+	if !completed && state.PlayedPercentage != nil && *state.PlayedPercentage >= policy.MaxPct {
 		completed = true
 	}
 	if completed {
@@ -800,7 +932,7 @@ func (s *Server) writeProxyResponse(w http.ResponseWriter, r *http.Request, rel 
 		return
 	}
 
-	if isJSONContentType(ct) {
+	if isJSONContentType(ct) || strings.TrimSpace(ct) == "" {
 		data, err := readLimited(resp.Body, proxyJSONLimit)
 		if err != nil {
 			s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "proxy_read_failed", Message: "backend response read failed", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
@@ -808,9 +940,9 @@ func (s *Server) writeProxyResponse(w http.ResponseWriter, r *http.Request, rel 
 			return
 		}
 		var value any
-		if err := json.Unmarshal(data, &value); err == nil {
+		if looksLikeJSON(data) && json.Unmarshal(data, &value) == nil {
 			w.Header().Del("Content-Length")
-			writeJSON(w, resp.StatusCode, s.rewriteProxyJSONValue(r.Context(), value, session, gatewayToken, publicGatewayBase))
+			writeJSON(w, resp.StatusCode, s.rewriteProxyJSONValueForRequest(r.Context(), r, value, session, gatewayToken, publicGatewayBase))
 			return
 		}
 		w.WriteHeader(resp.StatusCode)
@@ -823,6 +955,10 @@ func (s *Server) writeProxyResponse(w http.ResponseWriter, r *http.Request, rel 
 }
 
 func (s *Server) rewriteProxyJSONValue(ctx context.Context, v any, session *Session, gatewayToken, publicGatewayBase string) any {
+	return s.rewriteProxyJSONValueForRequest(ctx, nil, v, session, gatewayToken, publicGatewayBase)
+}
+
+func (s *Server) rewriteProxyJSONValueForRequest(ctx context.Context, r *http.Request, v any, session *Session, gatewayToken, publicGatewayBase string) any {
 	rewritten := rewriteJSONValue(v, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
 	if session == nil {
 		return rewritten
@@ -837,8 +973,70 @@ func (s *Server) rewriteProxyJSONValue(ctx context.Context, v any, session *Sess
 	if err != nil {
 		aggregates = PlaybackAggregates{Series: map[string]PlaybackAggregate{}, Seasons: map[string]PlaybackAggregate{}}
 	}
+	s.applyChildCountsToAggregates(ctx, r, session, gatewayToken, rewritten, &aggregates)
 	s.overlayUserData(rewritten, session, states, aggregates)
 	return rewritten
+}
+
+func (s *Server) applyChildCountsToAggregates(ctx context.Context, r *http.Request, session *Session, gatewayToken string, value any, aggregates *PlaybackAggregates) {
+	ids := aggregateIDsFromValue(value)
+	counts, err := s.store.ListItemChildCounts(ctx, session.BackendAccountID, ids)
+	if err != nil {
+		counts = map[string]ItemChildCount{}
+	}
+	missing := []string{}
+	for _, id := range ids {
+		if count, ok := counts[id]; ok && count.ChildCount > 0 {
+			applyAggregateTotal(aggregates, id, count.ChildCount)
+			continue
+		}
+		if r != nil && len(missing) < aggregateChildCountLookups {
+			missing = append(missing, id)
+		}
+	}
+	for _, id := range missing {
+		count := s.fetchItemChildCount(ctx, r, session, gatewayToken, id)
+		if count <= 0 {
+			continue
+		}
+		applyAggregateTotal(aggregates, id, count)
+		_ = s.store.SaveItemChildCount(ctx, ItemChildCount{BackendAccountID: session.BackendAccountID, ItemID: id, ChildCount: count})
+	}
+}
+
+func (s *Server) fetchItemChildCount(ctx context.Context, r *http.Request, session *Session, gatewayToken, itemID string) int {
+	q := url.Values{}
+	q.Set("ParentId", itemID)
+	q.Set("Recursive", "true")
+	q.Set("IncludeItemTypes", "Episode")
+	q.Set("Limit", "0")
+	value, status, err := s.fetchBackendJSON(ctx, r, "/Users/"+session.SyntheticUserID+"/Items", q.Encode(), session, gatewayToken)
+	if err != nil || status < 200 || status >= 300 {
+		return 0
+	}
+	if total, ok := totalRecordCount(value); ok {
+		return total
+	}
+	return len(extractItems(value))
+}
+
+func aggregateIDsFromValue(value any) []string {
+	seriesIDs, seasonIDs := collectAggregateItemIDs(value)
+	ids := make([]string, 0, len(seriesIDs)+len(seasonIDs))
+	ids = append(ids, seriesIDs...)
+	ids = append(ids, seasonIDs...)
+	return ids
+}
+
+func applyAggregateTotal(aggregates *PlaybackAggregates, itemID string, count int) {
+	if aggregate, ok := aggregates.Series[itemID]; ok {
+		aggregate.TotalItemCount = count
+		aggregates.Series[itemID] = aggregate
+	}
+	if aggregate, ok := aggregates.Seasons[itemID]; ok {
+		aggregate.TotalItemCount = count
+		aggregates.Seasons[itemID] = aggregate
+	}
 }
 
 func collectUserDataItemIDs(v any) []string {
@@ -996,7 +1194,7 @@ func applyAggregateUserData(userData map[string]any, item map[string]any, aggreg
 	}
 	total := itemChildCount(item)
 	if total <= 0 {
-		total = aggregate.KnownItemCount
+		total = aggregate.TotalItemCount
 	}
 	if total <= 0 {
 		return
@@ -1168,6 +1366,11 @@ func isHopHeader(k string) bool {
 func isJSONContentType(ct string) bool {
 	mt, _, _ := mime.ParseMediaType(ct)
 	return mt == "application/json" || strings.HasSuffix(mt, "+json")
+}
+
+func looksLikeJSON(data []byte) bool {
+	data = bytes.TrimSpace(data)
+	return len(data) > 0 && (data[0] == '{' || data[0] == '[')
 }
 
 func isM3U8ContentType(ct string) bool {
