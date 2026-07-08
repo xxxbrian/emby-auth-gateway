@@ -10,6 +10,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"path"
 	"strings"
@@ -288,6 +289,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 		http.Error(w, "bad backend url", http.StatusBadGateway)
 		return
 	}
+	if isUpgradeRequest(r) {
+		s.handleUpgradeProxy(w, r, proxyURL, session, gatewayToken)
+		return
+	}
 
 	body, err := s.rewriteRequestBody(r, session, gatewayToken)
 	if err != nil {
@@ -314,6 +319,20 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 	defer resp.Body.Close()
 
 	s.writeProxyResponse(w, resp, session, gatewayToken)
+}
+
+func (s *Server) handleUpgradeProxy(w http.ResponseWriter, r *http.Request, proxyURL *url.URL, session *Session, gatewayToken string) {
+	proxy := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL = proxyURL
+			req.Host = proxyURL.Host
+			s.rewriteRequestHeaders(req.Header, session, gatewayToken)
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			http.Error(w, "backend unavailable", http.StatusBadGateway)
+		},
+	}
+	proxy.ServeHTTP(w, r)
 }
 
 func (s *Server) activeSession(w http.ResponseWriter, r *http.Request, token string) (*Session, bool) {
@@ -379,7 +398,6 @@ func (s *Server) rewriteRequestHeaders(h http.Header, session *Session, gatewayT
 			h.Set(name, auth.String())
 		}
 	}
-	removeHopHeaders(h)
 }
 
 func (s *Server) rewriteRequestBody(r *http.Request, session *Session, gatewayToken string) (io.Reader, error) {
@@ -559,6 +577,21 @@ func isM3U8ContentType(ct string) bool {
 func isStreamingContentType(ct string) bool {
 	mt, _, _ := mime.ParseMediaType(ct)
 	return strings.HasPrefix(mt, "video/") || strings.HasPrefix(mt, "audio/") || strings.HasPrefix(mt, "image/") || mt == "application/octet-stream"
+}
+
+func isUpgradeRequest(r *http.Request) bool {
+	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") && headerHasToken(r.Header, "Connection", "upgrade")
+}
+
+func headerHasToken(h http.Header, name, token string) bool {
+	for _, value := range h.Values(name) {
+		for _, part := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), token) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func isRewriteableContentType(ct string) bool {

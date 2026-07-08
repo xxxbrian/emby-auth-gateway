@@ -1,10 +1,13 @@
 package gateway
 
 import (
+	"bufio"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -219,6 +222,111 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 	_ = postLogoutResp.Body.Close()
 	if postLogoutResp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected revoked token to be unauthorized, got %d", postLogoutResp.StatusCode)
+	}
+}
+
+func TestGatewayWebSocketUpgradeProxy(t *testing.T) {
+	const (
+		backendToken    = "backend-token-secret"
+		backendUserID   = "backend-user-id"
+		syntheticUserID = "gateway-user-id"
+	)
+	var sawBackendToken bool
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/emby/Users/AuthenticateByName":
+			writeTestJSON(w, map[string]any{
+				"AccessToken": backendToken,
+				"ServerId":    "backend-server-id",
+				"User": map[string]any{
+					"Id":   backendUserID,
+					"Name": "shared",
+				},
+			})
+		case "/emby/socket":
+			if r.URL.Query().Get("api_key") == backendToken && r.Header.Get("X-Emby-Token") == backendToken {
+				sawBackendToken = true
+			}
+			if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+				t.Fatalf("expected websocket upgrade, got %q", r.Header.Get("Upgrade"))
+			}
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("response writer does not support hijacking")
+			}
+			conn, rw, err := hj.Hijack()
+			if err != nil {
+				t.Fatalf("hijack backend: %v", err)
+			}
+			defer conn.Close()
+			_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\nbackend-upgrade-ok")
+			_ = rw.Flush()
+		default:
+			t.Fatalf("unexpected backend request %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer backend.Close()
+
+	store := NewMemoryStore()
+	store.Users["u1"] = MemoryUser{
+		GatewayUser: GatewayUser{ID: "u1", Username: "alice", SyntheticUserID: syntheticUserID, Enabled: true},
+		Password:    "alice-pass",
+	}
+	store.Mappings["u1"] = UserMapping{
+		ID:               "m1",
+		GatewayUserID:    "u1",
+		BackendAccountID: "b1",
+		Enabled:          true,
+		BackendAccount: BackendAccount{
+			ID:       "b1",
+			BaseURL:  backend.URL + "/emby",
+			Username: "shared",
+			Password: "backend-pass",
+			Enabled:  true,
+		},
+	}
+
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	loginReq := mustRequest(t, http.MethodPost, gw.URL+"/emby/Users/AuthenticateByName", strings.NewReader(`{"Username":"alice","Pw":"alice-pass"}`))
+	loginReq.Header.Set("Content-Type", "application/json")
+	loginResp := do(t, loginReq)
+	defer loginResp.Body.Close()
+	var login map[string]any
+	decodeJSON(t, loginResp.Body, &login)
+	gatewayToken, _ := login["AccessToken"].(string)
+	if gatewayToken == "" {
+		t.Fatal("missing gateway token")
+	}
+
+	gwURL, err := url.Parse(gw.URL)
+	if err != nil {
+		t.Fatalf("parse gateway url: %v", err)
+	}
+	conn, err := net.Dial("tcp", gwURL.Host)
+	if err != nil {
+		t.Fatalf("dial gateway: %v", err)
+	}
+	defer conn.Close()
+	_, _ = conn.Write([]byte("GET /emby/socket?api_key=" + gatewayToken + " HTTP/1.1\r\n" +
+		"Host: " + gwURL.Host + "\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+		"Sec-WebSocket-Version: 13\r\n\r\n"))
+
+	reader := bufio.NewReader(conn)
+	status, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read upgrade status: %v", err)
+	}
+	if !strings.Contains(status, "101") {
+		t.Fatalf("expected 101 upgrade, got %q", status)
+	}
+	if !sawBackendToken {
+		t.Fatal("backend did not receive mapped token on websocket upgrade")
 	}
 }
 
