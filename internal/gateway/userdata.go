@@ -426,7 +426,7 @@ func (s *Server) resolveItemsByID(ctx context.Context, r *http.Request, session 
 			continue
 		}
 		fingerprint := itemFingerprint(item)
-		if state.Fingerprint != "" && fingerprint != "" && state.Fingerprint != fingerprint {
+		if state.Fingerprint != "" && fingerprint != "" && !fingerprintsCompatible(state.Fingerprint, fingerprint) {
 			state.OrphanedAt = &now
 			_ = s.store.SavePlaybackState(ctx, *state)
 			continue
@@ -693,6 +693,32 @@ func itemFingerprint(item map[string]any) string {
 		}
 	}
 	return strings.Join(parts, "|")
+}
+
+func fingerprintsCompatible(a, b string) bool {
+	aParts := fingerprintParts(a)
+	bParts := fingerprintParts(b)
+	if len(aParts) == 0 || len(bParts) == 0 {
+		return true
+	}
+	for key, aValue := range aParts {
+		if bValue, ok := bParts[key]; ok && bValue != aValue {
+			return false
+		}
+	}
+	return true
+}
+
+func fingerprintParts(fingerprint string) map[string]string {
+	parts := map[string]string{}
+	for _, part := range strings.Split(fingerprint, "|") {
+		name, value, ok := strings.Cut(part, "=")
+		if !ok || name == "" {
+			continue
+		}
+		parts[name] = value
+	}
+	return parts
 }
 
 func splitFilterValues(values []string) []string {

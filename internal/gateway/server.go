@@ -730,8 +730,6 @@ func playbackDetailsFromJSON(v any) (playbackDetails, bool) {
 }
 
 func applyStoppedPlaybackState(state *PlaybackState, now time.Time, wasPlayed bool) {
-	lastPlayed := now
-	state.LastPlayedDate = &lastPlayed
 	completed := state.Played
 	position := state.PlaybackPositionTicks
 	if position < 0 {
@@ -757,6 +755,8 @@ func applyStoppedPlaybackState(state *PlaybackState, now time.Time, wasPlayed bo
 		completed = true
 	}
 	if completed {
+		lastPlayed := now
+		state.LastPlayedDate = &lastPlayed
 		state.Played = true
 		state.PlaybackPositionTicks = 0
 		state.PlayedPercentage = floatPtr(100)

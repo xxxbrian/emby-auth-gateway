@@ -779,7 +779,7 @@ func TestStoppedPlaybackUsesEmbyTicksForResumeThresholds(t *testing.T) {
 		PlaybackPositionTicks: 3 * 60 * embyTicksPerSecond,
 	}
 	applyStoppedPlaybackState(state, now, false)
-	if state.Played || state.PlaybackPositionTicks != 3*60*embyTicksPerSecond || state.PlayCount != 0 {
+	if state.Played || state.PlaybackPositionTicks != 3*60*embyTicksPerSecond || state.PlayCount != 0 || state.LastPlayedDate != nil {
 		t.Fatalf("10%% into a 30 minute video should remain resumable: %#v", state)
 	}
 }
@@ -957,7 +957,7 @@ func TestResumeUsesGatewayStateAndResolvesExistingItems(t *testing.T) {
 	u2.SyntheticUserID = "gateway-user-2"
 	store.Sessions[u2.GatewayTokenHash] = &u2
 	pct := 12.5
-	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "item-u1", SeriesID: "show-1", PlaybackPositionTicks: 1200, PlayedPercentage: &pct, UpdatedAt: time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)})
+	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "item-u1", SeriesID: "show-1", PlaybackPositionTicks: 1200, PlayedPercentage: &pct, Fingerprint: "type=Episode", UpdatedAt: time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)})
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "item-u1-older", SeriesID: "show-1", PlaybackPositionTicks: 1000, UpdatedAt: time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)})
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "missing-item", PlaybackPositionTicks: 800, UpdatedAt: time.Date(2026, 7, 8, 11, 0, 0, 0, time.UTC)})
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u2", SyntheticUserID: "gateway-user-2", ItemID: "item-u2", PlaybackPositionTicks: 9999})
@@ -980,6 +980,10 @@ func TestResumeUsesGatewayStateAndResolvesExistingItems(t *testing.T) {
 	missing, err := store.FindPlaybackState(context.Background(), "u1", "missing-item")
 	if err != nil || missing.OrphanedAt == nil {
 		t.Fatalf("missing item was not marked orphaned: %#v err=%v", missing, err)
+	}
+	resolved, err := store.FindPlaybackState(context.Background(), "u1", "item-u1")
+	if err != nil || resolved.OrphanedAt != nil || resolved.Fingerprint == "type=Episode" {
+		t.Fatalf("partial fingerprint should be compatible with resolved item metadata: %#v err=%v", resolved, err)
 	}
 }
 
