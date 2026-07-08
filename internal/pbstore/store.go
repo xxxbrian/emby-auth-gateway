@@ -259,6 +259,91 @@ func (s *Store) ListPlaybackAggregates(ctx context.Context, gatewayUserID string
 	return aggregates, nil
 }
 
+func (s *Store) ListItemChildCounts(ctx context.Context, backendAccountID string, itemIDs []string) (map[string]gateway.ItemChildCount, error) {
+	counts := map[string]gateway.ItemChildCount{}
+	if backendAccountID == "" || len(itemIDs) == 0 {
+		return counts, nil
+	}
+	for start := 0; start < len(itemIDs); start += playbackStateItemIDBatchLimit {
+		end := start + playbackStateItemIDBatchLimit
+		if end > len(itemIDs) {
+			end = len(itemIDs)
+		}
+		batch, err := s.listItemChildCountBatch(ctx, backendAccountID, itemIDs[start:end])
+		if err != nil {
+			return nil, err
+		}
+		for itemID, count := range batch {
+			counts[itemID] = count
+		}
+	}
+	return counts, nil
+}
+
+func (s *Store) listItemChildCountBatch(ctx context.Context, backendAccountID string, itemIDs []string) (map[string]gateway.ItemChildCount, error) {
+	filterParts := make([]string, 0, len(itemIDs))
+	params := dbx.Params{"backendAccountID": backendAccountID}
+	for i, itemID := range itemIDs {
+		if itemID == "" {
+			continue
+		}
+		name := fmt.Sprintf("itemID%d", i)
+		filterParts = append(filterParts, "item_id = {:"+name+"}")
+		params[name] = itemID
+	}
+	if len(filterParts) == 0 {
+		return map[string]gateway.ItemChildCount{}, nil
+	}
+	records, err := s.app.FindRecordsByFilter(
+		"item_child_counts",
+		"backend_account_id = {:backendAccountID} && ("+strings.Join(filterParts, " || ")+")",
+		"",
+		0,
+		0,
+		params,
+	)
+	if err != nil {
+		return nil, err
+	}
+	counts := make(map[string]gateway.ItemChildCount, len(records))
+	for _, record := range records {
+		count := itemChildCountFromRecord(record)
+		counts[count.ItemID] = count
+	}
+	return counts, nil
+}
+
+func (s *Store) SaveItemChildCount(ctx context.Context, count gateway.ItemChildCount) error {
+	if count.BackendAccountID == "" || count.ItemID == "" || count.ChildCount <= 0 {
+		return nil
+	}
+	records, err := s.app.FindRecordsByFilter(
+		"item_child_counts",
+		"backend_account_id = {:backendAccountID} && item_id = {:itemID}",
+		"",
+		1,
+		0,
+		dbx.Params{"backendAccountID": count.BackendAccountID, "itemID": count.ItemID},
+	)
+	if err != nil {
+		return err
+	}
+	var record *core.Record
+	if len(records) > 0 {
+		record = records[0]
+	} else {
+		collection, err := s.app.FindCollectionByNameOrId("item_child_counts")
+		if err != nil {
+			return err
+		}
+		record = core.NewRecord(collection)
+		record.Set("backend_account_id", count.BackendAccountID)
+		record.Set("item_id", count.ItemID)
+	}
+	record.Set("child_count", count.ChildCount)
+	return s.app.Save(record)
+}
+
 func (s *Store) ListPlaybackStates(ctx context.Context, gatewayUserID string, filter gateway.PlaybackStateFilter) ([]gateway.PlaybackState, error) {
 	records, err := s.app.FindRecordsByFilter(
 		"user_item_data",
@@ -660,6 +745,15 @@ func displayPreferenceFromRecord(record *core.Record) *gateway.DisplayPreference
 		Client:          record.GetString("client"),
 		PayloadJSON:     record.GetString("payload_json"),
 		UpdatedAt:       record.GetDateTime("updated").Time(),
+	}
+}
+
+func itemChildCountFromRecord(record *core.Record) gateway.ItemChildCount {
+	return gateway.ItemChildCount{
+		BackendAccountID: record.GetString("backend_account_id"),
+		ItemID:           record.GetString("item_id"),
+		ChildCount:       record.GetInt("child_count"),
+		UpdatedAt:        record.GetDateTime("updated").Time(),
 	}
 }
 

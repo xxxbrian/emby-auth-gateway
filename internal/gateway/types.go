@@ -11,10 +11,13 @@ import (
 )
 
 type Config struct {
-	PublicBaseURL   string
-	GatewayBasePath string
-	GatewayServerID string
-	HTTPClient      *http.Client
+	PublicBaseURL            string
+	GatewayBasePath          string
+	GatewayServerID          string
+	HTTPClient               *http.Client
+	MinResumePct             float64
+	MaxResumePct             float64
+	MinResumeDurationSeconds float64
 }
 
 type Store interface {
@@ -30,6 +33,8 @@ type Store interface {
 	FindPlaybackState(ctx context.Context, gatewayUserID, itemID string) (*PlaybackState, error)
 	ListPlaybackStatesByItemIDs(ctx context.Context, gatewayUserID string, itemIDs []string) (map[string]*PlaybackState, error)
 	ListPlaybackAggregates(ctx context.Context, gatewayUserID string, seriesIDs, seasonIDs []string) (PlaybackAggregates, error)
+	ListItemChildCounts(ctx context.Context, backendAccountID string, itemIDs []string) (map[string]ItemChildCount, error)
+	SaveItemChildCount(ctx context.Context, count ItemChildCount) error
 	ListPlaybackStates(ctx context.Context, gatewayUserID string, filter PlaybackStateFilter) ([]PlaybackState, error)
 	SavePlaybackState(ctx context.Context, state PlaybackState) error
 	FindDisplayPreference(ctx context.Context, gatewayUserID, preferenceID, client string) (*DisplayPreference, error)
@@ -124,6 +129,7 @@ type PlaybackStateFilter struct {
 type PlaybackAggregate struct {
 	PlayedCount      int
 	KnownItemCount   int
+	TotalItemCount   int
 	LastPlayedDate   *time.Time
 	LastActivityDate *time.Time
 }
@@ -131,6 +137,13 @@ type PlaybackAggregate struct {
 type PlaybackAggregates struct {
 	Series  map[string]PlaybackAggregate
 	Seasons map[string]PlaybackAggregate
+}
+
+type ItemChildCount struct {
+	BackendAccountID string
+	ItemID           string
+	ChildCount       int
+	UpdatedAt        time.Time
 }
 
 type DisplayPreference struct {

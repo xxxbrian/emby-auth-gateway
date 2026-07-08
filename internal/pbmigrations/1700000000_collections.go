@@ -161,6 +161,18 @@ func init() {
 			return err
 		}
 
+		itemChildCounts := core.NewBaseCollection("item_child_counts")
+		lockCollection(itemChildCounts)
+		itemChildCounts.Fields.Add(&core.TextField{Name: "backend_account_id", Required: true, Max: 80})
+		itemChildCounts.Fields.Add(&core.TextField{Name: "item_id", Required: true, Max: 80})
+		itemChildCounts.Fields.Add(&core.NumberField{Name: "child_count", Required: true, OnlyInt: true})
+		itemChildCounts.Fields.Add(&core.AutodateField{Name: "created", OnCreate: true})
+		itemChildCounts.Fields.Add(&core.AutodateField{Name: "updated", OnCreate: true, OnUpdate: true})
+		itemChildCounts.AddIndex("idx_item_child_counts_account_item", true, "backend_account_id, item_id", "")
+		if err := app.Save(itemChildCounts); err != nil {
+			return err
+		}
+
 		displayPreferences := core.NewBaseCollection("display_preferences")
 		lockCollection(displayPreferences)
 		displayPreferences.Fields.Add(&core.RelationField{Name: "gateway_user", CollectionId: users.Id, Required: true, MaxSelect: 1})
@@ -191,7 +203,7 @@ func init() {
 }
 
 func gatewayCollectionNames() []string {
-	return []string{"users", "emby_servers", "backend_accounts", "user_mappings", "gateway_sessions", "audit_logs", "playback_events", "user_item_data", "display_preferences", "path_policies"}
+	return []string{"users", "emby_servers", "backend_accounts", "user_mappings", "gateway_sessions", "audit_logs", "playback_events", "user_item_data", "item_child_counts", "display_preferences", "path_policies"}
 }
 
 func lockCollection(collection *core.Collection) {

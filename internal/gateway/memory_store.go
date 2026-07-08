@@ -16,6 +16,7 @@ type MemoryStore struct {
 	PathPolicies       []PathPolicy
 	PlaybackEvents     []PlaybackEvent
 	PlaybackStates     map[string]*PlaybackState
+	ItemChildCounts    map[string]ItemChildCount
 	DisplayPreferences map[string]*DisplayPreference
 }
 
@@ -30,6 +31,7 @@ func NewMemoryStore() *MemoryStore {
 		Mappings:           map[string]UserMapping{},
 		Sessions:           map[string]*Session{},
 		PlaybackStates:     map[string]*PlaybackState{},
+		ItemChildCounts:    map[string]ItemChildCount{},
 		DisplayPreferences: map[string]*DisplayPreference{},
 	}
 }
@@ -183,6 +185,31 @@ func (m *MemoryStore) ListPlaybackAggregates(ctx context.Context, gatewayUserID 
 	return aggregates, nil
 }
 
+func (m *MemoryStore) ListItemChildCounts(ctx context.Context, backendAccountID string, itemIDs []string) (map[string]ItemChildCount, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	counts := map[string]ItemChildCount{}
+	for _, itemID := range itemIDs {
+		if count, ok := m.ItemChildCounts[itemChildCountKey(backendAccountID, itemID)]; ok {
+			counts[itemID] = count
+		}
+	}
+	return counts, nil
+}
+
+func (m *MemoryStore) SaveItemChildCount(ctx context.Context, count ItemChildCount) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ItemChildCounts == nil {
+		m.ItemChildCounts = map[string]ItemChildCount{}
+	}
+	if count.UpdatedAt.IsZero() {
+		count.UpdatedAt = time.Now().UTC()
+	}
+	m.ItemChildCounts[itemChildCountKey(count.BackendAccountID, count.ItemID)] = count
+	return nil
+}
+
 func playbackIDSet(ids []string) map[string]bool {
 	set := map[string]bool{}
 	for _, id := range ids {
@@ -319,6 +346,10 @@ func (m *MemoryStore) RevokeSession(ctx context.Context, tokenHash string) error
 
 func playbackStateKey(gatewayUserID, itemID string) string {
 	return gatewayUserID + "\x00" + itemID
+}
+
+func itemChildCountKey(backendAccountID, itemID string) string {
+	return backendAccountID + "\x00" + itemID
 }
 
 func displayPreferenceKey(gatewayUserID, preferenceID, client string) string {
