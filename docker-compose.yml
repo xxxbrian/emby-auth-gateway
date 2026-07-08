@@ -4,7 +4,6 @@ services:
     ports:
       - "${GATEWAY_PORT:-8090}:8090"
     environment:
-      GATEWAY_SECRET_KEY: "${GATEWAY_SECRET_KEY:?set GATEWAY_SECRET_KEY in your environment or .env}"
       GATEWAY_PUBLIC_URL: "${GATEWAY_PUBLIC_URL:-http://localhost:${GATEWAY_PORT:-8090}${GATEWAY_BASE_PATH:-/emby}}"
       GATEWAY_BASE_PATH: "${GATEWAY_BASE_PATH:-/emby}"
       GATEWAY_SERVER_ID: "${GATEWAY_SERVER_ID:-emby-auth-gateway-dev}"

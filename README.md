@@ -1,6 +1,6 @@
 # Emby Auth Gateway
 
-Emby Auth Gateway is a PocketBase-backed reverse proxy for Emby clients. Clients sign in with gateway credentials, while the gateway signs in to a controlled real Emby backend account, stores the backend session securely, and rewrites backend user ids, tokens, server ids, and URLs before returning responses to clients.
+Emby Auth Gateway is a PocketBase-backed reverse proxy for Emby clients. Clients sign in with gateway credentials, while the gateway signs in to a controlled real Emby backend account, stores the backend session, and rewrites backend user ids, tokens, server ids, and URLs before returning responses to clients.
 
 ## Architecture
 
@@ -17,7 +17,6 @@ Gateway environment variables:
 
 | Name | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `GATEWAY_SECRET_KEY` | Yes | None | Derives the encryption key for backend passwords and backend tokens stored in PocketBase. Use a long random value and keep it stable for an existing `pb_data`; losing or changing it makes existing encrypted gateway data unreadable. |
 | `GATEWAY_PUBLIC_URL` | No, but set it in production | Request host/proxy headers | Externally reachable gateway Emby base URL, including `GATEWAY_BASE_PATH`, for example `https://media.example.com/emby`. Without it, URL rewriting follows the inbound request host, which can produce unusable `127.0.0.1` URLs behind some proxies. |
 | `GATEWAY_BASE_PATH` | No | `/emby` | Path where Emby-compatible gateway routes are served. |
 | `GATEWAY_SERVER_ID` | No | `emby-auth-gateway` | Synthetic server id returned to clients instead of the backend Emby server id. |
@@ -28,11 +27,21 @@ PocketBase runtime flags you will commonly use:
 | --- | --- |
 | `--http` | Listen address for `serve`, for example `0.0.0.0:8090` in containers. |
 | `--dir` | PocketBase data directory. The default is `pb_data` under the working directory. |
-| `--encryptionEnv` | Optional PocketBase app settings encryption environment variable. This is separate from `GATEWAY_SECRET_KEY`. |
+| `--encryptionEnv` | Optional PocketBase app settings encryption environment variable. This is separate from gateway backend account storage. |
+
+Backend client identity defaults written by `setup` into `emby_servers` records:
+
+| Field | Default |
+| --- | --- |
+| `backend_user_agent` | `SenPlayer/6.1.3` |
+| `backend_authorization_client` | `SenPlayer` |
+| `backend_authorization_device` | `Mac` |
+| `backend_authorization_device_id` | `E680121A-04F6-4E47-BA8F-30E1DB01EFB6` |
+| `backend_authorization_version` | `6.1.3` |
 
 ## Local Compose
 
-Copy `.env.example` to your own local `.env` and replace `GATEWAY_SECRET_KEY` with a generated secret. The base compose file starts only the gateway; add `docker-compose.dev.yml` when you want the local Emby container.
+Copy `.env.example` to your own local `.env`. The base compose file starts only the gateway; add `docker-compose.dev.yml` when you want the local Emby container.
 
 ```sh
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
@@ -51,7 +60,7 @@ go build -o ./bin/gateway ./cmd/gateway
 Create a PocketBase superuser for the gateway instance:
 
 ```sh
-GATEWAY_SECRET_KEY="$GATEWAY_SECRET_KEY" ./bin/gateway superuser create admin@example.com 'replace-with-a-strong-password'
+./bin/gateway superuser create admin@example.com 'replace-with-a-strong-password'
 ```
 
 For Docker Compose:
@@ -69,7 +78,7 @@ Use `setup` to create or update the Emby server record, controlled backend accou
 Local binary example:
 
 ```sh
-GATEWAY_SECRET_KEY="$GATEWAY_SECRET_KEY" ./bin/gateway setup \
+./bin/gateway setup \
   --gateway-username alice \
   --gateway-password 'gateway-client-password' \
   --synthetic-user-id gateway-alice-001 \
@@ -78,6 +87,23 @@ GATEWAY_SECRET_KEY="$GATEWAY_SECRET_KEY" ./bin/gateway setup \
   --backend-account-name alice-backend \
   --backend-username real-emby-user \
   --backend-password 'real-emby-password'
+```
+
+The backend client identity flags are optional because they default to the SenPlayer values above. Override them when a backend node requires different headers:
+
+```sh
+./bin/gateway setup \
+  --gateway-username alice \
+  --gateway-password 'gateway-client-password' \
+  --synthetic-user-id gateway-alice-001 \
+  --emby-url https://media.example.com \
+  --backend-username real-emby-user \
+  --backend-password 'real-emby-password' \
+  --backend-user-agent 'SenPlayer/6.1.3' \
+  --backend-authorization-client SenPlayer \
+  --backend-authorization-device Mac \
+  --backend-authorization-device-id E680121A-04F6-4E47-BA8F-30E1DB01EFB6 \
+  --backend-authorization-version 6.1.3
 ```
 
 Docker Compose example:
@@ -100,7 +126,6 @@ Run directly:
 
 ```sh
 GATEWAY_BASE_PATH="${GATEWAY_BASE_PATH:-/emby}"
-GATEWAY_SECRET_KEY="$GATEWAY_SECRET_KEY" \
 GATEWAY_BASE_PATH="$GATEWAY_BASE_PATH" \
 GATEWAY_PUBLIC_URL="http://localhost:8090$GATEWAY_BASE_PATH" \
 ./bin/gateway serve --http=127.0.0.1:8090
@@ -175,13 +200,12 @@ Useful smoke variables:
 - Keep PocketBase internal collections locked down. `users`, `emby_servers`, `backend_accounts`, `user_mappings`, `gateway_sessions`, and `audit_logs` should not be anonymously readable or writable. PocketBase superusers bypass collection rules and are the intended administrators.
 - Gateway users are client identities only. Ordinary `users` records cannot access the PocketBase API and must not be used as an administrator boundary.
 - Gateway tokens are stored only as SHA-256 hashes.
-- Backend Emby passwords and backend Emby session tokens are encrypted at rest using `GATEWAY_SECRET_KEY`.
+- Backend Emby passwords and backend Emby session tokens are stored as plaintext fields in PocketBase so administrators can configure and inspect backend records in the Admin UI. PocketBase superuser access or direct database file access is secret access.
 - Do not expose the real Emby backend directly to untrusted clients when testing gateway isolation.
 - Do not commit `.env` files or real secrets. `.env.example` contains placeholders only.
 
 ## Troubleshooting
 
-- `GATEWAY_SECRET_KEY is required`: set the environment variable for `serve`, `setup`, and any command that touches encrypted gateway data.
 - Login returns `401`: verify the gateway username and password created by `setup`, confirm the `users` record is enabled, and confirm `user_mappings`, `backend_accounts`, and `emby_servers` records exist and are enabled.
 - Login returns `502 backend authentication failed`: verify `--emby-url`, backend username, backend password, and network reachability from the gateway to Emby. In Compose, the backend URL should be `http://emby:8096/emby`.
 - Proxied requests return `401`: the gateway token may be missing, expired, revoked, or sent under an unsupported header/query name. Supported inputs include `X-Emby-Token`, `X-MediaBrowser-Token`, Emby authorization headers, `api_key`, `access_token`, and `token`.
