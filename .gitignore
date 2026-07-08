@@ -10,3 +10,4 @@ dist/
 *.sqlite
 *.sqlite3
 coverage.out
+AGENTS.md
