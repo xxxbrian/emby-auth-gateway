@@ -3,6 +3,7 @@ package pbsetup
 import (
 	"regexp"
 	"testing"
+	"time"
 
 	"github.com/xxxbrian/emby-auth-gateway/internal/gateway"
 	_ "github.com/xxxbrian/emby-auth-gateway/internal/pbmigrations"
@@ -54,6 +55,55 @@ func TestSetupWritesPlainBackendPasswordAndDefaultClientIdentity(t *testing.T) {
 	}
 	if account.GetString("backend_password") != "backend-pass" {
 		t.Fatalf("backend_password = %q, want plaintext backend-pass", account.GetString("backend_password"))
+	}
+}
+
+func TestSetupClearsBackendTokenWhenCredentialsChange(t *testing.T) {
+	app := newTestApp(t)
+	opts := options{
+		GatewayUsername:    "alice",
+		GatewayPassword:    "gateway-pass",
+		SyntheticUserID:    "gateway-alice",
+		EmbyServerName:     "server",
+		EmbyBaseURL:        "https://emby.example.com",
+		BackendAccountName: "backend",
+		BackendUsername:    "real-alice",
+		BackendPassword:    "backend-pass",
+	}
+	if err := run(app, opts); err != nil {
+		t.Fatalf("run setup: %v", err)
+	}
+	account, err := app.FindFirstRecordByData("backend_accounts", "name", "backend")
+	if err != nil {
+		t.Fatalf("find account: %v", err)
+	}
+	account.Set("backend_user_id", "backend-user")
+	account.Set("backend_token", "backend-token")
+	account.Set("token_updated_at", time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC))
+	if err := app.Save(account); err != nil {
+		t.Fatalf("save account token: %v", err)
+	}
+	if err := run(app, opts); err != nil {
+		t.Fatalf("run setup same credentials: %v", err)
+	}
+	account, err = app.FindFirstRecordByData("backend_accounts", "name", "backend")
+	if err != nil {
+		t.Fatalf("find unchanged account: %v", err)
+	}
+	if account.GetString("backend_token") != "backend-token" {
+		t.Fatalf("token was cleared without credential change")
+	}
+
+	opts.BackendPassword = "new-backend-pass"
+	if err := run(app, opts); err != nil {
+		t.Fatalf("run setup changed credentials: %v", err)
+	}
+	account, err = app.FindFirstRecordByData("backend_accounts", "name", "backend")
+	if err != nil {
+		t.Fatalf("find changed account: %v", err)
+	}
+	if account.GetString("backend_token") != "" || account.GetString("backend_user_id") != "" || !account.GetDateTime("token_updated_at").IsZero() {
+		t.Fatalf("backend token state was not cleared: %#v", account)
 	}
 }
 

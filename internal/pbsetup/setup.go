@@ -137,10 +137,17 @@ func upsertBackendAccount(app core.App, serverID string, opts options) (*core.Re
 		}
 		record = core.NewRecord(collection)
 	}
+	credentialsChanged := record.Id != "" && (record.GetString("server") != serverID || record.GetString("backend_username") != opts.BackendUsername || record.GetString("backend_password") != opts.BackendPassword)
 	record.Set("server", serverID)
 	record.Set("name", opts.BackendAccountName)
 	record.Set("backend_username", opts.BackendUsername)
 	record.Set("backend_password", opts.BackendPassword)
+	if credentialsChanged {
+		record.Set("backend_user_id", "")
+		record.Set("backend_token", "")
+		record.Set("token_updated_at", nil)
+		record.Set("last_login_error", "")
+	}
 	record.Set("enabled", true)
 	if err := app.Save(record); err != nil {
 		return nil, err
