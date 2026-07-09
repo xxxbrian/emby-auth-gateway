@@ -22,12 +22,14 @@ import (
 )
 
 type Server struct {
-	cfg         Config
-	store       Store
-	client      *http.Client
-	proxyClient *http.Client
-	logins      *loginFailureLimiter
-	backendAuth singleflight.Group
+	cfg                   Config
+	store                 Store
+	client                *http.Client
+	proxyClient           *http.Client
+	logins                *loginFailureLimiter
+	backendAuth           singleflight.Group
+	backendAuthFailuresMu sync.Mutex
+	backendAuthFailures   map[string]backendLoginFailure
 }
 
 func NewServer(cfg Config, store Store) *Server {
@@ -57,7 +59,7 @@ func NewServer(cfg Config, store Store) *Server {
 	if proxyClient == nil {
 		proxyClient = &http.Client{Transport: defaultProxyTransport()}
 	}
-	return &Server{cfg: cfg, store: store, client: client, proxyClient: proxyClient, logins: newLoginFailureLimiter()}
+	return &Server{cfg: cfg, store: store, client: client, proxyClient: proxyClient, logins: newLoginFailureLimiter(), backendAuthFailures: map[string]backendLoginFailure{}}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {

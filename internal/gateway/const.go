@@ -7,6 +7,7 @@ const (
 	gatewayVersion    = "0.3.4"
 
 	backendAuthTimeout              = 15 * time.Second
+	backendLoginFailureCooldown     = 30 * time.Second
 	proxyResponseHeaderTimeout      = 30 * time.Second
 	proxyIdleConnTimeout            = 90 * time.Second
 	loginFailureLimit               = 5

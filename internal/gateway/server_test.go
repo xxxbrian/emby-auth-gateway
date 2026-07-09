@@ -447,6 +447,42 @@ func TestProxyRefreshesBackendTokenOnUnauthorized(t *testing.T) {
 	}
 }
 
+func TestBackendLoginFailureBackoff(t *testing.T) {
+	var authCount int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/emby/Users/AuthenticateByName" {
+			authCount++
+			http.Error(w, "backend auth failed", http.StatusUnauthorized)
+			return
+		}
+		t.Fatalf("unexpected backend request %s %s", r.Method, r.URL.String())
+	}))
+	defer backend.Close()
+
+	store := testStore(backend.URL + "/emby")
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby", GatewayServerID: "gateway-server"}, store))
+	defer gw.Close()
+
+	loginResp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice","Pw":"alice-pass"}`))
+	var login map[string]any
+	decodeJSON(t, loginResp.Body, &login)
+	_ = loginResp.Body.Close()
+	token, _ := login["AccessToken"].(string)
+
+	for i := 0; i < 2; i++ {
+		req := mustRequest(t, http.MethodGet, gw.URL+"/emby/System/Info", nil)
+		req.Header.Set("X-Emby-Token", token)
+		resp := do(t, req)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Fatalf("request %d status = %d, want 502", i+1, resp.StatusCode)
+		}
+	}
+	if authCount != 1 {
+		t.Fatalf("backend auth count = %d, want 1 due to cooldown", authCount)
+	}
+}
+
 func TestAnonymousPublicInfoAndPing(t *testing.T) {
 	store := NewMemoryStore()
 	store.Mappings["m1"] = UserMapping{BackendAccount: BackendAccount{ID: "b1", ServerID: "s1", Enabled: true, Server: EmbyServer{ID: "s1", Enabled: true, ServerVersion: "4.9.1"}}}
