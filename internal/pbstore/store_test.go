@@ -334,20 +334,17 @@ func TestBackendAccountAndSessionUsePlainCredentialsAndClientIdentity(t *testing
 	if account.ClientIdentity.UserAgent != "Custom/1.0" || account.ClientIdentity.Client != "Custom" || account.ClientIdentity.Device != "Desktop" || account.ClientIdentity.DeviceID != "device-1" || account.ClientIdentity.Version != "1.0" {
 		t.Fatalf("unexpected backend identity: %#v", account.ClientIdentity)
 	}
-
 	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	if err := store.UpdateBackendToken(context.Background(), accountID, "backend-token", "backend-user", now); err != nil {
+		t.Fatalf("update backend token: %v", err)
+	}
+
 	session := &gateway.Session{
 		GatewayTokenHash: "hash",
 		GatewayUserID:    userID,
 		GatewayUsername:  "alice",
 		SyntheticUserID:  "gateway-user",
 		BackendAccountID: accountID,
-		BackendServerID:  "server",
-		BackendBaseURL:   "https://emby.example.com",
-		BackendUserID:    "backend-user",
-		BackendUsername:  "real-alice",
-		BackendToken:     "backend-token",
-		BackendIdentity:  account.ClientIdentity,
 		ExpiresAt:        now.Add(time.Hour),
 	}
 	if err := store.SaveSession(context.Background(), session); err != nil {
@@ -357,8 +354,12 @@ func TestBackendAccountAndSessionUsePlainCredentialsAndClientIdentity(t *testing
 	if err != nil {
 		t.Fatalf("find raw session: %v", err)
 	}
-	if saved.GetString("backend_token") != "backend-token" {
-		t.Fatalf("stored backend_token = %q, want plaintext backend-token", saved.GetString("backend_token"))
+	collection, err := app.FindCollectionByNameOrId("gateway_sessions")
+	if err != nil {
+		t.Fatalf("find gateway_sessions collection: %v", err)
+	}
+	if collection.Fields.GetByName("backend_token") != nil || saved.GetString("backend_token") != "" {
+		t.Fatalf("gateway_sessions should not store backend_token, field=%#v value=%q", collection.Fields.GetByName("backend_token"), saved.GetString("backend_token"))
 	}
 
 	found, err := store.FindSessionByTokenHash(context.Background(), "hash")

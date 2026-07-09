@@ -177,14 +177,8 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 	if gatewayToken == "" || gatewayToken == backendToken {
 		t.Fatalf("expected gateway token, got %q", gatewayToken)
 	}
-	if !sawControlledBackendLogin {
-		t.Fatal("backend did not receive controlled backend account credentials")
-	}
-	if !sawBackendAuthUserAgent {
-		t.Fatal("backend authentication did not receive configured user agent")
-	}
-	if !sawBackendAuthIdentity {
-		t.Fatal("backend authentication did not receive configured authorization identity")
+	if sawControlledBackendLogin || sawBackendAuthUserAgent || sawBackendAuthIdentity {
+		t.Fatal("gateway login unexpectedly authenticated to backend")
 	}
 	if strings.Contains(mustJSON(t, login), backendToken) || strings.Contains(mustJSON(t, login), backendUserID) {
 		t.Fatalf("login leaked backend token or user id: %s", mustJSON(t, login))
@@ -203,6 +197,15 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 	systemJSON := mustJSON(t, system)
 	if !sawBackendTokenInRequest {
 		t.Fatal("backend did not receive mapped token")
+	}
+	if !sawControlledBackendLogin {
+		t.Fatal("lazy backend authentication did not use controlled backend account credentials")
+	}
+	if !sawBackendAuthUserAgent {
+		t.Fatal("backend authentication did not receive configured user agent")
+	}
+	if !sawBackendAuthIdentity {
+		t.Fatal("backend authentication did not receive configured authorization identity")
 	}
 	if !sawProxyUserAgent || !sawProxyIdentity {
 		t.Fatal("backend proxy request did not receive configured identity")
@@ -380,12 +383,72 @@ func TestGatewayWebSocketUpgradeProxy(t *testing.T) {
 	}
 }
 
+func TestProxyRefreshesBackendTokenOnUnauthorized(t *testing.T) {
+	const syntheticUserID = "gateway-user"
+	var authCount int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/emby/Users/AuthenticateByName":
+			authCount++
+			writeTestJSON(w, map[string]any{
+				"AccessToken": "backend-token-" + strconv.Itoa(authCount),
+				"ServerId":    "backend-server",
+				"User": map[string]any{
+					"Id":   "backend-user",
+					"Name": "shared",
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/emby/System/Info":
+			if r.Header.Get("X-Emby-Token") == "backend-token-1" {
+				http.Error(w, "stale", http.StatusUnauthorized)
+				return
+			}
+			if r.Header.Get("X-Emby-Token") != "backend-token-2" {
+				t.Fatalf("unexpected backend token %q", r.Header.Get("X-Emby-Token"))
+			}
+			writeTestJSON(w, map[string]any{"Id": "backend-server", "UserId": "backend-user"})
+		default:
+			t.Fatalf("unexpected backend request %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer backend.Close()
+
+	store := testStore(backend.URL + "/emby")
+	store.Users["u1"] = MemoryUser{GatewayUser: GatewayUser{ID: "u1", Username: "alice", SyntheticUserID: syntheticUserID, Enabled: true}, Password: "alice-pass"}
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby", GatewayServerID: "gateway-server"}, store))
+	defer gw.Close()
+
+	loginResp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice","Pw":"alice-pass"}`))
+	var login map[string]any
+	decodeJSON(t, loginResp.Body, &login)
+	_ = loginResp.Body.Close()
+	token, _ := login["AccessToken"].(string)
+
+	req := mustRequest(t, http.MethodGet, gw.URL+"/emby/System/Info", nil)
+	req.Header.Set("X-Emby-Token", token)
+	resp := do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("proxy status = %d: %s", resp.StatusCode, string(body))
+	}
+	if authCount != 2 {
+		t.Fatalf("backend auth count = %d, want 2", authCount)
+	}
+	if store.Mappings["u1"].BackendAccount.BackendToken != "backend-token-2" {
+		t.Fatalf("backend token was not refreshed in store: %#v", store.Mappings["u1"].BackendAccount)
+	}
+}
+
 func TestAnonymousPublicInfoAndPing(t *testing.T) {
+	store := NewMemoryStore()
+	store.Mappings["m1"] = UserMapping{BackendAccount: BackendAccount{ID: "b1", ServerID: "s1", Enabled: true, Server: EmbyServer{ID: "s1", Enabled: true, ServerVersion: "4.9.1"}}}
+	store.Mappings["m2"] = UserMapping{BackendAccount: BackendAccount{ID: "b2", ServerID: "s2", Enabled: true, Server: EmbyServer{ID: "s2", Enabled: true, ServerVersion: "4.10.0"}}}
 	gw := httptest.NewServer(NewServer(Config{
 		PublicBaseURL:   "https://media.example.com",
 		GatewayBasePath: "/emby",
 		GatewayServerID: "gateway-server-id",
-	}, NewMemoryStore()))
+	}, store))
 	defer gw.Close()
 
 	infoResp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/System/Info/Public", nil))
@@ -401,6 +464,9 @@ func TestAnonymousPublicInfoAndPing(t *testing.T) {
 	}
 	if info["LocalAddress"] != "https://media.example.com/emby" || info["WanAddress"] != "https://media.example.com/emby" {
 		t.Fatalf("public info did not use gateway addresses: %s", body)
+	}
+	if info["Version"] != "4.10.0" {
+		t.Fatalf("public info Version = %#v, want highest backend version 4.10.0", info["Version"])
 	}
 
 	for _, method := range []string{http.MethodGet, http.MethodPost} {
@@ -611,10 +677,22 @@ func TestAuditLogsForAuthDependencyFailures(t *testing.T) {
 		gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 		defer gw.Close()
 
-		resp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice","Pw":"alice-pass"}`))
+		loginResp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice","Pw":"alice-pass"}`))
+		if loginResp.StatusCode != http.StatusOK {
+			_ = loginResp.Body.Close()
+			t.Fatalf("login status = %d, want 200", loginResp.StatusCode)
+		}
+		var login map[string]any
+		decodeJSON(t, loginResp.Body, &login)
+		_ = loginResp.Body.Close()
+		token, _ := login["AccessToken"].(string)
+
+		req := mustRequest(t, http.MethodGet, gw.URL+"/emby/System/Info", nil)
+		req.Header.Set("X-Emby-Token", token)
+		resp := do(t, req)
 		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusBadGateway {
-			t.Fatalf("login status = %d, want 502", resp.StatusCode)
+			t.Fatalf("proxy status = %d, want 502", resp.StatusCode)
 		}
 		if !hasAuditEvent(store, "backend_auth_failure") {
 			t.Fatalf("missing backend_auth_failure audit in %#v", store.AuditLogs)
