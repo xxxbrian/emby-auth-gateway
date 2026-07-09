@@ -120,6 +120,7 @@ func isPlainNumericVersion(version string) bool {
 }
 
 func versionParts(version string) []int {
+	version = numericVersionCore(version)
 	parts := []int{}
 	start := -1
 	for i, r := range version {
@@ -138,6 +139,16 @@ func versionParts(version string) []int {
 		parts = append(parts, atoiZero(version[start:]))
 	}
 	return parts
+}
+
+func numericVersionCore(version string) string {
+	version = strings.TrimSpace(version)
+	for i, r := range version {
+		if (r < '0' || r > '9') && r != '.' {
+			return version[:i]
+		}
+	}
+	return version
 }
 
 func atoiZero(value string) int {

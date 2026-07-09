@@ -673,6 +673,9 @@ func TestCompareVersionsPrefersReleaseOverPrerelease(t *testing.T) {
 	if compareVersions("4.9.0.30", "4.9.0.30-beta") <= 0 {
 		t.Fatal("release version should compare greater than matching prerelease")
 	}
+	if compareVersions("4.9.0.30", "4.9.0.30-beta.2") <= 0 {
+		t.Fatal("release version should compare greater than matching prerelease with numeric suffix")
+	}
 	if compareVersions("4.10.0", "4.9.9") <= 0 {
 		t.Fatal("numeric version comparison should compare each segment")
 	}

@@ -427,6 +427,36 @@ func newTestApp(t *testing.T) core.App {
 	return app
 }
 
+func TestUpdateServerInfoPreservesExistingValuesWhenInputsAreEmpty(t *testing.T) {
+	app := newTestApp(t)
+	store := New(app)
+	servers, err := app.FindCollectionByNameOrId("emby_servers")
+	if err != nil {
+		t.Fatalf("find emby_servers: %v", err)
+	}
+	server := core.NewRecord(servers)
+	server.Set("name", "server")
+	server.Set("base_url", "https://emby.example.com")
+	server.Set("server_id", "real-server")
+	server.Set("server_name", "Real Emby")
+	server.Set("server_version", "4.9.5.0")
+	server.Set("enabled", true)
+	if err := app.Save(server); err != nil {
+		t.Fatalf("save server: %v", err)
+	}
+
+	if err := store.UpdateServerInfo(context.Background(), server.Id, "", "", "", time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("update server info: %v", err)
+	}
+	updated, err := app.FindRecordById("emby_servers", server.Id)
+	if err != nil {
+		t.Fatalf("find updated server: %v", err)
+	}
+	if updated.GetString("server_id") != "real-server" || updated.GetString("server_name") != "Real Emby" || updated.GetString("server_version") != "4.9.5.0" {
+		t.Fatalf("server info was cleared by empty update: %#v", updated)
+	}
+}
+
 func createBackendAccount(t *testing.T, app core.App) string {
 	t.Helper()
 	servers, err := app.FindCollectionByNameOrId("emby_servers")
