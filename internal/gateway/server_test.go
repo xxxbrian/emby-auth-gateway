@@ -695,7 +695,7 @@ func TestPublicSystemInfoProbesBackendWhenVersionMissing(t *testing.T) {
 	}
 }
 
-func TestPublicSystemInfoUnavailableWithoutBackendVersion(t *testing.T) {
+func TestPublicSystemInfoFallsBackWithoutBackendVersion(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/emby/System/Info/Public" {
 			t.Fatalf("unexpected backend request %s %s", r.Method, r.URL.String())
@@ -710,12 +710,14 @@ func TestPublicSystemInfoUnavailableWithoutBackendVersion(t *testing.T) {
 
 	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/System/Info/Public", nil))
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("public info status = %d, want 503: %s", resp.StatusCode, string(body))
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("public info status = %d, want 200: %s", resp.StatusCode, string(body))
 	}
-	if strings.Contains(string(body), "0.3.4") || strings.Contains(string(body), "dev") {
-		t.Fatalf("public info unavailable response leaked gateway version-like content: %s", string(body))
+	var info map[string]any
+	decodeJSON(t, resp.Body, &info)
+	if info["Version"] != defaultBackendServerVersion {
+		t.Fatalf("public info Version = %#v, want fallback %s", info["Version"], defaultBackendServerVersion)
 	}
 }
 

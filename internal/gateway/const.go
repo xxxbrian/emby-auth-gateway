@@ -27,4 +27,5 @@ const (
 	defaultBackendAuthorizationClient  = "SenPlayer"
 	defaultBackendAuthorizationDevice  = "Mac"
 	defaultBackendAuthorizationVersion = "6.1.3"
+	defaultBackendServerVersion        = "4.8.11.0"
 )
