@@ -572,6 +572,7 @@ func (s *Server) fetchBackendJSON(ctx context.Context, r *http.Request, rel, raw
 	if resp.StatusCode == http.StatusUnauthorized {
 		failedToken := session.BackendToken
 		if err := s.refreshBackendSession(ctx, session, failedToken); err == nil {
+			s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh", "backend token refreshed after unauthorized response", http.StatusOK)
 			_ = resp.Body.Close()
 			u, err = s.proxyURL(session, rel, rawQuery, gatewayToken)
 			if err != nil {

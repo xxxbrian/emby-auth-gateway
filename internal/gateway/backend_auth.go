@@ -55,6 +55,7 @@ func (s *Server) refreshBackendSession(ctx context.Context, session *Session, fa
 	if session.BackendToken == "" || session.BackendToken == failedToken {
 		return ErrUnauthorized
 	}
+	_ = s.logoutBackendToken(ctx, session, failedToken)
 	return nil
 }
 
@@ -82,6 +83,35 @@ func (s *Server) backendTokenIsUnauthorized(ctx context.Context, session *Sessio
 	}
 	defer resp.Body.Close()
 	return resp.StatusCode == http.StatusUnauthorized, nil
+}
+
+func (s *Server) logoutBackendToken(ctx context.Context, session *Session, token string) error {
+	if strings.TrimSpace(token) == "" || session == nil {
+		return nil
+	}
+	u, err := backendURL(session.BackendBaseURL, "/Sessions/Logout")
+	if err != nil {
+		return err
+	}
+	logoutCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), backendAuthTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(logoutCtx, http.MethodPost, u, nil)
+	if err != nil {
+		return err
+	}
+	identity := session.BackendIdentity.WithDefaults()
+	req.Header.Set("User-Agent", identity.UserAgent)
+	req.Header.Set("X-Emby-Token", token)
+	req.Header.Set("X-Emby-Authorization", backendAuthHeader(identity, session.BackendUserID, token).String())
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusInternalServerError {
+		return fmt.Errorf("backend logout status %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func tokenRefreshTooSoon(account BackendAccount, failedToken string, now time.Time) bool {

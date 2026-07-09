@@ -399,6 +399,7 @@ func TestGatewayWebSocketUpgradeProxy(t *testing.T) {
 func TestProxyRefreshesBackendTokenOnUnauthorized(t *testing.T) {
 	const syntheticUserID = "gateway-user"
 	var refreshCount int
+	var logoutCount int
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/emby/Users/AuthenticateByName":
@@ -420,6 +421,12 @@ func TestProxyRefreshesBackendTokenOnUnauthorized(t *testing.T) {
 				t.Fatalf("unexpected backend token %q", r.Header.Get("X-Emby-Token"))
 			}
 			writeTestJSON(w, map[string]any{"Id": "backend-server", "UserId": "backend-user"})
+		case r.Method == http.MethodPost && r.URL.Path == "/emby/Sessions/Logout":
+			logoutCount++
+			if r.Header.Get("X-Emby-Token") != "backend-token-1" {
+				t.Fatalf("logout token = %q, want old backend token", r.Header.Get("X-Emby-Token"))
+			}
+			w.WriteHeader(http.StatusNoContent)
 		default:
 			t.Fatalf("unexpected backend request %s %s", r.Method, r.URL.String())
 		}
@@ -454,6 +461,12 @@ func TestProxyRefreshesBackendTokenOnUnauthorized(t *testing.T) {
 	}
 	if refreshCount != 1 {
 		t.Fatalf("backend refresh count = %d, want 1", refreshCount)
+	}
+	if logoutCount != 1 {
+		t.Fatalf("backend logout count = %d, want 1", logoutCount)
+	}
+	if !hasAuditEvent(store, "backend_token_refresh") {
+		t.Fatalf("missing backend token refresh audit log: %#v", store.AuditLogs)
 	}
 	if store.Mappings["u1"].BackendAccount.BackendToken != "backend-token-2" {
 		t.Fatalf("backend token was not refreshed in store: %#v", store.Mappings["u1"].BackendAccount)
@@ -664,6 +677,7 @@ func TestProxyRetryRewritesBodyWithRefreshedToken(t *testing.T) {
 		syntheticUserID = "gateway-user"
 	)
 	var refreshCount int
+	var logoutCount int
 	var postCount int
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -702,6 +716,12 @@ func TestProxyRetryRewritesBodyWithRefreshedToken(t *testing.T) {
 				return
 			}
 			writeTestJSON(w, map[string]any{"Id": "backend-server"})
+		case r.Method == http.MethodPost && r.URL.Path == "/emby/Sessions/Logout":
+			logoutCount++
+			if r.Header.Get("X-Emby-Token") != "backend-token-1" {
+				t.Fatalf("logout token = %q, want old backend token", r.Header.Get("X-Emby-Token"))
+			}
+			w.WriteHeader(http.StatusNoContent)
 		default:
 			t.Fatalf("unexpected backend request %s %s", r.Method, r.URL.String())
 		}
@@ -737,6 +757,9 @@ func TestProxyRetryRewritesBodyWithRefreshedToken(t *testing.T) {
 	}
 	if refreshCount != 1 || postCount != 2 {
 		t.Fatalf("refresh/post counts = %d/%d, want 1/2", refreshCount, postCount)
+	}
+	if logoutCount != 1 {
+		t.Fatalf("backend logout count = %d, want 1", logoutCount)
 	}
 }
 

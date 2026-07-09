@@ -419,6 +419,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 	if resp.StatusCode == http.StatusUnauthorized && replayable {
 		failedToken := session.BackendToken
 		if err := s.refreshBackendSession(r.Context(), session, failedToken); err == nil {
+			s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh", "backend token refreshed after unauthorized response", http.StatusOK)
 			_ = resp.Body.Close()
 			retryURL, retryErr := s.proxyURL(session, rel, r.URL.RawQuery, gatewayToken)
 			if retryErr != nil {
@@ -448,6 +449,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 				return
 			}
 			defer resp.Body.Close()
+		} else if !errors.Is(err, ErrUnauthorized) {
+			s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh_failure", err.Error(), http.StatusUnauthorized)
 		}
 	}
 
@@ -525,6 +528,10 @@ func (s *Server) audit(ctx context.Context, entry AuditLog) {
 		entry.CreatedAt = time.Now().UTC()
 	}
 	_ = s.store.RecordAudit(ctx, entry)
+}
+
+func (s *Server) auditBackendTokenRefresh(r *http.Request, rel string, session *Session, event, message string, status int) {
+	s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: event, Message: message, RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: status})
 }
 
 func (s *Server) proxyURL(session *Session, rel, rawQuery, gatewayToken string) (*url.URL, error) {
