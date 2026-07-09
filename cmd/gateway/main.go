@@ -27,6 +27,7 @@ func main() {
 	app.RootCmd.AddCommand(pbsetup.NewCommand(app))
 	app.RootCmd.AddCommand(newVersionCommand())
 	registerBackendIdentityDefaults(app)
+	registerMappingSessionRevocation(app)
 
 	app.OnBootstrap().BindFunc(func(e *core.BootstrapEvent) error {
 		if err := e.Next(); err != nil {
@@ -117,6 +118,87 @@ func registerBackendIdentityDefaults(app core.App) {
 		e.Record.Set("backend_authorization_version", identity.Version)
 		return e.Next()
 	})
+}
+
+func registerMappingSessionRevocation(app core.App) {
+	app.OnRecordUpdateExecute("user_mappings").BindFunc(func(e *core.RecordEvent) error {
+		original, err := e.App.FindRecordById("user_mappings", e.Record.Id)
+		if err != nil {
+			return err
+		}
+		oldGatewayUserID := relationID(original, "gateway_user")
+		newGatewayUserID := relationID(e.Record, "gateway_user")
+		backendChanged := relationID(original, "backend_account") != relationID(e.Record, "backend_account")
+		gatewayUserChanged := oldGatewayUserID != newGatewayUserID
+		disabled := original.GetBool("enabled") && !e.Record.GetBool("enabled")
+		if err := e.Next(); err != nil {
+			return err
+		}
+		if !backendChanged && !gatewayUserChanged && !disabled {
+			return nil
+		}
+		affected := []string{newGatewayUserID}
+		if gatewayUserChanged {
+			affected = append(affected, oldGatewayUserID)
+		}
+		for _, gatewayUserID := range uniqueNonEmpty(affected) {
+			if err := revokeActiveGatewaySessionsForUser(e.App, gatewayUserID, time.Now().UTC()); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func relationID(record *core.Record, field string) string {
+	if record == nil {
+		return ""
+	}
+	if value := strings.TrimSpace(record.GetString(field)); value != "" {
+		return value
+	}
+	values := record.GetStringSlice(field)
+	if len(values) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(values[0])
+}
+
+func revokeActiveGatewaySessionsForUser(app core.App, gatewayUserID string, revokedAt time.Time) error {
+	result, err := app.DB().NewQuery("update gateway_sessions set revoked_at = {:revokedAt} where gateway_user = {:gatewayUserID} and (revoked_at is null or revoked_at = '')").Bind(map[string]any{"revokedAt": revokedAt.UTC(), "gatewayUserID": gatewayUserID}).Execute()
+	if err != nil {
+		return err
+	}
+	count, _ := result.RowsAffected()
+	if count <= 0 {
+		return nil
+	}
+	audit, err := app.FindCollectionByNameOrId("audit_logs")
+	if err != nil {
+		return err
+	}
+	record := core.NewRecord(audit)
+	record.Set("gateway_user", gatewayUserID)
+	record.Set("event", "sessions_revoked")
+	record.Set("message", "mapping changed; active sessions revoked")
+	record.Set("method", "UPDATE")
+	record.Set("path", "user_mappings")
+	record.Set("status", 200)
+	return app.Save(record)
+}
+
+func uniqueNonEmpty(values []string) []string {
+	seen := map[string]bool{}
+	unique := []string{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		unique = append(unique, value)
+	}
+	return unique
 }
 
 func cleanupGatewaySessions(app core.App, now time.Time) error {

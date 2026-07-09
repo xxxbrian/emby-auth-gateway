@@ -126,16 +126,106 @@ func TestBackendIdentityDefaultsArePersistedOnServerCreate(t *testing.T) {
 	}
 }
 
+func TestMappingBackendChangeRevokesUserSessions(t *testing.T) {
+	app, err := tests.NewTestAppWithConfig(core.BaseAppConfig{
+		DataDir:       t.TempDir(),
+		EncryptionEnv: "test",
+	})
+	if err != nil {
+		t.Fatalf("new test app: %v", err)
+	}
+	defer app.Cleanup()
+	registerMappingSessionRevocation(app)
+
+	userID := createTestUser(t, app)
+	otherUserID := createTestUserWithName(t, app, "bob", "gateway-bob")
+	accountID := createTestBackendAccount(t, app)
+	newAccountID := createTestBackendAccount(t, app)
+	mapping := createTestMapping(t, app, userID, accountID, true)
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	createGatewaySession(t, app, userID, accountID, "active-1", now.Add(time.Hour), nil)
+	createGatewaySession(t, app, userID, accountID, "active-2", now.Add(time.Hour), nil)
+	revokedAt := now.Add(-time.Hour)
+	createGatewaySession(t, app, userID, accountID, "already-revoked", now.Add(time.Hour), &revokedAt)
+	createGatewaySession(t, app, otherUserID, accountID, "other-active", now.Add(time.Hour), nil)
+
+	mapping.Set("backend_account", newAccountID)
+	if err := app.Save(mapping); err != nil {
+		t.Fatalf("save mapping: %v", err)
+	}
+
+	assertSessionRevoked(t, app, "active-1", true)
+	assertSessionRevoked(t, app, "active-2", true)
+	assertSessionRevoked(t, app, "already-revoked", true)
+	assertSessionRevoked(t, app, "other-active", false)
+	assertAuditEvent(t, app, userID, "sessions_revoked")
+}
+
+func TestMappingDisableRevokesUserSessions(t *testing.T) {
+	app, err := tests.NewTestAppWithConfig(core.BaseAppConfig{
+		DataDir:       t.TempDir(),
+		EncryptionEnv: "test",
+	})
+	if err != nil {
+		t.Fatalf("new test app: %v", err)
+	}
+	defer app.Cleanup()
+	registerMappingSessionRevocation(app)
+
+	userID := createTestUser(t, app)
+	accountID := createTestBackendAccount(t, app)
+	mapping := createTestMapping(t, app, userID, accountID, true)
+	createGatewaySession(t, app, userID, accountID, "active", time.Now().UTC().Add(time.Hour), nil)
+
+	mapping.Set("enabled", false)
+	if err := app.Save(mapping); err != nil {
+		t.Fatalf("save mapping: %v", err)
+	}
+
+	assertSessionRevoked(t, app, "active", true)
+	assertAuditEvent(t, app, userID, "sessions_revoked")
+}
+
+func TestMappingUnrelatedUpdateKeepsUserSessions(t *testing.T) {
+	app, err := tests.NewTestAppWithConfig(core.BaseAppConfig{
+		DataDir:       t.TempDir(),
+		EncryptionEnv: "test",
+	})
+	if err != nil {
+		t.Fatalf("new test app: %v", err)
+	}
+	defer app.Cleanup()
+	registerMappingSessionRevocation(app)
+
+	userID := createTestUser(t, app)
+	accountID := createTestBackendAccount(t, app)
+	mapping := createTestMapping(t, app, userID, accountID, true)
+	createGatewaySession(t, app, userID, accountID, "active", time.Now().UTC().Add(time.Hour), nil)
+
+	mapping.Set("enabled", true)
+	if err := app.Save(mapping); err != nil {
+		t.Fatalf("save mapping: %v", err)
+	}
+
+	assertSessionRevoked(t, app, "active", false)
+	assertNoAuditEvent(t, app, userID, "sessions_revoked")
+}
+
 func createTestUser(t *testing.T, app core.App) string {
+	t.Helper()
+	return createTestUserWithName(t, app, "alice", "gateway-user")
+}
+
+func createTestUserWithName(t *testing.T, app core.App, username, syntheticUserID string) string {
 	t.Helper()
 	users, err := app.FindCollectionByNameOrId("users")
 	if err != nil {
 		t.Fatalf("find users: %v", err)
 	}
 	record := core.NewRecord(users)
-	record.Set("username", "alice")
-	record.Set("email", "alice@example.com")
-	record.Set("synthetic_user_id", "gateway-user")
+	record.Set("username", username)
+	record.Set("email", username+"@example.com")
+	record.Set("synthetic_user_id", syntheticUserID)
 	record.Set("enabled", true)
 	record.SetPassword("test-pass")
 	if err := app.Save(record); err != nil {
@@ -197,6 +287,22 @@ func createTestBackendAccount(t *testing.T, app core.App) string {
 	return account.Id
 }
 
+func createTestMapping(t *testing.T, app core.App, userID, accountID string, enabled bool) *core.Record {
+	t.Helper()
+	mappings, err := app.FindCollectionByNameOrId("user_mappings")
+	if err != nil {
+		t.Fatalf("find user_mappings: %v", err)
+	}
+	record := core.NewRecord(mappings)
+	record.Set("gateway_user", userID)
+	record.Set("backend_account", accountID)
+	record.Set("enabled", enabled)
+	if err := app.Save(record); err != nil {
+		t.Fatalf("save mapping: %v", err)
+	}
+	return record
+}
+
 func createGatewaySession(t *testing.T, app core.App, userID, accountID, tokenHash string, expiresAt time.Time, revokedAt *time.Time) {
 	t.Helper()
 	sessions, err := app.FindCollectionByNameOrId("gateway_sessions")
@@ -216,4 +322,39 @@ func createGatewaySession(t *testing.T, app core.App, userID, accountID, tokenHa
 	if err := app.Save(record); err != nil {
 		t.Fatalf("save gateway session: %v", err)
 	}
+}
+
+func assertSessionRevoked(t *testing.T, app core.App, tokenHash string, wantRevoked bool) {
+	t.Helper()
+	record, err := app.FindFirstRecordByData("gateway_sessions", "gateway_token_hash", tokenHash)
+	if err != nil {
+		t.Fatalf("find session %q: %v", tokenHash, err)
+	}
+	revoked := !record.GetDateTime("revoked_at").IsZero()
+	if revoked != wantRevoked {
+		t.Fatalf("session %q revoked=%v, want %v", tokenHash, revoked, wantRevoked)
+	}
+}
+
+func assertAuditEvent(t *testing.T, app core.App, userID, event string) {
+	t.Helper()
+	if !hasAuditEvent(t, app, userID, event) {
+		t.Fatalf("missing audit event %q for user %s", event, userID)
+	}
+}
+
+func assertNoAuditEvent(t *testing.T, app core.App, userID, event string) {
+	t.Helper()
+	if hasAuditEvent(t, app, userID, event) {
+		t.Fatalf("unexpected audit event %q for user %s", event, userID)
+	}
+}
+
+func hasAuditEvent(t *testing.T, app core.App, userID, event string) bool {
+	t.Helper()
+	records, err := app.FindRecordsByFilter("audit_logs", "gateway_user = {:userID} && event = {:event}", "", 1, 0, map[string]any{"userID": userID, "event": event})
+	if err != nil {
+		t.Fatalf("find audit logs: %v", err)
+	}
+	return len(records) > 0
 }
