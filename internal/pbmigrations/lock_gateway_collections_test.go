@@ -32,23 +32,31 @@ func TestGatewayCollectionsAreLockedAndStoreAuthStillWorks(t *testing.T) {
 	}
 
 	assertFields(t, app, "emby_servers", []string{
+		"server_id",
+		"server_name",
+		"server_version",
+		"version_checked_at",
 		"backend_user_agent",
 		"backend_authorization_client",
 		"backend_authorization_device",
 		"backend_authorization_device_id",
 		"backend_authorization_version",
 	}, nil)
-	assertFields(t, app, "backend_accounts", []string{"backend_password"}, []string{"backend_password_encrypted"})
-	assertFields(t, app, "gateway_sessions", []string{
+	assertFields(t, app, "backend_accounts", []string{"backend_password", "backend_user_id", "backend_token", "token_updated_at"}, []string{"backend_password_encrypted"})
+	assertFields(t, app, "gateway_sessions", nil, []string{
 		"backend_token",
+		"backend_server_id",
+		"backend_base_url",
+		"backend_user_id",
+		"backend_username",
 		"backend_user_agent",
 		"backend_authorization_client",
 		"backend_authorization_device",
 		"backend_authorization_device_id",
 		"backend_authorization_version",
-	}, []string{"backend_token_encrypted"})
+		"backend_token_encrypted",
+	})
 	assertTextFieldsOptional(t, app, "emby_servers", backendIdentityFieldNames)
-	assertTextFieldsOptional(t, app, "gateway_sessions", backendIdentityFieldNames)
 	assertFields(t, app, "user_item_data", []string{"season_id", "run_time_ticks", "orphaned_at", "last_seen_at"}, nil)
 
 	users, err := app.FindCollectionByNameOrId("users")
