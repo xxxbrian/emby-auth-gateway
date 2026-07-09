@@ -324,7 +324,7 @@ func TestBackendAccountAndSessionUsePlainCredentialsAndClientIdentity(t *testing
 	userID := createGatewayUser(t, app, "alice", "gateway-user")
 	accountID := createBackendAccount(t, app)
 
-	account, err := store.DefaultBackend(context.Background())
+	account, err := store.FindBackendAccountByID(context.Background(), accountID)
 	if err != nil {
 		t.Fatalf("default backend: %v", err)
 	}
@@ -401,7 +401,7 @@ func TestBackendServerIdentityFieldsAreOptionalAndDefaulted(t *testing.T) {
 		t.Fatalf("save backend account: %v", err)
 	}
 
-	account, err := store.DefaultBackend(context.Background())
+	account, err := store.FindBackendAccountByID(context.Background(), accountRecord.Id)
 	if err != nil {
 		t.Fatalf("default backend: %v", err)
 	}

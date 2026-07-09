@@ -86,17 +86,6 @@ func (s *Store) FindMappingByGatewayUserID(ctx context.Context, gatewayUserID st
 	}, nil
 }
 
-func (s *Store) DefaultBackend(ctx context.Context) (*gateway.BackendAccount, error) {
-	records, err := s.app.FindAllRecords("backend_accounts", dbx.HashExp{"enabled": true})
-	if err != nil {
-		return nil, err
-	}
-	if len(records) == 0 {
-		return nil, gateway.ErrNotFound
-	}
-	return s.backendAccountFromRecord(records[0])
-}
-
 func (s *Store) FindBackendAccountByID(ctx context.Context, backendAccountID string) (*gateway.BackendAccount, error) {
 	return s.backendAccountByID(backendAccountID)
 }
