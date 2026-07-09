@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 type Server struct {
@@ -25,6 +27,7 @@ type Server struct {
 	client      *http.Client
 	proxyClient *http.Client
 	logins      *loginFailureLimiter
+	backendAuth singleflight.Group
 }
 
 func NewServer(cfg Config, store Store) *Server {
@@ -126,12 +129,6 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	clientAuth := firstAuthHeader(r)
-	backendResult, err := s.authenticateBackend(ctx, mapping.BackendAccount)
-	if err != nil {
-		s.audit(ctx, AuditLog{GatewayUserID: user.ID, SyntheticUserID: user.SyntheticUserID, Event: "backend_auth_failure", Message: "backend authentication failed", RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusBadGateway})
-		http.Error(w, "backend authentication failed", http.StatusBadGateway)
-		return
-	}
 
 	s.logins.clear(key)
 
@@ -147,11 +144,12 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 		GatewayUsername:  user.Username,
 		SyntheticUserID:  user.SyntheticUserID,
 		BackendAccountID: mapping.BackendAccount.ID,
-		BackendServerID:  backendResult.ServerID,
+		BackendAccount:   mapping.BackendAccount,
+		BackendServerID:  mapping.BackendAccount.Server.BackendServerID,
 		BackendBaseURL:   mapping.BackendAccount.BaseURL,
-		BackendUserID:    backendResult.UserID,
-		BackendUsername:  backendResult.Username,
-		BackendToken:     backendResult.AccessToken,
+		BackendUserID:    mapping.BackendAccount.BackendUserID,
+		BackendUsername:  mapping.BackendAccount.Username,
+		BackendToken:     mapping.BackendAccount.BackendToken,
 		BackendIdentity:  mapping.BackendAccount.ClientIdentity.WithDefaults(),
 		Client:           clientAuth.Client,
 		Device:           clientAuth.Device,
@@ -168,18 +166,7 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit(ctx, AuditLog{GatewayUserID: user.ID, SyntheticUserID: user.SyntheticUserID, Event: "login_success", Message: "login succeeded", RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusOK})
 
-	rewritten := rewriteJSONValue(backendResult.Raw, session, token, s.gatewayBaseForRequest(r), s.cfg.GatewayServerID)
-	if obj, ok := rewritten.(map[string]any); ok {
-		obj["AccessToken"] = token
-		obj["ServerId"] = s.cfg.GatewayServerID
-		if u, ok := obj["User"].(map[string]any); ok {
-			u["Id"] = user.SyntheticUserID
-			u["Name"] = user.Username
-			u["ServerId"] = s.cfg.GatewayServerID
-		}
-	}
-
-	writeJSON(w, http.StatusOK, rewritten)
+	writeJSON(w, http.StatusOK, authenticationResultDTO(*user, token, s.cfg.GatewayServerID))
 }
 
 type authenticateForm struct {
@@ -253,6 +240,12 @@ func (s *Server) authenticateBackend(ctx context.Context, account BackendAccount
 	if v, _ := raw["ServerId"].(string); v != "" {
 		result.ServerID = v
 	}
+	if v, _ := raw["ServerName"].(string); v != "" {
+		result.ServerName = v
+	}
+	if v, _ := raw["Version"].(string); v != "" {
+		result.ServerVersion = v
+	}
 	if user, _ := raw["User"].(map[string]any); user != nil {
 		result.UserID, _ = user["Id"].(string)
 		result.Username, _ = user["Name"].(string)
@@ -264,11 +257,13 @@ func (s *Server) authenticateBackend(ctx context.Context, account BackendAccount
 }
 
 type backendAuthResult struct {
-	AccessToken string
-	ServerID    string
-	UserID      string
-	Username    string
-	Raw         map[string]any
+	AccessToken   string
+	ServerID      string
+	ServerName    string
+	ServerVersion string
+	UserID        string
+	Username      string
+	Raw           map[string]any
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, rel string) {
@@ -278,9 +273,6 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, rel string
 		s.audit(r.Context(), AuditLog{Event: "logout_failure", Message: "session unavailable", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusUnauthorized})
 		return
 	}
-	if err := s.forwardLogout(r.Context(), r, rel, session, token); err != nil {
-		s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "logout_failure", Message: "backend logout failed", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
-	}
 	if err := s.store.RevokeSession(r.Context(), HashToken(token)); err != nil {
 		s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "logout_failure", Message: "session revoke failed", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusInternalServerError})
 		http.Error(w, "session revoke failed", http.StatusInternalServerError)
@@ -288,25 +280,6 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, rel string
 	}
 	s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "logout_success", Message: "logout succeeded", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusOK})
 	w.WriteHeader(http.StatusOK)
-}
-
-func (s *Server) forwardLogout(ctx context.Context, r *http.Request, rel string, session *Session, gatewayToken string) error {
-	u, err := s.proxyURL(session, rel, r.URL.RawQuery, gatewayToken)
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), nil)
-	if err != nil {
-		return err
-	}
-	copyRequestHeaders(req.Header, r.Header)
-	s.rewriteRequestHeaders(req.Header, session, gatewayToken)
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return err
-	}
-	_ = resp.Body.Close()
-	return nil
 }
 
 func (s *Server) handlePublicUsers(w http.ResponseWriter, r *http.Request) {
@@ -327,11 +300,17 @@ func (s *Server) handlePublicUsers(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePublicSystemInfo(w http.ResponseWriter, r *http.Request) {
 	base := s.gatewayBaseForRequest(r)
+	version := gatewayVersion
+	if servers, err := s.store.ListEnabledServers(r.Context()); err == nil {
+		if highest := highestServerVersion(servers); highest != "" {
+			version = highest
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"Id":              s.cfg.GatewayServerID,
 		"ServerId":        s.cfg.GatewayServerID,
 		"ServerName":      "Emby Gateway",
-		"Version":         gatewayVersion,
+		"Version":         version,
 		"LocalAddress":    base,
 		"WanAddress":      base,
 		"RemoteAddresses": []string{base},
@@ -368,6 +347,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 	if s.handlePersonalDataRequest(w, r, rel, session, gatewayToken) {
 		return
 	}
+	if err := s.ensureBackendSession(r.Context(), session); err != nil {
+		s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "backend_auth_failure", Message: "backend authentication failed", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
+		http.Error(w, "backend authentication failed", http.StatusBadGateway)
+		return
+	}
 	proxyURL, err := s.proxyURL(session, rel, r.URL.RawQuery, gatewayToken)
 	if err != nil {
 		s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "proxy_backend_unavailable", Message: "backend url unavailable", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
@@ -390,6 +374,17 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 		http.Error(w, "bad request body", http.StatusBadRequest)
 		return
 	}
+	var bodyData []byte
+	replayable := body == nil
+	if body != nil && contentLength(body) >= 0 {
+		bodyData, err = io.ReadAll(body)
+		if err != nil {
+			http.Error(w, "bad request body", http.StatusBadRequest)
+			return
+		}
+		body = bytes.NewReader(bodyData)
+		replayable = true
+	}
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, proxyURL.String(), body)
 	if err != nil {
 		http.Error(w, "bad proxy request", http.StatusInternalServerError)
@@ -409,6 +404,39 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 		return
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized && replayable {
+		if err := s.refreshBackendSession(r.Context(), session); err == nil {
+			_ = resp.Body.Close()
+			retryURL, retryErr := s.proxyURL(session, rel, r.URL.RawQuery, gatewayToken)
+			if retryErr != nil {
+				s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "proxy_backend_unavailable", Message: "backend url unavailable", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
+				http.Error(w, "bad backend url", http.StatusBadGateway)
+				return
+			}
+			var retryBody io.Reader
+			if bodyData != nil {
+				retryBody = bytes.NewReader(bodyData)
+			}
+			retryReq, retryErr := http.NewRequestWithContext(r.Context(), r.Method, retryURL.String(), retryBody)
+			if retryErr != nil {
+				http.Error(w, "bad proxy request", http.StatusInternalServerError)
+				return
+			}
+			if retryBody != nil {
+				retryReq.ContentLength = contentLength(retryBody)
+			}
+			copyRequestHeaders(retryReq.Header, r.Header)
+			s.rewriteRequestHeaders(retryReq.Header, session, gatewayToken)
+			retryReq.Host = retryURL.Host
+			resp, err = s.proxyClient.Do(retryReq)
+			if err != nil {
+				s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "proxy_backend_unavailable", Message: "backend unavailable", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
+				http.Error(w, "backend unavailable", http.StatusBadGateway)
+				return
+			}
+			defer resp.Body.Close()
+		}
+	}
 
 	s.writeProxyResponse(w, r, rel, resp, session, gatewayToken, s.gatewayBaseForRequest(r))
 }
@@ -1252,7 +1280,7 @@ func rewriteJSONValue(v any, session *Session, gatewayToken, publicGatewayBase, 
 			if s, ok := out[k].(string); ok && session != nil {
 				switch strings.ToLower(k) {
 				case "accesstoken":
-					if s == session.BackendToken {
+					if session.BackendToken != "" && s == session.BackendToken {
 						out[k] = gatewayToken
 					}
 				case "serverid":
@@ -1260,11 +1288,11 @@ func rewriteJSONValue(v any, session *Session, gatewayToken, publicGatewayBase, 
 						out[k] = gatewayServerID
 					}
 				case "userid":
-					if s == session.BackendUserID {
+					if session.BackendUserID != "" && s == session.BackendUserID {
 						out[k] = session.SyntheticUserID
 					}
 				case "id":
-					if s == session.BackendUserID {
+					if session.BackendUserID != "" && s == session.BackendUserID {
 						out[k] = session.SyntheticUserID
 					} else if s == session.BackendServerID {
 						out[k] = gatewayServerID
@@ -1315,8 +1343,12 @@ func rewriteM3U8(data []byte, session *Session, gatewayToken, publicGatewayBase,
 }
 
 func rewriteString(s string, session *Session, gatewayToken, publicGatewayBase, gatewayServerID string) string {
-	s = strings.ReplaceAll(s, session.BackendToken, gatewayToken)
-	s = strings.ReplaceAll(s, session.BackendUserID, session.SyntheticUserID)
+	if session.BackendToken != "" {
+		s = strings.ReplaceAll(s, session.BackendToken, gatewayToken)
+	}
+	if session.BackendUserID != "" {
+		s = strings.ReplaceAll(s, session.BackendUserID, session.SyntheticUserID)
+	}
 	if session.BackendServerID != "" {
 		s = strings.ReplaceAll(s, session.BackendServerID, gatewayServerID)
 	}
@@ -1482,6 +1514,14 @@ func userDTO(user GatewayUser, serverID string) map[string]any {
 		"HasPassword":           true,
 		"HasConfiguredPassword": true,
 		"EnableAutoLogin":       false,
+	}
+}
+
+func authenticationResultDTO(user GatewayUser, token, serverID string) map[string]any {
+	return map[string]any{
+		"AccessToken": token,
+		"ServerId":    serverID,
+		"User":        userDTO(user, serverID),
 	}
 }
 

@@ -550,6 +550,9 @@ func lowerSet(values []string) map[string]bool {
 }
 
 func (s *Server) fetchBackendJSON(ctx context.Context, r *http.Request, rel, rawQuery string, session *Session, gatewayToken string) (any, int, error) {
+	if err := s.ensureBackendSession(ctx, session); err != nil {
+		return nil, 0, err
+	}
 	u, err := s.proxyURL(session, rel, rawQuery, gatewayToken)
 	if err != nil {
 		return nil, 0, err
@@ -566,6 +569,27 @@ func (s *Server) fetchBackendJSON(ctx context.Context, r *http.Request, rel, raw
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		if err := s.refreshBackendSession(ctx, session); err == nil {
+			_ = resp.Body.Close()
+			u, err = s.proxyURL(session, rel, rawQuery, gatewayToken)
+			if err != nil {
+				return nil, 0, err
+			}
+			req, err = http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+			if err != nil {
+				return nil, 0, err
+			}
+			copyRequestHeaders(req.Header, r.Header)
+			s.rewriteRequestHeaders(req.Header, session, gatewayToken)
+			req.Host = u.Host
+			resp, err = s.proxyClient.Do(req)
+			if err != nil {
+				return nil, 0, err
+			}
+			defer resp.Body.Close()
+		}
+	}
 	data, err := readLimited(resp.Body, proxyJSONLimit)
 	if err != nil {
 		return nil, resp.StatusCode, err

@@ -27,6 +27,10 @@ type Store interface {
 	FindUserBySyntheticID(ctx context.Context, syntheticID string) (*GatewayUser, error)
 	FindMappingByGatewayUserID(ctx context.Context, gatewayUserID string) (*UserMapping, error)
 	DefaultBackend(ctx context.Context) (*BackendAccount, error)
+	ListEnabledServers(ctx context.Context) ([]EmbyServer, error)
+	UpdateBackendToken(ctx context.Context, accountID, token, backendUserID string, updatedAt time.Time) error
+	RecordBackendLoginError(ctx context.Context, accountID, message string) error
+	UpdateServerInfo(ctx context.Context, serverRecordID, serverID, serverName, serverVersion string, checkedAt time.Time) error
 	RecordAudit(ctx context.Context, entry AuditLog) error
 	CheckPathPolicy(ctx context.Context, method, relativePath string) (PathPolicyDecision, error)
 	RecordPlaybackEvent(ctx context.Context, event PlaybackEvent) error
@@ -209,7 +213,25 @@ type BackendAccount struct {
 	Username       string
 	Password       string
 	Enabled        bool
+	BackendUserID  string
+	BackendToken   string
+	TokenUpdatedAt *time.Time
+	LastLoginAt    *time.Time
+	LastLoginError string
+	Server         EmbyServer
 	ClientIdentity BackendClientIdentity
+}
+
+type EmbyServer struct {
+	ID               string
+	Name             string
+	BaseURL          string
+	BackendServerID  string
+	ServerName       string
+	ServerVersion    string
+	VersionCheckedAt *time.Time
+	Enabled          bool
+	ClientIdentity   BackendClientIdentity
 }
 
 type BackendClientIdentity struct {
@@ -273,20 +295,22 @@ type Session struct {
 	GatewayUsername  string
 	SyntheticUserID  string
 	BackendAccountID string
-	BackendServerID  string
-	BackendBaseURL   string
-	BackendUserID    string
-	BackendUsername  string
-	BackendToken     string
-	BackendIdentity  BackendClientIdentity
-	Client           string
-	Device           string
-	DeviceID         string
-	Version          string
-	RemoteIP         string
-	CreatedAt        time.Time
-	ExpiresAt        time.Time
-	RevokedAt        *time.Time
+	BackendAccount   BackendAccount
+	// The backend fields below are resolved from backend_accounts/emby_servers at runtime.
+	BackendServerID string
+	BackendBaseURL  string
+	BackendUserID   string
+	BackendUsername string
+	BackendToken    string
+	BackendIdentity BackendClientIdentity
+	Client          string
+	Device          string
+	DeviceID        string
+	Version         string
+	RemoteIP        string
+	CreatedAt       time.Time
+	ExpiresAt       time.Time
+	RevokedAt       *time.Time
 }
 
 func (s *Session) Active(now time.Time) bool {

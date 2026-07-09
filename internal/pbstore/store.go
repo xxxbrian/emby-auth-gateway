@@ -97,6 +97,52 @@ func (s *Store) DefaultBackend(ctx context.Context) (*gateway.BackendAccount, er
 	return s.backendAccountFromRecord(records[0])
 }
 
+func (s *Store) ListEnabledServers(ctx context.Context) ([]gateway.EmbyServer, error) {
+	records, err := s.app.FindAllRecords("emby_servers", dbx.HashExp{"enabled": true})
+	if err != nil {
+		return nil, err
+	}
+	servers := make([]gateway.EmbyServer, 0, len(records))
+	for _, record := range records {
+		servers = append(servers, serverFromRecord(record))
+	}
+	return servers, nil
+}
+
+func (s *Store) UpdateBackendToken(ctx context.Context, accountID, token, backendUserID string, updatedAt time.Time) error {
+	record, err := s.app.FindRecordById("backend_accounts", accountID)
+	if err != nil {
+		return gateway.ErrNotFound
+	}
+	record.Set("backend_token", token)
+	record.Set("backend_user_id", backendUserID)
+	record.Set("token_updated_at", updatedAt.UTC())
+	record.Set("last_login_at", updatedAt.UTC())
+	record.Set("last_login_error", "")
+	return s.app.Save(record)
+}
+
+func (s *Store) RecordBackendLoginError(ctx context.Context, accountID, message string) error {
+	record, err := s.app.FindRecordById("backend_accounts", accountID)
+	if err != nil {
+		return gateway.ErrNotFound
+	}
+	record.Set("last_login_error", message)
+	return s.app.Save(record)
+}
+
+func (s *Store) UpdateServerInfo(ctx context.Context, serverRecordID, serverID, serverName, serverVersion string, checkedAt time.Time) error {
+	record, err := s.app.FindRecordById("emby_servers", serverRecordID)
+	if err != nil {
+		return gateway.ErrNotFound
+	}
+	record.Set("server_id", serverID)
+	record.Set("server_name", serverName)
+	record.Set("server_version", serverVersion)
+	record.Set("version_checked_at", checkedAt.UTC())
+	return s.app.Save(record)
+}
+
 func (s *Store) RecordAudit(ctx context.Context, entry gateway.AuditLog) error {
 	collection, err := s.app.FindCollectionByNameOrId("audit_logs")
 	if err != nil {
@@ -538,26 +584,12 @@ func (s *Store) SaveSession(ctx context.Context, session *gateway.Session) error
 	if err != nil {
 		return err
 	}
-	identity := session.BackendIdentity.WithDefaults()
-	if strings.TrimSpace(identity.DeviceID) == "" {
-		identity.DeviceID = gateway.StableBackendDeviceID(session.BackendServerID)
-	}
 	record := core.NewRecord(collection)
 	record.Set("gateway_token_hash", session.GatewayTokenHash)
 	record.Set("gateway_user", session.GatewayUserID)
 	record.Set("gateway_username", session.GatewayUsername)
 	record.Set("synthetic_user_id", session.SyntheticUserID)
 	record.Set("backend_account", session.BackendAccountID)
-	record.Set("backend_server_id", session.BackendServerID)
-	record.Set("backend_base_url", session.BackendBaseURL)
-	record.Set("backend_user_id", session.BackendUserID)
-	record.Set("backend_username", session.BackendUsername)
-	record.Set("backend_token", session.BackendToken)
-	record.Set("backend_user_agent", identity.UserAgent)
-	record.Set("backend_authorization_client", identity.Client)
-	record.Set("backend_authorization_device", identity.Device)
-	record.Set("backend_authorization_device_id", identity.DeviceID)
-	record.Set("backend_authorization_version", identity.Version)
 	record.Set("client", session.Client)
 	record.Set("device", session.Device)
 	record.Set("device_id", session.DeviceID)
@@ -579,15 +611,9 @@ func (s *Store) FindSessionByTokenHash(ctx context.Context, tokenHash string) (*
 		t := record.GetDateTime("revoked_at").Time()
 		revokedAt = &t
 	}
-	identity := gateway.BackendClientIdentity{
-		UserAgent: record.GetString("backend_user_agent"),
-		Client:    record.GetString("backend_authorization_client"),
-		Device:    record.GetString("backend_authorization_device"),
-		DeviceID:  record.GetString("backend_authorization_device_id"),
-		Version:   record.GetString("backend_authorization_version"),
-	}.WithDefaults()
-	if strings.TrimSpace(identity.DeviceID) == "" {
-		identity.DeviceID = gateway.StableBackendDeviceID(record.GetString("backend_server_id"))
+	account, err := s.backendAccountByID(record.GetString("backend_account"))
+	if err != nil {
+		return nil, err
 	}
 	return &gateway.Session{
 		GatewayTokenHash: record.GetString("gateway_token_hash"),
@@ -595,12 +621,13 @@ func (s *Store) FindSessionByTokenHash(ctx context.Context, tokenHash string) (*
 		GatewayUsername:  record.GetString("gateway_username"),
 		SyntheticUserID:  record.GetString("synthetic_user_id"),
 		BackendAccountID: record.GetString("backend_account"),
-		BackendServerID:  record.GetString("backend_server_id"),
-		BackendBaseURL:   record.GetString("backend_base_url"),
-		BackendUserID:    record.GetString("backend_user_id"),
-		BackendUsername:  record.GetString("backend_username"),
-		BackendToken:     record.GetString("backend_token"),
-		BackendIdentity:  identity,
+		BackendAccount:   *account,
+		BackendServerID:  account.Server.BackendServerID,
+		BackendBaseURL:   account.BaseURL,
+		BackendUserID:    account.BackendUserID,
+		BackendUsername:  account.Username,
+		BackendToken:     account.BackendToken,
+		BackendIdentity:  account.ClientIdentity.WithDefaults(),
 		Client:           record.GetString("client"),
 		Device:           record.GetString("device"),
 		DeviceID:         record.GetString("device_id"),
@@ -641,25 +668,66 @@ func (s *Store) backendAccountFromRecord(record *core.Record) (*gateway.BackendA
 	if err != nil {
 		return nil, gateway.ErrNotFound
 	}
-	identity := gateway.BackendClientIdentity{
-		UserAgent: server.GetString("backend_user_agent"),
-		Client:    server.GetString("backend_authorization_client"),
-		Device:    server.GetString("backend_authorization_device"),
-		DeviceID:  server.GetString("backend_authorization_device_id"),
-		Version:   server.GetString("backend_authorization_version"),
-	}.WithDefaults()
+	serverInfo := serverFromRecord(server)
+	identity := serverInfo.ClientIdentity.WithDefaults()
 	if strings.TrimSpace(identity.DeviceID) == "" {
 		identity.DeviceID = gateway.StableBackendDeviceID(server.Id)
+	}
+	serverInfo.ClientIdentity = identity
+	var tokenUpdatedAt *time.Time
+	if !record.GetDateTime("token_updated_at").IsZero() {
+		t := record.GetDateTime("token_updated_at").Time()
+		tokenUpdatedAt = &t
+	}
+	var lastLoginAt *time.Time
+	if !record.GetDateTime("last_login_at").IsZero() {
+		t := record.GetDateTime("last_login_at").Time()
+		lastLoginAt = &t
 	}
 	return &gateway.BackendAccount{
 		ID:             record.Id,
 		ServerID:       serverID,
-		BaseURL:        server.GetString("base_url"),
+		BaseURL:        serverInfo.BaseURL,
 		Username:       record.GetString("backend_username"),
 		Password:       record.GetString("backend_password"),
-		Enabled:        record.GetBool("enabled") && server.GetBool("enabled"),
+		Enabled:        record.GetBool("enabled") && serverInfo.Enabled,
+		BackendUserID:  record.GetString("backend_user_id"),
+		BackendToken:   record.GetString("backend_token"),
+		TokenUpdatedAt: tokenUpdatedAt,
+		LastLoginAt:    lastLoginAt,
+		LastLoginError: record.GetString("last_login_error"),
+		Server:         serverInfo,
 		ClientIdentity: identity,
 	}, nil
+}
+
+func serverFromRecord(record *core.Record) gateway.EmbyServer {
+	identity := gateway.BackendClientIdentity{
+		UserAgent: record.GetString("backend_user_agent"),
+		Client:    record.GetString("backend_authorization_client"),
+		Device:    record.GetString("backend_authorization_device"),
+		DeviceID:  record.GetString("backend_authorization_device_id"),
+		Version:   record.GetString("backend_authorization_version"),
+	}.WithDefaults()
+	if strings.TrimSpace(identity.DeviceID) == "" {
+		identity.DeviceID = gateway.StableBackendDeviceID(record.Id)
+	}
+	var versionCheckedAt *time.Time
+	if !record.GetDateTime("version_checked_at").IsZero() {
+		t := record.GetDateTime("version_checked_at").Time()
+		versionCheckedAt = &t
+	}
+	return gateway.EmbyServer{
+		ID:               record.Id,
+		Name:             record.GetString("name"),
+		BaseURL:          record.GetString("base_url"),
+		BackendServerID:  record.GetString("server_id"),
+		ServerName:       record.GetString("server_name"),
+		ServerVersion:    record.GetString("server_version"),
+		VersionCheckedAt: versionCheckedAt,
+		Enabled:          record.GetBool("enabled"),
+		ClientIdentity:   identity,
+	}
 }
 
 func (s *Store) enabledPathPolicies() ([]gateway.PathPolicy, error) {
