@@ -398,13 +398,13 @@ func TestGatewayWebSocketUpgradeProxy(t *testing.T) {
 
 func TestProxyRefreshesBackendTokenOnUnauthorized(t *testing.T) {
 	const syntheticUserID = "gateway-user"
-	var authCount int
+	var refreshCount int
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/emby/Users/AuthenticateByName":
-			authCount++
+			refreshCount++
 			writeTestJSON(w, map[string]any{
-				"AccessToken": "backend-token-" + strconv.Itoa(authCount),
+				"AccessToken": "backend-token-2",
 				"ServerId":    "backend-server",
 				"User": map[string]any{
 					"Id":   "backend-user",
@@ -431,6 +431,10 @@ func TestProxyRefreshesBackendTokenOnUnauthorized(t *testing.T) {
 	mapping := store.Mappings["u1"]
 	mapping.BackendAccount.Server.ServerVersion = "4.9.5.0"
 	mapping.BackendAccount.Server.ServerName = "Probed Emby"
+	mapping.BackendAccount.BackendToken = "backend-token-1"
+	mapping.BackendAccount.BackendUserID = "backend-user"
+	oldTokenTime := time.Now().UTC().Add(-backendTokenRefreshMinInterval - time.Second)
+	mapping.BackendAccount.TokenUpdatedAt = &oldTokenTime
 	store.Mappings["u1"] = mapping
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby", GatewayServerID: "gateway-server"}, store))
 	defer gw.Close()
@@ -440,7 +444,6 @@ func TestProxyRefreshesBackendTokenOnUnauthorized(t *testing.T) {
 	decodeJSON(t, loginResp.Body, &login)
 	_ = loginResp.Body.Close()
 	token, _ := login["AccessToken"].(string)
-
 	req := mustRequest(t, http.MethodGet, gw.URL+"/emby/System/Info", nil)
 	req.Header.Set("X-Emby-Token", token)
 	resp := do(t, req)
@@ -449,14 +452,173 @@ func TestProxyRefreshesBackendTokenOnUnauthorized(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("proxy status = %d: %s", resp.StatusCode, string(body))
 	}
-	if authCount != 2 {
-		t.Fatalf("backend auth count = %d, want 2", authCount)
+	if refreshCount != 1 {
+		t.Fatalf("backend refresh count = %d, want 1", refreshCount)
 	}
 	if store.Mappings["u1"].BackendAccount.BackendToken != "backend-token-2" {
 		t.Fatalf("backend token was not refreshed in store: %#v", store.Mappings["u1"].BackendAccount)
 	}
 	if store.Mappings["u1"].BackendAccount.Server.ServerVersion != "4.9.5.0" || store.Mappings["u1"].BackendAccount.Server.ServerName != "Probed Emby" {
 		t.Fatalf("lazy login cleared probed server info: %#v", store.Mappings["u1"].BackendAccount.Server)
+	}
+}
+
+func TestProxyDoesNotRefreshWhenUnauthorizedTokenStillWorks(t *testing.T) {
+	const syntheticUserID = "gateway-user"
+	var authCount int
+	var playbackCount int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/emby/Users/AuthenticateByName":
+			authCount++
+			writeTestJSON(w, map[string]any{
+				"AccessToken": "backend-token",
+				"ServerId":    "backend-server",
+				"User": map[string]any{
+					"Id":   "backend-user",
+					"Name": "shared",
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/emby/Items/item-1/PlaybackInfo":
+			playbackCount++
+			http.Error(w, "playback access denied", http.StatusUnauthorized)
+		case r.Method == http.MethodGet && r.URL.Path == "/emby/System/Info":
+			writeTestJSON(w, map[string]any{"Id": "backend-server"})
+		default:
+			t.Fatalf("unexpected backend request %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer backend.Close()
+
+	store := testStore(backend.URL + "/emby")
+	store.Users["u1"] = MemoryUser{GatewayUser: GatewayUser{ID: "u1", Username: "alice", SyntheticUserID: syntheticUserID, Enabled: true}, Password: "alice-pass"}
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby", GatewayServerID: "gateway-server"}, store))
+	defer gw.Close()
+
+	loginResp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice","Pw":"alice-pass"}`))
+	var login map[string]any
+	decodeJSON(t, loginResp.Body, &login)
+	_ = loginResp.Body.Close()
+	gatewayToken, _ := login["AccessToken"].(string)
+
+	req := mustRequest(t, http.MethodGet, gw.URL+"/emby/Items/item-1/PlaybackInfo", nil)
+	req.Header.Set("X-Emby-Token", gatewayToken)
+	resp := do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("proxy status = %d, want 401: %s", resp.StatusCode, string(body))
+	}
+	if authCount != 1 || playbackCount != 1 {
+		t.Fatalf("auth/playback counts = %d/%d, want 1/1", authCount, playbackCount)
+	}
+}
+
+func TestProxyDoesNotRefreshRecentUnauthorizedToken(t *testing.T) {
+	const syntheticUserID = "gateway-user"
+	var authCount int
+	var playbackCount int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/emby/Users/AuthenticateByName":
+			authCount++
+			writeTestJSON(w, map[string]any{
+				"AccessToken": "backend-token",
+				"ServerId":    "backend-server",
+				"User": map[string]any{
+					"Id":   "backend-user",
+					"Name": "shared",
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/emby/Items/item-1/PlaybackInfo":
+			playbackCount++
+			http.Error(w, "stale", http.StatusUnauthorized)
+		case r.Method == http.MethodGet && r.URL.Path == "/emby/System/Info":
+			http.Error(w, "stale", http.StatusUnauthorized)
+		default:
+			t.Fatalf("unexpected backend request %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer backend.Close()
+
+	store := testStore(backend.URL + "/emby")
+	store.Users["u1"] = MemoryUser{GatewayUser: GatewayUser{ID: "u1", Username: "alice", SyntheticUserID: syntheticUserID, Enabled: true}, Password: "alice-pass"}
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby", GatewayServerID: "gateway-server"}, store))
+	defer gw.Close()
+
+	loginResp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice","Pw":"alice-pass"}`))
+	var login map[string]any
+	decodeJSON(t, loginResp.Body, &login)
+	_ = loginResp.Body.Close()
+	gatewayToken, _ := login["AccessToken"].(string)
+
+	req := mustRequest(t, http.MethodGet, gw.URL+"/emby/Items/item-1/PlaybackInfo", nil)
+	req.Header.Set("X-Emby-Token", gatewayToken)
+	resp := do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("proxy status = %d, want 401: %s", resp.StatusCode, string(body))
+	}
+	if authCount != 1 || playbackCount != 1 {
+		t.Fatalf("auth/playback counts = %d/%d, want 1/1", authCount, playbackCount)
+	}
+}
+
+func TestProxyDoesNotRetryWhenRefreshReturnsSameToken(t *testing.T) {
+	const syntheticUserID = "gateway-user"
+	var refreshCount int
+	var playbackCount int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/emby/Users/AuthenticateByName":
+			refreshCount++
+			writeTestJSON(w, map[string]any{
+				"AccessToken": "backend-token",
+				"ServerId":    "backend-server",
+				"User": map[string]any{
+					"Id":   "backend-user",
+					"Name": "shared",
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/emby/Items/item-1/PlaybackInfo":
+			playbackCount++
+			http.Error(w, "stale", http.StatusUnauthorized)
+		case r.Method == http.MethodGet && r.URL.Path == "/emby/System/Info":
+			http.Error(w, "stale", http.StatusUnauthorized)
+		default:
+			t.Fatalf("unexpected backend request %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer backend.Close()
+
+	store := testStore(backend.URL + "/emby")
+	store.Users["u1"] = MemoryUser{GatewayUser: GatewayUser{ID: "u1", Username: "alice", SyntheticUserID: syntheticUserID, Enabled: true}, Password: "alice-pass"}
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby", GatewayServerID: "gateway-server"}, store))
+	defer gw.Close()
+
+	loginResp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice","Pw":"alice-pass"}`))
+	var login map[string]any
+	decodeJSON(t, loginResp.Body, &login)
+	_ = loginResp.Body.Close()
+	gatewayToken, _ := login["AccessToken"].(string)
+	oldTokenTime := time.Now().UTC().Add(-backendTokenRefreshMinInterval - time.Second)
+	mapping := store.Mappings["u1"]
+	mapping.BackendAccount.BackendToken = "backend-token"
+	mapping.BackendAccount.BackendUserID = "backend-user"
+	mapping.BackendAccount.TokenUpdatedAt = &oldTokenTime
+	store.Mappings["u1"] = mapping
+
+	req := mustRequest(t, http.MethodGet, gw.URL+"/emby/Items/item-1/PlaybackInfo", nil)
+	req.Header.Set("X-Emby-Token", gatewayToken)
+	resp := do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("proxy status = %d, want 401: %s", resp.StatusCode, string(body))
+	}
+	if refreshCount != 1 || playbackCount != 1 {
+		t.Fatalf("refresh/playback counts = %d/%d, want 1/1", refreshCount, playbackCount)
 	}
 }
 
@@ -501,14 +663,14 @@ func TestProxyRetryRewritesBodyWithRefreshedToken(t *testing.T) {
 		backendUserID   = "backend-user"
 		syntheticUserID = "gateway-user"
 	)
-	var authCount int
+	var refreshCount int
 	var postCount int
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/emby/Users/AuthenticateByName":
-			authCount++
+			refreshCount++
 			writeTestJSON(w, map[string]any{
-				"AccessToken": "backend-token-" + strconv.Itoa(authCount),
+				"AccessToken": "backend-token-2",
 				"ServerId":    "backend-server",
 				"User": map[string]any{
 					"Id":   backendUserID,
@@ -534,6 +696,12 @@ func TestProxyRetryRewritesBodyWithRefreshedToken(t *testing.T) {
 				t.Fatalf("retry body still contained stale token: %s", body)
 			}
 			writeTestJSON(w, map[string]any{"ok": true})
+		case r.Method == http.MethodGet && r.URL.Path == "/emby/System/Info":
+			if r.Header.Get("X-Emby-Token") == "backend-token-1" {
+				http.Error(w, "stale", http.StatusUnauthorized)
+				return
+			}
+			writeTestJSON(w, map[string]any{"Id": "backend-server"})
 		default:
 			t.Fatalf("unexpected backend request %s %s", r.Method, r.URL.String())
 		}
@@ -550,6 +718,12 @@ func TestProxyRetryRewritesBodyWithRefreshedToken(t *testing.T) {
 	decodeJSON(t, loginResp.Body, &login)
 	_ = loginResp.Body.Close()
 	gatewayToken, _ := login["AccessToken"].(string)
+	oldTokenTime := time.Now().UTC().Add(-backendTokenRefreshMinInterval - time.Second)
+	mapping := store.Mappings["u1"]
+	mapping.BackendAccount.BackendToken = "backend-token-1"
+	mapping.BackendAccount.BackendUserID = backendUserID
+	mapping.BackendAccount.TokenUpdatedAt = &oldTokenTime
+	store.Mappings["u1"] = mapping
 
 	body := `{"Token":"` + gatewayToken + `","UserId":"` + syntheticUserID + `"}`
 	req := mustRequest(t, http.MethodPost, gw.URL+"/emby/Users/"+syntheticUserID+"/Items", strings.NewReader(body))
@@ -561,8 +735,8 @@ func TestProxyRetryRewritesBodyWithRefreshedToken(t *testing.T) {
 		data, _ := io.ReadAll(resp.Body)
 		t.Fatalf("proxy status = %d: %s", resp.StatusCode, string(data))
 	}
-	if authCount != 2 || postCount != 2 {
-		t.Fatalf("auth/post counts = %d/%d, want 2/2", authCount, postCount)
+	if refreshCount != 1 || postCount != 2 {
+		t.Fatalf("refresh/post counts = %d/%d, want 1/2", refreshCount, postCount)
 	}
 }
 

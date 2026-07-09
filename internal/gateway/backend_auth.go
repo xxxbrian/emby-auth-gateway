@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 )
@@ -27,7 +28,9 @@ func (s *Server) refreshBackendSession(ctx context.Context, session *Session, fa
 	if session == nil {
 		return ErrNotFound
 	}
-	if account, err := s.store.FindBackendAccountByID(ctx, session.BackendAccountID); err == nil && account != nil {
+	var account *BackendAccount
+	if fetched, err := s.store.FindBackendAccountByID(ctx, session.BackendAccountID); err == nil && fetched != nil {
+		account = fetched
 		if !account.Enabled {
 			return ErrDisabled
 		}
@@ -36,9 +39,59 @@ func (s *Server) refreshBackendSession(ctx context.Context, session *Session, fa
 			return nil
 		}
 		session.BackendAccount = *account
+	} else {
+		account = &session.BackendAccount
+	}
+	if stale, err := s.backendTokenIsUnauthorized(ctx, session, failedToken); err != nil || !stale {
+		return ErrUnauthorized
+	}
+	if account != nil && tokenRefreshTooSoon(*account, failedToken, time.Now().UTC()) {
+		return ErrUnauthorized
 	}
 	session.BackendToken = ""
-	return s.loginBackendAccount(ctx, session)
+	if err := s.loginBackendAccount(ctx, session); err != nil {
+		return err
+	}
+	if session.BackendToken == "" || session.BackendToken == failedToken {
+		return ErrUnauthorized
+	}
+	return nil
+}
+
+func (s *Server) backendTokenIsUnauthorized(ctx context.Context, session *Session, token string) (bool, error) {
+	if strings.TrimSpace(token) == "" {
+		return true, nil
+	}
+	u, err := backendURL(session.BackendBaseURL, "/System/Info")
+	if err != nil {
+		return false, err
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, backendAuthTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(checkCtx, http.MethodGet, u, nil)
+	if err != nil {
+		return false, err
+	}
+	identity := session.BackendIdentity.WithDefaults()
+	req.Header.Set("User-Agent", identity.UserAgent)
+	req.Header.Set("X-Emby-Token", token)
+	req.Header.Set("X-Emby-Authorization", backendAuthHeader(identity, session.BackendUserID, token).String())
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusUnauthorized, nil
+}
+
+func tokenRefreshTooSoon(account BackendAccount, failedToken string, now time.Time) bool {
+	if account.TokenUpdatedAt == nil || strings.TrimSpace(failedToken) == "" {
+		return false
+	}
+	if account.BackendToken != "" && account.BackendToken != failedToken {
+		return false
+	}
+	return now.Sub(account.TokenUpdatedAt.UTC()) < backendTokenRefreshMinInterval
 }
 
 func (s *Server) loginBackendAccount(ctx context.Context, session *Session) error {

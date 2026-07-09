@@ -7,6 +7,7 @@ const (
 
 	backendAuthTimeout              = 15 * time.Second
 	backendLoginFailureCooldown     = 30 * time.Second
+	backendTokenRefreshMinInterval  = 2 * time.Minute
 	proxyResponseHeaderTimeout      = 30 * time.Second
 	proxyIdleConnTimeout            = 90 * time.Second
 	loginFailureLimit               = 5
