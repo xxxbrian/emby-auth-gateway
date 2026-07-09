@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
 	"strconv"
@@ -55,6 +56,11 @@ func main() {
 			gw.ServeHTTP(re.Response, re.Request)
 			return nil
 		})
+		go func() {
+			if err := gw.RefreshBackendServerInfo(context.Background()); err != nil {
+				e.App.Logger().Warn("Failed to refresh backend server info", "error", err)
+			}
+		}()
 
 		if err := e.App.Cron().Add("gatewayPlaybackEventCleanup", "@hourly", func() {
 			if err := cleanupPlaybackEvents(e.App, time.Now().UTC()); err != nil {
@@ -62,6 +68,9 @@ func main() {
 			}
 			if err := cleanupGatewaySessions(e.App, time.Now().UTC()); err != nil {
 				e.App.Logger().Warn("Failed to cleanup gateway sessions", "error", err)
+			}
+			if err := gw.RefreshBackendServerInfo(context.Background()); err != nil {
+				e.App.Logger().Warn("Failed to refresh backend server info", "error", err)
 			}
 		}); err != nil {
 			return err
