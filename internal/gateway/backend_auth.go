@@ -49,21 +49,26 @@ func (s *Server) loginBackendAccount(ctx context.Context, session *Session) erro
 	if account.ID == "" {
 		return ErrNotFound
 	}
+	if !account.Enabled {
+		return ErrDisabled
+	}
 	if err := s.backendLoginCooldownError(account.ID, time.Now().UTC()); err != nil {
 		return err
 	}
 	value, err, _ := s.backendAuth.Do(account.ID, func() (any, error) {
+		loginCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), backendAuthTimeout)
+		defer cancel()
 		if err := s.backendLoginCooldownError(account.ID, time.Now().UTC()); err != nil {
 			return nil, err
 		}
-		result, loginErr := s.authenticateBackend(ctx, account)
+		result, loginErr := s.authenticateBackend(loginCtx, account)
 		if loginErr != nil {
-			_ = s.store.RecordBackendLoginError(ctx, account.ID, loginErr.Error())
+			_ = s.store.RecordBackendLoginError(loginCtx, account.ID, loginErr.Error())
 			s.recordBackendLoginFailure(account.ID, loginErr.Error(), time.Now().UTC())
 			return nil, loginErr
 		}
 		now := time.Now().UTC()
-		if err := s.store.UpdateBackendToken(ctx, account.ID, result.AccessToken, result.UserID, now); err != nil {
+		if err := s.store.UpdateBackendToken(loginCtx, account.ID, result.AccessToken, result.UserID, now); err != nil {
 			return nil, err
 		}
 		s.clearBackendLoginFailure(account.ID)

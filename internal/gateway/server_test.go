@@ -578,6 +578,46 @@ func TestRefreshBackendSessionReusesRotatedToken(t *testing.T) {
 	}
 }
 
+func TestBackendLoginIgnoresCallerCancellation(t *testing.T) {
+	backend := testAuthBackend(t)
+	defer backend.Close()
+	store := testStore(backend.URL + "/emby")
+	session := testSession(backend.URL + "/emby")
+	session.BackendToken = ""
+	session.BackendUserID = ""
+	session.BackendAccount = store.Mappings["u1"].BackendAccount
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	server := NewServer(Config{GatewayBasePath: "/emby"}, store)
+	if err := server.ensureBackendSession(ctx, session); err != nil {
+		t.Fatalf("ensure backend session with canceled caller context: %v", err)
+	}
+	if session.BackendToken == "" || store.Mappings["u1"].BackendAccount.BackendToken == "" {
+		t.Fatalf("backend token was not stored after canceled caller context")
+	}
+}
+
+func TestDisabledBackendAccountDoesNotLogin(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("disabled backend account should not call backend: %s %s", r.Method, r.URL.String())
+	}))
+	defer backend.Close()
+	store := testStore(backend.URL + "/emby")
+	mapping := store.Mappings["u1"]
+	mapping.BackendAccount.Enabled = false
+	store.Mappings["u1"] = mapping
+	session := testSession(backend.URL + "/emby")
+	session.BackendToken = ""
+	session.BackendUserID = ""
+	session.BackendAccount = mapping.BackendAccount
+
+	server := NewServer(Config{GatewayBasePath: "/emby"}, store)
+	if err := server.ensureBackendSession(context.Background(), session); !errors.Is(err, ErrDisabled) {
+		t.Fatalf("ensure backend session error = %v, want ErrDisabled", err)
+	}
+}
+
 func TestAnonymousPublicInfoAndPing(t *testing.T) {
 	store := NewMemoryStore()
 	store.Mappings["m1"] = UserMapping{BackendAccount: BackendAccount{ID: "b1", ServerID: "s1", Enabled: true, Server: EmbyServer{ID: "s1", Enabled: true, ServerVersion: "4.9.1"}}}
