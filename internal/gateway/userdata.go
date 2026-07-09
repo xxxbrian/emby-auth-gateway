@@ -14,6 +14,9 @@ import (
 )
 
 func (s *Server) handlePersonalDataRequest(w http.ResponseWriter, r *http.Request, rel string, session *Session, gatewayToken string) bool {
+	if s.handleLocalSessionStateRequest(w, r, rel, session, gatewayToken) {
+		return true
+	}
 	if s.handleDisplayPreferences(w, r, rel, session) {
 		return true
 	}
@@ -41,6 +44,23 @@ func (s *Server) handlePersonalDataRequest(w http.ResponseWriter, r *http.Reques
 		return true
 	case shouldLocalizePersonalFilter(rel, r.URL.Query()):
 		s.writePersonalFilteredItems(w, r, rel, session, gatewayToken)
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) handleLocalSessionStateRequest(w http.ResponseWriter, r *http.Request, rel string, session *Session, gatewayToken string) bool {
+	switch {
+	case isPlaybackReportRequest(r.Method, rel):
+		if err := s.recordPlaybackRequest(r, rel, session, gatewayToken); err != nil {
+			http.Error(w, "bad request body", http.StatusBadRequest)
+			return true
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return true
+	case isPlaybackKeepaliveRequest(r.Method, rel), isSessionCapabilitiesRequest(r.Method, rel):
+		w.WriteHeader(http.StatusNoContent)
 		return true
 	default:
 		return false

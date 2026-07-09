@@ -385,13 +385,6 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 		s.handleUpgradeProxy(w, r, proxyURL, session, gatewayToken, rel)
 		return
 	}
-	if isPlaybackRequest(r.Method, rel) {
-		if err := s.recordPlaybackRequest(r, rel, session, gatewayToken); err != nil {
-			http.Error(w, "bad request body", http.StatusBadRequest)
-			return
-		}
-	}
-
 	body, rawBody, replayable, err := s.rewriteRequestBody(r, session, gatewayToken)
 	if err != nil {
 		http.Error(w, "bad request body", http.StatusBadRequest)
@@ -615,7 +608,7 @@ func (s *Server) rewriteRequestBodyData(data []byte, session *Session, gatewayTo
 	return strings.NewReader(text)
 }
 
-func isPlaybackRequest(method, rel string) bool {
+func isPlaybackReportRequest(method, rel string) bool {
 	if method != http.MethodPost {
 		return false
 	}
@@ -625,6 +618,24 @@ func isPlaybackRequest(method, rel string) bool {
 	case equalPath(rel, "/Sessions/Playing/Progress"):
 		return true
 	case equalPath(rel, "/Sessions/Playing/Stopped"):
+		return true
+	default:
+		return false
+	}
+}
+
+func isPlaybackKeepaliveRequest(method, rel string) bool {
+	return method == http.MethodPost && equalPath(rel, "/Sessions/Playing/Ping")
+}
+
+func isSessionCapabilitiesRequest(method, rel string) bool {
+	if method != http.MethodPost {
+		return false
+	}
+	switch {
+	case equalPath(rel, "/Sessions/Capabilities"):
+		return true
+	case equalPath(rel, "/Sessions/Capabilities/Full"):
 		return true
 	default:
 		return false

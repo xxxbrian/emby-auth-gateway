@@ -1245,15 +1245,12 @@ func TestPathPolicyDenyAndDefaultAllow(t *testing.T) {
 	}
 }
 
-func TestPlaybackEventsAndStateAreRecordedAndForwarded(t *testing.T) {
+func TestPlaybackEventsAndStateAreRecordedWithoutForwarding(t *testing.T) {
 	const gatewayToken = "gateway-token"
 	var forwarded []string
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		forwarded = append(forwarded, r.URL.Path+":"+string(body))
-		if strings.Contains(string(body), "gateway-user") || !strings.Contains(string(body), "backend-user") {
-			t.Fatalf("playback body was not mapped to backend user: %s", string(body))
-		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer backend.Close()
@@ -1280,8 +1277,8 @@ func TestPlaybackEventsAndStateAreRecordedAndForwarded(t *testing.T) {
 			t.Fatalf("%s status = %d, want 204", req.path, resp.StatusCode)
 		}
 	}
-	if len(forwarded) != 3 || len(store.PlaybackEvents) != 3 {
-		t.Fatalf("forwarded=%d events=%d, want 3/3", len(forwarded), len(store.PlaybackEvents))
+	if len(forwarded) != 0 || len(store.PlaybackEvents) != 3 {
+		t.Fatalf("forwarded=%d events=%d, want 0/3", len(forwarded), len(store.PlaybackEvents))
 	}
 	state, err := store.FindPlaybackState(context.Background(), "u1", "item-1")
 	if err != nil {
@@ -1296,6 +1293,74 @@ func TestPlaybackEventsAndStateAreRecordedAndForwarded(t *testing.T) {
 	playbackJSON := mustJSON(t, store.PlaybackEvents)
 	if strings.Contains(playbackJSON, gatewayToken) || strings.Contains(playbackJSON, "backend-token") || strings.Contains(playbackJSON, "alice-pass") {
 		t.Fatalf("playback event leaked secret: %s", playbackJSON)
+	}
+}
+
+func TestPlaybackReportsSucceedWhenBackendUnavailable(t *testing.T) {
+	store := NewMemoryStore()
+	store.Sessions[HashToken("gateway-token")] = testSession("http://127.0.0.1:1/emby")
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	req := mustRequest(t, http.MethodPost, gw.URL+"/emby/Sessions/Playing/Progress?api_key=gateway-token&ItemId=item-1&PlaybackPositionTicks=700", nil)
+	resp := do(t, req)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("playback status = %d, want 204", resp.StatusCode)
+	}
+	state, err := store.FindPlaybackState(context.Background(), "u1", "item-1")
+	if err != nil || state.PlaybackPositionTicks != 700 {
+		t.Fatalf("playback state = %#v err=%v", state, err)
+	}
+}
+
+func TestPlaybackPingAndCapabilitiesAreLocalOnly(t *testing.T) {
+	var forwarded []string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwarded = append(forwarded, r.Method+" "+r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	store := NewMemoryStore()
+	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	for _, path := range []string{"/Sessions/Playing/Ping", "/Sessions/Capabilities", "/Sessions/Capabilities/Full"} {
+		req := mustRequest(t, http.MethodPost, gw.URL+"/emby"+path+"?api_key=gateway-token", strings.NewReader(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+		resp := do(t, req)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("%s status = %d, want 204", path, resp.StatusCode)
+		}
+	}
+	if len(forwarded) != 0 || len(store.PlaybackEvents) != 0 || len(store.PlaybackStates) != 0 {
+		t.Fatalf("forwarded=%v events=%d states=%d, want no local/proxy side effects", forwarded, len(store.PlaybackEvents), len(store.PlaybackStates))
+	}
+}
+
+func TestRemoteControlPlaybackRequestStillForwards(t *testing.T) {
+	var forwarded []string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwarded = append(forwarded, r.Method+" "+r.URL.Path)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer backend.Close()
+
+	store := NewMemoryStore()
+	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	resp := do(t, mustRequest(t, http.MethodPost, gw.URL+"/emby/Sessions/session-1/Playing/Pause?api_key=gateway-token", nil))
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("remote control status = %d, want 204", resp.StatusCode)
+	}
+	if len(forwarded) != 1 || forwarded[0] != "POST /emby/Sessions/session-1/Playing/Pause" {
+		t.Fatalf("forwarded = %v, want remote control request", forwarded)
 	}
 }
 
@@ -2146,7 +2211,9 @@ func TestLatestLargeLimitIsCappedInsteadOfReturningEmpty(t *testing.T) {
 }
 
 func TestPlaybackReportsCanUseFormBodyAndQueryParameters(t *testing.T) {
+	var forwarded int
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwarded++
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer backend.Close()
@@ -2161,7 +2228,7 @@ func TestPlaybackReportsCanUseFormBodyAndQueryParameters(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp := do(t, req)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("form playback status = %d", resp.StatusCode)
 	}
 	state, err := store.FindPlaybackState(context.Background(), "u1", "form-item")
@@ -2171,6 +2238,9 @@ func TestPlaybackReportsCanUseFormBodyAndQueryParameters(t *testing.T) {
 
 	resp = do(t, mustRequest(t, http.MethodPost, gw.URL+"/emby/Sessions/Playing/Progress?api_key=gateway-token&ItemId=query-item&PlaybackPositionTicks=700", nil))
 	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("query playback status = %d", resp.StatusCode)
+	}
 	state, err = store.FindPlaybackState(context.Background(), "u1", "query-item")
 	if err != nil || state.PlaybackPositionTicks != 700 {
 		t.Fatalf("query playback state = %#v err=%v", state, err)
@@ -2180,9 +2250,15 @@ func TestPlaybackReportsCanUseFormBodyAndQueryParameters(t *testing.T) {
 	jsonReq.Header.Set("Content-Type", "application/json")
 	resp = do(t, jsonReq)
 	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("json/query playback status = %d", resp.StatusCode)
+	}
 	state, err = store.FindPlaybackState(context.Background(), "u1", "json-query-item")
 	if err != nil || state.PlaybackPositionTicks != 900 || state.RunTimeTicks != 1800 {
 		t.Fatalf("json/query playback state = %#v err=%v", state, err)
+	}
+	if forwarded != 0 {
+		t.Fatalf("forwarded playback reports = %d, want 0", forwarded)
 	}
 }
 
