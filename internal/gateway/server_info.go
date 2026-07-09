@@ -95,7 +95,28 @@ func compareVersions(a, b string) int {
 			return -1
 		}
 	}
+	aRelease := isPlainNumericVersion(a)
+	bRelease := isPlainNumericVersion(b)
+	if aRelease && !bRelease {
+		return 1
+	}
+	if !aRelease && bRelease {
+		return -1
+	}
 	return strings.Compare(a, b)
+}
+
+func isPlainNumericVersion(version string) bool {
+	version = strings.TrimSpace(version)
+	if version == "" {
+		return false
+	}
+	for _, r := range version {
+		if (r < '0' || r > '9') && r != '.' {
+			return false
+		}
+	}
+	return true
 }
 
 func versionParts(version string) []int {

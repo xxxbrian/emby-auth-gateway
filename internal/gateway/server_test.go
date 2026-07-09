@@ -669,6 +669,15 @@ func TestAnonymousPublicInfoAndPing(t *testing.T) {
 	}
 }
 
+func TestCompareVersionsPrefersReleaseOverPrerelease(t *testing.T) {
+	if compareVersions("4.9.0.30", "4.9.0.30-beta") <= 0 {
+		t.Fatal("release version should compare greater than matching prerelease")
+	}
+	if compareVersions("4.10.0", "4.9.9") <= 0 {
+		t.Fatal("numeric version comparison should compare each segment")
+	}
+}
+
 func TestAuthenticateByNameAcceptsFormBody(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/emby/Users/AuthenticateByName" {
