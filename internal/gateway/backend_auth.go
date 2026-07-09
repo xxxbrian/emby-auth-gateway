@@ -73,7 +73,7 @@ func (s *Server) loginBackendAccount(ctx context.Context, session *Session) erro
 		}
 		s.clearBackendLoginFailure(account.ID)
 		if result.ServerID != "" && account.ServerID != "" {
-			_ = s.store.UpdateServerInfo(ctx, account.ServerID, result.ServerID, result.ServerName, result.ServerVersion, now)
+			_ = s.store.UpdateServerInfo(loginCtx, account.ServerID, result.ServerID, result.ServerName, result.ServerVersion, now)
 		}
 		return result, nil
 	})
