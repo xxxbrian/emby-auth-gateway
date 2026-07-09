@@ -136,9 +136,15 @@ func (s *Store) UpdateServerInfo(ctx context.Context, serverRecordID, serverID, 
 	if err != nil {
 		return gateway.ErrNotFound
 	}
-	record.Set("server_id", serverID)
-	record.Set("server_name", serverName)
-	record.Set("server_version", serverVersion)
+	if strings.TrimSpace(serverID) != "" {
+		record.Set("server_id", serverID)
+	}
+	if strings.TrimSpace(serverName) != "" {
+		record.Set("server_name", serverName)
+	}
+	if strings.TrimSpace(serverVersion) != "" {
+		record.Set("server_version", serverVersion)
+	}
 	record.Set("version_checked_at", checkedAt.UTC())
 	return s.app.Save(record)
 }

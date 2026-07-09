@@ -179,9 +179,15 @@ func (m *MemoryStore) UpdateServerInfo(ctx context.Context, serverRecordID, serv
 			continue
 		}
 		server.ID = serverRecordID
-		server.BackendServerID = serverID
-		server.ServerName = serverName
-		server.ServerVersion = serverVersion
+		if strings.TrimSpace(serverID) != "" {
+			server.BackendServerID = serverID
+		}
+		if strings.TrimSpace(serverName) != "" {
+			server.ServerName = serverName
+		}
+		if strings.TrimSpace(serverVersion) != "" {
+			server.ServerVersion = serverVersion
+		}
 		t := checkedAt.UTC()
 		server.VersionCheckedAt = &t
 		mapping.BackendAccount.Server = server

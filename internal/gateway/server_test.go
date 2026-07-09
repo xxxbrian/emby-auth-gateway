@@ -415,6 +415,10 @@ func TestProxyRefreshesBackendTokenOnUnauthorized(t *testing.T) {
 
 	store := testStore(backend.URL + "/emby")
 	store.Users["u1"] = MemoryUser{GatewayUser: GatewayUser{ID: "u1", Username: "alice", SyntheticUserID: syntheticUserID, Enabled: true}, Password: "alice-pass"}
+	mapping := store.Mappings["u1"]
+	mapping.BackendAccount.Server.ServerVersion = "4.9.5.0"
+	mapping.BackendAccount.Server.ServerName = "Probed Emby"
+	store.Mappings["u1"] = mapping
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby", GatewayServerID: "gateway-server"}, store))
 	defer gw.Close()
 
@@ -437,6 +441,9 @@ func TestProxyRefreshesBackendTokenOnUnauthorized(t *testing.T) {
 	}
 	if store.Mappings["u1"].BackendAccount.BackendToken != "backend-token-2" {
 		t.Fatalf("backend token was not refreshed in store: %#v", store.Mappings["u1"].BackendAccount)
+	}
+	if store.Mappings["u1"].BackendAccount.Server.ServerVersion != "4.9.5.0" || store.Mappings["u1"].BackendAccount.Server.ServerName != "Probed Emby" {
+		t.Fatalf("lazy login cleared probed server info: %#v", store.Mappings["u1"].BackendAccount.Server)
 	}
 }
 
