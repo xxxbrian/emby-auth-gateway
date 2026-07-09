@@ -168,7 +168,7 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit(ctx, AuditLog{GatewayUserID: user.ID, SyntheticUserID: user.SyntheticUserID, Event: "login_success", Message: "login succeeded", RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusOK})
 
-	writeJSON(w, http.StatusOK, authenticationResultDTO(*user, token, s.cfg.GatewayServerID))
+	writeJSON(w, http.StatusOK, authenticationResultDTO(*user, session, token, s.cfg.GatewayServerID))
 }
 
 type authenticateForm struct {
@@ -1513,11 +1513,64 @@ func userDTO(user GatewayUser, serverID string) map[string]any {
 	}
 }
 
-func authenticationResultDTO(user GatewayUser, token, serverID string) map[string]any {
+func authenticationResultDTO(user GatewayUser, session *Session, token, serverID string) map[string]any {
+	userObj := userDTO(user, serverID)
+	userObj["Configuration"] = map[string]any{
+		"PlayDefaultAudioTrack":      true,
+		"SubtitleMode":               "Smart",
+		"RememberAudioSelections":    true,
+		"RememberSubtitleSelections": true,
+		"EnableNextEpisodeAutoPlay":  true,
+		"HidePlayedInLatest":         true,
+		"HidePlayedInMoreLikeThis":   false,
+		"HidePlayedInSuggestions":    false,
+		"EnableLocalPassword":        false,
+		"DisplayMissingEpisodes":     false,
+		"ResumeRewindSeconds":        0,
+		"OrderedViews":               []any{},
+		"LatestItemsExcludes":        []any{},
+		"MyMediaExcludes":            []any{},
+	}
+	userObj["Policy"] = map[string]any{
+		"IsAdministrator":                 false,
+		"IsHidden":                        false,
+		"IsDisabled":                      false,
+		"EnableUserPreferenceAccess":      true,
+		"EnableRemoteControlOfOtherUsers": false,
+		"EnableSharedDeviceControl":       false,
+		"EnableRemoteAccess":              true,
+		"EnableMediaPlayback":             true,
+		"EnableAudioPlaybackTranscoding":  true,
+		"EnableVideoPlaybackTranscoding":  true,
+		"EnablePlaybackRemuxing":          true,
+		"EnableContentDownloading":        true,
+		"EnableAllChannels":               true,
+		"EnableAllFolders":                true,
+		"EnableAllDevices":                true,
+		"BlockedTags":                     []any{},
+		"AccessSchedules":                 []any{},
+		"BlockUnratedItems":               []any{},
+		"EnabledChannels":                 []any{},
+		"EnabledFolders":                  []any{},
+		"EnabledDevices":                  []any{},
+	}
+	sessionInfo := map[string]any{
+		"ServerId":           serverID,
+		"UserId":             user.SyntheticUserID,
+		"UserName":           user.Username,
+		"Client":             session.Client,
+		"DeviceName":         session.Device,
+		"DeviceId":           session.DeviceID,
+		"ApplicationVersion": session.Version,
+		"SupportedCommands":  []any{},
+		"PlayableMediaTypes": []any{},
+		"AdditionalUsers":    []any{},
+	}
 	return map[string]any{
 		"AccessToken": token,
 		"ServerId":    serverID,
-		"User":        userDTO(user, serverID),
+		"User":        userObj,
+		"SessionInfo": sessionInfo,
 	}
 }
 

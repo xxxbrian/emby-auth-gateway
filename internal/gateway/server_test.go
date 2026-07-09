@@ -183,6 +183,19 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 	if strings.Contains(mustJSON(t, login), backendToken) || strings.Contains(mustJSON(t, login), backendUserID) {
 		t.Fatalf("login leaked backend token or user id: %s", mustJSON(t, login))
 	}
+	loginUser, ok := login["User"].(map[string]any)
+	if !ok {
+		t.Fatalf("login User missing: %#v", login)
+	}
+	if _, ok := loginUser["Policy"].(map[string]any); !ok {
+		t.Fatalf("login User.Policy missing: %#v", loginUser)
+	}
+	if _, ok := loginUser["Configuration"].(map[string]any); !ok {
+		t.Fatalf("login User.Configuration missing: %#v", loginUser)
+	}
+	if _, ok := login["SessionInfo"].(map[string]any); !ok {
+		t.Fatalf("login SessionInfo missing: %#v", login)
+	}
 
 	systemReq, _ := http.NewRequest(http.MethodGet, gw.URL+"/emby/System/Info", nil)
 	systemReq.Header.Set("X-Emby-Token", gatewayToken)
