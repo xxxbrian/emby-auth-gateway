@@ -11,6 +11,7 @@ import (
 	"github.com/xxxbrian/emby-auth-gateway/internal/gateway"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pbsetup"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pbstore"
+	"github.com/xxxbrian/emby-auth-gateway/internal/version"
 
 	_ "github.com/xxxbrian/emby-auth-gateway/internal/pbmigrations"
 
@@ -21,8 +22,10 @@ import (
 
 func main() {
 	app := pocketbase.New()
+	app.RootCmd.Version = version.Version
 	migratecmd.MustRegister(app, app.RootCmd, migratecmd.Config{})
 	app.RootCmd.AddCommand(pbsetup.NewCommand(app))
+	app.RootCmd.AddCommand(newVersionCommand())
 	registerBackendIdentityDefaults(app)
 
 	app.OnBootstrap().BindFunc(func(e *core.BootstrapEvent) error {

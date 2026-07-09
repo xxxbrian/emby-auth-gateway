@@ -4,7 +4,6 @@ import "time"
 
 const (
 	defaultSessionTTL = 30 * 24 * time.Hour
-	gatewayVersion    = "0.3.4"
 
 	backendAuthTimeout              = 15 * time.Second
 	backendLoginFailureCooldown     = 30 * time.Second

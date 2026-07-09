@@ -56,6 +56,7 @@ jobs:
             printf 'version=%s\n' "$version"
             printf 'version_no_v=%s\n' "${version#v}"
             printf 'latest=%s\n' "$latest"
+            printf 'build_date=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } >> "$GITHUB_OUTPUT"
 
       - name: Checkout
@@ -94,6 +95,10 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.release.outputs.version_no_v }}
+            REVISION=${{ github.sha }}
+            BUILD_DATE=${{ steps.release.outputs.build_date }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: true
@@ -121,6 +126,9 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ needs.docker.outputs.version_no_v }}"
+          commit="${{ github.sha }}"
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ldflags="-s -w -X github.com/xxxbrian/emby-auth-gateway/internal/version.Version=$version -X github.com/xxxbrian/emby-auth-gateway/internal/version.Commit=$commit -X github.com/xxxbrian/emby-auth-gateway/internal/version.Date=$build_date"
           mkdir -p dist build
           targets=(
             "linux amd64"
@@ -133,7 +141,7 @@ jobs:
             name="gateway_${version}_${goos}_${goarch}"
             out="build/${name}/gateway"
             mkdir -p "build/${name}"
-            GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$out" ./cmd/gateway
+            GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 go build -trimpath -ldflags="$ldflags" -o "$out" ./cmd/gateway
             tar -C "build/${name}" -czf "dist/${name}.tar.gz" gateway
           done
           (cd dist && sha256sum *.tar.gz > checksums.txt)

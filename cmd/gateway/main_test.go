@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,6 +12,22 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tests"
 )
+
+func TestVersionCommandPrintsBuildMetadata(t *testing.T) {
+	cmd := newVersionCommand()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs(nil)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute version command: %v", err)
+	}
+	text := out.String()
+	for _, want := range []string{"version:", "commit:", "date:"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("version output missing %q: %s", want, text)
+		}
+	}
+}
 
 func TestCleanupPlaybackEventsKeepsOnlyRecentEvents(t *testing.T) {
 	app, err := tests.NewTestAppWithConfig(core.BaseAppConfig{

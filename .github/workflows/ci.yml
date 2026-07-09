@@ -44,5 +44,9 @@ jobs:
           context: .
           push: false
           tags: emby-auth-gateway:ci
+          build-args: |
+            VERSION=ci
+            REVISION=${{ github.sha }}
+            BUILD_DATE=unknown
           cache-from: type=gha
           cache-to: type=gha,mode=max

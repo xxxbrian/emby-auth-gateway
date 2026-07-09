@@ -18,8 +18,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xxxbrian/emby-auth-gateway/internal/version"
+
 	"golang.org/x/sync/singleflight"
 )
+
+const gatewayVersionHeader = "X-Emby-Auth-Gateway-Version"
 
 type Server struct {
 	cfg                   Config
@@ -63,6 +67,7 @@ func NewServer(cfg Config, store Store) *Server {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set(gatewayVersionHeader, version.Version)
 	rel, ok := s.relativePath(r.URL.Path)
 	if !ok {
 		http.NotFound(w, r)

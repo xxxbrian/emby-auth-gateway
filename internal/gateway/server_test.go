@@ -714,8 +714,8 @@ func TestPublicSystemInfoUnavailableWithoutBackendVersion(t *testing.T) {
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("public info status = %d, want 503: %s", resp.StatusCode, string(body))
 	}
-	if strings.Contains(string(body), gatewayVersion) {
-		t.Fatalf("public info unavailable response leaked gateway version: %s", string(body))
+	if strings.Contains(string(body), "0.3.4") || strings.Contains(string(body), "dev") {
+		t.Fatalf("public info unavailable response leaked gateway version-like content: %s", string(body))
 	}
 }
 
@@ -2317,6 +2317,9 @@ func TestGatewayBasePathCanBeChanged(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("custom base path ping status = %d", resp.StatusCode)
+	}
+	if resp.Header.Get(gatewayVersionHeader) == "" {
+		t.Fatal("gateway version header was not set")
 	}
 	resp = do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/System/Ping", nil))
 	_ = resp.Body.Close()
