@@ -23,9 +23,19 @@ func (s *Server) ensureBackendSession(ctx context.Context, session *Session) err
 	return s.loginBackendAccount(ctx, session)
 }
 
-func (s *Server) refreshBackendSession(ctx context.Context, session *Session) error {
+func (s *Server) refreshBackendSession(ctx context.Context, session *Session, failedToken string) error {
 	if session == nil {
 		return ErrNotFound
+	}
+	if account, err := s.store.FindBackendAccountByID(ctx, session.BackendAccountID); err == nil && account != nil {
+		if !account.Enabled {
+			return ErrDisabled
+		}
+		if strings.TrimSpace(account.BackendToken) != "" && account.BackendToken != failedToken && strings.TrimSpace(account.BackendUserID) != "" {
+			applyBackendAccountToSession(session, *account)
+			return nil
+		}
+		session.BackendAccount = *account
 	}
 	session.BackendToken = ""
 	return s.loginBackendAccount(ctx, session)
@@ -83,6 +93,17 @@ func (s *Server) loginBackendAccount(ctx context.Context, session *Session) erro
 	session.BackendAccount.BackendToken = result.AccessToken
 	session.BackendAccount.BackendUserID = result.UserID
 	return nil
+}
+
+func applyBackendAccountToSession(session *Session, account BackendAccount) {
+	session.BackendAccount = account
+	session.BackendAccountID = account.ID
+	session.BackendServerID = account.Server.BackendServerID
+	session.BackendBaseURL = account.BaseURL
+	session.BackendUserID = account.BackendUserID
+	session.BackendUsername = account.Username
+	session.BackendToken = account.BackendToken
+	session.BackendIdentity = account.ClientIdentity.WithDefaults()
 }
 
 func (s *Server) backendLoginCooldownError(accountID string, now time.Time) error {

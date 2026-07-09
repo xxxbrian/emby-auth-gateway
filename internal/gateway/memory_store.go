@@ -101,6 +101,18 @@ func (m *MemoryStore) DefaultBackend(ctx context.Context) (*BackendAccount, erro
 	return nil, ErrNotFound
 }
 
+func (m *MemoryStore) FindBackendAccountByID(ctx context.Context, backendAccountID string) (*BackendAccount, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, mapping := range m.Mappings {
+		if mapping.BackendAccount.ID == backendAccountID {
+			account := mapping.BackendAccount
+			return &account, nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
 func (m *MemoryStore) ListEnabledServers(ctx context.Context) ([]EmbyServer, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

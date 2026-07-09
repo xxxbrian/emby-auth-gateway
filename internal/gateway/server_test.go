@@ -483,6 +483,101 @@ func TestBackendLoginFailureBackoff(t *testing.T) {
 	}
 }
 
+func TestProxyRetryRewritesBodyWithRefreshedToken(t *testing.T) {
+	const (
+		backendUserID   = "backend-user"
+		syntheticUserID = "gateway-user"
+	)
+	var authCount int
+	var postCount int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/emby/Users/AuthenticateByName":
+			authCount++
+			writeTestJSON(w, map[string]any{
+				"AccessToken": "backend-token-" + strconv.Itoa(authCount),
+				"ServerId":    "backend-server",
+				"User": map[string]any{
+					"Id":   backendUserID,
+					"Name": "shared",
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/emby/Users/"+backendUserID+"/Items":
+			postCount++
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+			body := string(data)
+			wantToken := "backend-token-" + strconv.Itoa(postCount)
+			if r.Header.Get("X-Emby-Token") != wantToken || !strings.Contains(body, wantToken) {
+				t.Fatalf("request %d did not use %s in header/body: header=%q body=%s", postCount, wantToken, r.Header.Get("X-Emby-Token"), body)
+			}
+			if postCount == 1 {
+				http.Error(w, "stale", http.StatusUnauthorized)
+				return
+			}
+			if strings.Contains(body, "backend-token-1") {
+				t.Fatalf("retry body still contained stale token: %s", body)
+			}
+			writeTestJSON(w, map[string]any{"ok": true})
+		default:
+			t.Fatalf("unexpected backend request %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer backend.Close()
+
+	store := testStore(backend.URL + "/emby")
+	store.Users["u1"] = MemoryUser{GatewayUser: GatewayUser{ID: "u1", Username: "alice", SyntheticUserID: syntheticUserID, Enabled: true}, Password: "alice-pass"}
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby", GatewayServerID: "gateway-server"}, store))
+	defer gw.Close()
+
+	loginResp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice","Pw":"alice-pass"}`))
+	var login map[string]any
+	decodeJSON(t, loginResp.Body, &login)
+	_ = loginResp.Body.Close()
+	gatewayToken, _ := login["AccessToken"].(string)
+
+	body := `{"Token":"` + gatewayToken + `","UserId":"` + syntheticUserID + `"}`
+	req := mustRequest(t, http.MethodPost, gw.URL+"/emby/Users/"+syntheticUserID+"/Items", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Emby-Token", gatewayToken)
+	resp := do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(resp.Body)
+		t.Fatalf("proxy status = %d: %s", resp.StatusCode, string(data))
+	}
+	if authCount != 2 || postCount != 2 {
+		t.Fatalf("auth/post counts = %d/%d, want 2/2", authCount, postCount)
+	}
+}
+
+func TestRefreshBackendSessionReusesRotatedToken(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("refresh should not call backend when token already rotated: %s %s", r.Method, r.URL.String())
+	}))
+	defer backend.Close()
+
+	store := testStore(backend.URL + "/emby")
+	mapping := store.Mappings["u1"]
+	mapping.BackendAccount.BackendToken = "new-token"
+	mapping.BackendAccount.BackendUserID = "backend-user"
+	store.Mappings["u1"] = mapping
+	session := testSession(backend.URL + "/emby")
+	session.BackendToken = "old-token"
+	session.BackendUserID = "backend-user"
+	session.BackendAccount = mapping.BackendAccount
+
+	server := NewServer(Config{GatewayBasePath: "/emby"}, store)
+	if err := server.refreshBackendSession(context.Background(), session, "old-token"); err != nil {
+		t.Fatalf("refresh backend session: %v", err)
+	}
+	if session.BackendToken != "new-token" {
+		t.Fatalf("session token = %q, want rotated token", session.BackendToken)
+	}
+}
+
 func TestAnonymousPublicInfoAndPing(t *testing.T) {
 	store := NewMemoryStore()
 	store.Mappings["m1"] = UserMapping{BackendAccount: BackendAccount{ID: "b1", ServerID: "s1", Enabled: true, Server: EmbyServer{ID: "s1", Enabled: true, ServerVersion: "4.9.1"}}}

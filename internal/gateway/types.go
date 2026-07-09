@@ -26,6 +26,7 @@ type Store interface {
 	ListPublicUsers(ctx context.Context) ([]GatewayUser, error)
 	FindUserBySyntheticID(ctx context.Context, syntheticID string) (*GatewayUser, error)
 	FindMappingByGatewayUserID(ctx context.Context, gatewayUserID string) (*UserMapping, error)
+	FindBackendAccountByID(ctx context.Context, backendAccountID string) (*BackendAccount, error)
 	DefaultBackend(ctx context.Context) (*BackendAccount, error)
 	ListEnabledServers(ctx context.Context) ([]EmbyServer, error)
 	UpdateBackendToken(ctx context.Context, accountID, token, backendUserID string, updatedAt time.Time) error

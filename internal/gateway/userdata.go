@@ -570,7 +570,8 @@ func (s *Server) fetchBackendJSON(ctx context.Context, r *http.Request, rel, raw
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusUnauthorized {
-		if err := s.refreshBackendSession(ctx, session); err == nil {
+		failedToken := session.BackendToken
+		if err := s.refreshBackendSession(ctx, session, failedToken); err == nil {
 			_ = resp.Body.Close()
 			u, err = s.proxyURL(session, rel, rawQuery, gatewayToken)
 			if err != nil {

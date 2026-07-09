@@ -97,6 +97,10 @@ func (s *Store) DefaultBackend(ctx context.Context) (*gateway.BackendAccount, er
 	return s.backendAccountFromRecord(records[0])
 }
 
+func (s *Store) FindBackendAccountByID(ctx context.Context, backendAccountID string) (*gateway.BackendAccount, error) {
+	return s.backendAccountByID(backendAccountID)
+}
+
 func (s *Store) ListEnabledServers(ctx context.Context) ([]gateway.EmbyServer, error) {
 	records, err := s.app.FindAllRecords("emby_servers", dbx.HashExp{"enabled": true})
 	if err != nil {

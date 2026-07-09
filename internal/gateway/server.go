@@ -371,21 +371,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 		}
 	}
 
-	body, err := s.rewriteRequestBody(r, session, gatewayToken)
+	body, rawBody, replayable, err := s.rewriteRequestBody(r, session, gatewayToken)
 	if err != nil {
 		http.Error(w, "bad request body", http.StatusBadRequest)
 		return
-	}
-	var bodyData []byte
-	replayable := body == nil
-	if body != nil && contentLength(body) >= 0 {
-		bodyData, err = io.ReadAll(body)
-		if err != nil {
-			http.Error(w, "bad request body", http.StatusBadRequest)
-			return
-		}
-		body = bytes.NewReader(bodyData)
-		replayable = true
 	}
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, proxyURL.String(), body)
 	if err != nil {
@@ -407,7 +396,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusUnauthorized && replayable {
-		if err := s.refreshBackendSession(r.Context(), session); err == nil {
+		failedToken := session.BackendToken
+		if err := s.refreshBackendSession(r.Context(), session, failedToken); err == nil {
 			_ = resp.Body.Close()
 			retryURL, retryErr := s.proxyURL(session, rel, r.URL.RawQuery, gatewayToken)
 			if retryErr != nil {
@@ -416,8 +406,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 				return
 			}
 			var retryBody io.Reader
-			if bodyData != nil {
-				retryBody = bytes.NewReader(bodyData)
+			if rawBody != nil {
+				retryBody = s.rewriteRequestBodyData(rawBody, session, gatewayToken)
 			}
 			retryReq, retryErr := http.NewRequestWithContext(r.Context(), r.Method, retryURL.String(), retryBody)
 			if retryErr != nil {
@@ -577,20 +567,24 @@ func backendAuthHeader(identity BackendClientIdentity, userID, token string) Aut
 	}
 }
 
-func (s *Server) rewriteRequestBody(r *http.Request, session *Session, gatewayToken string) (io.Reader, error) {
+func (s *Server) rewriteRequestBody(r *http.Request, session *Session, gatewayToken string) (io.Reader, []byte, bool, error) {
 	if r.Body == nil || r.Method == http.MethodGet || r.Method == http.MethodHead {
-		return nil, nil
+		return nil, nil, true, nil
 	}
 	if !isRewriteableContentType(r.Header.Get("Content-Type")) {
-		return r.Body, nil
+		return r.Body, nil, false, nil
 	}
 	data, err := io.ReadAll(http.MaxBytesReader(nilResponseWriter{}, r.Body, 10<<20))
 	if err != nil {
-		return nil, err
+		return nil, nil, false, err
 	}
+	return s.rewriteRequestBodyData(data, session, gatewayToken), data, true, nil
+}
+
+func (s *Server) rewriteRequestBodyData(data []byte, session *Session, gatewayToken string) io.Reader {
 	text := strings.ReplaceAll(string(data), gatewayToken, session.BackendToken)
 	text = strings.ReplaceAll(text, session.SyntheticUserID, session.BackendUserID)
-	return strings.NewReader(text), nil
+	return strings.NewReader(text)
 }
 
 func isPlaybackRequest(method, rel string) bool {
