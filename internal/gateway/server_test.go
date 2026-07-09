@@ -669,6 +669,56 @@ func TestAnonymousPublicInfoAndPing(t *testing.T) {
 	}
 }
 
+func TestPublicSystemInfoProbesBackendWhenVersionMissing(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/emby/System/Info/Public" {
+			t.Fatalf("unexpected backend request %s %s", r.Method, r.URL.String())
+		}
+		writeTestJSON(w, map[string]any{"Id": "real-server", "ServerName": "Real Emby", "Version": "4.9.5.0"})
+	}))
+	defer backend.Close()
+	store := NewMemoryStore()
+	store.Mappings["m1"] = UserMapping{BackendAccount: BackendAccount{ID: "b1", ServerID: "s1", BaseURL: backend.URL + "/emby", Enabled: true, Server: EmbyServer{ID: "s1", BaseURL: backend.URL + "/emby", Enabled: true}}}
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby", GatewayServerID: "gateway-server"}, store))
+	defer gw.Close()
+
+	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/System/Info/Public", nil))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("public info status = %d: %s", resp.StatusCode, string(body))
+	}
+	var info map[string]any
+	decodeJSON(t, resp.Body, &info)
+	if info["Version"] != "4.9.5.0" {
+		t.Fatalf("public info Version = %#v, want probed backend version", info["Version"])
+	}
+}
+
+func TestPublicSystemInfoUnavailableWithoutBackendVersion(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/emby/System/Info/Public" {
+			t.Fatalf("unexpected backend request %s %s", r.Method, r.URL.String())
+		}
+		writeTestJSON(w, map[string]any{"Id": "real-server", "ServerName": "Real Emby"})
+	}))
+	defer backend.Close()
+	store := NewMemoryStore()
+	store.Mappings["m1"] = UserMapping{BackendAccount: BackendAccount{ID: "b1", ServerID: "s1", BaseURL: backend.URL + "/emby", Enabled: true, Server: EmbyServer{ID: "s1", BaseURL: backend.URL + "/emby", Enabled: true}}}
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby", GatewayServerID: "gateway-server"}, store))
+	defer gw.Close()
+
+	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/System/Info/Public", nil))
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("public info status = %d, want 503: %s", resp.StatusCode, string(body))
+	}
+	if strings.Contains(string(body), gatewayVersion) {
+		t.Fatalf("public info unavailable response leaked gateway version: %s", string(body))
+	}
+}
+
 func TestCompareVersionsPrefersReleaseOverPrerelease(t *testing.T) {
 	if compareVersions("4.9.0.30", "4.9.0.30-beta") <= 0 {
 		t.Fatal("release version should compare greater than matching prerelease")

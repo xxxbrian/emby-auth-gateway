@@ -302,11 +302,10 @@ func (s *Server) handlePublicUsers(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePublicSystemInfo(w http.ResponseWriter, r *http.Request) {
 	base := s.gatewayBaseForRequest(r)
-	version := gatewayVersion
-	if servers, err := s.store.ListEnabledServers(r.Context()); err == nil {
-		if highest := highestServerVersion(servers); highest != "" {
-			version = highest
-		}
+	version, err := s.publicSystemInfoVersion(r.Context())
+	if err != nil {
+		http.Error(w, "backend system info unavailable", http.StatusServiceUnavailable)
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"Id":              s.cfg.GatewayServerID,
@@ -318,6 +317,27 @@ func (s *Server) handlePublicSystemInfo(w http.ResponseWriter, r *http.Request) 
 		"RemoteAddresses": []string{base},
 		"LocalAddresses":  []string{base},
 	})
+}
+
+func (s *Server) publicSystemInfoVersion(ctx context.Context) (string, error) {
+	servers, err := s.store.ListEnabledServers(ctx)
+	if err != nil {
+		return "", err
+	}
+	if highest := highestServerVersion(servers); highest != "" {
+		return highest, nil
+	}
+	if err := s.RefreshBackendServerInfo(ctx); err != nil {
+		return "", err
+	}
+	servers, err = s.store.ListEnabledServers(ctx)
+	if err != nil {
+		return "", err
+	}
+	if highest := highestServerVersion(servers); highest != "" {
+		return highest, nil
+	}
+	return "", errors.New("backend system info unavailable")
 }
 
 func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
