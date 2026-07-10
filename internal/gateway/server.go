@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -974,8 +975,19 @@ func playbackEventName(rel string) string {
 }
 
 func (s *Server) writeProxyResponse(w http.ResponseWriter, r *http.Request, rel string, resp *http.Response, session *Session, gatewayToken, publicGatewayBase string) {
-	copyResponseHeaders(w.Header(), resp.Header, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
 	ct := resp.Header.Get("Content-Type")
+	if !responseAllowsBody(r.Method, resp.StatusCode) {
+		copyResponseHeaders(w.Header(), resp.Header, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
+		setContentLength(w.Header(), resp.ContentLength)
+		w.WriteHeader(resp.StatusCode)
+		return
+	}
+	if isImageContentType(ct) && resp.StatusCode >= 200 && resp.StatusCode < 300 && resp.ContentLength == 0 {
+		s.rejectInvalidImageResponse(w, r, rel, session, "backend returned an empty image")
+		return
+	}
+
+	copyResponseHeaders(w.Header(), resp.Header, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
 	if isM3U8ContentType(ct) || strings.HasSuffix(strings.ToLower(resp.Request.URL.Path), ".m3u8") {
 		data, err := readLimited(resp.Body, proxyM3U8Limit)
 		if err != nil {
@@ -990,8 +1002,13 @@ func (s *Server) writeProxyResponse(w http.ResponseWriter, r *http.Request, rel 
 	}
 
 	if isStreamingContentType(ct) {
+		if isImageContentType(ct) {
+			s.writeImageProxyResponse(w, r, rel, resp, session)
+			return
+		}
+		setContentLength(w.Header(), resp.ContentLength)
 		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
+		s.copyProxyBodyOrAbort(w, r, rel, resp.Body, session)
 		return
 	}
 
@@ -1013,8 +1030,182 @@ func (s *Server) writeProxyResponse(w http.ResponseWriter, r *http.Request, rel 
 		return
 	}
 
+	setContentLength(w.Header(), resp.ContentLength)
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	s.copyProxyBodyOrAbort(w, r, rel, resp.Body, session)
+}
+
+func (s *Server) writeImageProxyResponse(w http.ResponseWriter, r *http.Request, rel string, resp *http.Response, session *Session) {
+	var first [imageValidationTailSize]byte
+	n, err := resp.Body.Read(first[:])
+	if n == 0 {
+		if err == io.EOF {
+			s.rejectInvalidImageResponse(w, r, rel, session, "backend returned an empty image")
+			return
+		}
+		if err != nil {
+			s.rejectInvalidImageResponse(w, r, rel, session, "backend image response read failed")
+			return
+		}
+		s.rejectInvalidImageResponse(w, r, rel, session, "backend returned an invalid image response")
+		return
+	}
+
+	setContentLength(w.Header(), resp.ContentLength)
+	w.WriteHeader(resp.StatusCode)
+	fullImage := resp.StatusCode == http.StatusOK && strings.TrimSpace(r.Header.Get("Range")) == "" && strings.TrimSpace(resp.Header.Get("Content-Range")) == ""
+	if !fullImage {
+		if _, writeErr := w.Write(first[:n]); writeErr != nil {
+			return
+		}
+		if err != nil && err != io.EOF {
+			s.abortProxyBody(r, rel, session, err)
+		}
+		if err != io.EOF {
+			s.copyProxyBodyOrAbort(w, r, rel, resp.Body, session)
+		}
+		return
+	}
+
+	validator := newImageStreamValidator(w, resp.Header.Get("Content-Type"))
+	if _, writeErr := validator.Write(first[:n]); writeErr != nil {
+		return
+	}
+	if err != nil && err != io.EOF {
+		s.abortProxyBody(r, rel, session, err)
+	}
+	if err != io.EOF {
+		if _, copyErr := io.Copy(validator, resp.Body); copyErr != nil {
+			s.abortProxyBody(r, rel, session, copyErr)
+		}
+	}
+	if finishErr := validator.Finish(); finishErr != nil {
+		s.abortProxyBody(r, rel, session, finishErr)
+	}
+}
+
+const imageValidationTailSize = 12
+
+type imageStreamValidator struct {
+	dst         io.Writer
+	mediaType   string
+	prefix      []byte
+	tail        []byte
+	total       int64
+	passthrough bool
+}
+
+func newImageStreamValidator(dst io.Writer, contentType string) *imageStreamValidator {
+	mediaType, _, _ := mime.ParseMediaType(contentType)
+	return &imageStreamValidator{dst: dst, mediaType: mediaType, passthrough: mediaType != "image/jpeg" && mediaType != "image/png" && mediaType != "image/webp"}
+}
+
+func (v *imageStreamValidator) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	v.total += int64(len(p))
+	if len(v.prefix) < imageValidationTailSize {
+		need := imageValidationTailSize - len(v.prefix)
+		if need > len(p) {
+			need = len(p)
+		}
+		v.prefix = append(v.prefix, p[:need]...)
+	}
+	if v.passthrough {
+		return v.dst.Write(p)
+	}
+
+	combined := make([]byte, 0, len(v.tail)+len(p))
+	combined = append(combined, v.tail...)
+	combined = append(combined, p...)
+	if len(combined) <= imageValidationTailSize {
+		v.tail = combined
+		return len(p), nil
+	}
+	flushLen := len(combined) - imageValidationTailSize
+	if _, err := v.dst.Write(combined[:flushLen]); err != nil {
+		return 0, err
+	}
+	v.tail = append(v.tail[:0], combined[flushLen:]...)
+	return len(p), nil
+}
+
+func (v *imageStreamValidator) Finish() error {
+	if v.passthrough {
+		return nil
+	}
+	if err := v.validate(); err != nil {
+		return err
+	}
+	_, err := v.dst.Write(v.tail)
+	return err
+}
+
+func (v *imageStreamValidator) validate() error {
+	switch v.mediaType {
+	case "image/jpeg":
+		if len(v.prefix) < 2 || len(v.tail) < 2 || v.prefix[0] != 0xff || v.prefix[1] != 0xd8 || v.tail[len(v.tail)-2] != 0xff || v.tail[len(v.tail)-1] != 0xd9 {
+			return errors.New("backend returned an incomplete JPEG image")
+		}
+	case "image/png":
+		pngSignature := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}
+		pngIEND := []byte{0, 0, 0, 0, 'I', 'E', 'N', 'D', 0xae, 0x42, 0x60, 0x82}
+		if len(v.prefix) < len(pngSignature) || !bytes.Equal(v.prefix[:len(pngSignature)], pngSignature) || len(v.tail) != len(pngIEND) || !bytes.Equal(v.tail, pngIEND) {
+			return errors.New("backend returned an incomplete PNG image")
+		}
+	case "image/webp":
+		if len(v.prefix) < 12 || string(v.prefix[:4]) != "RIFF" || string(v.prefix[8:12]) != "WEBP" || int64(binary.LittleEndian.Uint32(v.prefix[4:8]))+8 != v.total {
+			return errors.New("backend returned an incomplete WebP image")
+		}
+	}
+	return nil
+}
+
+func (s *Server) copyProxyBodyOrAbort(w http.ResponseWriter, r *http.Request, rel string, body io.Reader, session *Session) {
+	if _, err := io.Copy(w, body); err != nil {
+		s.abortProxyBody(r, rel, session, err)
+	}
+}
+
+func (s *Server) abortProxyBody(r *http.Request, rel string, session *Session, err error) {
+	s.audit(r.Context(), AuditLog{GatewayUserID: sessionGatewayUserID(session), SyntheticUserID: sessionSyntheticUserID(session), Event: "proxy_read_failed", Message: err.Error(), RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
+	panic(http.ErrAbortHandler)
+}
+
+func (s *Server) rejectInvalidImageResponse(w http.ResponseWriter, r *http.Request, rel string, session *Session, message string) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Del("ETag")
+	w.Header().Del("Last-Modified")
+	s.audit(r.Context(), AuditLog{GatewayUserID: sessionGatewayUserID(session), SyntheticUserID: sessionSyntheticUserID(session), Event: "proxy_invalid_image", Message: message, RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
+	http.Error(w, "invalid image response", http.StatusBadGateway)
+}
+
+func setContentLength(header http.Header, length int64) {
+	if length >= 0 {
+		header.Set("Content-Length", strconv.FormatInt(length, 10))
+	}
+}
+
+func responseAllowsBody(method string, status int) bool {
+	if method == http.MethodHead {
+		return false
+	}
+	return status >= 200 && status != http.StatusNoContent && status != http.StatusResetContent && status != http.StatusNotModified
+}
+
+func sessionGatewayUserID(session *Session) string {
+	if session == nil {
+		return ""
+	}
+	return session.GatewayUserID
+}
+
+func sessionSyntheticUserID(session *Session) string {
+	if session == nil {
+		return ""
+	}
+	return session.SyntheticUserID
 }
 
 func (s *Server) rewriteProxyJSONValue(ctx context.Context, v any, session *Session, gatewayToken, publicGatewayBase string) any {
@@ -1448,6 +1639,11 @@ func isM3U8ContentType(ct string) bool {
 func isStreamingContentType(ct string) bool {
 	mt, _, _ := mime.ParseMediaType(ct)
 	return strings.HasPrefix(mt, "video/") || strings.HasPrefix(mt, "audio/") || strings.HasPrefix(mt, "image/") || mt == "application/octet-stream"
+}
+
+func isImageContentType(ct string) bool {
+	mt, _, _ := mime.ParseMediaType(ct)
+	return strings.HasPrefix(mt, "image/")
 }
 
 func isUpgradeRequest(r *http.Request) bool {

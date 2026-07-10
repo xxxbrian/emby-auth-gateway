@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -19,6 +20,171 @@ import (
 )
 
 var testHTTPClient = &http.Client{Timeout: 5 * time.Second}
+
+func TestWriteProxyResponseRejectsEmptyImage(t *testing.T) {
+	store := NewMemoryStore()
+	server := NewServer(Config{GatewayBasePath: "/emby"}, store)
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items/item-1/Images/Primary", nil)
+	resp := &http.Response{
+		StatusCode:    http.StatusOK,
+		Header:        http.Header{"Content-Type": []string{"image/jpeg"}, "Cache-Control": []string{"public, max-age=604800"}},
+		Body:          io.NopCloser(strings.NewReader("")),
+		ContentLength: 0,
+		Request:       req,
+	}
+	recorder := httptest.NewRecorder()
+
+	server.writeProxyResponse(recorder, req, "/Items/item-1/Images/Primary", resp, &Session{}, "", "")
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadGateway)
+	}
+	if got := recorder.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+	if got := recorder.Header().Get("ETag"); got != "" {
+		t.Fatalf("ETag = %q, want empty", got)
+	}
+}
+
+func TestWriteProxyResponseAbortsTruncatedImage(t *testing.T) {
+	store := NewMemoryStore()
+	server := NewServer(Config{GatewayBasePath: "/emby"}, store)
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items/item-1/Images/Primary", nil)
+	resp := &http.Response{
+		StatusCode:    http.StatusOK,
+		Header:        http.Header{"Content-Type": []string{"image/jpeg"}},
+		Body:          &truncatedReadCloser{data: []byte("ab")},
+		ContentLength: 4,
+		Request:       req,
+	}
+	recorder := httptest.NewRecorder()
+
+	defer func() {
+		if got := recover(); got != http.ErrAbortHandler {
+			t.Fatalf("panic = %#v, want http.ErrAbortHandler", got)
+		}
+		if got := recorder.Code; got != http.StatusOK {
+			t.Fatalf("status = %d, want %d", got, http.StatusOK)
+		}
+		if got := recorder.Header().Get("Content-Length"); got != "4" {
+			t.Fatalf("Content-Length = %q, want 4", got)
+		}
+	}()
+	server.writeProxyResponse(recorder, req, "/Items/item-1/Images/Primary", resp, &Session{}, "", "")
+}
+
+func TestWriteProxyResponseAllowsBodylessImageResponses(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		status int
+		length int64
+	}{
+		{name: "head", method: http.MethodHead, status: http.StatusOK, length: 1234},
+		{name: "not modified", method: http.MethodGet, status: http.StatusNotModified, length: 0},
+		{name: "no content", method: http.MethodGet, status: http.StatusNoContent, length: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewMemoryStore()
+			server := NewServer(Config{GatewayBasePath: "/emby"}, store)
+			req := httptest.NewRequest(tt.method, "http://gateway.test/emby/Items/item-1/Images/Primary", nil)
+			resp := &http.Response{
+				StatusCode:    tt.status,
+				Header:        http.Header{"Content-Type": []string{"image/jpeg"}, "ETag": []string{`"tag"`}},
+				Body:          panicReadCloser{},
+				ContentLength: tt.length,
+				Request:       req,
+			}
+			recorder := httptest.NewRecorder()
+
+			server.writeProxyResponse(recorder, req, "/Items/item-1/Images/Primary", resp, &Session{}, "", "")
+
+			if recorder.Code != tt.status {
+				t.Fatalf("status = %d, want %d", recorder.Code, tt.status)
+			}
+			if recorder.Body.Len() != 0 {
+				t.Fatalf("body length = %d, want 0", recorder.Body.Len())
+			}
+			if got := recorder.Header().Get("ETag"); got != `"tag"` {
+				t.Fatalf("ETag = %q, want tag", got)
+			}
+		})
+	}
+}
+
+func TestWriteProxyResponseValidatesCompleteImage(t *testing.T) {
+	validJPEG := []byte{0xff, 0xd8, 1, 2, 3, 0xff, 0xd9}
+	tests := []struct {
+		name         string
+		status       int
+		requestHead  http.Header
+		responseHead http.Header
+		body         []byte
+		wantAbort    bool
+	}{
+		{name: "valid jpeg", status: http.StatusOK, body: validJPEG},
+		{name: "clean eof truncated jpeg", status: http.StatusOK, body: []byte{0xff, 0xd8, 1, 2, 3}, wantAbort: true},
+		{name: "partial content", status: http.StatusPartialContent, requestHead: http.Header{"Range": []string{"bytes=0-3"}}, responseHead: http.Header{"Content-Range": []string{"bytes 0-3/100"}}, body: []byte{0xff, 0xd8, 1, 2}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewMemoryStore()
+			server := NewServer(Config{GatewayBasePath: "/emby"}, store)
+			req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items/item-1/Images/Primary", nil)
+			req.Header = tt.requestHead
+			header := tt.responseHead.Clone()
+			if header == nil {
+				header = http.Header{}
+			}
+			header.Set("Content-Type", "image/jpeg")
+			resp := &http.Response{StatusCode: tt.status, Header: header, Body: io.NopCloser(strings.NewReader(string(tt.body))), ContentLength: int64(len(tt.body)), Request: req}
+			recorder := httptest.NewRecorder()
+
+			aborted := false
+			func() {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						if recovered != http.ErrAbortHandler {
+							t.Fatalf("panic = %#v, want http.ErrAbortHandler", recovered)
+						}
+						aborted = true
+					}
+				}()
+				server.writeProxyResponse(recorder, req, "/Items/item-1/Images/Primary", resp, &Session{}, "", "")
+			}()
+
+			if aborted != tt.wantAbort {
+				t.Fatalf("aborted = %v, want %v", aborted, tt.wantAbort)
+			}
+			if !tt.wantAbort && !bytes.Equal(recorder.Body.Bytes(), tt.body) {
+				t.Fatalf("body = %x, want %x", recorder.Body.Bytes(), tt.body)
+			}
+		})
+	}
+}
+
+type panicReadCloser struct{}
+
+func (panicReadCloser) Read([]byte) (int, error) { panic("body must not be read") }
+func (panicReadCloser) Close() error             { return nil }
+
+type truncatedReadCloser struct {
+	data []byte
+	off  int
+}
+
+func (r *truncatedReadCloser) Read(p []byte) (int, error) {
+	if r.off >= len(r.data) {
+		return 0, io.ErrUnexpectedEOF
+	}
+	n := copy(p, r.data[r.off:])
+	r.off += n
+	return n, nil
+}
+
+func (r *truncatedReadCloser) Close() error { return nil }
 
 func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 	const (
