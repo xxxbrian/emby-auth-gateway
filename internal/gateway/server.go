@@ -35,6 +35,7 @@ type Server struct {
 	backendAuth           singleflight.Group
 	backendAuthFailuresMu sync.Mutex
 	backendAuthFailures   map[string]backendLoginFailure
+	playbackGuards        *playbackGuardTracker
 }
 
 func NewServer(cfg Config, store Store) *Server {
@@ -64,7 +65,7 @@ func NewServer(cfg Config, store Store) *Server {
 	if proxyClient == nil {
 		proxyClient = &http.Client{Transport: defaultProxyTransport()}
 	}
-	return &Server{cfg: cfg, store: store, client: client, proxyClient: proxyClient, logins: newLoginFailureLimiter(), backendAuthFailures: map[string]backendLoginFailure{}}
+	return &Server{cfg: cfg, store: store, client: client, proxyClient: proxyClient, logins: newLoginFailureLimiter(), backendAuthFailures: map[string]backendLoginFailure{}, playbackGuards: newPlaybackGuardTracker()}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -368,6 +369,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 	if !ok {
 		return
 	}
+	playbackItemID, isPlaybackInfo := playbackInfoItemID(r.Method, rel)
+	guardKey := playbackGuardKey{GatewayTokenHash: session.GatewayTokenHash, ItemID: playbackItemID}
+	guardGeneration := uint64(0)
+	if isPlaybackInfo {
+		guardGeneration = s.playbackGuards.snapshot(guardKey)
+	}
 	if s.handlePersonalDataRequest(w, r, rel, session, gatewayToken) {
 		return
 	}
@@ -410,6 +417,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 		return
 	}
 	defer resp.Body.Close()
+	if isPlaybackInfo && resp.StatusCode == http.StatusUnauthorized && isConcurrentPlaybackDenial(resp) {
+		s.writeConcurrentPlaybackDenied(w, r, rel, session, guardKey)
+		return
+	}
 	if resp.StatusCode == http.StatusUnauthorized && replayable {
 		failedToken := session.BackendToken
 		if err := s.refreshBackendSession(r.Context(), session, failedToken); err == nil {
@@ -443,12 +454,141 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 				return
 			}
 			defer resp.Body.Close()
+			if isPlaybackInfo && resp.StatusCode == http.StatusUnauthorized && isConcurrentPlaybackDenial(resp) {
+				s.writeConcurrentPlaybackDenied(w, r, rel, session, guardKey)
+				return
+			}
 		} else if !errors.Is(err, ErrUnauthorized) {
 			s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh_failure", err.Error(), http.StatusUnauthorized)
 		}
 	}
+	if isPlaybackInfo && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+		s.playbackGuards.clearIfGeneration(guardKey, guardGeneration)
+	}
 
 	s.writeProxyResponse(w, r, rel, resp, session, gatewayToken, s.gatewayBaseForRequest(r))
+}
+
+const concurrentPlaybackResponse = `{"error":"playback_access_denied","message":"Playback denied because the concurrent playback limit was exceeded.","reason_code":"max_concurrent_sessions_exceeded"}`
+
+func playbackInfoItemID(method, rel string) (string, bool) {
+	if method != http.MethodGet && method != http.MethodPost {
+		return "", false
+	}
+	parts := strings.Split(strings.Trim(rel, "/"), "/")
+	if len(parts) != 3 || !strings.EqualFold(parts[0], "Items") || strings.TrimSpace(parts[1]) == "" || !strings.EqualFold(parts[2], "PlaybackInfo") {
+		return "", false
+	}
+	return parts[1], true
+}
+
+type delegatedReadCloser struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (r delegatedReadCloser) Close() error { return r.closer.Close() }
+
+type replayReadErrorCloser struct {
+	prefix       []byte
+	err          error
+	errorPending bool
+	remainder    io.Reader
+	closer       io.Closer
+}
+
+func (r *replayReadErrorCloser) Read(p []byte) (int, error) {
+	if len(r.prefix) > 0 {
+		n := copy(p, r.prefix)
+		r.prefix = r.prefix[n:]
+		if len(r.prefix) == 0 && r.errorPending {
+			r.errorPending = false
+			return n, r.err
+		}
+		return n, nil
+	}
+	if r.errorPending {
+		r.errorPending = false
+		return 0, r.err
+	}
+	return r.remainder.Read(p)
+}
+
+func (r *replayReadErrorCloser) Close() error { return r.closer.Close() }
+
+func isConcurrentPlaybackDenial(resp *http.Response) bool {
+	const limit = 48 << 10
+	original := resp.Body
+	data, err := io.ReadAll(io.LimitReader(original, limit+1))
+	restore := func() {
+		resp.Body = delegatedReadCloser{Reader: io.MultiReader(bytes.NewReader(data), original), closer: original}
+	}
+	if err != nil {
+		resp.Body = &replayReadErrorCloser{prefix: data, err: err, errorPending: true, remainder: original, closer: original}
+		return false
+	}
+	if len(data) > limit {
+		restore()
+		return false
+	}
+	if !hasConcurrentPlaybackReason(data) {
+		restore()
+		return false
+	}
+	return true
+}
+
+func hasConcurrentPlaybackReason(data []byte) bool {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	start, err := decoder.Token()
+	if err != nil || start != json.Delim('{') {
+		return false
+	}
+	count := 0
+	var reason string
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			return false
+		}
+		name, ok := key.(string)
+		if !ok {
+			return false
+		}
+		var value any
+		if err := decoder.Decode(&value); err != nil {
+			return false
+		}
+		if strings.EqualFold(name, "reason_code") {
+			count++
+			if count > 1 {
+				return false
+			}
+			reason, ok = value.(string)
+			if !ok {
+				return false
+			}
+		}
+	}
+	end, err := decoder.Token()
+	if err != nil || end != json.Delim('}') {
+		return false
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return false
+	}
+	return count == 1 && reason == "max_concurrent_sessions_exceeded"
+}
+
+func (s *Server) writeConcurrentPlaybackDenied(w http.ResponseWriter, r *http.Request, rel string, session *Session, key playbackGuardKey) {
+	if s.playbackGuards.deny(key) {
+		s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "playback_concurrency_denied", Message: "playback denied because the concurrent playback limit was exceeded", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusForbidden})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusForbidden)
+	_, _ = io.WriteString(w, concurrentPlaybackResponse)
 }
 
 func (s *Server) handleUpgradeProxy(w http.ResponseWriter, r *http.Request, proxyURL *url.URL, session *Session, gatewayToken, rel string) {
@@ -655,6 +795,13 @@ func (s *Server) recordPlaybackRequest(r *http.Request, rel string, session *Ses
 	}
 	details, ok := playbackDetailsFromRequest(r, data)
 	if !ok || details.ItemID == "" {
+		return nil
+	}
+	key := playbackGuardKey{GatewayTokenHash: session.GatewayTokenHash, ItemID: details.ItemID}
+	if active, auditEligible := s.playbackGuards.suppress(key); active {
+		if auditEligible {
+			s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "playback_report_suppressed", Message: "playback report suppressed after concurrent playback denial", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusNoContent})
+		}
 		return nil
 	}
 	now := time.Now().UTC()
