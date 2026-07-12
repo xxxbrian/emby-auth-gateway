@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -37,12 +38,66 @@ func TestParseConfigAcceptsLimitNames(t *testing.T) {
 		"--username", "user",
 		"--password", "pass",
 		"--limit-names", "3",
+		"--progress-interval", "2s",
 	})
 	if err != nil {
 		t.Fatalf("parse config: %v", err)
 	}
 	if cfg.LimitNames != 3 {
 		t.Fatalf("LimitNames = %d, want 3", cfg.LimitNames)
+	}
+	if cfg.ProgressInterval != 2*time.Second {
+		t.Fatalf("ProgressInterval = %s, want 2s", cfg.ProgressInterval)
+	}
+}
+
+func TestFormatProgressLine(t *testing.T) {
+	now := time.Date(2026, 7, 10, 4, 0, 10, 0, time.UTC)
+	current := progressSnapshot{
+		StartedAt:        now.Add(-10 * time.Second),
+		Sources:          120,
+		URLsPlanned:      960,
+		URLsSelected:     100,
+		QueueDepth:       8,
+		MetadataEndpoint: "Items",
+		MetadataScanned:  500,
+		MetadataTotal:    1000,
+		MetadataKnown:    true,
+		MetadataPageSize: 250,
+		Completed:        50,
+		Succeeded:        49,
+		Failed:           1,
+		Bytes:            2 << 20,
+		Active:           4,
+	}
+	previous := current
+	previous.Completed = 40
+	previous.Bytes = 1 << 20
+	line := formatProgressLine(current, now, previous, now.Add(-5*time.Second), false)
+	for _, want := range []string{"phase=discovering", "endpoint=Items", "metadata=500/1000", "page=250", "completed=50", "ok=49", "failed=1", "active=4", "queue=8", "rate=2.0_img/s", "bandwidth=204.8_KiB/s", "eta=discovering"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("progress line missing %q: %s", want, line)
+		}
+	}
+
+	current.PlanningDone = true
+	current.URLsSelected = 150
+	line = formatProgressLine(current, now, previous, now.Add(-5*time.Second), false)
+	if !strings.Contains(line, "phase=warming") || !strings.Contains(line, "eta=50s") {
+		t.Fatalf("warming progress line has wrong phase or ETA: %s", line)
+	}
+}
+
+func TestProgressReporterWritesFinalLine(t *testing.T) {
+	state := newRunState(config{ProgressInterval: time.Hour}, nil, time.Now().Add(-time.Second))
+	var output bytes.Buffer
+	state.progressOut = &output
+	state.startProgressReporter()
+	state.markDiscoveryDone()
+	state.markPlanningDone()
+	state.stopProgressReporter()
+	if line := output.String(); !strings.Contains(line, "progress final=true") || !strings.Contains(line, "phase=complete") {
+		t.Fatalf("final progress line = %q", line)
 	}
 }
 
@@ -128,7 +183,7 @@ func TestDiscoverSourcesAdaptsPageSizeAndPreservesOffsets(t *testing.T) {
 			discovered = append(discovered, source.ItemID)
 		}
 		return nil
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("discover sources: %v", err)
 	}
@@ -163,7 +218,7 @@ func TestDiscoverSourcesPaginatesArrayResponses(t *testing.T) {
 			discovered = append(discovered, source.ItemID)
 		}
 		return nil
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("discover sources: %v", err)
 	}
@@ -386,7 +441,7 @@ func TestRunWarmsImagesBeforeDiscoveryCompletes(t *testing.T) {
 		case strings.HasPrefix(r.URL.Path, "/emby/Items/"):
 			closeImageSeen.Do(func() { close(imageSeen) })
 			w.Header().Set("Content-Type", "image/jpeg")
-			_, _ = w.Write([]byte("jpeg"))
+			_, _ = w.Write([]byte{0xff, 0xd8, 0xff, 0xd9})
 		case r.URL.Path == "/emby/Sessions/Logout":
 			w.WriteHeader(http.StatusNoContent)
 		default:

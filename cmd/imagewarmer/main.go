@@ -52,6 +52,7 @@ type config struct {
 	Timeout          time.Duration
 	MetadataRetries  int
 	RetryDelay       time.Duration
+	ProgressInterval time.Duration
 }
 
 type metadataStatusError struct {
@@ -152,23 +153,73 @@ type report struct {
 }
 
 type runState struct {
-	cfg         config
-	db          *sql.DB
-	dbMu        sync.Mutex
-	jobs        chan warmURL
-	results     chan warmResult
-	workersDone chan struct{}
-	reportMu    sync.Mutex
-	report      report
-	seenSources map[string]bool
-	seenURLs    map[string]bool
-	queuedURLs  map[string]bool
-	queueMu     sync.Mutex
-	selected    int
-	runErr      error
-	errMu       sync.Mutex
-	stopOnce    sync.Once
-	workerWG    sync.WaitGroup
+	cfg              config
+	db               *sql.DB
+	dbMu             sync.Mutex
+	jobs             chan warmURL
+	results          chan warmResult
+	workersDone      chan struct{}
+	reportMu         sync.Mutex
+	report           report
+	seenSources      map[string]bool
+	seenURLs         map[string]bool
+	queuedURLs       map[string]bool
+	queueMu          sync.Mutex
+	selected         int
+	runErr           error
+	errMu            sync.Mutex
+	stopOnce         sync.Once
+	workerWG         sync.WaitGroup
+	progressMu       sync.Mutex
+	progress         progressState
+	progressOut      io.Writer
+	progressStop     chan struct{}
+	progressStopOnce sync.Once
+	progressWG       sync.WaitGroup
+}
+
+type progressState struct {
+	MetadataEndpoint string
+	MetadataScanned  int
+	MetadataTotal    int
+	MetadataKnown    bool
+	MetadataPageSize int
+	DiscoveryDone    bool
+	PlanningDone     bool
+	Completed        int
+	Succeeded        int
+	Failed           int
+	Bytes            int64
+	Active           int
+}
+
+type progressSnapshot struct {
+	StartedAt        time.Time
+	DryRun           bool
+	Sources          int
+	URLsPlanned      int
+	URLsSelected     int
+	QueueDepth       int
+	MetadataEndpoint string
+	MetadataScanned  int
+	MetadataTotal    int
+	MetadataKnown    bool
+	MetadataPageSize int
+	DiscoveryDone    bool
+	PlanningDone     bool
+	Completed        int
+	Succeeded        int
+	Failed           int
+	Bytes            int64
+	Active           int
+}
+
+type metadataProgress struct {
+	Endpoint   string
+	Scanned    int
+	Total      int
+	TotalKnown bool
+	PageSize   int
 }
 
 func main() {
@@ -209,7 +260,8 @@ func run(ctx context.Context, args []string) error {
 	taskCount := 1
 	taskResults := make(chan error, 2)
 	go func() {
-		taskResults <- discoverSources(workCtx, client, cfg, auth, state.handleSources)
+		defer state.markDiscoveryDone()
+		taskResults <- discoverSources(workCtx, client, cfg, auth, state.handleSources, state.updateMetadataProgress)
 	}()
 	if !cfg.DryRun {
 		taskCount++
@@ -224,6 +276,7 @@ func run(ctx context.Context, args []string) error {
 			cancelWork()
 		}
 	}
+	state.markPlanningDone()
 	if err := state.finish(); runErr == nil {
 		runErr = err
 	}
@@ -242,19 +295,22 @@ func run(ctx context.Context, args []string) error {
 
 func newRunState(cfg config, db *sql.DB, started time.Time) *runState {
 	return &runState{
-		cfg:         cfg,
-		db:          db,
-		jobs:        make(chan warmURL, max(1, cfg.Concurrency*2)),
-		results:     make(chan warmResult, max(1, cfg.Concurrency*2)),
-		workersDone: make(chan struct{}),
-		report:      report{StartedAt: started, DryRun: cfg.DryRun, HTTPStatus: map[string]int{}, CFStatus: map[string]int{}, ByVariant: map[string]int{}, ByImageType: map[string]int{}},
-		seenSources: map[string]bool{},
-		seenURLs:    map[string]bool{},
-		queuedURLs:  map[string]bool{},
+		cfg:          cfg,
+		db:           db,
+		jobs:         make(chan warmURL, max(1, cfg.Concurrency*2)),
+		results:      make(chan warmResult, max(1, cfg.Concurrency*2)),
+		workersDone:  make(chan struct{}),
+		report:       report{StartedAt: started, DryRun: cfg.DryRun, HTTPStatus: map[string]int{}, CFStatus: map[string]int{}, ByVariant: map[string]int{}, ByImageType: map[string]int{}},
+		seenSources:  map[string]bool{},
+		seenURLs:     map[string]bool{},
+		queuedURLs:   map[string]bool{},
+		progressOut:  os.Stderr,
+		progressStop: make(chan struct{}),
 	}
 }
 
 func (s *runState) start(ctx context.Context, client *http.Client, auth authResult) error {
+	s.startProgressReporter()
 	if s.cfg.DryRun {
 		close(s.workersDone)
 		return nil
@@ -264,7 +320,10 @@ func (s *runState) start(ctx context.Context, client *http.Client, auth authResu
 		go func() {
 			defer s.workerWG.Done()
 			for u := range s.jobs {
-				s.results <- warmOne(ctx, client, s.cfg, auth, u)
+				s.workerStarted()
+				result := warmOne(ctx, client, s.cfg, auth, u)
+				s.workerFinished()
+				s.results <- result
 			}
 		}()
 	}
@@ -275,6 +334,7 @@ func (s *runState) start(ctx context.Context, client *http.Client, auth authResu
 	go func() {
 		defer close(s.workersDone)
 		for result := range s.results {
+			s.recordProgressResult(result)
 			s.dbMu.Lock()
 			err := updateWarmResult(ctx, s.db, result)
 			s.dbMu.Unlock()
@@ -416,6 +476,7 @@ func (s *runState) remainingLimit() int {
 
 func (s *runState) finish() error {
 	s.stop()
+	s.stopProgressReporter()
 	return s.err()
 }
 
@@ -452,11 +513,195 @@ func (s *runState) err() error {
 	return s.runErr
 }
 
+func (s *runState) startProgressReporter() {
+	if s.cfg.ProgressInterval <= 0 || s.progressOut == nil {
+		return
+	}
+	s.progressWG.Add(1)
+	go func() {
+		defer s.progressWG.Done()
+		ticker := time.NewTicker(s.cfg.ProgressInterval)
+		defer ticker.Stop()
+		previousAt := time.Now()
+		previous := s.progressSnapshot()
+		for {
+			select {
+			case now := <-ticker.C:
+				current := s.progressSnapshot()
+				fmt.Fprintln(s.progressOut, formatProgressLine(current, now, previous, previousAt, false))
+				previous = current
+				previousAt = now
+			case <-s.progressStop:
+				now := time.Now()
+				current := s.progressSnapshot()
+				fmt.Fprintln(s.progressOut, formatProgressLine(current, now, previous, previousAt, true))
+				return
+			}
+		}
+	}()
+}
+
+func (s *runState) stopProgressReporter() {
+	if s.cfg.ProgressInterval <= 0 || s.progressOut == nil {
+		return
+	}
+	s.progressStopOnce.Do(func() { close(s.progressStop) })
+	s.progressWG.Wait()
+}
+
+func (s *runState) workerStarted() {
+	s.progressMu.Lock()
+	s.progress.Active++
+	s.progressMu.Unlock()
+}
+
+func (s *runState) workerFinished() {
+	s.progressMu.Lock()
+	s.progress.Active--
+	s.progressMu.Unlock()
+}
+
+func (s *runState) recordProgressResult(result warmResult) {
+	s.progressMu.Lock()
+	s.progress.Completed++
+	s.progress.Bytes += result.Bytes
+	if warmResultSucceeded(result) {
+		s.progress.Succeeded++
+	} else {
+		s.progress.Failed++
+	}
+	s.progressMu.Unlock()
+}
+
+func (s *runState) updateMetadataProgress(progress metadataProgress) {
+	s.progressMu.Lock()
+	s.progress.MetadataEndpoint = progress.Endpoint
+	s.progress.MetadataScanned = progress.Scanned
+	s.progress.MetadataTotal = progress.Total
+	s.progress.MetadataKnown = progress.TotalKnown
+	s.progress.MetadataPageSize = progress.PageSize
+	s.progressMu.Unlock()
+}
+
+func (s *runState) markDiscoveryDone() {
+	s.progressMu.Lock()
+	s.progress.DiscoveryDone = true
+	s.progressMu.Unlock()
+}
+
+func (s *runState) markPlanningDone() {
+	s.progressMu.Lock()
+	s.progress.PlanningDone = true
+	s.progressMu.Unlock()
+}
+
+func (s *runState) progressSnapshot() progressSnapshot {
+	s.reportMu.Lock()
+	snapshot := progressSnapshot{
+		StartedAt:    s.report.StartedAt,
+		DryRun:       s.report.DryRun,
+		Sources:      s.report.Sources,
+		URLsPlanned:  s.report.URLsPlanned,
+		URLsSelected: s.report.URLsSelected,
+		QueueDepth:   len(s.jobs),
+	}
+	s.reportMu.Unlock()
+	s.progressMu.Lock()
+	snapshot.MetadataEndpoint = s.progress.MetadataEndpoint
+	snapshot.MetadataScanned = s.progress.MetadataScanned
+	snapshot.MetadataTotal = s.progress.MetadataTotal
+	snapshot.MetadataKnown = s.progress.MetadataKnown
+	snapshot.MetadataPageSize = s.progress.MetadataPageSize
+	snapshot.DiscoveryDone = s.progress.DiscoveryDone
+	snapshot.PlanningDone = s.progress.PlanningDone
+	snapshot.Completed = s.progress.Completed
+	snapshot.Succeeded = s.progress.Succeeded
+	snapshot.Failed = s.progress.Failed
+	snapshot.Bytes = s.progress.Bytes
+	snapshot.Active = s.progress.Active
+	s.progressMu.Unlock()
+	return snapshot
+}
+
+func formatProgressLine(current progressSnapshot, now time.Time, previous progressSnapshot, previousAt time.Time, final bool) string {
+	elapsed := max(now.Sub(current.StartedAt), 0)
+	window := max(now.Sub(previousAt), time.Nanosecond)
+	deltaCompleted := max(current.Completed-previous.Completed, 0)
+	deltaBytes := max(current.Bytes-previous.Bytes, 0)
+	rate := float64(deltaCompleted) / window.Seconds()
+	averageRate := 0.0
+	if elapsed > 0 {
+		averageRate = float64(current.Completed) / elapsed.Seconds()
+	}
+	bandwidth := float64(deltaBytes) / window.Seconds()
+	phase := "discovering"
+	if current.DryRun {
+		phase = "dry-run"
+	} else if current.PlanningDone {
+		phase = "warming"
+	} else if current.DiscoveryDone {
+		phase = "scheduling"
+	}
+	if current.PlanningDone && (current.DryRun || current.Completed >= current.URLsSelected) {
+		phase = "complete"
+	}
+	metadataTotal := "?"
+	if current.MetadataKnown {
+		metadataTotal = strconv.Itoa(current.MetadataTotal)
+	}
+	endpoint := current.MetadataEndpoint
+	if endpoint == "" {
+		endpoint = "-"
+	}
+	eta := "discovering"
+	if current.PlanningDone {
+		remaining := max(current.URLsSelected-current.Completed, 0)
+		etaRate := rate
+		if etaRate <= 0 {
+			etaRate = averageRate
+		}
+		switch {
+		case current.DryRun || remaining == 0:
+			eta = "0s"
+		case etaRate > 0:
+			eta = formatProgressDuration(time.Duration(float64(time.Second) * float64(remaining) / etaRate))
+		default:
+			eta = "unknown"
+		}
+	}
+	return fmt.Sprintf("progress final=%t elapsed=%s phase=%s endpoint=%s metadata=%d/%s page=%d sources=%d planned=%d selected=%d completed=%d ok=%d failed=%d active=%d queue=%d rate=%.1f_img/s avg=%.1f_img/s bandwidth=%s/s eta=%s", final, formatProgressDuration(elapsed), phase, endpoint, current.MetadataScanned, metadataTotal, current.MetadataPageSize, current.Sources, current.URLsPlanned, current.URLsSelected, current.Completed, current.Succeeded, current.Failed, current.Active, current.QueueDepth, rate, averageRate, formatProgressBytes(bandwidth), eta)
+}
+
+func formatProgressDuration(duration time.Duration) string {
+	if duration < time.Second {
+		return "0s"
+	}
+	return duration.Truncate(time.Second).String()
+}
+
+func formatProgressBytes(bytesPerSecond float64) string {
+	const (
+		kib = 1024
+		mib = 1024 * kib
+		gib = 1024 * mib
+	)
+	switch {
+	case bytesPerSecond >= gib:
+		return fmt.Sprintf("%.1f_GiB", bytesPerSecond/gib)
+	case bytesPerSecond >= mib:
+		return fmt.Sprintf("%.1f_MiB", bytesPerSecond/mib)
+	case bytesPerSecond >= kib:
+		return fmt.Sprintf("%.1f_KiB", bytesPerSecond/kib)
+	default:
+		return fmt.Sprintf("%.0f_B", bytesPerSecond)
+	}
+}
+
 func parseConfig(args []string) (config, error) {
 	fs := flag.NewFlagSet("imagewarmer", flag.ContinueOnError)
 	var widths string
 	var timeout time.Duration
-	cfg := config{Quality: 90, Concurrency: 8, PageSize: 500, MinPageSize: 25, DBPath: "imagewarmer.sqlite", ReportPath: "warm-report.json", IncludeItemTypes: defaultIncludeItemTypes, IncludeNames: true, Timeout: 30 * time.Second}
+	cfg := config{Quality: 90, Concurrency: 8, PageSize: 500, MinPageSize: 25, DBPath: "imagewarmer.sqlite", ReportPath: "warm-report.json", IncludeItemTypes: defaultIncludeItemTypes, IncludeNames: true, Timeout: 30 * time.Second, ProgressInterval: 5 * time.Second}
 	fs.StringVar(&cfg.GatewayURL, "gateway-url", "", "gateway base URL, for example https://emby.xvv.net/emby")
 	fs.StringVar(&cfg.CDNURL, "cdn-url", "", "CDN base URL, for example https://emby-cf.xvv.net/emby")
 	fs.StringVar(&cfg.Username, "username", "", "gateway username")
@@ -478,6 +723,7 @@ func parseConfig(args []string) (config, error) {
 	fs.DurationVar(&timeout, "timeout", cfg.Timeout, "HTTP request timeout")
 	fs.IntVar(&cfg.MetadataRetries, "metadata-retries", 4, "retries for transient metadata request failures")
 	fs.DurationVar(&cfg.RetryDelay, "retry-delay", time.Second, "initial retry delay for transient metadata failures")
+	fs.DurationVar(&cfg.ProgressInterval, "progress-interval", cfg.ProgressInterval, "progress log interval; 0 disables progress output")
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
 	}
@@ -511,6 +757,9 @@ func parseConfig(args []string) (config, error) {
 	}
 	if cfg.RetryDelay <= 0 {
 		cfg.RetryDelay = time.Second
+	}
+	if cfg.ProgressInterval < 0 {
+		cfg.ProgressInterval = 0
 	}
 	return cfg, nil
 }
@@ -587,7 +836,7 @@ func logout(ctx context.Context, client *http.Client, gatewayURL, token string) 
 	_, _ = io.Copy(io.Discard, resp.Body)
 }
 
-func discoverSources(ctx context.Context, client *http.Client, cfg config, auth authResult, handle func(context.Context, []imageSource) error) error {
+func discoverSources(ctx context.Context, client *http.Client, cfg config, auth authResult, handle func(context.Context, []imageSource) error, progress func(metadataProgress)) error {
 	start := 0
 	pageSize := cfg.PageSize
 	previousPage := ""
@@ -615,6 +864,9 @@ func discoverSources(ctx context.Context, client *http.Client, cfg config, auth 
 			return fmt.Errorf("metadata endpoint repeated page at StartIndex=%d", start)
 		}
 		previousPage = fingerprint
+		if progress != nil {
+			progress(metadataProgress{Endpoint: "Items", Scanned: start + len(page.Items), Total: page.TotalRecordCount, TotalKnown: page.TotalKnown, PageSize: usedLimit})
+		}
 		if err := handle(ctx, sourcesFromItems(page.Items, "item")); err != nil {
 			return err
 		}
@@ -625,7 +877,7 @@ func discoverSources(ctx context.Context, client *http.Client, cfg config, auth 
 	}
 	if cfg.IncludeNames {
 		for _, endpoint := range []string{"/Persons", "/Artists", "/Artists/AlbumArtists", "/Studios"} {
-			err := discoverNamedSources(ctx, client, cfg, auth, endpoint, handle)
+			err := discoverNamedSources(ctx, client, cfg, auth, endpoint, handle, progress)
 			if err != nil {
 				return err
 			}
@@ -634,7 +886,7 @@ func discoverSources(ctx context.Context, client *http.Client, cfg config, auth 
 	return nil
 }
 
-func discoverNamedSources(ctx context.Context, client *http.Client, cfg config, auth authResult, endpoint string, handle func(context.Context, []imageSource) error) error {
+func discoverNamedSources(ctx context.Context, client *http.Client, cfg config, auth authResult, endpoint string, handle func(context.Context, []imageSource) error, progress func(metadataProgress)) error {
 	start := 0
 	pageSize := cfg.PageSize
 	previousPage := ""
@@ -660,6 +912,9 @@ func discoverNamedSources(ctx context.Context, client *http.Client, cfg config, 
 			return fmt.Errorf("metadata endpoint %s repeated page at StartIndex=%d", endpoint, start)
 		}
 		previousPage = fingerprint
+		if progress != nil {
+			progress(metadataProgress{Endpoint: strings.TrimPrefix(endpoint, "/"), Scanned: start + len(page.Items), Total: page.TotalRecordCount, TotalKnown: page.TotalKnown, PageSize: usedLimit})
+		}
 		kind := strings.Trim(strings.ToLower(strings.ReplaceAll(endpoint, "/", "_")), "_")
 		if err := handle(ctx, sourcesFromItems(page.Items, kind)); err != nil {
 			return err
@@ -1118,11 +1373,15 @@ func (v *downloadedImageValidator) Validate() string {
 
 func updateWarmResult(ctx context.Context, db *sql.DB, result warmResult) error {
 	status := "done"
-	if result.Error != "" || result.HTTPStatus < 200 || result.HTTPStatus >= 300 || !strings.HasPrefix(strings.ToLower(result.ContentType), "image/") {
+	if !warmResultSucceeded(result) {
 		status = "failed"
 	}
 	_, err := db.ExecContext(ctx, `update warm_urls set status=?, attempts=attempts+1, last_http_status=?, last_cf_cache_status=?, last_age=?, last_content_type=?, last_bytes=?, last_duration_ms=?, last_error=?, last_warmed_at=? where url_path=?`, status, result.HTTPStatus, result.CFCacheStatus, result.Age, result.ContentType, result.Bytes, result.DurationMS, result.Error, time.Now().UTC().Format(time.RFC3339), result.URLPath)
 	return err
+}
+
+func warmResultSucceeded(result warmResult) bool {
+	return result.Error == "" && result.HTTPStatus >= 200 && result.HTTPStatus < 300 && strings.HasPrefix(strings.ToLower(result.ContentType), "image/")
 }
 
 func applyResult(rep *report, result warmResult) {
