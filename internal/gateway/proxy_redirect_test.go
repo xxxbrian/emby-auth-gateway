@@ -48,7 +48,7 @@ func TestProxyClientRedirectCrossOriginSanitizesHeadersAndTokens(t *testing.T) {
 		"https://other.test/video",
 	} {
 		t.Run(target, func(t *testing.T) {
-			next := httptest.NewRequest(http.MethodGet, target+"?token=auth-token&token=keep&api_key=header-token&signature=cdn", nil)
+			next := httptest.NewRequest(http.MethodGet, target+"?token=auth-token&token=keep&api_key=header-token&access_token=other&X-Emby-Token=official&signature=cdn", nil)
 			next.Header = initial.Header.Clone()
 			if err := newProxyClient(nil).CheckRedirect(next, []*http.Request{initial}); err != nil {
 				t.Fatal("cross-origin redirect rejected")
@@ -62,10 +62,45 @@ func TestProxyClientRedirectCrossOriginSanitizesHeadersAndTokens(t *testing.T) {
 				t.Fatal("media headers were not preserved")
 			}
 			query := next.URL.Query()
-			if values := query["token"]; len(values) != 1 || values[0] != "keep" || query.Get("api_key") != "" || query.Get("signature") != "cdn" {
-				t.Fatal("redirect query was not sanitized correctly")
+			if values := query["token"]; len(values) != 1 || values[0] != "keep" {
+				t.Fatalf("generic token values = %v", values)
+			}
+			if query.Get("api_key") != "" || query.Get("access_token") != "" || query.Get("X-Emby-Token") != "" {
+				t.Fatalf("strict auth query keys were not stripped: %v", query)
+			}
+			if query.Get("signature") != "cdn" {
+				t.Fatal("signature was not preserved")
 			}
 		})
+	}
+}
+
+func TestSanitizeCrossOriginRedirectStripsStrictKeysWithoutTokenMatch(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "https://target.test?api_key=unrelated&access_token=also&X-Emby-Token=official&token=keep&signature=cdn", nil)
+	sanitizeCrossOriginRedirect(req, nil)
+	query := req.URL.Query()
+	if query.Get("api_key") != "" || query.Get("access_token") != "" || query.Get("X-Emby-Token") != "" {
+		t.Fatalf("strict keys remained: %v", query)
+	}
+	if query.Get("token") != "keep" || query.Get("signature") != "cdn" {
+		t.Fatalf("non-sensitive query changed: %v", query)
+	}
+}
+
+func TestSanitizeCrossOriginRedirectUsesContextGatewayToken(t *testing.T) {
+	initial := httptest.NewRequest(http.MethodGet, "https://origin.test/video", nil)
+	initial = initial.WithContext(withRedirectCredentialTokens(initial.Context(), "gateway-token", "backend-token"))
+	initial.Header.Set("X-Emby-Token", "backend-token")
+	next := httptest.NewRequest(http.MethodGet, "https://cdn.test/video?token=gateway-token&token=backend-token&token=signature&api_key=x", nil)
+	if err := newProxyClient(nil).CheckRedirect(next, []*http.Request{initial}); err != nil {
+		t.Fatal(err)
+	}
+	query := next.URL.Query()
+	if values := query["token"]; len(values) != 1 || values[0] != "signature" {
+		t.Fatalf("token values = %v", values)
+	}
+	if query.Get("api_key") != "" {
+		t.Fatal("api_key was not stripped")
 	}
 }
 

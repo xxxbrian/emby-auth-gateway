@@ -28,6 +28,7 @@ func main() {
 	app.RootCmd.AddCommand(newVersionCommand())
 	registerBackendIdentityDefaults(app)
 	registerMappingSessionRevocation(app)
+	registerActivityLogTokenRedaction(app)
 
 	app.OnBootstrap().BindFunc(func(e *core.BootstrapEvent) error {
 		if err := e.Next(); err != nil {

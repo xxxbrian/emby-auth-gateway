@@ -414,6 +414,52 @@ func TestBackendServerIdentityFieldsAreOptionalAndDefaulted(t *testing.T) {
 	}
 }
 
+func TestSessionTokenExistsExistingMissingAndOperationalError(t *testing.T) {
+	app := newTestApp(t)
+	store := New(app)
+	userID := createGatewayUser(t, app, "alice", "gateway-user")
+	accountID := createBackendAccount(t, app)
+
+	const tokenHash = "exists-hash-value"
+	if err := store.SaveSession(context.Background(), &gateway.Session{
+		GatewayTokenHash: tokenHash,
+		GatewayUserID:    userID,
+		GatewayUsername:  "alice",
+		SyntheticUserID:  "gateway-user",
+		BackendAccountID: accountID,
+		ExpiresAt:        time.Now().UTC().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("save session: %v", err)
+	}
+
+	exists, err := store.SessionTokenExists(context.Background(), tokenHash)
+	if err != nil || !exists {
+		t.Fatalf("existing SessionTokenExists = (%v, %v), want (true, nil)", exists, err)
+	}
+
+	exists, err = store.SessionTokenExists(context.Background(), "missing-hash-value")
+	if err != nil || exists {
+		t.Fatalf("missing SessionTokenExists = (%v, %v), want (false, nil)", exists, err)
+	}
+
+	// Deterministic schema break: delete the sessions collection so existence
+	// checks surface an operational error rather than false.
+	collection, err := app.FindCollectionByNameOrId("gateway_sessions")
+	if err != nil {
+		t.Fatalf("find gateway_sessions: %v", err)
+	}
+	if err := app.Delete(collection); err != nil {
+		t.Fatalf("delete gateway_sessions collection: %v", err)
+	}
+	exists, err = store.SessionTokenExists(context.Background(), tokenHash)
+	if err == nil {
+		t.Fatal("operational SessionTokenExists error = nil, want non-nil")
+	}
+	if exists {
+		t.Fatal("operational SessionTokenExists returned exists=true")
+	}
+}
+
 func newTestApp(t *testing.T) core.App {
 	t.Helper()
 	app, err := tests.NewTestAppWithConfig(core.BaseAppConfig{

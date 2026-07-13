@@ -45,6 +45,10 @@ type Store interface {
 	SaveDisplayPreference(ctx context.Context, preference DisplayPreference) error
 	SaveSession(ctx context.Context, session *Session) error
 	FindSessionByTokenHash(ctx context.Context, tokenHash string) (*Session, error)
+	// SessionTokenExists reports whether any session row exists for tokenHash
+	// (active, revoked, or expired) without hydrating account/session details.
+	// false,nil means not found; non-nil error is an operational/store failure.
+	SessionTokenExists(ctx context.Context, tokenHash string) (bool, error)
 	RevokeSession(ctx context.Context, tokenHash string) error
 }
 

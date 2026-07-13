@@ -2769,6 +2769,710 @@ func TestGatewayBasePathCanBeChanged(t *testing.T) {
 	}
 }
 
+func TestCredentialQueryXEmbyTokenProxiesBackendTokenOnly(t *testing.T) {
+	const backendToken = "backend-token"
+	var upstreamQuery url.Values
+	var upstreamHeader string
+	var backendHits int
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/emby/Users/AuthenticateByName" {
+			writeTestJSON(w, map[string]any{
+				"AccessToken": backendToken,
+				"ServerId":    "backend-server",
+				"User":        map[string]any{"Id": "backend-user", "Name": "shared"},
+			})
+			return
+		}
+		backendHits++
+		upstreamQuery = r.URL.Query()
+		upstreamHeader = r.Header.Get("X-Emby-Token")
+		writeTestJSON(w, map[string]any{"Id": "backend-server"})
+	}))
+	defer backend.Close()
+
+	selected, _, err := NewOpaqueToken()
+	if err != nil {
+		t.Fatalf("NewOpaqueToken: %v", err)
+	}
+	store := testStore(backend.URL + "/emby")
+	session := testSession(backend.URL + "/emby")
+	session.GatewayTokenHash = HashToken(selected)
+	session.BackendToken = backendToken
+	store.Sessions[session.GatewayTokenHash] = session
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/System/Info?X-Emby-Token="+url.QueryEscape(selected), nil))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if backendHits != 1 {
+		t.Fatalf("backend hits = %d, want 1", backendHits)
+	}
+	if upstreamHeader != backendToken {
+		t.Fatalf("upstream header token mismatch")
+	}
+	if got := upstreamQuery.Get("X-Emby-Token"); got != backendToken {
+		t.Fatalf("upstream X-Emby-Token query = %q, want backend token", got)
+	}
+	if strings.Contains(upstreamQuery.Encode(), selected) {
+		t.Fatal("upstream query leaked selected gateway token")
+	}
+}
+
+func TestCredentialQueryNormalizationAndGuards(t *testing.T) {
+	selected, _, err := NewOpaqueToken()
+	if err != nil {
+		t.Fatalf("NewOpaqueToken: %v", err)
+	}
+	otherActive, _, err := NewOpaqueToken()
+	if err != nil {
+		t.Fatalf("NewOpaqueToken: %v", err)
+	}
+	otherRevoked, _, err := NewOpaqueToken()
+	if err != nil {
+		t.Fatalf("NewOpaqueToken: %v", err)
+	}
+	otherExpired, _, err := NewOpaqueToken()
+	if err != nil {
+		t.Fatalf("NewOpaqueToken: %v", err)
+	}
+	unknownShaped, _, err := NewOpaqueToken()
+	if err != nil {
+		t.Fatalf("NewOpaqueToken: %v", err)
+	}
+	secondShaped, _, err := NewOpaqueToken()
+	if err != nil {
+		t.Fatalf("NewOpaqueToken: %v", err)
+	}
+
+	type captured struct {
+		hits   int
+		query  url.Values
+		header string
+	}
+
+	for _, tc := range []struct {
+		name            string
+		rawQuery        string
+		headerToken     string
+		wantStatus      int
+		wantBackendHits int
+		wantFinds       int
+		wantExists      int
+		checkUpstream   func(t *testing.T, c captured)
+		prepare         func(store *countingSessionStore)
+	}{
+		{
+			name:            "header plus different strict query rewritten",
+			rawQuery:        "api_key=other-strict&access_token=another&X-Emby-Token=third",
+			headerToken:     selected,
+			wantStatus:      http.StatusOK,
+			wantBackendHits: 1,
+			wantFinds:       1,
+			checkUpstream: func(t *testing.T, c captured) {
+				t.Helper()
+				for _, key := range []string{"api_key", "access_token", "X-Emby-Token"} {
+					for _, value := range c.query[key] {
+						if value != "backend-token" {
+							t.Fatalf("%s values = %v, want all backend-token", key, c.query[key])
+						}
+					}
+				}
+			},
+		},
+		{
+			name:            "header plus opaque generic preserved without extra lookup",
+			rawQuery:        "token=cdn-signature&signature=keep",
+			headerToken:     selected,
+			wantStatus:      http.StatusOK,
+			wantBackendHits: 1,
+			wantFinds:       1,
+			checkUpstream: func(t *testing.T, c captured) {
+				t.Helper()
+				if c.query.Get("token") != "cdn-signature" || c.query.Get("signature") != "keep" {
+					t.Fatalf("opaque query not preserved: %v", c.query)
+				}
+			},
+		},
+		{
+			name:            "selected under arbitrary signature key rewritten",
+			rawQuery:        "signature=" + url.QueryEscape(selected) + "&token=cdn-signature",
+			headerToken:     selected,
+			wantStatus:      http.StatusOK,
+			wantBackendHits: 1,
+			wantFinds:       1,
+			checkUpstream: func(t *testing.T, c captured) {
+				t.Helper()
+				if c.query.Get("signature") != "backend-token" {
+					t.Fatalf("signature = %q, want backend-token", c.query.Get("signature"))
+				}
+				if c.query.Get("token") != "cdn-signature" {
+					t.Fatalf("opaque token = %q", c.query.Get("token"))
+				}
+				if strings.Contains(c.query.Encode(), selected) {
+					t.Fatal("upstream query leaked selected gateway token")
+				}
+			},
+		},
+		{
+			name:            "selected generic token rewritten",
+			rawQuery:        "token=" + url.QueryEscape(selected),
+			wantStatus:      http.StatusOK,
+			wantBackendHits: 1,
+			wantFinds:       1,
+			checkUpstream: func(t *testing.T, c captured) {
+				t.Helper()
+				if c.query.Get("token") != "backend-token" {
+					t.Fatalf("token = %q, want backend-token", c.query.Get("token"))
+				}
+			},
+		},
+		{
+			name:            "unknown gateway-shaped generic preserved",
+			rawQuery:        "token=" + url.QueryEscape(unknownShaped),
+			headerToken:     selected,
+			wantStatus:      http.StatusOK,
+			wantBackendHits: 1,
+			wantFinds:       1,
+			wantExists:      1,
+			checkUpstream: func(t *testing.T, c captured) {
+				t.Helper()
+				if c.query.Get("token") != unknownShaped {
+					t.Fatalf("unknown shaped token was rewritten")
+				}
+			},
+		},
+		{
+			name:            "active gateway-shaped generic rejected",
+			rawQuery:        "token=" + url.QueryEscape(otherActive),
+			headerToken:     selected,
+			wantStatus:      http.StatusBadRequest,
+			wantBackendHits: 0,
+			wantFinds:       1,
+			wantExists:      1,
+			prepare: func(store *countingSessionStore) {
+				session := testSession("http://backend/emby")
+				session.GatewayTokenHash = HashToken(otherActive)
+				store.Sessions[session.GatewayTokenHash] = session
+			},
+		},
+		{
+			name:            "revoked gateway-shaped generic rejected",
+			rawQuery:        "token=" + url.QueryEscape(otherRevoked),
+			headerToken:     selected,
+			wantStatus:      http.StatusBadRequest,
+			wantBackendHits: 0,
+			wantFinds:       1,
+			wantExists:      1,
+			prepare: func(store *countingSessionStore) {
+				session := testSession("http://backend/emby")
+				session.GatewayTokenHash = HashToken(otherRevoked)
+				now := time.Now().UTC()
+				session.RevokedAt = &now
+				store.Sessions[session.GatewayTokenHash] = session
+			},
+		},
+		{
+			name:            "expired gateway-shaped generic rejected",
+			rawQuery:        "token=" + url.QueryEscape(otherExpired),
+			headerToken:     selected,
+			wantStatus:      http.StatusBadRequest,
+			wantBackendHits: 0,
+			wantFinds:       1,
+			wantExists:      1,
+			prepare: func(store *countingSessionStore) {
+				session := testSession("http://backend/emby")
+				session.GatewayTokenHash = HashToken(otherExpired)
+				session.ExpiresAt = time.Now().UTC().Add(-time.Hour)
+				store.Sessions[session.GatewayTokenHash] = session
+			},
+		},
+		{
+			name:            "duplicate same gateway-shaped value one exists lookup",
+			rawQuery:        "token=" + url.QueryEscape(unknownShaped) + "&token=" + url.QueryEscape(unknownShaped),
+			headerToken:     selected,
+			wantStatus:      http.StatusOK,
+			wantBackendHits: 1,
+			wantFinds:       1,
+			wantExists:      1,
+		},
+		{
+			name:            "multiple different gateway-shaped values rejected without exists lookup",
+			rawQuery:        "token=" + url.QueryEscape(unknownShaped) + "&token=" + url.QueryEscape(secondShaped),
+			headerToken:     selected,
+			wantStatus:      http.StatusBadRequest,
+			wantBackendHits: 0,
+			wantFinds:       1,
+			wantExists:      0,
+		},
+		{
+			name:            "empty strict values preserved",
+			rawQuery:        "api_key=&api_key=" + url.QueryEscape(selected) + "&access_token=",
+			wantStatus:      http.StatusOK,
+			wantBackendHits: 1,
+			wantFinds:       1,
+			checkUpstream: func(t *testing.T, c captured) {
+				t.Helper()
+				if got := c.query["api_key"]; len(got) != 2 || got[0] != "" || got[1] != "backend-token" {
+					t.Fatalf("api_key = %v", got)
+				}
+				if got := c.query["access_token"]; len(got) != 1 || got[0] != "" {
+					t.Fatalf("access_token = %v", got)
+				}
+			},
+		},
+		{
+			name:            "malformed query rejected without auth before session lookup",
+			rawQuery:        "api_key=%ZZ",
+			wantStatus:      http.StatusBadRequest,
+			wantBackendHits: 0,
+			wantFinds:       0,
+			wantExists:      0,
+		},
+		{
+			name:            "malformed query rejected with header before session lookup",
+			rawQuery:        "api_key=%ZZ",
+			headerToken:     selected,
+			wantStatus:      http.StatusBadRequest,
+			wantBackendHits: 0,
+			wantFinds:       0,
+			wantExists:      0,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var c captured
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/emby/Users/AuthenticateByName" {
+					writeTestJSON(w, map[string]any{
+						"AccessToken": "backend-token",
+						"ServerId":    "backend-server",
+						"User":        map[string]any{"Id": "backend-user", "Name": "shared"},
+					})
+					return
+				}
+				c.hits++
+				c.query = r.URL.Query()
+				c.header = r.Header.Get("X-Emby-Token")
+				writeTestJSON(w, map[string]any{"Id": "backend-server"})
+			}))
+			defer backend.Close()
+
+			base := testStore(backend.URL + "/emby")
+			store := &countingSessionStore{MemoryStore: base}
+			session := testSession(backend.URL + "/emby")
+			session.GatewayTokenHash = HashToken(selected)
+			session.BackendToken = "backend-token"
+			store.Sessions[session.GatewayTokenHash] = session
+			if tc.prepare != nil {
+				tc.prepare(store)
+			}
+			gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+			defer gw.Close()
+
+			req := mustRequest(t, http.MethodGet, gw.URL+"/emby/System/Info?"+tc.rawQuery, nil)
+			if tc.headerToken != "" {
+				req.Header.Set("X-Emby-Token", tc.headerToken)
+			}
+			beforeFinds := store.findCountLocked()
+			beforeExists := store.existsCountLocked()
+			resp := do(t, req)
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode != tc.wantStatus {
+				t.Fatalf("status = %d, want %d body=%s", resp.StatusCode, tc.wantStatus, body)
+			}
+			if c.hits != tc.wantBackendHits {
+				t.Fatalf("backend hits = %d, want %d", c.hits, tc.wantBackendHits)
+			}
+			finds := store.findCountLocked() - beforeFinds
+			exists := store.existsCountLocked() - beforeExists
+			if finds != tc.wantFinds || exists != tc.wantExists {
+				t.Fatalf("lookups finds=%d wantFinds=%d exists=%d wantExists=%d (findHashes=%v existsHashes=%v)",
+					finds, tc.wantFinds, exists, tc.wantExists, store.hashesLocked(), store.existsHashesLocked())
+			}
+			if strings.Contains(string(body), selected) || strings.Contains(string(body), otherActive) {
+				t.Fatal("response body leaked a token value")
+			}
+			if tc.checkUpstream != nil {
+				tc.checkUpstream(t, c)
+			}
+		})
+	}
+}
+
+func TestCredentialQueryStoreErrorReturns503WithoutUpstream(t *testing.T) {
+	selected, _, err := NewOpaqueToken()
+	if err != nil {
+		t.Fatalf("NewOpaqueToken: %v", err)
+	}
+	conflict, _, err := NewOpaqueToken()
+	if err != nil {
+		t.Fatalf("NewOpaqueToken: %v", err)
+	}
+
+	var backendHits int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendHits++
+		t.Fatalf("backend should not be dialed: %s %s", r.Method, r.URL.String())
+	}))
+	defer backend.Close()
+
+	base := testStore(backend.URL + "/emby")
+	store := &storeErrorOnMissingSession{MemoryStore: base}
+	session := testSession(backend.URL + "/emby")
+	session.GatewayTokenHash = HashToken(selected)
+	session.BackendToken = "backend-token"
+	store.Sessions[session.GatewayTokenHash] = session
+
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	req := mustRequest(t, http.MethodGet, gw.URL+"/emby/System/Info?token="+url.QueryEscape(conflict), nil)
+	req.Header.Set("X-Emby-Token", selected)
+	resp := do(t, req)
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 body=%s", resp.StatusCode, body)
+	}
+	if backendHits != 0 {
+		t.Fatalf("backend hits = %d, want 0", backendHits)
+	}
+	if strings.Contains(string(body), selected) || strings.Contains(string(body), conflict) {
+		t.Fatal("response body leaked a token value")
+	}
+}
+
+func TestCredentialQueryLogoutRevokesSelectedToken(t *testing.T) {
+	selected, _, err := NewOpaqueToken()
+	if err != nil {
+		t.Fatalf("NewOpaqueToken: %v", err)
+	}
+	store := testStore("http://backend/emby")
+	session := testSession("http://backend/emby")
+	session.GatewayTokenHash = HashToken(selected)
+	store.Sessions[session.GatewayTokenHash] = session
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	logout := do(t, mustRequest(t, http.MethodPost, gw.URL+"/emby/Sessions/Logout?X-Emby-Token="+url.QueryEscape(selected), nil))
+	_ = logout.Body.Close()
+	if logout.StatusCode != http.StatusOK {
+		t.Fatalf("logout status = %d", logout.StatusCode)
+	}
+	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/System/Info?api_key="+url.QueryEscape(selected), nil))
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("post-logout status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestCredentialQueryLogoutMalformedQueryReturns400(t *testing.T) {
+	store := &countingOpsStore{MemoryStore: testStore("http://backend/emby")}
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	resp := do(t, mustRequest(t, http.MethodPost, gw.URL+"/emby/Sessions/Logout?api_key=%ZZ", nil))
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	if store.pathPolicy != 0 || store.finds != 0 || store.exists != 0 || store.audits != 0 {
+		t.Fatalf("store ops path=%d finds=%d exists=%d audits=%d, want all 0", store.pathPolicy, store.finds, store.exists, store.audits)
+	}
+}
+
+func TestCredentialQueryMalformedProxySkipsAllStoreOps(t *testing.T) {
+	var backendHits int
+	backend := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		backendHits++
+	}))
+	defer backend.Close()
+
+	store := &countingOpsStore{MemoryStore: testStore(backend.URL + "/emby")}
+	store.PathPolicies = []PathPolicy{{
+		ID: "deny-all", Method: "*", Path: "/**", Action: "deny", Priority: 1, Enabled: true,
+	}}
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/System/Info?api_key=%ZZ", nil))
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	if backendHits != 0 {
+		t.Fatalf("backend hits = %d", backendHits)
+	}
+	if store.pathPolicy != 0 || store.finds != 0 || store.exists != 0 || store.audits != 0 {
+		t.Fatalf("store ops path=%d finds=%d exists=%d audits=%d, want all 0", store.pathPolicy, store.finds, store.exists, store.audits)
+	}
+}
+
+func TestCredentialQueryLogoutSelectedOnlyIgnoresLowerPriorityToken(t *testing.T) {
+	selected, _, err := NewOpaqueToken()
+	if err != nil {
+		t.Fatalf("NewOpaqueToken: %v", err)
+	}
+	other, _, err := NewOpaqueToken()
+	if err != nil {
+		t.Fatalf("NewOpaqueToken: %v", err)
+	}
+
+	store := &countingSessionStore{MemoryStore: testStore("http://backend/emby")}
+	selectedSession := testSession("http://backend/emby")
+	selectedSession.GatewayTokenHash = HashToken(selected)
+	store.Sessions[selectedSession.GatewayTokenHash] = selectedSession
+	otherSession := testSession("http://backend/emby")
+	otherSession.GatewayTokenHash = HashToken(other)
+	store.Sessions[otherSession.GatewayTokenHash] = otherSession
+
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	req := mustRequest(t, http.MethodPost, gw.URL+"/emby/Sessions/Logout?token="+url.QueryEscape(other), nil)
+	req.Header.Set("X-Emby-Token", selected)
+	beforeExists := store.existsCountLocked()
+	resp := do(t, req)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("logout status = %d", resp.StatusCode)
+	}
+	if store.existsCountLocked() != beforeExists {
+		t.Fatalf("logout performed exists lookups = %d", store.existsCountLocked()-beforeExists)
+	}
+
+	selectedFound, err := store.FindSessionByTokenHash(context.Background(), HashToken(selected))
+	if err != nil {
+		t.Fatalf("selected session lookup: %v", err)
+	}
+	if selectedFound.Active(time.Now().UTC()) {
+		t.Fatal("selected session should be revoked")
+	}
+	otherFound, err := store.FindSessionByTokenHash(context.Background(), HashToken(other))
+	if err != nil {
+		t.Fatalf("other session lookup: %v", err)
+	}
+	if !otherFound.Active(time.Now().UTC()) {
+		t.Fatal("lower-priority token session should remain active")
+	}
+}
+
+func TestCredentialQueryWebSocketGuardAndAPIKey(t *testing.T) {
+	selected, _, err := NewOpaqueToken()
+	if err != nil {
+		t.Fatalf("NewOpaqueToken: %v", err)
+	}
+	conflict, _, err := NewOpaqueToken()
+	if err != nil {
+		t.Fatalf("NewOpaqueToken: %v", err)
+	}
+
+	t.Run("api_key upgrade", func(t *testing.T) {
+		var sawBackend bool
+		backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/emby/Users/AuthenticateByName":
+				writeTestJSON(w, map[string]any{
+					"AccessToken": "backend-token",
+					"ServerId":    "backend-server",
+					"User":        map[string]any{"Id": "backend-user", "Name": "shared"},
+				})
+			case "/emby/socket":
+				if r.URL.Query().Get("api_key") == "backend-token" && r.Header.Get("X-Emby-Token") == "backend-token" {
+					sawBackend = true
+				}
+				hj, ok := w.(http.Hijacker)
+				if !ok {
+					t.Fatal("backend cannot hijack")
+				}
+				conn, rw, err := hj.Hijack()
+				if err != nil {
+					t.Fatalf("hijack: %v", err)
+				}
+				defer conn.Close()
+				_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+				_ = rw.Flush()
+			default:
+				t.Fatalf("unexpected backend path %s", r.URL.Path)
+			}
+		}))
+		defer backend.Close()
+
+		store := testStore(backend.URL + "/emby")
+		session := testSession(backend.URL + "/emby")
+		session.GatewayTokenHash = HashToken(selected)
+		session.BackendToken = "backend-token"
+		store.Sessions[session.GatewayTokenHash] = session
+		gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+		defer gw.Close()
+
+		gwURL, err := url.Parse(gw.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn, err := net.Dial("tcp", gwURL.Host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		_, _ = conn.Write([]byte("GET /emby/socket?api_key=" + selected + " HTTP/1.1\r\n" +
+			"Host: " + gwURL.Host + "\r\n" +
+			"Connection: Upgrade\r\n" +
+			"Upgrade: websocket\r\n" +
+			"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+			"Sec-WebSocket-Version: 13\r\n\r\n"))
+		status, err := bufio.NewReader(conn).ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(status, "101") {
+			t.Fatalf("status line = %q", status)
+		}
+		if !sawBackend {
+			t.Fatal("backend did not receive rewritten websocket credentials")
+		}
+	})
+
+	t.Run("conflict does not dial", func(t *testing.T) {
+		var backendHits int
+		backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			backendHits++
+			t.Fatalf("backend should not be dialed: %s %s", r.Method, r.URL.String())
+		}))
+		defer backend.Close()
+
+		store := testStore(backend.URL + "/emby")
+		session := testSession(backend.URL + "/emby")
+		session.GatewayTokenHash = HashToken(selected)
+		store.Sessions[session.GatewayTokenHash] = session
+		conflictSession := testSession(backend.URL + "/emby")
+		conflictSession.GatewayTokenHash = HashToken(conflict)
+		store.Sessions[conflictSession.GatewayTokenHash] = conflictSession
+		gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+		defer gw.Close()
+
+		gwURL, err := url.Parse(gw.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn, err := net.Dial("tcp", gwURL.Host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		_, _ = conn.Write([]byte("GET /emby/socket?api_key=" + selected + "&token=" + conflict + " HTTP/1.1\r\n" +
+			"Host: " + gwURL.Host + "\r\n" +
+			"Connection: Upgrade\r\n" +
+			"Upgrade: websocket\r\n" +
+			"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+			"Sec-WebSocket-Version: 13\r\n\r\n"))
+		status, err := bufio.NewReader(conn).ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(status, "400") {
+			t.Fatalf("status line = %q, want 400", status)
+		}
+		if backendHits != 0 {
+			t.Fatalf("backend hits = %d", backendHits)
+		}
+	})
+}
+
+type countingSessionStore struct {
+	*MemoryStore
+	mu           sync.Mutex
+	hashes       []string
+	existsHashes []string
+}
+
+func (c *countingSessionStore) FindSessionByTokenHash(ctx context.Context, tokenHash string) (*Session, error) {
+	c.mu.Lock()
+	c.hashes = append(c.hashes, tokenHash)
+	c.mu.Unlock()
+	return c.MemoryStore.FindSessionByTokenHash(ctx, tokenHash)
+}
+
+func (c *countingSessionStore) SessionTokenExists(ctx context.Context, tokenHash string) (bool, error) {
+	c.mu.Lock()
+	c.existsHashes = append(c.existsHashes, tokenHash)
+	c.mu.Unlock()
+	return c.MemoryStore.SessionTokenExists(ctx, tokenHash)
+}
+
+func (c *countingSessionStore) findCountLocked() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.hashes)
+}
+
+func (c *countingSessionStore) existsCountLocked() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.existsHashes)
+}
+
+func (c *countingSessionStore) hashesLocked() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.hashes...)
+}
+
+func (c *countingSessionStore) existsHashesLocked() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.existsHashes...)
+}
+
+type countingOpsStore struct {
+	*MemoryStore
+	pathPolicy int
+	finds      int
+	exists     int
+	audits     int
+}
+
+func (c *countingOpsStore) CheckPathPolicy(ctx context.Context, method, relativePath string) (PathPolicyDecision, error) {
+	c.pathPolicy++
+	return c.MemoryStore.CheckPathPolicy(ctx, method, relativePath)
+}
+
+func (c *countingOpsStore) FindSessionByTokenHash(ctx context.Context, tokenHash string) (*Session, error) {
+	c.finds++
+	return c.MemoryStore.FindSessionByTokenHash(ctx, tokenHash)
+}
+
+func (c *countingOpsStore) SessionTokenExists(ctx context.Context, tokenHash string) (bool, error) {
+	c.exists++
+	return c.MemoryStore.SessionTokenExists(ctx, tokenHash)
+}
+
+func (c *countingOpsStore) RecordAudit(ctx context.Context, entry AuditLog) error {
+	c.audits++
+	return c.MemoryStore.RecordAudit(ctx, entry)
+}
+
+// storeErrorOnMissingSession keeps known sessions working for auth, but turns
+// missing conflict existence checks into a store failure so the guard can return 503.
+type storeErrorOnMissingSession struct {
+	*MemoryStore
+}
+
+func (s *storeErrorOnMissingSession) SessionTokenExists(ctx context.Context, tokenHash string) (bool, error) {
+	exists, err := s.MemoryStore.SessionTokenExists(ctx, tokenHash)
+	if err != nil {
+		return false, err
+	}
+	if !exists {
+		return false, errors.New("session index unavailable")
+	}
+	return true, nil
+}
+
 type failingRevokeStore struct {
 	*MemoryStore
 }

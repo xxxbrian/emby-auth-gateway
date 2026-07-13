@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/url"
@@ -8,6 +9,30 @@ import (
 )
 
 var errCrossOriginRedirectBody = errors.New("cross-origin redirect with request body rejected")
+
+type redirectCredentialTokensKey struct{}
+
+func withRedirectCredentialTokens(ctx context.Context, tokens ...string) context.Context {
+	existing := credentialTokensFromContext(ctx)
+	merged := make(map[string]struct{}, len(existing)+len(tokens))
+	for token := range existing {
+		merged[token] = struct{}{}
+	}
+	for _, token := range tokens {
+		if token = strings.TrimSpace(token); token != "" {
+			merged[token] = struct{}{}
+		}
+	}
+	return context.WithValue(ctx, redirectCredentialTokensKey{}, merged)
+}
+
+func credentialTokensFromContext(ctx context.Context) map[string]struct{} {
+	if ctx == nil {
+		return nil
+	}
+	tokens, _ := ctx.Value(redirectCredentialTokensKey{}).(map[string]struct{})
+	return tokens
+}
 
 func newProxyClient(client *http.Client) *http.Client {
 	if client == nil {
@@ -28,7 +53,7 @@ func newProxyClient(client *http.Client) *http.Client {
 		}
 
 		if len(via) > 0 && !sameOrigin(req.URL, via[0].URL) {
-			sanitizeCrossOriginRedirect(req, redirectTokens(via[0]))
+			sanitizeCrossOriginRedirect(req, redirectAuthTokens(via[0]))
 			if req.Body != nil && req.Body != http.NoBody {
 				return errCrossOriginRedirectBody
 			}
@@ -36,6 +61,17 @@ func newProxyClient(client *http.Client) *http.Client {
 		return nil
 	}
 	return client
+}
+
+func redirectAuthTokens(req *http.Request) map[string]struct{} {
+	tokens := redirectTokens(req)
+	for token := range credentialTokensFromContext(req.Context()) {
+		if tokens == nil {
+			tokens = map[string]struct{}{}
+		}
+		tokens[token] = struct{}{}
+	}
+	return tokens
 }
 
 func sameOrigin(a, b *url.URL) bool {
@@ -64,7 +100,7 @@ func sanitizeCrossOriginRedirect(req *http.Request, tokens map[string]struct{}) 
 			delete(req.Header, name)
 		}
 	}
-	if len(tokens) == 0 {
+	if req.URL.RawQuery == "" {
 		return
 	}
 	req.URL.RawQuery = removeSensitiveQuerySegments(req.URL.RawQuery, tokens)
@@ -75,12 +111,22 @@ func removeSensitiveQuerySegments(rawQuery string, tokens map[string]struct{}) s
 	kept := make([]string, 0, len(segments))
 	removed := false
 	for _, segment := range segments {
-		_, value, hasValue := strings.Cut(segment, "=")
-		decoded, err := url.QueryUnescape(value)
-		if hasValue && err == nil {
-			if _, sensitive := tokens[decoded]; sensitive {
-				removed = true
-				continue
+		name, value, hasValue := strings.Cut(segment, "=")
+		key := name
+		if decodedName, err := url.QueryUnescape(name); err == nil {
+			key = decodedName
+		}
+		if isStrictQueryAuthKey(key) {
+			removed = true
+			continue
+		}
+		if key == genericQueryAuthKey && hasValue {
+			decoded, err := url.QueryUnescape(value)
+			if err == nil {
+				if _, sensitive := tokens[decoded]; sensitive {
+					removed = true
+					continue
+				}
 			}
 		}
 		kept = append(kept, segment)

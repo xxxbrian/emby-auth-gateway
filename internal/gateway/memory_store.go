@@ -456,6 +456,13 @@ func (m *MemoryStore) FindSessionByTokenHash(ctx context.Context, tokenHash stri
 	return &copySession, nil
 }
 
+func (m *MemoryStore) SessionTokenExists(ctx context.Context, tokenHash string) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.Sessions[tokenHash]
+	return ok, nil
+}
+
 func (m *MemoryStore) RevokeSession(ctx context.Context, tokenHash string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

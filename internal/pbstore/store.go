@@ -2,6 +2,8 @@ package pbstore
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -602,6 +604,22 @@ func (s *Store) SaveSession(ctx context.Context, session *gateway.Session) error
 	record.Set("remote_ip", session.RemoteIP)
 	record.Set("expires_at", session.ExpiresAt)
 	return s.app.Save(record)
+}
+
+func (s *Store) SessionTokenExists(ctx context.Context, tokenHash string) (bool, error) {
+	// Resolve the collection first so a missing/broken schema is an operational
+	// error rather than a false "not found".
+	if _, err := s.app.FindCollectionByNameOrId("gateway_sessions"); err != nil {
+		return false, err
+	}
+	_, err := s.app.FindFirstRecordByData("gateway_sessions", "gateway_token_hash", tokenHash)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Store) FindSessionByTokenHash(ctx context.Context, tokenHash string) (*gateway.Session, error) {

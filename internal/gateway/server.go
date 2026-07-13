@@ -74,6 +74,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// Credential-accepting routes reject malformed query encoding before any
+	// store operation (path policy, session, audit, etc.).
+	if acceptsClientCredentials(r.Method, rel) {
+		if err := validateRawQuery(r.URL.RawQuery); err != nil {
+			writeCredentialQueryError(w, err)
+			return
+		}
+	}
 	if !s.pathPolicyAllows(w, r, rel) {
 		return
 	}
@@ -368,6 +376,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 	if !ok {
 		return
 	}
+	if err := s.guardProxyQueryCredentials(r.Context(), r.URL.RawQuery, gatewayToken); err != nil {
+		writeCredentialQueryError(w, err)
+		return
+	}
 	playbackItemID, isPlaybackInfo := playbackInfoItemID(r.Method, rel)
 	guardKey := playbackGuardKey{GatewayTokenHash: session.GatewayTokenHash, ItemID: playbackItemID}
 	guardGeneration := uint64(0)
@@ -384,6 +396,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 	}
 	proxyURL, err := s.proxyURL(session, rel, r.URL.RawQuery, gatewayToken)
 	if err != nil {
+		if errors.Is(err, errMalformedQuery) || errors.Is(err, errCredentialConflict) || errors.Is(err, errCredentialStore) {
+			writeCredentialQueryError(w, err)
+			return
+		}
 		s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "proxy_backend_unavailable", Message: "backend url unavailable", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
 		http.Error(w, "bad backend url", http.StatusBadGateway)
 		return
@@ -397,7 +413,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 		http.Error(w, "bad request body", http.StatusBadRequest)
 		return
 	}
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, proxyURL.String(), body)
+	req, err := http.NewRequestWithContext(withRedirectCredentialTokens(r.Context(), gatewayToken, session.BackendToken), r.Method, proxyURL.String(), body)
 	if err != nil {
 		http.Error(w, "bad proxy request", http.StatusInternalServerError)
 		return
@@ -436,7 +452,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 			if rawBody != nil {
 				retryBody = s.rewriteRequestBodyData(rawBody, session, gatewayToken)
 			}
-			retryReq, retryErr := http.NewRequestWithContext(r.Context(), r.Method, retryURL.String(), retryBody)
+			retryReq, retryErr := http.NewRequestWithContext(withRedirectCredentialTokens(r.Context(), gatewayToken, session.BackendToken), r.Method, retryURL.String(), retryBody)
 			if retryErr != nil {
 				http.Error(w, "bad proxy request", http.StatusInternalServerError)
 				return
@@ -594,6 +610,7 @@ func (s *Server) writeConcurrentPlaybackDenied(w http.ResponseWriter, r *http.Re
 
 func (s *Server) handleUpgradeProxy(w http.ResponseWriter, r *http.Request, proxyURL *url.URL, session *Session, gatewayToken, rel string) {
 	started := time.Now()
+	r = r.WithContext(withRedirectCredentialTokens(r.Context(), gatewayToken, session.BackendToken))
 	trackedWriter := &upgradeResponseWriter{ResponseWriter: w}
 	proxy := &httputil.ReverseProxy{
 		Transport: s.proxyClient.Transport,
@@ -682,40 +699,31 @@ func (s *Server) proxyURL(session *Session, rel, rawQuery, gatewayToken string) 
 	if err != nil {
 		return nil, err
 	}
-	q, err := url.ParseQuery(rawQuery)
+	q, err := parseRawQuery(rawQuery)
 	if err != nil {
-		return nil, err
+		return nil, errMalformedQuery
 	}
-	for key, vals := range q {
-		for i, val := range vals {
-			if val == gatewayToken {
-				vals[i] = session.BackendToken
-			}
-			if val == session.SyntheticUserID {
-				vals[i] = session.BackendUserID
-			}
-		}
-		q[key] = vals
-	}
+	rewriteProxyQueryValues(q, gatewayToken, session)
 	u.RawQuery = q.Encode()
 	u.Path = strings.ReplaceAll(u.Path, session.SyntheticUserID, session.BackendUserID)
 	return u, nil
 }
 
 func (s *Server) rewriteRequestHeaders(h http.Header, session *Session, gatewayToken string) {
+	// Set replaces all values for a key, collapsing duplicate client headers.
 	for _, name := range []string{"X-Emby-Token", "X-MediaBrowser-Token"} {
-		if h.Get(name) != "" {
+		if len(h.Values(name)) > 0 {
 			h.Set(name, session.BackendToken)
 		}
 	}
-	if h.Get("X-Emby-Token") == "" {
+	if len(h.Values("X-Emby-Token")) == 0 {
 		h.Set("X-Emby-Token", session.BackendToken)
 	}
 	identity := session.BackendIdentity.WithDefaults()
 	h.Set("User-Agent", identity.UserAgent)
 	auth := backendAuthHeader(identity, session.BackendUserID, session.BackendToken).String()
 	h.Set("X-Emby-Authorization", auth)
-	if h.Get("Authorization") != "" {
+	if len(h.Values("Authorization")) > 0 {
 		h.Set("Authorization", auth)
 	}
 }

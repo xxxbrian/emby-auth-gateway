@@ -2,9 +2,28 @@ package gateway
 
 import (
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 )
+
+// TokenSource identifies where ExtractCredential found the selected token.
+type TokenSource int
+
+const (
+	TokenSourceNone TokenSource = iota
+	TokenSourceTokenHeader
+	TokenSourceAuthHeader
+	TokenSourceStrictQuery
+	TokenSourceGenericQuery
+)
+
+// ExtractedCredential is the selected client credential and its source metadata.
+type ExtractedCredential struct {
+	Token    string
+	Source   TokenSource
+	QueryKey string
+}
 
 func ParseEmbyAuthHeader(value string) AuthHeader {
 	value = strings.TrimSpace(value)
@@ -86,24 +105,90 @@ func (h AuthHeader) String() string {
 	return scheme + " " + strings.Join(parts, ", ")
 }
 
+// ExtractToken returns the selected credential token using Emby-compatible precedence.
+// It is a compatibility wrapper around ExtractCredential.
 func ExtractToken(r *http.Request) string {
+	return ExtractCredential(r).Token
+}
+
+// ExtractCredential selects one client credential by precedence:
+//  1. X-Emby-Token / X-MediaBrowser-Token headers
+//  2. X-Emby-Authorization / Authorization Emby token fields
+//  3. strict query keys api_key, access_token, X-Emby-Token (case-sensitive)
+//  4. generic query key token
+//
+// A non-empty higher-priority value wins and never falls back. Query keys are
+// case-sensitive; within a key the first trimmed non-empty value is used.
+// Repeated token headers use the first trimmed non-empty value per header name.
+// Repeated Authorization/X-Emby-Authorization values also use the first trimmed
+// non-empty field-value per header key: if that value is not a token-bearing
+// Emby/MediaBrowser authorization, later values for the same key are not
+// scanned and lower-priority query credentials are not considered.
+func ExtractCredential(r *http.Request) ExtractedCredential {
 	for _, name := range []string{"X-Emby-Token", "X-MediaBrowser-Token"} {
-		if token := strings.TrimSpace(r.Header.Get(name)); token != "" {
-			return token
+		if token := firstNonEmptyHeaderValue(r.Header, name); token != "" {
+			return ExtractedCredential{Token: token, Source: TokenSourceTokenHeader}
 		}
 	}
 	for _, name := range []string{"X-Emby-Authorization", "Authorization"} {
-		if auth := ParseEmbyAuthHeader(r.Header.Get(name)); auth.Token != "" {
-			return auth.Token
+		first := firstNonEmptyHeaderValue(r.Header, name)
+		if first == "" {
+			continue
+		}
+		// First nonempty value is authoritative for this header key.
+		if token, ok := embyAuthHeaderToken(first); ok {
+			return ExtractedCredential{Token: token, Source: TokenSourceAuthHeader}
+		}
+		// Non-token-bearing / non-Emby auth: do not scan later values or fall back.
+		return ExtractedCredential{}
+	}
+
+	q := r.URL.Query()
+	for _, name := range strictQueryAuthKeys {
+		if token := firstNonEmptyQueryValue(q[name]); token != "" {
+			return ExtractedCredential{Token: token, Source: TokenSourceStrictQuery, QueryKey: name}
 		}
 	}
-	q := r.URL.Query()
-	for _, name := range []string{"api_key", "access_token", "token"} {
-		if token := strings.TrimSpace(q.Get(name)); token != "" {
+	if token := firstNonEmptyQueryValue(q[genericQueryAuthKey]); token != "" {
+		return ExtractedCredential{Token: token, Source: TokenSourceGenericQuery, QueryKey: genericQueryAuthKey}
+	}
+	return ExtractedCredential{}
+}
+
+// embyAuthHeaderToken reports whether value is a token-bearing Emby/MediaBrowser
+// authorization header field-value and returns its token.
+func embyAuthHeaderToken(value string) (string, bool) {
+	auth := ParseEmbyAuthHeader(value)
+	token := strings.TrimSpace(auth.Token)
+	if token == "" {
+		return "", false
+	}
+	if !strings.EqualFold(auth.Scheme, "Emby") && !strings.EqualFold(auth.Scheme, "MediaBrowser") {
+		return "", false
+	}
+	return token, true
+}
+
+func firstNonEmptyHeaderValue(h http.Header, name string) string {
+	for _, value := range h.Values(name) {
+		if token := strings.TrimSpace(value); token != "" {
 			return token
 		}
 	}
 	return ""
+}
+
+func firstNonEmptyQueryValue(values []string) string {
+	for _, value := range values {
+		if token := strings.TrimSpace(value); token != "" {
+			return token
+		}
+	}
+	return ""
+}
+
+func parseRawQuery(rawQuery string) (url.Values, error) {
+	return url.ParseQuery(rawQuery)
 }
 
 func splitHeaderFields(s string) []string {
