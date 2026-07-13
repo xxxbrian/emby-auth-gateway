@@ -1,10 +1,8 @@
 package gateway
 
 import (
-	"context"
 	"errors"
 	"io"
-	"net"
 	"net/http"
 	"time"
 )
@@ -119,12 +117,4 @@ func (s *Server) auditMediaCopyFailure(r *http.Request, rel string, upstreamStat
 		UpstreamStatus:    upstreamStatus,
 		ResponseCommitted: true,
 	})
-}
-
-func isTimeoutError(err error) bool {
-	if errors.Is(err, context.DeadlineExceeded) {
-		return true
-	}
-	var netErr net.Error
-	return errors.As(err, &netErr) && netErr.Timeout()
 }

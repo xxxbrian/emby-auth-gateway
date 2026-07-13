@@ -409,10 +409,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 	s.rewriteRequestHeaders(req.Header, session, gatewayToken)
 	req.Host = proxyURL.Host
 
+	attemptStarted := time.Now()
 	resp, err := s.proxyClient.Do(req)
 	if err != nil {
-		s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "proxy_backend_unavailable", Message: "backend unavailable", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
-		http.Error(w, "backend unavailable", http.StatusBadGateway)
+		upstreamStatus := closeResponseOnError(resp)
+		s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_backend_unavailable", AuditMessage: "backend unavailable", ClientBody: "backend unavailable", FallbackKind: "upstream_request_error", Duration: time.Since(attemptStarted), UpstreamStatus: upstreamStatus})
 		return
 	}
 	defer resp.Body.Close()
@@ -446,10 +447,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 			copyRequestHeaders(retryReq.Header, r.Header)
 			s.rewriteRequestHeaders(retryReq.Header, session, gatewayToken)
 			retryReq.Host = retryURL.Host
+			attemptStarted = time.Now()
 			resp, err = s.proxyClient.Do(retryReq)
 			if err != nil {
-				s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "proxy_backend_unavailable", Message: "backend unavailable", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
-				http.Error(w, "backend unavailable", http.StatusBadGateway)
+				upstreamStatus := closeResponseOnError(resp)
+				s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_backend_unavailable", AuditMessage: "backend unavailable", ClientBody: "backend unavailable", FallbackKind: "upstream_request_error", Duration: time.Since(attemptStarted), UpstreamStatus: upstreamStatus})
 				return
 			}
 			defer resp.Body.Close()
@@ -591,6 +593,8 @@ func (s *Server) writeConcurrentPlaybackDenied(w http.ResponseWriter, r *http.Re
 }
 
 func (s *Server) handleUpgradeProxy(w http.ResponseWriter, r *http.Request, proxyURL *url.URL, session *Session, gatewayToken, rel string) {
+	started := time.Now()
+	trackedWriter := &upgradeResponseWriter{ResponseWriter: w}
 	proxy := &httputil.ReverseProxy{
 		Transport: s.proxyClient.Transport,
 		Director: func(req *http.Request) {
@@ -599,11 +603,13 @@ func (s *Server) handleUpgradeProxy(w http.ResponseWriter, r *http.Request, prox
 			s.rewriteRequestHeaders(req.Header, session, gatewayToken)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "proxy_backend_unavailable", Message: "backend unavailable", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
-			http.Error(w, "backend unavailable", http.StatusBadGateway)
+			if trackedWriter.finalResponse.Load() || trackedWriter.hijacked.Load() {
+				return
+			}
+			s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_backend_unavailable", AuditMessage: "backend unavailable", ClientBody: "backend unavailable", FallbackKind: "upstream_request_error", Duration: time.Since(started)})
 		},
 	}
-	proxy.ServeHTTP(w, r)
+	proxy.ServeHTTP(trackedWriter, r)
 }
 
 func (s *Server) activeSession(w http.ResponseWriter, r *http.Request, token string) (*Session, bool) {
@@ -1136,10 +1142,10 @@ func (s *Server) writeProxyResponse(w http.ResponseWriter, r *http.Request, rel 
 
 	copyResponseHeaders(w.Header(), resp.Header, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
 	if isM3U8ContentType(ct) || strings.HasSuffix(strings.ToLower(resp.Request.URL.Path), ".m3u8") {
+		readStarted := time.Now()
 		data, err := readLimited(resp.Body, proxyM3U8Limit)
 		if err != nil {
-			s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "proxy_read_failed", Message: "backend response read failed", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
-			http.Error(w, "response read failed", http.StatusBadGateway)
+			s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_read_failed", AuditMessage: "backend response read failed", ClientBody: "response read failed", FallbackKind: "upstream_read_error", Duration: time.Since(readStarted), UpstreamStatus: resp.StatusCode})
 			return
 		}
 		w.Header().Del("Content-Length")
@@ -1167,10 +1173,10 @@ func (s *Server) writeProxyResponse(w http.ResponseWriter, r *http.Request, rel 
 	}
 
 	if isJSONContentType(ct) || strings.TrimSpace(ct) == "" {
+		readStarted := time.Now()
 		data, err := readLimited(resp.Body, proxyJSONLimit)
 		if err != nil {
-			s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "proxy_read_failed", Message: "backend response read failed", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
-			http.Error(w, "response read failed", http.StatusBadGateway)
+			s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_read_failed", AuditMessage: "backend response read failed", ClientBody: "response read failed", FallbackKind: "upstream_read_error", Duration: time.Since(readStarted), UpstreamStatus: resp.StatusCode})
 			return
 		}
 		var value any
@@ -1191,14 +1197,18 @@ func (s *Server) writeProxyResponse(w http.ResponseWriter, r *http.Request, rel 
 
 func (s *Server) writeImageProxyResponse(w http.ResponseWriter, r *http.Request, rel string, resp *http.Response, session *Session) {
 	var first [imageValidationTailSize]byte
+	readStarted := time.Now()
 	n, err := resp.Body.Read(first[:])
+	if err != nil && err != io.EOF {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Del("ETag")
+		w.Header().Del("Last-Modified")
+		s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_invalid_image", AuditMessage: "backend image response read failed", ClientBody: "invalid image response", FallbackKind: "upstream_read_error", Duration: time.Since(readStarted), UpstreamStatus: resp.StatusCode})
+		return
+	}
 	if n == 0 {
 		if err == io.EOF {
 			s.rejectInvalidImageResponse(w, r, rel, session, "backend returned an empty image")
-			return
-		}
-		if err != nil {
-			s.rejectInvalidImageResponse(w, r, rel, session, "backend image response read failed")
 			return
 		}
 		s.rejectInvalidImageResponse(w, r, rel, session, "backend returned an invalid image response")
