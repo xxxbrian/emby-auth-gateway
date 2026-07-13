@@ -61,10 +61,7 @@ func NewServer(cfg Config, store Store) *Server {
 	if client == nil {
 		client = &http.Client{Timeout: backendAuthTimeout}
 	}
-	proxyClient := cfg.HTTPClient
-	if proxyClient == nil {
-		proxyClient = &http.Client{Transport: defaultProxyTransport()}
-	}
+	proxyClient := newProxyClient(cfg.HTTPClient)
 	return &Server{cfg: cfg, store: store, client: client, proxyClient: proxyClient, logins: newLoginFailureLimiter(), backendAuthFailures: map[string]backendLoginFailure{}, playbackGuards: newPlaybackGuardTracker()}
 }
 
