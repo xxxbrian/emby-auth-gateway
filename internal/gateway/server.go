@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xxxbrian/emby-auth-gateway/internal/version"
@@ -36,6 +37,7 @@ type Server struct {
 	backendAuthFailuresMu sync.Mutex
 	backendAuthFailures   map[string]backendLoginFailure
 	playbackGuards        *playbackGuardTracker
+	mediaDeadlineWarning  atomic.Bool
 }
 
 func NewServer(cfg Config, store Store) *Server {
@@ -1126,6 +1128,7 @@ func (s *Server) writeProxyResponse(w http.ResponseWriter, r *http.Request, rel 
 		w.WriteHeader(resp.StatusCode)
 		return
 	}
+	s.clearMediaWriteDeadline(w, r, rel, resp, session)
 	if isImageContentType(ct) && resp.StatusCode >= 200 && resp.StatusCode < 300 && resp.ContentLength == 0 {
 		s.rejectInvalidImageResponse(w, r, rel, session, "backend returned an empty image")
 		return
