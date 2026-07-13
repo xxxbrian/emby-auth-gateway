@@ -1171,6 +1171,10 @@ func (s *Server) writeProxyResponse(w http.ResponseWriter, r *http.Request, rel 
 		s.copyMediaBodyOrAbort(w, r, rel, resp, session)
 		return
 	}
+	if resp.StatusCode == http.StatusOK && strings.TrimSpace(ct) == "" {
+		s.writeMissingContentTypeResponse(w, r, rel, resp, session, gatewayToken, publicGatewayBase)
+		return
+	}
 
 	if isJSONContentType(ct) || strings.TrimSpace(ct) == "" {
 		readStarted := time.Now()
@@ -1333,12 +1337,16 @@ func (s *Server) copyProxyBodyOrAbort(w http.ResponseWriter, r *http.Request, re
 }
 
 func (s *Server) copyMediaBodyOrAbort(w http.ResponseWriter, r *http.Request, rel string, resp *http.Response, session *Session) {
-	result := copyMediaBody(w, resp.Body, resp.ContentLength)
+	s.copyMediaReaderOrAbort(w, r, rel, resp.Body, resp.ContentLength, resp.StatusCode, session)
+}
+
+func (s *Server) copyMediaReaderOrAbort(w http.ResponseWriter, r *http.Request, rel string, src io.Reader, expectedLength int64, upstreamStatus int, session *Session) {
+	result := copyMediaBody(w, src, expectedLength)
 	if result.Err == nil {
 		return
 	}
 	if r.Context().Err() == nil {
-		s.auditMediaCopyFailure(r, rel, resp.StatusCode, session, result)
+		s.auditMediaCopyFailure(r, rel, upstreamStatus, session, result)
 	}
 	panic(http.ErrAbortHandler)
 }

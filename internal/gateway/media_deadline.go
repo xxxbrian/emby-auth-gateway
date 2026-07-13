@@ -10,6 +10,10 @@ func (s *Server) clearMediaWriteDeadline(w http.ResponseWriter, r *http.Request,
 	if !isMediaStreamResponse(r, rel, resp) {
 		return
 	}
+	s.clearMediaWriteDeadlineNow(w, r, rel, resp, session)
+}
+
+func (s *Server) clearMediaWriteDeadlineNow(w http.ResponseWriter, r *http.Request, rel string, resp *http.Response, session *Session) {
 	if err := http.NewResponseController(w).SetWriteDeadline(time.Time{}); err != nil && s.mediaDeadlineWarning.CompareAndSwap(false, true) {
 		s.audit(r.Context(), AuditLog{
 			GatewayUserID:   sessionGatewayUserID(session),
