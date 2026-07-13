@@ -58,6 +58,7 @@ func TestGatewayCollectionsAreLockedAndStoreAuthStillWorks(t *testing.T) {
 	})
 	assertTextFieldsOptional(t, app, "emby_servers", backendIdentityFieldNames)
 	assertFields(t, app, "user_item_data", []string{"season_id", "run_time_ticks", "orphaned_at", "last_seen_at"}, nil)
+	assertFields(t, app, "audit_logs", proxyAuditFieldNames, nil)
 
 	users, err := app.FindCollectionByNameOrId("users")
 	if err != nil {

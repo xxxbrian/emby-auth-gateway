@@ -292,7 +292,7 @@ func TestAuditAndPlaybackEventAreWritable(t *testing.T) {
 	userID := createGatewayUser(t, app, "alice", "gateway-user")
 	pct := 12.5
 
-	if err := store.RecordAudit(context.Background(), gateway.AuditLog{GatewayUserID: userID, SyntheticUserID: "gateway-user", Event: "login_success", Message: "login succeeded", RemoteIP: "127.0.0.1", Method: "POST", Path: "/Users/AuthenticateByName", Status: 200}); err != nil {
+	if err := store.RecordAudit(context.Background(), gateway.AuditLog{GatewayUserID: userID, SyntheticUserID: "gateway-user", Event: "login_success", Message: "login succeeded", RemoteIP: "127.0.0.1", Method: "POST", Path: "/Users/AuthenticateByName", Status: 200, ErrorKind: "upstream_read_error", Direction: "upstream", BytesTransferred: 123, DurationMS: 45, UpstreamStatus: 206, ResponseCommitted: true}); err != nil {
 		t.Fatalf("record audit: %v", err)
 	}
 	if err := store.RecordPlaybackEvent(context.Background(), gateway.PlaybackEvent{GatewayUserID: userID, SyntheticUserID: "gateway-user", ItemID: "item-1", Event: "progress", PositionTicks: 1234, PlayedPercentage: &pct, RemoteIP: "127.0.0.1"}); err != nil {
@@ -306,7 +306,7 @@ func TestAuditAndPlaybackEventAreWritable(t *testing.T) {
 	if len(audits) != 1 {
 		t.Fatalf("audit records = %d, want 1", len(audits))
 	}
-	if audits[0].GetString("synthetic_user_id") != "gateway-user" || audits[0].GetString("method") != "POST" || audits[0].GetString("path") != "/Users/AuthenticateByName" || audits[0].GetInt("status") != 200 {
+	if audits[0].GetString("synthetic_user_id") != "gateway-user" || audits[0].GetString("method") != "POST" || audits[0].GetString("path") != "/Users/AuthenticateByName" || audits[0].GetInt("status") != 200 || audits[0].GetString("error_kind") != "upstream_read_error" || audits[0].GetString("direction") != "upstream" || audits[0].GetInt("bytes_transferred") != 123 || audits[0].GetInt("duration_ms") != 45 || audits[0].GetInt("upstream_status") != 206 || !audits[0].GetBool("response_committed") {
 		t.Fatalf("audit details not persisted: %#v", audits[0])
 	}
 	events, err := app.FindRecordsByFilter("playback_events", "gateway_user = {:gatewayUserID} && item_id = 'item-1'", "", 0, 0, dbx.Params{"gatewayUserID": userID})

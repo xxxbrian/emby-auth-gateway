@@ -158,6 +158,12 @@ func (s *Store) RecordAudit(ctx context.Context, entry gateway.AuditLog) error {
 	record.Set("method", entry.Method)
 	record.Set("path", entry.Path)
 	record.Set("status", entry.Status)
+	record.Set("error_kind", entry.ErrorKind)
+	record.Set("direction", entry.Direction)
+	record.Set("bytes_transferred", entry.BytesTransferred)
+	record.Set("duration_ms", entry.DurationMS)
+	record.Set("upstream_status", entry.UpstreamStatus)
+	record.Set("response_committed", entry.ResponseCommitted)
 	return s.app.Save(record)
 }
 

@@ -58,7 +58,14 @@ type AuditLog struct {
 	Method          string
 	Path            string
 	Status          int
-	CreatedAt       time.Time
+	ErrorKind       string
+	Direction       string
+	// BytesTransferred is the number of response body bytes successfully written downstream.
+	BytesTransferred  int64
+	DurationMS        int
+	UpstreamStatus    int
+	ResponseCommitted bool
+	CreatedAt         time.Time
 }
 
 type PathPolicy struct {

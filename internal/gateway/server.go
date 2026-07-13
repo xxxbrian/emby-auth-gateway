@@ -1148,6 +1148,13 @@ func (s *Server) writeProxyResponse(w http.ResponseWriter, r *http.Request, rel 
 		return
 	}
 
+	if isMediaStreamResponse(r, rel, resp) {
+		setContentLength(w.Header(), resp.ContentLength)
+		w.WriteHeader(resp.StatusCode)
+		s.copyMediaBodyOrAbort(w, r, rel, resp, session)
+		return
+	}
+
 	if isStreamingContentType(ct) {
 		if isImageContentType(ct) {
 			s.writeImageProxyResponse(w, r, rel, resp, session)
@@ -1155,7 +1162,7 @@ func (s *Server) writeProxyResponse(w http.ResponseWriter, r *http.Request, rel 
 		}
 		setContentLength(w.Header(), resp.ContentLength)
 		w.WriteHeader(resp.StatusCode)
-		s.copyProxyBodyOrAbort(w, r, rel, resp.Body, session)
+		s.copyMediaBodyOrAbort(w, r, rel, resp, session)
 		return
 	}
 
@@ -1313,6 +1320,17 @@ func (s *Server) copyProxyBodyOrAbort(w http.ResponseWriter, r *http.Request, re
 	if _, err := io.Copy(w, body); err != nil {
 		s.abortProxyBody(r, rel, session, err)
 	}
+}
+
+func (s *Server) copyMediaBodyOrAbort(w http.ResponseWriter, r *http.Request, rel string, resp *http.Response, session *Session) {
+	result := copyMediaBody(w, resp.Body, resp.ContentLength)
+	if result.Err == nil {
+		return
+	}
+	if r.Context().Err() == nil {
+		s.auditMediaCopyFailure(r, rel, resp.StatusCode, session, result)
+	}
+	panic(http.ErrAbortHandler)
 }
 
 func (s *Server) abortProxyBody(r *http.Request, rel string, session *Session, err error) {
