@@ -106,6 +106,69 @@ func validAssetPath(p string) bool {
 	return true
 }
 
+// USTAR header field sizes (archive/tar nameSize / prefixSize). Trusted catalog
+// paths must be strictly representable so built-in catalogs support dir, archive
+// (FormatUSTAR), and URL acquisition modes without PAX/GNU long-name extensions.
+const (
+	ustarNameMax   = 100
+	ustarPrefixMax = 155
+)
+
+// pathIsASCII reports whether s is a NUL-free ASCII string (bytes < 0x80),
+// matching archive/tar isASCII used by the USTAR writer/reader.
+func pathIsASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] == 0 || s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+// ustarNamePrefixRepresentable reports whether name can be stored in a strict
+// USTAR header using only the 100-byte name field and optional 155-byte prefix,
+// mirroring archive/tar.splitUSTARPath / allowedFormats USTAR rules.
+//
+// A path is representable when it is ASCII and either fits in name (≤100 bytes)
+// or splits on a '/' into non-empty prefix (≤155) and suffix (≤100).
+func ustarNamePrefixRepresentable(name string) bool {
+	if !pathIsASCII(name) {
+		return false
+	}
+	if len(name) <= ustarNameMax {
+		return true
+	}
+	// Mirror archive/tar.splitUSTARPath exactly.
+	length := len(name)
+	if length > ustarPrefixMax+1 {
+		length = ustarPrefixMax + 1
+	} else if name[length-1] == '/' {
+		length--
+	}
+	i := strings.LastIndex(name[:length], "/")
+	nlen := len(name) - i - 1 // suffix length
+	plen := i                 // prefix length
+	if i <= 0 || nlen > ustarNameMax || nlen == 0 || plen > ustarPrefixMax {
+		return false
+	}
+	return true
+}
+
+// validTrustedCatalogPath enforces admission path rules for trusted catalogs:
+// canonical relative asset path, ASCII-only, and strict USTAR name/prefix form.
+func validTrustedCatalogPath(p string) error {
+	if !validAssetPath(p) {
+		return fmt.Errorf("path %q is not a canonical relative path", p)
+	}
+	if !pathIsASCII(p) {
+		return fmt.Errorf("path %q is not ASCII", p)
+	}
+	if !ustarNamePrefixRepresentable(p) {
+		return fmt.Errorf("path %q is not USTAR name/prefix representable", p)
+	}
+	return nil
+}
+
 func validSHA256Hex(s string) bool {
 	if len(s) != 64 {
 		return false

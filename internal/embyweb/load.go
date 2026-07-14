@@ -33,9 +33,10 @@ type installEntry struct {
 	CacheClass string `json:"cache_class"`
 }
 
-// loadAssets loads and verifies the asset tree at absRoot.
+// loadAssets loads and verifies the asset tree at absRoot against reg.
 // Missing required paths yield StateMissing; all other failures yield StateCorrupt.
-func loadAssets(absRoot string) (Status, map[string]*asset) {
+// Unknown catalog digests are StateCorrupt with ErrUntrustedCatalog before Ready.
+func loadAssets(absRoot string, reg *catalogRegistry) (Status, map[string]*asset) {
 	// Assets root must exist as a real directory (not a symlink).
 	fi, err := os.Lstat(absRoot)
 	if err != nil {
@@ -77,113 +78,28 @@ func loadAssets(absRoot string) (Status, map[string]*asset) {
 		return Status{State: StateCorrupt, Err: err}, nil
 	}
 
-	releaseRel := path.Join("releases", ptr.Release)
-	if st, err := lstatDirOrMissing(root, "releases"); err != nil {
-		return mapLoadErr(err, "releases"), nil
-	} else if st == nil {
-		return Status{State: StateMissing, Err: errors.New("releases directory missing"), Release: ptr.Release, CatalogSHA256: ptr.CatalogSHA256}, nil
-	}
-
-	if st, err := lstatDirOrMissing(root, releaseRel); err != nil {
-		return mapLoadErrWithID(err, "release directory", ptr), nil
-	} else if st == nil {
-		return Status{State: StateMissing, Err: fmt.Errorf("release %q missing", ptr.Release), Release: ptr.Release, CatalogSHA256: ptr.CatalogSHA256}, nil
-	}
-
-	installRel := path.Join(releaseRel, "install.json")
-	if st, err := lstatRegularOrMissing(root, installRel); err != nil {
-		return mapLoadErrWithID(err, "install.json", ptr), nil
-	} else if st == nil {
-		return Status{State: StateMissing, Err: errors.New("install.json missing"), Release: ptr.Release, CatalogSHA256: ptr.CatalogSHA256}, nil
-	}
-
-	filesRel := path.Join(releaseRel, "files")
-	if st, err := lstatDirOrMissing(root, filesRel); err != nil {
-		return mapLoadErrWithID(err, "files directory", ptr), nil
-	} else if st == nil {
-		return Status{State: StateMissing, Err: errors.New("files directory missing"), Release: ptr.Release, CatalogSHA256: ptr.CatalogSHA256}, nil
-	}
-
-	manData, err := readRootFile(root, installRel, maxManifestBytes)
+	// Trust gate: catalog digest must resolve in the immutable registry before
+	// any Ready outcome. Unknown digests are corrupt/untrusted.
+	tc, err := reg.lookupByDigest(ptr.CatalogSHA256)
 	if err != nil {
-		return Status{State: StateCorrupt, Err: fmt.Errorf("read install.json: %w", err), Release: ptr.Release, CatalogSHA256: ptr.CatalogSHA256}, nil
+		return Status{
+			State:         StateCorrupt,
+			Release:       ptr.Release,
+			CatalogSHA256: ptr.CatalogSHA256,
+			Err:           fmt.Errorf("%w: %s", ErrUntrustedCatalog, ptr.CatalogSHA256),
+		}, nil
+	}
+	if err := pointerMatchesTrusted(ptr, tc); err != nil {
+		return Status{
+			State:         StateCorrupt,
+			Release:       ptr.Release,
+			CatalogSHA256: ptr.CatalogSHA256,
+			Err:           err,
+		}, nil
 	}
 
-	var man installManifest
-	if err := decodeStrictJSON(manData, &man); err != nil {
-		return Status{State: StateCorrupt, Err: fmt.Errorf("parse install.json: %w", err), Release: ptr.Release, CatalogSHA256: ptr.CatalogSHA256}, nil
-	}
-	if err := validateManifest(man, ptr); err != nil {
-		return Status{State: StateCorrupt, Err: err, Release: ptr.Release, CatalogSHA256: ptr.CatalogSHA256}, nil
-	}
-
-	// Open nested roots for release and files; reject symlinks via Lstat already done.
-	filesRoot, err := root.OpenRoot(filesRel)
-	if err != nil {
-		return Status{State: StateCorrupt, Err: fmt.Errorf("open files root: %w", err), Release: ptr.Release, CatalogSHA256: ptr.CatalogSHA256}, nil
-	}
-	defer filesRoot.Close()
-
-	// Manifest-derived expected sets only (bounded by maxEntries / maxDirs).
-	entryByPath, requiredDirs, err := expectedTreeFromManifest(man.Entries)
-	if err != nil {
-		return Status{State: StateCorrupt, Err: err, Release: ptr.Release, CatalogSHA256: ptr.CatalogSHA256}, nil
-	}
-
-	// Bounded walk: only fixed ReadDir batches + deletions from expected sets.
-	// Unexpected/excess nodes => Corrupt; remaining expected after walk => Missing.
-	if err := verifyExactTree(filesRoot, entryByPath, requiredDirs); err != nil {
-		st := classifyTreeErr(err, ptr)
-		return st, nil
-	}
-
-	assets := make(map[string]*asset, len(man.Entries))
-	var total int64
-	for _, e := range man.Entries {
-		if e.Size < 0 || e.Size > maxFileBytes {
-			return Status{State: StateCorrupt, Err: fmt.Errorf("entry %q size out of bounds: %d", e.Path, e.Size), Release: ptr.Release, CatalogSHA256: ptr.CatalogSHA256}, nil
-		}
-		total += e.Size
-		if total > maxTotalBytes {
-			return Status{State: StateCorrupt, Err: fmt.Errorf("total size exceeds %d bytes", maxTotalBytes), Release: ptr.Release, CatalogSHA256: ptr.CatalogSHA256}, nil
-		}
-
-		// Re-check path components are not symlinks while reading.
-		if err := ensurePathComponentsSafe(filesRoot, e.Path); err != nil {
-			if isNotExist(err) {
-				return Status{State: StateMissing, Err: fmt.Errorf("path %q missing: %w", e.Path, err), Release: ptr.Release, CatalogSHA256: ptr.CatalogSHA256}, nil
-			}
-			return Status{State: StateCorrupt, Err: fmt.Errorf("path %q: %w", e.Path, err), Release: ptr.Release, CatalogSHA256: ptr.CatalogSHA256}, nil
-		}
-
-		data, sum, err := readVerifyFile(filesRoot, e.Path, e.Size, e.SHA256)
-		if err != nil {
-			if isNotExist(err) {
-				return Status{State: StateMissing, Err: fmt.Errorf("file %q missing: %w", e.Path, err), Release: ptr.Release, CatalogSHA256: ptr.CatalogSHA256}, nil
-			}
-			return Status{State: StateCorrupt, Err: fmt.Errorf("file %q: %w", e.Path, err), Release: ptr.Release, CatalogSHA256: ptr.CatalogSHA256}, nil
-		}
-
-		cacheClass := e.CacheClass
-		if forceRevalidate(e.Path, e.MediaType) {
-			cacheClass = cacheRevalidate
-		}
-
-		assets[e.Path] = &asset{
-			path:       e.Path,
-			data:       data,
-			sha256:     sum,
-			mediaType:  e.MediaType,
-			cacheClass: cacheClass,
-			etag:       `"` + sum + `"`,
-		}
-	}
-
-	return Status{
-		State:         StateReady,
-		Release:       ptr.Release,
-		CatalogSHA256: ptr.CatalogSHA256,
-	}, assets
+	// Shared full verifier (also used by status --verify and installer).
+	return verifyTrustedRelease(root, ptr.Release, tc, true)
 }
 
 // expectedTreeFromManifest builds bounded expected file and required-directory
@@ -242,11 +158,19 @@ func classifyTreeErr(err error, ptr currentPointer) Status {
 	return Status{State: StateCorrupt, Err: err, Release: ptr.Release, CatalogSHA256: ptr.CatalogSHA256}
 }
 
+// treeWalker is the minimal surface for exact-tree verification. *os.Root
+// implements it for serve/load; *anchoredDir implements it for directory-source
+// acquisition on linux/darwin (descriptor-relative, no /dev/fd).
+type treeWalker interface {
+	Lstat(name string) (fs.FileInfo, error)
+	Open(name string) (*os.File, error)
+}
+
 // verifyExactTree walks files/ using only fixed-size ReadDir batches and the
 // manifest-derived expected sets. It mutates remainingFiles/remainingDirs by
 // deleting observed expected nodes. Unexpected or excess nodes are Corrupt;
 // leftover expected nodes after a complete walk are Missing.
-func verifyExactTree(filesRoot *os.Root, remainingFiles map[string]installEntry, remainingDirs map[string]struct{}) error {
+func verifyExactTree(filesRoot treeWalker, remainingFiles map[string]installEntry, remainingDirs map[string]struct{}) error {
 	// remainingDirs includes "."; track observed required dirs separately so we
 	// can detect missing parent directories after the walk.
 	expectedDirCount := len(remainingDirs)
@@ -546,7 +470,7 @@ func readRootFile(root *os.Root, name string, limit int64) ([]byte, error) {
 	return data, nil
 }
 
-func ensurePathComponentsSafe(filesRoot *os.Root, assetPath string) error {
+func ensurePathComponentsSafe(filesRoot treeWalker, assetPath string) error {
 	// Check each directory component and the final file with Lstat.
 	parts := strings.Split(assetPath, "/")
 	cur := ""
@@ -576,7 +500,7 @@ func ensurePathComponentsSafe(filesRoot *os.Root, assetPath string) error {
 	return nil
 }
 
-func readVerifyFile(filesRoot *os.Root, assetPath string, wantSize int64, wantSHA string) ([]byte, string, error) {
+func readVerifyFile(filesRoot treeWalker, assetPath string, wantSize int64, wantSHA string) ([]byte, string, error) {
 	fi, err := filesRoot.Lstat(assetPath)
 	if err != nil {
 		return nil, "", err

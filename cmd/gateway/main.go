@@ -26,6 +26,7 @@ func main() {
 	migratecmd.MustRegister(app, app.RootCmd, migratecmd.Config{})
 	app.RootCmd.AddCommand(pbsetup.NewCommand(app))
 	app.RootCmd.AddCommand(newVersionCommand())
+	app.RootCmd.AddCommand(newWebCommand())
 	registerBackendIdentityDefaults(app)
 	registerMappingSessionRevocation(app)
 	registerActivityLogTokenRedaction(app)

@@ -45,16 +45,16 @@ func TestNewDisabled(t *testing.T) {
 }
 
 func TestNewEnabledRequiresEmbyBase(t *testing.T) {
-	root := buildFixture(t, fixtureOpts{Files: readyMinimalFiles()})
+	tree := buildFixture(t, fixtureOpts{Files: readyMinimalFiles()})
 	for _, base := range []string{"", "/api", "/Emby", "/EMBY", "/emby/extra", "/emby/web"} {
-		_, err := New(Config{GatewayBasePath: base, AssetsRoot: root})
+		_, err := New(Config{GatewayBasePath: base, AssetsRoot: tree.Root})
 		if err == nil {
 			t.Fatalf("base %q: expected error", base)
 		}
 	}
 	// Exact /emby after normalization (leading slash, strip trailing slash).
 	for _, base := range []string{"/emby", "/emby/", "emby"} {
-		s, err := New(Config{GatewayBasePath: base, AssetsRoot: root})
+		s, err := newWithRegistry(Config{GatewayBasePath: base, AssetsRoot: tree.Root}, tree.Registry)
 		if err != nil {
 			t.Fatalf("base %q: %v", base, err)
 		}
@@ -72,18 +72,22 @@ func TestMissingStates(t *testing.T) {
 		{"no_current", fixtureOpts{Files: readyMinimalFiles(), SkipCurrent: true}},
 		{"no_release", fixtureOpts{Files: readyMinimalFiles(), SkipReleaseDir: true}},
 		{"no_install", fixtureOpts{Files: readyMinimalFiles(), SkipInstall: true}},
-		{"no_files_dir", fixtureOpts{Files: nil, SkipFilesDir: true}},
+		{"no_files_dir", fixtureOpts{Files: readyMinimalFiles(), SkipFilesDir: true}},
 		{"missing_root", fixtureOpts{Files: readyMinimalFiles()}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var assetsRoot string
+			var reg *catalogRegistry
 			if tc.name == "missing_root" {
 				assetsRoot = filepath.Join(t.TempDir(), "does-not-exist")
+				reg, _ = newCatalogRegistry(nil)
 			} else {
-				assetsRoot = buildFixture(t, tc.opts)
+				ft := buildFixture(t, tc.opts)
+				assetsRoot = ft.Root
+				reg = ft.Registry
 			}
-			s, err := New(Config{GatewayBasePath: "/emby", AssetsRoot: assetsRoot})
+			s, err := newWithRegistry(Config{GatewayBasePath: "/emby", AssetsRoot: assetsRoot}, reg)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -105,11 +109,11 @@ func TestCorruptStrictJSONAndBounds(t *testing.T) {
 		name string
 		opts fixtureOpts
 	}{
-		{"unknown_field_current", fixtureOpts{Files: validFiles, CurrentRaw: []byte(`{"schema":1,"release":"1.0.0-deadbeef","catalog_sha256":"` + defaultCatalogSHA() + `","extra":true}`)}},
-		{"trailing_current", fixtureOpts{Files: validFiles, CurrentRaw: []byte(`{"schema":1,"release":"1.0.0-deadbeef","catalog_sha256":"` + defaultCatalogSHA() + `"}{"x":1}`)}},
+		{"unknown_field_current", fixtureOpts{Files: validFiles, CurrentRaw: []byte(`{"schema":1,"release":"1.0.0-deadbeef","catalog_sha256":"` + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" + `","extra":true}`)}},
+		{"trailing_current", fixtureOpts{Files: validFiles, CurrentRaw: []byte(`{"schema":1,"release":"1.0.0-deadbeef","catalog_sha256":"` + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" + `"}{"x":1}`)}},
 		{"bad_schema", fixtureOpts{Files: validFiles, CurrentOverride: map[string]any{"schema": 2}}},
 		{"bad_release_path", fixtureOpts{Files: validFiles, CurrentOverride: map[string]any{"release": "../x"}}},
-		{"bad_catalog_case", fixtureOpts{Files: validFiles, CurrentOverride: map[string]any{"catalog_sha256": strings.ToUpper(defaultCatalogSHA())}}},
+		{"bad_catalog_case", fixtureOpts{Files: validFiles, CurrentOverride: map[string]any{"catalog_sha256": strings.ToUpper("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}}},
 		{"identity_mismatch", fixtureOpts{Files: validFiles, InstallOverride: map[string]any{"release": "other-release"}}},
 		{"bad_media_type", fixtureOpts{Files: validFiles, EntryOverrides: []map[string]any{
 			{"path": "index.html", "size": 10, "sha256": sha256Hex([]byte("0123456789")), "media_type": "text/plain", "cache_class": "revalidate"},
@@ -123,7 +127,7 @@ func TestCorruptStrictJSONAndBounds(t *testing.T) {
 		}},
 		{"hash_mismatch", fixtureOpts{Files: validFiles, MutateAfter: func(root string) {
 			// rewrite install entry hash after write by rebuilding install with wrong hash
-			rel := filepath.Join(root, "releases", "1.0.0-deadbeef")
+			rel := filepath.Join(root, "releases", releaseNameFromRoot(root))
 			raw, _ := os.ReadFile(filepath.Join(rel, "install.json"))
 			var man map[string]any
 			_ = json.Unmarshal(raw, &man)
@@ -139,8 +143,8 @@ func TestCorruptStrictJSONAndBounds(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			root := buildFixture(t, tc.opts)
-			s, err := New(Config{GatewayBasePath: "/emby", AssetsRoot: root})
+			tree := buildFixture(t, tc.opts)
+			s, err := newWithRegistry(Config{GatewayBasePath: "/emby", AssetsRoot: tree.Root}, tree.Registry)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -159,11 +163,11 @@ func TestCorruptDuplicatePath(t *testing.T) {
 		"path": "modules/app.js", "size": len(data), "sha256": sum,
 		"media_type": mt, "cache_class": cacheImmutable,
 	}
-	root := buildFixture(t, fixtureOpts{
+	tree := buildFixture(t, fixtureOpts{
 		Files:          []fixtureFile{{Path: "modules/app.js", Data: data}},
 		EntryOverrides: []map[string]any{entry, entry},
 	})
-	s, err := New(Config{GatewayBasePath: "/emby", AssetsRoot: root})
+	s, err := newWithRegistry(Config{GatewayBasePath: "/emby", AssetsRoot: tree.Root}, tree.Registry)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,8 +209,8 @@ func TestSymlinkRejectionEveryLevel(t *testing.T) {
 			}
 		}},
 		{"release_dir_symlink", func(t *testing.T, root string) {
-			rel := filepath.Join(root, "releases", "1.0.0-deadbeef")
-			real := filepath.Join(root, "releases", "1.0.0-deadbeef.real")
+			rel := filepath.Join(root, "releases", releaseNameFromRoot(root))
+			real := filepath.Join(root, "releases", releaseNameFromRoot(root)+".real")
 			if err := os.Rename(rel, real); err != nil {
 				t.Fatal(err)
 			}
@@ -215,7 +219,7 @@ func TestSymlinkRejectionEveryLevel(t *testing.T) {
 			}
 		}},
 		{"install_json_symlink", func(t *testing.T, root string) {
-			p := filepath.Join(root, "releases", "1.0.0-deadbeef", "install.json")
+			p := filepath.Join(root, "releases", releaseNameFromRoot(root), "install.json")
 			real := p + ".real"
 			if err := os.Rename(p, real); err != nil {
 				t.Fatal(err)
@@ -225,7 +229,7 @@ func TestSymlinkRejectionEveryLevel(t *testing.T) {
 			}
 		}},
 		{"files_dir_symlink", func(t *testing.T, root string) {
-			p := filepath.Join(root, "releases", "1.0.0-deadbeef", "files")
+			p := filepath.Join(root, "releases", releaseNameFromRoot(root), "files")
 			real := p + ".real"
 			if err := os.Rename(p, real); err != nil {
 				t.Fatal(err)
@@ -235,7 +239,7 @@ func TestSymlinkRejectionEveryLevel(t *testing.T) {
 			}
 		}},
 		{"nested_dir_symlink", func(t *testing.T, root string) {
-			p := filepath.Join(root, "releases", "1.0.0-deadbeef", "files", "strings")
+			p := filepath.Join(root, "releases", releaseNameFromRoot(root), "files", "strings")
 			real := p + ".real"
 			if err := os.Rename(p, real); err != nil {
 				t.Fatal(err)
@@ -245,7 +249,7 @@ func TestSymlinkRejectionEveryLevel(t *testing.T) {
 			}
 		}},
 		{"file_symlink", func(t *testing.T, root string) {
-			p := filepath.Join(root, "releases", "1.0.0-deadbeef", "files", "index.html")
+			p := filepath.Join(root, "releases", releaseNameFromRoot(root), "files", "index.html")
 			real := p + ".real"
 			if err := os.Rename(p, real); err != nil {
 				t.Fatal(err)
@@ -259,9 +263,9 @@ func TestSymlinkRejectionEveryLevel(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.name == "assets_root_symlink" {
-				real := buildFixture(t, fixtureOpts{Files: readyMinimalFiles()})
+				realTree := buildFixture(t, fixtureOpts{Files: readyMinimalFiles()})
 				link := filepath.Join(t.TempDir(), "assets-link")
-				if err := os.Symlink(real, link); err != nil {
+				if err := os.Symlink(realTree.Root, link); err != nil {
 					t.Fatal(err)
 				}
 				s, err := New(Config{GatewayBasePath: "/emby", AssetsRoot: link})
@@ -273,9 +277,9 @@ func TestSymlinkRejectionEveryLevel(t *testing.T) {
 				}
 				return
 			}
-			root := buildFixture(t, fixtureOpts{Files: readyMinimalFiles()})
-			tc.setup(t, root)
-			s, err := New(Config{GatewayBasePath: "/emby", AssetsRoot: root})
+			tree := buildFixture(t, fixtureOpts{Files: readyMinimalFiles()})
+			tc.setup(t, tree.Root)
+			s, err := newWithRegistry(Config{GatewayBasePath: "/emby", AssetsRoot: tree.Root}, tree.Registry)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -287,8 +291,8 @@ func TestSymlinkRejectionEveryLevel(t *testing.T) {
 }
 
 func TestReadyServeBasics(t *testing.T) {
-	root := buildFixture(t, fixtureOpts{Files: readyMinimalFiles()})
-	s := mustNewReady(t, root)
+	tree := buildFixture(t, fixtureOpts{Files: readyMinimalFiles()})
+	s := mustNewReady(t, tree)
 
 	t.Run("redirect_root", func(t *testing.T) {
 		rr := httptest.NewRecorder()
@@ -375,17 +379,17 @@ func TestReadyServeBasics(t *testing.T) {
 }
 
 func TestMethodMatrix(t *testing.T) {
-	readyRoot := buildFixture(t, fixtureOpts{Files: readyMinimalFiles()})
-	ready := mustNewReady(t, readyRoot)
+	readyTree := buildFixture(t, fixtureOpts{Files: readyMinimalFiles()})
+	ready := mustNewReady(t, readyTree)
 
-	missingRoot := buildFixture(t, fixtureOpts{Files: readyMinimalFiles(), SkipCurrent: true})
-	missing, err := New(Config{GatewayBasePath: "/emby", AssetsRoot: missingRoot})
+	missingTree := buildFixture(t, fixtureOpts{Files: readyMinimalFiles(), SkipCurrent: true})
+	missing, err := newWithRegistry(Config{GatewayBasePath: "/emby", AssetsRoot: missingTree.Root}, missingTree.Registry)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	corruptRoot := buildFixture(t, fixtureOpts{Files: readyMinimalFiles(), CurrentOverride: map[string]any{"schema": 99}})
-	corrupt, err := New(Config{GatewayBasePath: "/emby", AssetsRoot: corruptRoot})
+	corruptTree := buildFixture(t, fixtureOpts{Files: readyMinimalFiles(), CurrentOverride: map[string]any{"schema": 99}})
+	corrupt, err := newWithRegistry(Config{GatewayBasePath: "/emby", AssetsRoot: corruptTree.Root}, corruptTree.Registry)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -447,8 +451,8 @@ func TestMethodMatrix(t *testing.T) {
 }
 
 func TestTraversalRejection(t *testing.T) {
-	root := buildFixture(t, fixtureOpts{Files: readyMinimalFiles()})
-	s := mustNewReady(t, root)
+	tree := buildFixture(t, fixtureOpts{Files: readyMinimalFiles()})
+	s := mustNewReady(t, tree)
 
 	paths := []string{
 		"/emby/web/../web/index.html",
@@ -484,13 +488,13 @@ func TestTraversalRejection(t *testing.T) {
 
 func TestETagRangeConditionals(t *testing.T) {
 	data := []byte("0123456789abcdef")
-	root := buildFixture(t, fixtureOpts{Files: []fixtureFile{
+	tree := buildFixture(t, fixtureOpts{Files: []fixtureFile{
 		{Path: "index.html", Data: []byte("<html></html>")},
 		{Path: "manifest.json", Data: []byte(`{}`)},
 		{Path: "strings/en-US.json", Data: []byte(`{}`)},
 		{Path: "modules/app.js", Data: data, CacheClass: cacheImmutable},
 	}})
-	s := mustNewReady(t, root)
+	s := mustNewReady(t, tree)
 
 	// Baseline
 	rr := httptest.NewRecorder()
@@ -570,8 +574,8 @@ func TestETagRangeConditionals(t *testing.T) {
 }
 
 func TestCORS(t *testing.T) {
-	root := buildFixture(t, fixtureOpts{Files: readyMinimalFiles()})
-	s := mustNewReady(t, root)
+	tree := buildFixture(t, fixtureOpts{Files: readyMinimalFiles()})
+	s := mustNewReady(t, tree)
 
 	wantPreflightVary := []string{
 		"Origin",
@@ -763,11 +767,11 @@ func TestCORS(t *testing.T) {
 }
 
 func TestPostStartMutationServesPinned(t *testing.T) {
-	root := buildFixture(t, fixtureOpts{Files: readyMinimalFiles()})
-	s := mustNewReady(t, root)
+	tree := buildFixture(t, fixtureOpts{Files: readyMinimalFiles()})
+	s := mustNewReady(t, tree)
 
 	// Mutate on-disk index after load.
-	indexPath := filepath.Join(root, "releases", "1.0.0-deadbeef", "files", "index.html")
+	indexPath := filepath.Join(tree.Root, "releases", tree.Release, "files", "index.html")
 	original, err := os.ReadFile(indexPath)
 	if err != nil {
 		t.Fatal(err)
@@ -787,8 +791,8 @@ func TestPostStartMutationServesPinned(t *testing.T) {
 }
 
 func TestConcurrentServeHTTP(t *testing.T) {
-	root := buildFixture(t, fixtureOpts{Files: readyMinimalFiles()})
-	s := mustNewReady(t, root)
+	tree := buildFixture(t, fixtureOpts{Files: readyMinimalFiles()})
+	s := mustNewReady(t, tree)
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, 64)
@@ -819,32 +823,34 @@ func TestConcurrentServeHTTP(t *testing.T) {
 }
 
 func TestStatusFields(t *testing.T) {
-	catalog := defaultCatalogSHA()
-	root := buildFixture(t, fixtureOpts{
-		Release:       "2.0.0-abc",
-		CatalogSHA256: catalog,
-		Files:         readyMinimalFiles(),
+	tree := buildFixture(t, fixtureOpts{
+		Files:          readyMinimalFiles(),
+		CatalogVersion: "2.0.0",
+		CatalogID:      "status-test",
 	})
-	s := mustNewReady(t, root)
+	s := mustNewReady(t, tree)
 	st := s.Status()
-	if st.Release != "2.0.0-abc" || st.CatalogSHA256 != catalog {
-		t.Fatalf("status=%+v", st)
+	if st.Release != tree.Release || st.CatalogSHA256 != tree.Digest {
+		t.Fatalf("status=%+v want release=%s digest=%s", st, tree.Release, tree.Digest)
 	}
 	if st.Err != nil {
 		t.Fatalf("err=%v", st.Err)
+	}
+	if !strings.HasPrefix(st.Release, "2.0.0-") {
+		t.Fatalf("release=%q want 2.0.0-<digest>", st.Release)
 	}
 }
 
 func TestNonRegularFileRejected(t *testing.T) {
 	// FIFO if supported.
-	root := buildFixture(t, fixtureOpts{Files: readyMinimalFiles()})
-	fifo := filepath.Join(root, "releases", "1.0.0-deadbeef", "files", "modules", "pipe.fifo")
+	tree := buildFixture(t, fixtureOpts{Files: readyMinimalFiles()})
+	fifo := filepath.Join(tree.Root, "releases", tree.Release, "files", "modules", "pipe.fifo")
 	if err := mkfifo(fifo); err != nil {
 		t.Skipf("mkfifo not available: %v", err)
 	}
 	// Add to install as if declared — still non-regular.
 	// Easier: leave undeclared FIFO in tree -> corrupt as non-regular.
-	s, err := New(Config{GatewayBasePath: "/emby", AssetsRoot: root})
+	s, err := newWithRegistry(Config{GatewayBasePath: "/emby", AssetsRoot: tree.Root}, tree.Registry)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -854,13 +860,13 @@ func TestNonRegularFileRejected(t *testing.T) {
 }
 
 func TestHTMLForcedRevalidateEvenIfImmutableDeclared(t *testing.T) {
-	root := buildFixture(t, fixtureOpts{Files: []fixtureFile{
+	tree := buildFixture(t, fixtureOpts{Files: []fixtureFile{
 		{Path: "index.html", Data: []byte("<html></html>"), CacheClass: cacheImmutable},
 		{Path: "manifest.json", Data: []byte(`{}`)},
 		{Path: "strings/en-US.json", Data: []byte(`{}`)},
 		{Path: "other.html", Data: []byte("<html>x</html>"), CacheClass: cacheImmutable},
 	}})
-	s := mustNewReady(t, root)
+	s := mustNewReady(t, tree)
 	for _, p := range []string{"/emby/web/", "/emby/web/other.html"} {
 		rr := httptest.NewRecorder()
 		s.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, p, nil))
@@ -871,12 +877,12 @@ func TestHTMLForcedRevalidateEvenIfImmutableDeclared(t *testing.T) {
 }
 
 func TestSizeMismatchCorrupt(t *testing.T) {
-	root := buildFixture(t, fixtureOpts{Files: readyMinimalFiles(), MutateAfter: func(root string) {
+	tree := buildFixture(t, fixtureOpts{Files: readyMinimalFiles(), MutateAfter: func(root string) {
 		// Truncate a file without updating manifest.
-		p := filepath.Join(root, "releases", "1.0.0-deadbeef", "files", "modules", "app.js")
+		p := filepath.Join(root, "releases", releaseNameFromRoot(root), "files", "modules", "app.js")
 		_ = os.WriteFile(p, []byte("x"), 0o644)
 	}})
-	s, err := New(Config{GatewayBasePath: "/emby", AssetsRoot: root})
+	s, err := newWithRegistry(Config{GatewayBasePath: "/emby", AssetsRoot: tree.Root}, tree.Registry)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -887,9 +893,9 @@ func TestSizeMismatchCorrupt(t *testing.T) {
 
 func TestInstallUnknownFieldCorrupt(t *testing.T) {
 	files := readyMinimalFiles()
-	root := buildFixture(t, fixtureOpts{Files: files})
+	tree := buildFixture(t, fixtureOpts{Files: files})
 	// Rewrite install with unknown field.
-	p := filepath.Join(root, "releases", "1.0.0-deadbeef", "install.json")
+	p := filepath.Join(tree.Root, "releases", tree.Release, "install.json")
 	raw, err := os.ReadFile(p)
 	if err != nil {
 		t.Fatal(err)
@@ -903,7 +909,7 @@ func TestInstallUnknownFieldCorrupt(t *testing.T) {
 	if err := os.WriteFile(p, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	s, err := New(Config{GatewayBasePath: "/emby", AssetsRoot: root})
+	s, err := newWithRegistry(Config{GatewayBasePath: "/emby", AssetsRoot: tree.Root}, tree.Registry)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -932,13 +938,13 @@ func TestStateString(t *testing.T) {
 
 func TestDeclaredAssetMissingIsMissing(t *testing.T) {
 	t.Run("root_file", func(t *testing.T) {
-		root := buildFixture(t, fixtureOpts{Files: readyMinimalFiles(), MutateAfter: func(root string) {
-			p := filepath.Join(root, "releases", "1.0.0-deadbeef", "files", "index.html")
+		tree := buildFixture(t, fixtureOpts{Files: readyMinimalFiles(), MutateAfter: func(root string) {
+			p := filepath.Join(root, "releases", releaseNameFromRoot(root), "files", "index.html")
 			if err := os.Remove(p); err != nil {
 				t.Fatal(err)
 			}
 		}})
-		s, err := New(Config{GatewayBasePath: "/emby", AssetsRoot: root})
+		s, err := newWithRegistry(Config{GatewayBasePath: "/emby", AssetsRoot: tree.Root}, tree.Registry)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -948,13 +954,13 @@ func TestDeclaredAssetMissingIsMissing(t *testing.T) {
 	})
 
 	t.Run("nested_file", func(t *testing.T) {
-		root := buildFixture(t, fixtureOpts{Files: readyMinimalFiles(), MutateAfter: func(root string) {
-			p := filepath.Join(root, "releases", "1.0.0-deadbeef", "files", "strings", "en-US.json")
+		tree := buildFixture(t, fixtureOpts{Files: readyMinimalFiles(), MutateAfter: func(root string) {
+			p := filepath.Join(root, "releases", releaseNameFromRoot(root), "files", "strings", "en-US.json")
 			if err := os.Remove(p); err != nil {
 				t.Fatal(err)
 			}
 		}})
-		s, err := New(Config{GatewayBasePath: "/emby", AssetsRoot: root})
+		s, err := newWithRegistry(Config{GatewayBasePath: "/emby", AssetsRoot: tree.Root}, tree.Registry)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -964,13 +970,13 @@ func TestDeclaredAssetMissingIsMissing(t *testing.T) {
 	})
 
 	t.Run("nested_directory", func(t *testing.T) {
-		root := buildFixture(t, fixtureOpts{Files: readyMinimalFiles(), MutateAfter: func(root string) {
-			p := filepath.Join(root, "releases", "1.0.0-deadbeef", "files", "strings")
+		tree := buildFixture(t, fixtureOpts{Files: readyMinimalFiles(), MutateAfter: func(root string) {
+			p := filepath.Join(root, "releases", releaseNameFromRoot(root), "files", "strings")
 			if err := os.RemoveAll(p); err != nil {
 				t.Fatal(err)
 			}
 		}})
-		s, err := New(Config{GatewayBasePath: "/emby", AssetsRoot: root})
+		s, err := newWithRegistry(Config{GatewayBasePath: "/emby", AssetsRoot: tree.Root}, tree.Registry)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -982,8 +988,8 @@ func TestDeclaredAssetMissingIsMissing(t *testing.T) {
 
 func TestBoundedInventoryRejectsExcess(t *testing.T) {
 	t.Run("extra_files_corrupt", func(t *testing.T) {
-		root := buildFixture(t, fixtureOpts{Files: readyMinimalFiles(), MutateAfter: func(root string) {
-			dir := filepath.Join(root, "releases", "1.0.0-deadbeef", "files")
+		tree := buildFixture(t, fixtureOpts{Files: readyMinimalFiles(), MutateAfter: func(root string) {
+			dir := filepath.Join(root, "releases", releaseNameFromRoot(root), "files")
 			// A handful of extras is enough: first undeclared stops the walk.
 			for i := 0; i < 8; i++ {
 				name := filepath.Join(dir, fmt.Sprintf("extra-%d.js", i))
@@ -992,7 +998,7 @@ func TestBoundedInventoryRejectsExcess(t *testing.T) {
 				}
 			}
 		}})
-		s, err := New(Config{GatewayBasePath: "/emby", AssetsRoot: root})
+		s, err := newWithRegistry(Config{GatewayBasePath: "/emby", AssetsRoot: tree.Root}, tree.Registry)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1002,8 +1008,8 @@ func TestBoundedInventoryRejectsExcess(t *testing.T) {
 	})
 
 	t.Run("extra_directory_corrupt", func(t *testing.T) {
-		root := buildFixture(t, fixtureOpts{Files: readyMinimalFiles(), ExtraDiskDirs: []string{"orphan-empty"}})
-		s, err := New(Config{GatewayBasePath: "/emby", AssetsRoot: root})
+		tree := buildFixture(t, fixtureOpts{Files: readyMinimalFiles(), ExtraDiskDirs: []string{"orphan-empty"}})
+		s, err := newWithRegistry(Config{GatewayBasePath: "/emby", AssetsRoot: tree.Root}, tree.Registry)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1018,15 +1024,29 @@ func TestBoundedInventoryRejectsExcess(t *testing.T) {
 			segs[i] = "d"
 		}
 		deep := strings.Join(segs, "/") + ".js"
-		root := buildFixture(t, fixtureOpts{
-			Files: append(readyMinimalFiles(), fixtureFile{Path: deep, Data: []byte("x"), CacheClass: cacheImmutable}),
-		})
-		s, err := New(Config{GatewayBasePath: "/emby", AssetsRoot: root})
+		if validAssetPath(deep) {
+			t.Fatal("deep path should be invalid")
+		}
+		c := catalog{
+			Schema:            SchemaVersion,
+			ID:                "deep",
+			Version:           "1.0.0",
+			SourceImage:       "emby/embyserver:synthetic",
+			SourceImageDigest: "sha256:" + sha256Hex([]byte("x")),
+			Canaries:          append([]string(nil), canaryRelativePaths...),
+			Entries: []installEntry{
+				{Path: "index.html", Size: 1, SHA256: sha256Hex([]byte("a")), MediaType: "text/html; charset=utf-8", CacheClass: cacheRevalidate},
+				{Path: "manifest.json", Size: 1, SHA256: sha256Hex([]byte("b")), MediaType: "application/json", CacheClass: cacheRevalidate},
+				{Path: "strings/en-US.json", Size: 1, SHA256: sha256Hex([]byte("c")), MediaType: "application/json", CacheClass: cacheRevalidate},
+				{Path: deep, Size: 1, SHA256: sha256Hex([]byte("d")), MediaType: "text/javascript; charset=utf-8", CacheClass: cacheImmutable},
+			},
+		}
+		raw, err := encodeCatalog(c)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if s.Status().State != StateCorrupt {
-			t.Fatalf("state=%s err=%v", s.Status().State, s.Status().Err)
+		if _, err := parseCatalog(raw); err == nil {
+			t.Fatal("expected deep path catalog rejection")
 		}
 	})
 }
@@ -1035,13 +1055,13 @@ func TestMarkdownMediaType(t *testing.T) {
 	// Independent of mediaTypes map lookup: assert the canonical value literally.
 	const wantType = "text/markdown; charset=utf-8"
 	data := []byte("# hello\n")
-	root := buildFixture(t, fixtureOpts{Files: []fixtureFile{
+	tree := buildFixture(t, fixtureOpts{Files: []fixtureFile{
 		{Path: "index.html", Data: []byte("<html></html>")},
 		{Path: "manifest.json", Data: []byte(`{}`)},
 		{Path: "strings/en-US.json", Data: []byte(`{}`)},
 		{Path: "docs/readme.md", Data: data, MediaType: wantType, CacheClass: cacheImmutable},
 	}})
-	s := mustNewReady(t, root)
+	s := mustNewReady(t, tree)
 	rr := httptest.NewRecorder()
 	s.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/emby/web/docs/readme.md", nil))
 	if rr.Code != 200 {
@@ -1102,62 +1122,75 @@ func TestGuardEncodedWebPrefix(t *testing.T) {
 }
 
 func TestRequiredCanariesForReady(t *testing.T) {
-	t.Run("zero_entries", func(t *testing.T) {
-		root := buildFixture(t, fixtureOpts{Files: nil})
-		s, err := New(Config{GatewayBasePath: "/emby", AssetsRoot: root})
+	t.Run("catalog_requires_canary_entries", func(t *testing.T) {
+		// Catalog without canary entries is rejected at parse/registry time.
+		c := catalog{
+			Schema:            SchemaVersion,
+			ID:                "no-canaries",
+			Version:           "1.0.0",
+			SourceImage:       "emby/embyserver:synthetic",
+			SourceImageDigest: "sha256:" + sha256Hex([]byte("src")),
+			Canaries:          append([]string(nil), canaryRelativePaths...),
+			Entries: []installEntry{
+				{Path: "modules/app.js", Size: 1, SHA256: sha256Hex([]byte("x")), MediaType: "text/javascript; charset=utf-8", CacheClass: cacheImmutable},
+			},
+		}
+		raw, err := encodeCatalog(c)
 		if err != nil {
 			t.Fatal(err)
 		}
-		st := s.Status()
-		if st.State != StateCorrupt {
-			t.Fatalf("state=%s err=%v", st.State, st.Err)
-		}
-		if st.Err == nil || !strings.Contains(st.Err.Error(), "canary") {
-			t.Fatalf("err=%v", st.Err)
+		if _, err := parseCatalog(raw); err == nil || !strings.Contains(err.Error(), "canary") {
+			t.Fatalf("err=%v", err)
 		}
 	})
 
-	for _, missing := range CanaryPaths() {
-		missing := missing
-		t.Run("missing_"+strings.ReplaceAll(missing, "/", "_"), func(t *testing.T) {
-			files := make([]fixtureFile, 0, 3)
-			for _, c := range CanaryPaths() {
-				if c == missing {
-					continue
+	t.Run("install_missing_canary_corrupt", func(t *testing.T) {
+		// Trusted catalog has all canaries; install omits one => corrupt mismatch.
+		for _, missing := range CanaryPaths() {
+			missing := missing
+			t.Run(strings.ReplaceAll(missing, "/", "_"), func(t *testing.T) {
+				base := readyMinimalFiles()
+				tc := buildSyntheticCatalog(t, base, "canary-miss", "1.0.0")
+				reg := registryFromTrusted(t, tc)
+				// Build install entries without the missing canary.
+				var entries []map[string]any
+				for _, e := range tc.Catalog.Entries {
+					if e.Path == missing {
+						continue
+					}
+					entries = append(entries, map[string]any{
+						"path": e.Path, "size": e.Size, "sha256": e.SHA256,
+						"media_type": e.MediaType, "cache_class": e.CacheClass,
+					})
 				}
-				switch c {
-				case "index.html":
-					files = append(files, fixtureFile{Path: c, Data: []byte("<html></html>")})
-				case "manifest.json":
-					files = append(files, fixtureFile{Path: c, Data: []byte(`{}`)})
-				case "strings/en-US.json":
-					files = append(files, fixtureFile{Path: c, Data: []byte(`{}`)})
+				tree := buildFixture(t, fixtureOpts{
+					Files:                 base,
+					Release:               tc.Release,
+					CatalogSHA256:         tc.Digest,
+					EntryOverrides:        entries,
+					SkipSyntheticRegistry: true,
+				})
+				// Attach trusted registry manually (fixture skipped auto registry).
+				tree.Registry = reg
+				s, err := newWithRegistry(Config{GatewayBasePath: "/emby", AssetsRoot: tree.Root}, reg)
+				if err != nil {
+					t.Fatal(err)
 				}
-			}
-			// Keep a non-canary so the tree is non-empty and install is otherwise valid.
-			files = append(files, fixtureFile{Path: "modules/app.js", Data: []byte("x"), CacheClass: cacheImmutable})
-			root := buildFixture(t, fixtureOpts{Files: files})
-			s, err := New(Config{GatewayBasePath: "/emby", AssetsRoot: root})
-			if err != nil {
-				t.Fatal(err)
-			}
-			st := s.Status()
-			if st.State != StateCorrupt {
-				t.Fatalf("state=%s err=%v", st.State, st.Err)
-			}
-			if st.Err == nil || !strings.Contains(st.Err.Error(), missing) {
-				t.Fatalf("err=%v want mention of %q", st.Err, missing)
-			}
-		})
-	}
+				st := s.Status()
+				if st.State != StateCorrupt {
+					t.Fatalf("state=%s err=%v", st.State, st.Err)
+				}
+			})
+		}
+	})
 
 	t.Run("all_canaries_only_ready", func(t *testing.T) {
-		root := buildFixture(t, fixtureOpts{Files: []fixtureFile{
+		tree := buildFixture(t, fixtureOpts{Files: []fixtureFile{
 			{Path: "index.html", Data: []byte("<html></html>")},
 			{Path: "manifest.json", Data: []byte(`{}`)},
 			{Path: "strings/en-US.json", Data: []byte(`{}`)},
 		}})
-		s := mustNewReady(t, root)
+		s := mustNewReady(t, tree)
 		// Canaries must force revalidate.
 		for _, p := range []string{"/emby/web/", "/emby/web/manifest.json", "/emby/web/strings/en-US.json"} {
 			rr := httptest.NewRecorder()

@@ -120,12 +120,20 @@ func CanaryPaths() []string {
 	return out
 }
 
-// New constructs a Server from cfg.
+// New constructs a Server from cfg using the empty production catalog registry.
+// Configured trees whose catalog_sha256 is not in the production registry are
+// StateCorrupt (untrusted) and never Ready until a reviewed catalog is shipped.
 //
 // Disabled (empty AssetsRoot) always succeeds. Missing and corrupt asset trees
 // also succeed construction and serve 503. An enabled configuration with a
 // non-/emby base path returns an error.
 func New(cfg Config) (*Server, error) {
+	return newWithRegistry(cfg, getProductionRegistry())
+}
+
+// newWithRegistry is the package-private constructor used by tests to inject a
+// synthetic trusted catalog registry. Production code must call New.
+func newWithRegistry(cfg Config, reg *catalogRegistry) (*Server, error) {
 	root := strings.TrimSpace(cfg.AssetsRoot)
 	if root == "" {
 		return &Server{
@@ -146,7 +154,10 @@ func New(cfg Config) (*Server, error) {
 		}, nil
 	}
 
-	status, assets := loadAssets(abs)
+	if reg == nil {
+		reg = getProductionRegistry()
+	}
+	status, assets := loadAssets(abs, reg)
 	return &Server{status: status, assets: assets}, nil
 }
 

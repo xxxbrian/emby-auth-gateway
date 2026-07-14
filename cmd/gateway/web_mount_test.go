@@ -4,11 +4,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -76,14 +78,19 @@ func TestNewEmbyWebServerStates(t *testing.T) {
 		}
 	})
 
-	t.Run("ready", func(t *testing.T) {
-		root := writeReadyWebAssets(t)
+	t.Run("untrusted_synthetic_corrupt", func(t *testing.T) {
+		// Production registry is empty; public New never reaches Ready for
+		// hand-written trees. Composition tests use syntheticReadyWebHandler.
+		root := writeUntrustedWebAssets(t)
 		s, err := newEmbyWebServer("/emby", root)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if s.Status().State != embyweb.StateReady {
-			t.Fatalf("state=%s err=%v", s.Status().State, s.Status().Err)
+		if s.Status().State != embyweb.StateCorrupt {
+			t.Fatalf("state=%s err=%v want corrupt", s.Status().State, s.Status().Err)
+		}
+		if s.Status().Err == nil || !errors.Is(s.Status().Err, embyweb.ErrUntrustedCatalog) {
+			t.Fatalf("err=%v want ErrUntrustedCatalog", s.Status().Err)
 		}
 	})
 }
@@ -131,11 +138,9 @@ func TestMountGatewayRoutesComposition(t *testing.T) {
 	})
 
 	t.Run("ready_redirect_index_canaries_and_api", func(t *testing.T) {
-		root := writeReadyWebAssets(t)
-		web, err := newEmbyWebServer("/emby", root)
-		if err != nil {
-			t.Fatal(err)
-		}
+		// Production registry is empty; use a testing-safe ready double for
+		// composition (routing/CORS/guard) without registry injection.
+		web := syntheticReadyWebHandler()
 		var apiHits atomic.Int64
 		h := buildComposedHandler(t, "/emby", web, countingAPI(&apiHits, 418), true)
 
@@ -175,11 +180,7 @@ func TestMountGatewayRoutesComposition(t *testing.T) {
 	})
 
 	t.Run("unknown_web_methods", func(t *testing.T) {
-		root := writeReadyWebAssets(t)
-		web, err := newEmbyWebServer("/emby", root)
-		if err != nil {
-			t.Fatal(err)
-		}
+		web := syntheticReadyWebHandler()
 		h := buildComposedHandler(t, "/emby", web, countingAPI(new(atomic.Int64), 401), true)
 
 		rr := httptest.NewRecorder()
@@ -211,11 +212,7 @@ func TestMountGatewayRoutesComposition(t *testing.T) {
 	})
 
 	t.Run("canary_cors_unbinds_pbCors", func(t *testing.T) {
-		root := writeReadyWebAssets(t)
-		web, err := newEmbyWebServer("/emby", root)
-		if err != nil {
-			t.Fatal(err)
-		}
+		web := syntheticReadyWebHandler()
 		h := buildComposedHandler(t, "/emby", web, countingAPI(new(atomic.Int64), 401), true)
 
 		// Allowed origin simple GET.
@@ -274,11 +271,7 @@ func TestMountGatewayRoutesComposition(t *testing.T) {
 	})
 
 	t.Run("registration_order_independent", func(t *testing.T) {
-		root := writeReadyWebAssets(t)
-		web, err := newEmbyWebServer("/emby", root)
-		if err != nil {
-			t.Fatal(err)
-		}
+		web := syntheticReadyWebHandler()
 		var apiHits atomic.Int64
 		api := countingAPI(&apiHits, 401)
 
@@ -318,11 +311,7 @@ func TestMountGatewayRoutesComposition(t *testing.T) {
 	})
 
 	t.Run("guard_blocks_traversal_websocket_api", func(t *testing.T) {
-		root := writeReadyWebAssets(t)
-		web, err := newEmbyWebServer("/emby", root)
-		if err != nil {
-			t.Fatal(err)
-		}
+		web := syntheticReadyWebHandler()
 		var apiHits, webHits atomic.Int64
 		api := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			apiHits.Add(1)
@@ -428,11 +417,7 @@ func TestMountGatewayRoutesComposition(t *testing.T) {
 	})
 
 	t.Run("guard_encoded_web_prefix_composed", func(t *testing.T) {
-		root := writeReadyWebAssets(t)
-		web, err := newEmbyWebServer("/emby", root)
-		if err != nil {
-			t.Fatal(err)
-		}
+		web := syntheticReadyWebHandler()
 		var apiHits, webHits atomic.Int64
 		api := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			apiHits.Add(1)
@@ -570,9 +555,114 @@ func countingAPI(hits *atomic.Int64, code int) http.Handler {
 	})
 }
 
-// writeReadyWebAssets builds a minimal schema-1 tree with all three canaries.
-// Fixture JSON fields intentionally mirror the embyweb on-disk contract.
-func writeReadyWebAssets(t *testing.T) string {
+// syntheticReadyWebHandler is a testing-safe Ready double for composition tests.
+// Production embyweb.New cannot reach Ready while the built-in registry is empty
+// and registry injection is intentionally not exported. This handler mirrors the
+// Ready surface needed by mount/CORS/guard composition assertions only.
+func syntheticReadyWebHandler() http.Handler {
+	assets := map[string]string{
+		"index.html":         "<!doctype html><title>t</title>",
+		"manifest.json":      `{"name":"test"}`,
+		"strings/en-US.json": `{"Hello":"Hello"}`,
+		"modules/app.js":     "console.log(1)",
+	}
+	canaries := map[string]bool{
+		"index.html":         true,
+		"manifest.json":      true,
+		"strings/en-US.json": true,
+	}
+	const (
+		webExact = "/emby/web"
+		webSlash = "/emby/web/"
+	)
+	writeAllow := func(w http.ResponseWriter) {
+		w.Header().Set("Allow", "GET, HEAD")
+	}
+	applyCORS := func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Origin") != testAllowedCORSOrigin {
+			return
+		}
+		w.Header().Set("Access-Control-Allow-Origin", testAllowedCORSOrigin)
+		w.Header().Add("Vary", "Origin")
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		// Exact root redirect (GET/HEAD only).
+		if path == webExact {
+			switch r.Method {
+			case http.MethodGet, http.MethodHead:
+				target := webSlash
+				if r.URL.RawQuery != "" {
+					target = target + "?" + r.URL.RawQuery
+				}
+				w.Header().Set("Location", target)
+				w.WriteHeader(http.StatusPermanentRedirect)
+				return
+			default:
+				writeAllow(w)
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+		}
+		if path != webSlash && !strings.HasPrefix(path, webSlash) {
+			http.NotFound(w, r)
+			return
+		}
+		rel := strings.TrimPrefix(path, webSlash)
+		if path == webSlash {
+			rel = "index.html"
+		}
+		canary := canaries[rel]
+		switch r.Method {
+		case http.MethodOptions:
+			if !canary {
+				writeAllow(w)
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			// Canary preflight surface used by composition CORS tests.
+			w.Header().Set("Vary", "Origin")
+			w.Header().Add("Vary", "Access-Control-Request-Method")
+			w.Header().Add("Vary", "Access-Control-Request-Headers")
+			w.Header().Add("Vary", "Access-Control-Request-Private-Network")
+			if r.Header.Get("Origin") != testAllowedCORSOrigin {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			w.Header().Set("Access-Control-Allow-Origin", testAllowedCORSOrigin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD")
+			if strings.EqualFold(r.Header.Get("Access-Control-Request-Private-Network"), "true") {
+				w.Header().Set("Access-Control-Allow-Private-Network", "true")
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		case http.MethodGet, http.MethodHead:
+			// continue
+		default:
+			writeAllow(w)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		body, ok := assets[rel]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		if canary {
+			applyCORS(w, r)
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	})
+}
+
+// writeUntrustedWebAssets builds a minimal schema-1 tree that is intentionally
+// not in the empty production registry (StateCorrupt / untrusted).
+func writeUntrustedWebAssets(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
 	release := "1.0.0-test"
