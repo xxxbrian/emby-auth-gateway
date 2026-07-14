@@ -80,10 +80,13 @@ func gatewayRoutePatterns(basePath string) (webExact, webWild, apiExact, apiWild
 // assets root (typically GATEWAY_WEB_ASSETS_DIR). Blank/whitespace assets root
 // yields a disabled handler. Missing/corrupt trees succeed construction and
 // serve 503. An enabled non-/emby base returns a constructor error.
-func newEmbyWebServer(basePath, assetsRoot string) (*embyweb.Server, error) {
+// publicBaseURL (typically GATEWAY_PUBLIC_URL) supplies the fallback host for
+// serve-time JS host injection when the request has no Host.
+func newEmbyWebServer(basePath, assetsRoot, publicBaseURL string) (*embyweb.Server, error) {
 	return embyweb.New(embyweb.Config{
 		GatewayBasePath: basePath,
 		AssetsRoot:      strings.TrimSpace(assetsRoot),
+		PublicBaseURL:   strings.TrimSpace(publicBaseURL),
 	})
 }
 

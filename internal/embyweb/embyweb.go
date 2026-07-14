@@ -19,9 +19,12 @@ const SchemaVersion = 1
 //
 // GatewayBasePath must normalize to "/emby" when AssetsRoot is non-empty.
 // Empty or whitespace-only AssetsRoot disables the server (always 404).
+// PublicBaseURL is optional; its host is used as a fallback when host-inject
+// paths are served without a request Host (typically GATEWAY_PUBLIC_URL).
 type Config struct {
 	GatewayBasePath string
 	AssetsRoot      string
+	PublicBaseURL   string
 }
 
 // State is the load outcome of a Server.
@@ -63,8 +66,9 @@ type Status struct {
 
 // Server is an immutable, read-only Emby Web asset handler.
 type Server struct {
-	status Status
-	assets map[string]*asset // path relative to files/, no leading slash
+	status       Status
+	assets       map[string]*asset // path relative to files/, no leading slash
+	fallbackHost string            // host[:port] from PublicBaseURL, may be empty
 }
 
 type asset struct {
@@ -134,11 +138,14 @@ func New(cfg Config) (*Server, error) {
 // newWithRegistry is the package-private constructor used by tests to inject a
 // synthetic trusted catalog registry. Production code must call New.
 func newWithRegistry(cfg Config, reg *catalogRegistry) (*Server, error) {
+	fallbackHost := hostFromPublicURL(cfg.PublicBaseURL)
+
 	root := strings.TrimSpace(cfg.AssetsRoot)
 	if root == "" {
 		return &Server{
-			status: Status{State: StateDisabled},
-			assets: nil,
+			status:       Status{State: StateDisabled},
+			assets:       nil,
+			fallbackHost: fallbackHost,
 		}, nil
 	}
 
@@ -150,7 +157,8 @@ func newWithRegistry(cfg Config, reg *catalogRegistry) (*Server, error) {
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return &Server{
-			status: Status{State: StateCorrupt, Err: fmt.Errorf("resolve assets root: %w", err)},
+			status:       Status{State: StateCorrupt, Err: fmt.Errorf("resolve assets root: %w", err)},
+			fallbackHost: fallbackHost,
 		}, nil
 	}
 
@@ -158,7 +166,7 @@ func newWithRegistry(cfg Config, reg *catalogRegistry) (*Server, error) {
 		reg = getProductionRegistry()
 	}
 	status, assets := loadAssets(abs, reg)
-	return &Server{status: status, assets: assets}, nil
+	return &Server{status: status, assets: assets, fallbackHost: fallbackHost}, nil
 }
 
 // Status returns the pinned load status.

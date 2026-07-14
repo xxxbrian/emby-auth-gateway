@@ -26,7 +26,7 @@ const testAllowedCORSOrigin = "https://app.emby.media"
 
 func TestNewEmbyWebServerStates(t *testing.T) {
 	t.Run("blank_disabled", func(t *testing.T) {
-		s, err := newEmbyWebServer("/emby", "")
+		s, err := newEmbyWebServer("/emby", "", "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -36,7 +36,7 @@ func TestNewEmbyWebServerStates(t *testing.T) {
 	})
 
 	t.Run("whitespace_disabled", func(t *testing.T) {
-		s, err := newEmbyWebServer("/api", "  \t  ")
+		s, err := newEmbyWebServer("/api", "  \t  ", "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -47,7 +47,7 @@ func TestNewEmbyWebServerStates(t *testing.T) {
 
 	t.Run("enabled_non_emby_error", func(t *testing.T) {
 		root := t.TempDir()
-		_, err := newEmbyWebServer("/api", root)
+		_, err := newEmbyWebServer("/api", root, "")
 		if err == nil {
 			t.Fatal("expected constructor error for non-/emby base")
 		}
@@ -55,7 +55,7 @@ func TestNewEmbyWebServerStates(t *testing.T) {
 
 	t.Run("missing_no_startup_error", func(t *testing.T) {
 		missing := filepath.Join(t.TempDir(), "absent")
-		s, err := newEmbyWebServer("/emby", missing)
+		s, err := newEmbyWebServer("/emby", missing, "")
 		if err != nil {
 			t.Fatalf("missing must not fail construction: %v", err)
 		}
@@ -69,7 +69,7 @@ func TestNewEmbyWebServerStates(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(root, "current.json"), []byte(`{`), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		s, err := newEmbyWebServer("/emby", root)
+		s, err := newEmbyWebServer("/emby", root, "")
 		if err != nil {
 			t.Fatalf("corrupt must not fail construction: %v", err)
 		}
@@ -82,7 +82,7 @@ func TestNewEmbyWebServerStates(t *testing.T) {
 		// Hand-written trees use digests not in the production registry; public
 		// New is corrupt/untrusted. Composition tests use syntheticReadyWebHandler.
 		root := writeUntrustedWebAssets(t)
-		s, err := newEmbyWebServer("/emby", root)
+		s, err := newEmbyWebServer("/emby", root, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -97,7 +97,7 @@ func TestNewEmbyWebServerStates(t *testing.T) {
 
 func TestMountGatewayRoutesComposition(t *testing.T) {
 	t.Run("disabled_web_404_never_api", func(t *testing.T) {
-		web, err := newEmbyWebServer("/emby", "")
+		web, err := newEmbyWebServer("/emby", "", "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -121,7 +121,7 @@ func TestMountGatewayRoutesComposition(t *testing.T) {
 	})
 
 	t.Run("missing_web_503", func(t *testing.T) {
-		web, err := newEmbyWebServer("/emby", filepath.Join(t.TempDir(), "missing"))
+		web, err := newEmbyWebServer("/emby", filepath.Join(t.TempDir(), "missing"), "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -381,7 +381,7 @@ func TestMountGatewayRoutesComposition(t *testing.T) {
 
 	t.Run("blank_env_api_only_non_emby_base", func(t *testing.T) {
 		// Blank assets: disabled Web is allowed with any base for API-only deploys.
-		web, err := newEmbyWebServer("/custom", "")
+		web, err := newEmbyWebServer("/custom", "", "")
 		if err != nil {
 			t.Fatal(err)
 		}

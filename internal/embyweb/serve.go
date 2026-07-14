@@ -173,12 +173,28 @@ func (s *Server) serveReady(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request, a *asset, canary bool) {
+	data := a.data
+	etag := a.etag
+	cacheClass := a.cacheClass
+
+	// Host injection is serve-time only: verified assets stay catalog-original.
+	if needsHostInject(a.path) {
+		host := injectHostForRequest(r, s.fallbackHost)
+		if patched := rewriteHostPlaceholder(a.data, host); !bytes.Equal(patched, a.data) {
+			data = patched
+			etag = etagForBytes(data)
+		}
+		// Per-host body must not be cached as immutable shared content.
+		cacheClass = cacheRevalidate
+		w.Header().Set("Vary", "Host")
+	}
+
 	h := w.Header()
 	h.Set("Content-Type", a.mediaType)
-	h.Set("ETag", a.etag)
+	h.Set("ETag", etag)
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Referrer-Policy", "no-referrer")
-	switch a.cacheClass {
+	switch cacheClass {
 	case cacheImmutable:
 		h.Set("Cache-Control", "public, max-age=31536000, immutable")
 	default:
@@ -191,7 +207,7 @@ func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request, a *asset, ca
 
 	// ServeContent handles Range, If-Range, If-None-Match, HEAD, Accept-Ranges.
 	// Zero modtime suppresses Last-Modified.
-	http.ServeContent(w, r, path.Base(a.path), time.Time{}, bytes.NewReader(a.data))
+	http.ServeContent(w, r, path.Base(a.path), time.Time{}, bytes.NewReader(data))
 }
 
 // canaryPreflightVary lists Vary tokens required on every canary OPTIONS so

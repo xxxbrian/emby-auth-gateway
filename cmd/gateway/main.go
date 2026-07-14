@@ -49,7 +49,7 @@ func main() {
 			MinResumeDurationSeconds: envFloatDefault("GATEWAY_MIN_RESUME_DURATION_SECONDS", 0),
 		}, pbstore.New(e.App))
 
-		web, err := newEmbyWebServer(basePath, webAssetsDirFromEnv())
+		web, err := newEmbyWebServer(basePath, webAssetsDirFromEnv(), os.Getenv("GATEWAY_PUBLIC_URL"))
 		if err != nil {
 			// Enabled assets with unsupported base path fail startup.
 			return err
