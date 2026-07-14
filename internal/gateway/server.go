@@ -186,6 +186,8 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit(ctx, AuditLog{GatewayUserID: user.ID, SyntheticUserID: user.SyntheticUserID, Event: "login_success", Message: "login succeeded", RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusOK})
 
+	w.Header().Set("Cache-Control", "no-store")
+	s.setResourceCookie(w, token, session.ExpiresAt)
 	writeJSON(w, http.StatusOK, authenticationResultDTO(*user, session, token, s.cfg.GatewayServerID))
 }
 
@@ -298,6 +300,9 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, rel string
 		http.Error(w, "session revoke failed", http.StatusInternalServerError)
 		return
 	}
+	if resourceCookieMatches(r, token) {
+		s.clearResourceCookie(w)
+	}
 	s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "logout_success", Message: "logout succeeded", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusOK})
 	w.WriteHeader(http.StatusOK)
 }
@@ -392,6 +397,14 @@ func (s *Server) handleUser(w http.ResponseWriter, r *http.Request, rel string) 
 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string) {
 	gatewayToken := ExtractToken(r)
+	cookieAuthenticated := false
+	if gatewayToken == "" {
+		gatewayToken, cookieAuthenticated = resourceCookieToken(r, rel)
+	}
+	if cookieAuthenticated {
+		w.Header().Set("Cache-Control", "private, no-store")
+		w.Header().Set("Vary", "Cookie")
+	}
 	session, ok := s.activeSession(w, r, gatewayToken)
 	if !ok {
 		return
@@ -730,6 +743,7 @@ func (s *Server) proxyURL(session *Session, rel, rawQuery, gatewayToken string) 
 }
 
 func (s *Server) rewriteRequestHeaders(h http.Header, session *Session, gatewayToken string) {
+	stripResourceCookie(h)
 	// Set replaces all values for a key, collapsing duplicate client headers.
 	for _, name := range []string{"X-Emby-Token", "X-MediaBrowser-Token"} {
 		if len(h.Values(name)) > 0 {
@@ -1157,7 +1171,7 @@ func playbackEventName(rel string) string {
 func (s *Server) writeProxyResponse(w http.ResponseWriter, r *http.Request, rel string, resp *http.Response, session *Session, gatewayToken, publicGatewayBase string) {
 	ct := resp.Header.Get("Content-Type")
 	if !responseAllowsBody(r.Method, resp.StatusCode) {
-		copyResponseHeaders(w.Header(), resp.Header, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
+		copyResponseHeaders(w.Header(), resp.Header, rel, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
 		setContentLength(w.Header(), resp.ContentLength)
 		w.WriteHeader(resp.StatusCode)
 		return
@@ -1168,7 +1182,7 @@ func (s *Server) writeProxyResponse(w http.ResponseWriter, r *http.Request, rel 
 		return
 	}
 
-	copyResponseHeaders(w.Header(), resp.Header, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
+	copyResponseHeaders(w.Header(), resp.Header, rel, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
 	if isM3U8ContentType(ct) || strings.HasSuffix(strings.ToLower(resp.Request.URL.Path), ".m3u8") {
 		readStarted := time.Now()
 		data, err := readLimited(resp.Body, proxyM3U8Limit)
@@ -1178,7 +1192,7 @@ func (s *Server) writeProxyResponse(w http.ResponseWriter, r *http.Request, rel 
 		}
 		w.Header().Del("Content-Length")
 		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(rewriteM3U8(data, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID))
+		_, _ = w.Write(rewriteM3U8(data, rel, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID))
 		return
 	}
 
@@ -1713,7 +1727,11 @@ func rewriteJSONValue(v any, session *Session, gatewayToken, publicGatewayBase, 
 	case map[string]any:
 		out := make(map[string]any, len(x))
 		for k, v := range x {
-			out[k] = rewriteJSONValue(v, session, gatewayToken, publicGatewayBase, gatewayServerID)
+			if raw, ok := v.(string); ok && session != nil && (strings.EqualFold(k, "DirectStreamUrl") || strings.EqualFold(k, "TranscodingUrl")) {
+				out[k] = rewriteMediaReference(raw, session, gatewayToken, publicGatewayBase, gatewayServerID, false)
+			} else {
+				out[k] = rewriteJSONValue(v, session, gatewayToken, publicGatewayBase, gatewayServerID)
+			}
 			if s, ok := out[k].(string); ok && session != nil {
 				switch strings.ToLower(k) {
 				case "accesstoken":
@@ -1775,8 +1793,11 @@ func rewriteBytes(data []byte, session *Session, gatewayToken, publicGatewayBase
 	return []byte(rewriteString(string(data), session, gatewayToken, publicGatewayBase, gatewayServerID))
 }
 
-func rewriteM3U8(data []byte, session *Session, gatewayToken, publicGatewayBase, gatewayServerID string) []byte {
-	return rewriteBytes(data, session, gatewayToken, publicGatewayBase, gatewayServerID)
+func rewriteM3U8(data []byte, rel string, session *Session, gatewayToken, publicGatewayBase, gatewayServerID string) []byte {
+	if session == nil {
+		return data
+	}
+	return rewriteM3U8MediaReferences(data, rel, session, gatewayToken, publicGatewayBase, gatewayServerID)
 }
 
 func rewriteString(s string, session *Session, gatewayToken, publicGatewayBase, gatewayServerID string) string {
@@ -1789,19 +1810,24 @@ func rewriteString(s string, session *Session, gatewayToken, publicGatewayBase, 
 	if session.BackendServerID != "" {
 		s = strings.ReplaceAll(s, session.BackendServerID, gatewayServerID)
 	}
-	if session.BackendBaseURL != "" && publicGatewayBase != "" {
-		s = strings.ReplaceAll(s, strings.TrimRight(session.BackendBaseURL, "/"), strings.TrimRight(publicGatewayBase, "/"))
-	}
 	return s
 }
 
-func copyResponseHeaders(dst, src http.Header, session *Session, gatewayToken, publicGatewayBase, gatewayServerID string) {
+func copyResponseHeaders(dst, src http.Header, rel string, session *Session, gatewayToken, publicGatewayBase, gatewayServerID string) {
 	for k, vals := range src {
 		if isHopHeader(k) || strings.EqualFold(k, "Content-Length") {
 			continue
 		}
 		for _, val := range vals {
-			dst.Add(k, rewriteString(val, session, gatewayToken, publicGatewayBase, gatewayServerID))
+			if strings.EqualFold(k, "Set-Cookie") && strings.HasPrefix(strings.TrimSpace(val), resourceCookieName+"=") {
+				continue
+			}
+			if strings.EqualFold(k, "Location") || strings.EqualFold(k, "Content-Location") {
+				val = rewriteResponseLocation(val, rel, session, gatewayToken, publicGatewayBase, gatewayServerID)
+			} else {
+				val = rewriteString(val, session, gatewayToken, publicGatewayBase, gatewayServerID)
+			}
+			dst.Add(k, val)
 		}
 	}
 }
@@ -1815,6 +1841,7 @@ func copyRequestHeaders(dst, src http.Header) {
 			dst.Add(k, val)
 		}
 	}
+	stripResourceCookie(dst)
 }
 
 func removeHopHeaders(h http.Header) {

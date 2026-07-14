@@ -418,7 +418,7 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 	if strings.Contains(itemsText, backend.URL) || strings.Contains(itemsText, backendToken) || strings.Contains(itemsText, backendUserID) {
 		t.Fatalf("items response leaked backend details: %s", itemsText)
 	}
-	if !strings.Contains(itemsText, "https://media.example.com/emby/Videos/item-1/stream?api_key="+gatewayToken) {
+	if !strings.Contains(itemsText, `"DirectStreamUrl":"/Videos/item-1/stream?api_key=`+gatewayToken) {
 		t.Fatalf("items response did not rewrite stream url: %s", itemsText)
 	}
 
