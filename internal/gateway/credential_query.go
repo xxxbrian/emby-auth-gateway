@@ -65,8 +65,6 @@ func acceptsClientCredentials(method, rel string) bool {
 		return false
 	case method == http.MethodGet && equalPath(rel, "/Users/Public"):
 		return false
-	case method == http.MethodGet && isSingleUserPath(rel):
-		return false
 	case method == http.MethodGet && equalPath(rel, "/Branding/Configuration"):
 		return false
 	case method == http.MethodGet && equalPath(rel, "/Branding/Css.css"):

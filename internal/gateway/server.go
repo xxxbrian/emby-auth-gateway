@@ -98,7 +98,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && equalPath(rel, "/Users/Public"):
 		s.handlePublicUsers(w, r)
 	case r.Method == http.MethodGet && isSingleUserPath(rel):
-		s.handleUser(w, r, rel)
+		s.handleCurrentUser(w, r, rel)
 	case r.Method == http.MethodGet && equalPath(rel, "/Branding/Configuration"):
 		s.handleBrandingConfiguration(w, r)
 	case r.Method == http.MethodGet && equalPath(rel, "/Branding/Css.css"):
@@ -381,18 +381,28 @@ func (s *Server) handleBrandingCSS(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func (s *Server) handleUser(w http.ResponseWriter, r *http.Request, rel string) {
+func (s *Server) handleCurrentUser(w http.ResponseWriter, r *http.Request, rel string) {
 	parts := strings.Split(strings.Trim(rel, "/"), "/")
 	if len(parts) != 2 {
 		http.NotFound(w, r)
 		return
 	}
-	user, err := s.store.FindUserBySyntheticID(r.Context(), parts[1])
-	if err != nil || user == nil || !user.Enabled {
-		http.NotFound(w, r)
+	token := ExtractToken(r)
+	session, ok := s.activeSession(w, r, token)
+	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, userDTO(*user, s.cfg.GatewayServerID))
+	if err := s.guardProxyQueryCredentials(r.Context(), r.URL.RawQuery, token); err != nil {
+		writeCredentialQueryError(w, err)
+		return
+	}
+	requestedID := parts[1]
+	if !strings.EqualFold(requestedID, "Me") && requestedID != session.SyntheticUserID {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, privateUserDTO(session.GatewayUsername, session.SyntheticUserID, s.cfg.GatewayServerID))
 }
 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string) {
@@ -2006,46 +2016,7 @@ func userDTO(user GatewayUser, serverID string) map[string]any {
 }
 
 func authenticationResultDTO(user GatewayUser, session *Session, token, serverID string) map[string]any {
-	userObj := userDTO(user, serverID)
-	userObj["Configuration"] = map[string]any{
-		"PlayDefaultAudioTrack":      true,
-		"SubtitleMode":               "Smart",
-		"RememberAudioSelections":    true,
-		"RememberSubtitleSelections": true,
-		"EnableNextEpisodeAutoPlay":  true,
-		"HidePlayedInLatest":         true,
-		"HidePlayedInMoreLikeThis":   false,
-		"HidePlayedInSuggestions":    false,
-		"EnableLocalPassword":        false,
-		"DisplayMissingEpisodes":     false,
-		"ResumeRewindSeconds":        0,
-		"OrderedViews":               []any{},
-		"LatestItemsExcludes":        []any{},
-		"MyMediaExcludes":            []any{},
-	}
-	userObj["Policy"] = map[string]any{
-		"IsAdministrator":                 false,
-		"IsHidden":                        false,
-		"IsDisabled":                      false,
-		"EnableUserPreferenceAccess":      true,
-		"EnableRemoteControlOfOtherUsers": false,
-		"EnableSharedDeviceControl":       false,
-		"EnableRemoteAccess":              true,
-		"EnableMediaPlayback":             true,
-		"EnableAudioPlaybackTranscoding":  true,
-		"EnableVideoPlaybackTranscoding":  true,
-		"EnablePlaybackRemuxing":          true,
-		"EnableContentDownloading":        true,
-		"EnableAllChannels":               true,
-		"EnableAllFolders":                true,
-		"EnableAllDevices":                true,
-		"BlockedTags":                     []any{},
-		"AccessSchedules":                 []any{},
-		"BlockUnratedItems":               []any{},
-		"EnabledChannels":                 []any{},
-		"EnabledFolders":                  []any{},
-		"EnabledDevices":                  []any{},
-	}
+	userObj := privateUserDTO(user.Username, user.SyntheticUserID, serverID)
 	sessionInfo := map[string]any{
 		"ServerId":           serverID,
 		"UserId":             user.SyntheticUserID,
@@ -2064,6 +2035,60 @@ func authenticationResultDTO(user GatewayUser, session *Session, token, serverID
 		"User":        userObj,
 		"SessionInfo": sessionInfo,
 	}
+}
+
+func privateUserDTO(username, syntheticID, serverID string) map[string]any {
+	userObj := userDTO(GatewayUser{Username: username, SyntheticUserID: syntheticID}, serverID)
+	userObj["Configuration"] = map[string]any{
+		"PlayDefaultAudioTrack":      true,
+		"SubtitleMode":               "Smart",
+		"RememberAudioSelections":    true,
+		"RememberSubtitleSelections": true,
+		"EnableNextEpisodeAutoPlay":  true,
+		"HidePlayedInLatest":         true,
+		"HidePlayedInMoreLikeThis":   false,
+		"HidePlayedInSuggestions":    false,
+		"EnableLocalPassword":        false,
+		"DisplayMissingEpisodes":     false,
+		"ResumeRewindSeconds":        0,
+		"OrderedViews":               []any{},
+		"LatestItemsExcludes":        []any{},
+		"MyMediaExcludes":            []any{},
+	}
+	userObj["Policy"] = map[string]any{
+		"IsAdministrator":                  false,
+		"IsHidden":                         false,
+		"IsDisabled":                       false,
+		"EnableUserPreferenceAccess":       true,
+		"EnableRemoteControlOfOtherUsers":  false,
+		"EnableSharedDeviceControl":        false,
+		"EnableRemoteAccess":               true,
+		"EnableMediaPlayback":              true,
+		"EnableAudioPlaybackTranscoding":   true,
+		"EnableVideoPlaybackTranscoding":   true,
+		"EnablePlaybackRemuxing":           true,
+		"EnableContentDownloading":         true,
+		"EnableLiveTvAccess":               false,
+		"EnableLiveTvManagement":           false,
+		"EnableUserCreatedContent":         false,
+		"EnableCollectionManagement":       false,
+		"EnableSubtitleManagement":         false,
+		"EnableContentDeletion":            false,
+		"EnablePublicSharing":              false,
+		"EnableContentDeletionFromFolders": []any{},
+		"RestrictedFeatures":               []any{},
+		"EnableMediaConversion":            false,
+		"EnableAllChannels":                true,
+		"EnableAllFolders":                 true,
+		"EnableAllDevices":                 true,
+		"BlockedTags":                      []any{},
+		"AccessSchedules":                  []any{},
+		"BlockUnratedItems":                []any{},
+		"EnabledChannels":                  []any{},
+		"EnabledFolders":                   []any{},
+		"EnabledDevices":                   []any{},
+	}
+	return userObj
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

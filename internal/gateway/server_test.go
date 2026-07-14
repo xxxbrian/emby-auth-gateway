@@ -476,12 +476,18 @@ func TestGatewayWebSocketUpgradeProxy(t *testing.T) {
 					"Name": "shared",
 				},
 			})
-		case "/emby/socket":
+		case "/emby/embywebsocket":
 			if r.URL.Query().Get("api_key") == backendToken && r.Header.Get("X-Emby-Token") == backendToken {
 				sawBackendToken = true
 			}
+			if r.URL.Query().Get("deviceId") != "web-device" || r.Header.Get("Cookie") != "other=keep" {
+				t.Fatalf("websocket query/cookie = %q/%q", r.URL.RawQuery, r.Header.Get("Cookie"))
+			}
 			if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 				t.Fatalf("expected websocket upgrade, got %q", r.Header.Get("Upgrade"))
+			}
+			if !headerHasToken(r.Header, "Connection", "upgrade") || r.Header.Get("Sec-WebSocket-Key") != "dGhlIHNhbXBsZSBub25jZQ==" || r.Header.Get("Sec-WebSocket-Version") != "13" {
+				t.Fatalf("websocket handshake headers = Connection:%q Key:%q Version:%q", r.Header.Get("Connection"), r.Header.Get("Sec-WebSocket-Key"), r.Header.Get("Sec-WebSocket-Version"))
 			}
 			hj, ok := w.(http.Hijacker)
 			if !ok {
@@ -542,10 +548,11 @@ func TestGatewayWebSocketUpgradeProxy(t *testing.T) {
 		t.Fatalf("dial gateway: %v", err)
 	}
 	defer conn.Close()
-	_, _ = conn.Write([]byte("GET /emby/socket?api_key=" + gatewayToken + " HTTP/1.1\r\n" +
+	_, _ = conn.Write([]byte("GET /emby/embywebsocket?api_key=" + gatewayToken + "&deviceId=web-device HTTP/1.1\r\n" +
 		"Host: " + gwURL.Host + "\r\n" +
 		"Connection: Upgrade\r\n" +
 		"Upgrade: websocket\r\n" +
+		"Cookie: " + resourceCookieName + "=" + gatewayToken + "; other=keep\r\n" +
 		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
 		"Sec-WebSocket-Version: 13\r\n\r\n"))
 
@@ -559,6 +566,54 @@ func TestGatewayWebSocketUpgradeProxy(t *testing.T) {
 	}
 	if !sawBackendToken {
 		t.Fatal("backend did not receive mapped token on websocket upgrade")
+	}
+}
+
+func TestEmbyWebSocketRejectsBadCredentialsWithoutDial(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		setup  func(*MemoryStore, *http.Request)
+		status int
+	}{
+		{
+			name: "malformed query",
+			setup: func(_ *MemoryStore, req *http.Request) {
+				req.URL.RawQuery = "api_key=%ZZ"
+			},
+			status: http.StatusBadRequest,
+		},
+		{
+			name: "invalid token",
+			setup: func(_ *MemoryStore, req *http.Request) {
+				req.URL.RawQuery = "api_key=bad"
+			},
+			status: http.StatusUnauthorized,
+		},
+		{
+			name: "expired token",
+			setup: func(store *MemoryStore, req *http.Request) {
+				session := testSession("http://backend.invalid/emby")
+				session.ExpiresAt = time.Now().UTC().Add(-time.Minute)
+				store.Sessions[HashToken("gateway-token")] = session
+				req.URL.RawQuery = "api_key=gateway-token"
+			},
+			status: http.StatusUnauthorized,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			transport := &countingRoundTripper{}
+			store := NewMemoryStore()
+			server := NewServer(Config{GatewayBasePath: "/emby", HTTPClient: &http.Client{Transport: transport}}, store)
+			req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/embywebsocket", nil)
+			req.Header.Set("Connection", "Upgrade")
+			req.Header.Set("Upgrade", "websocket")
+			tt.setup(store, req)
+			writer := httptest.NewRecorder()
+			server.ServeHTTP(writer, req)
+			if writer.Code != tt.status || transport.hits != 0 {
+				t.Fatalf("status/hits = %d/%d", writer.Code, transport.hits)
+			}
+		})
 	}
 }
 
