@@ -11,7 +11,7 @@ import (
 
 // Host placeholder rewritten at serve time for selected JS assets only.
 // Disk release contents are never modified.
-var injectHostPlaceholder = []byte("mb3admin.co")
+var injectHostPlaceholder = []byte("mb3admin.com")
 
 // hostInjectPaths are catalog-relative paths that receive host injection.
 var hostInjectPaths = map[string]struct{}{
@@ -55,7 +55,7 @@ func hostFromPublicURL(publicURL string) string {
 	return u.Host
 }
 
-// rewriteHostPlaceholder replaces mb3admin.co with host. Empty host leaves data unchanged.
+// rewriteHostPlaceholder replaces mb3admin.com with host. Empty host leaves data unchanged.
 func rewriteHostPlaceholder(data []byte, host string) []byte {
 	host = strings.TrimSpace(host)
 	if host == "" || !bytes.Contains(data, injectHostPlaceholder) {

@@ -46,7 +46,7 @@ func TestInjectHostForRequest(t *testing.T) {
 }
 
 func TestRewriteHostPlaceholder(t *testing.T) {
-	in := []byte(`u="https://mb3admin.co/api"`)
+	in := []byte(`u="https://mb3admin.com/api"`)
 	got := rewriteHostPlaceholder(in, "media.xvv.net")
 	if !bytes.Equal(got, []byte(`u="https://media.xvv.net/api"`)) {
 		t.Fatalf("got %q", got)
@@ -57,9 +57,9 @@ func TestRewriteHostPlaceholder(t *testing.T) {
 }
 
 func TestServeHostInjectWhitelist(t *testing.T) {
-	connBody := []byte(`var api="https://mb3admin.co/emby"`)
-	premBody := []byte(`host:"mb3admin.co"`)
-	otherBody := []byte(`var api="https://mb3admin.co/emby"`)
+	connBody := []byte(`var api="https://mb3admin.com/emby"`)
+	premBody := []byte(`host:"mb3admin.com"`)
+	otherBody := []byte(`var api="https://mb3admin.com/emby"`)
 	tree := buildFixture(t, fixtureOpts{Files: []fixtureFile{
 		{Path: "manifest.json", Data: []byte(`{}`)},
 		{Path: "index.html", Data: []byte(`<!doctype html>`)},
@@ -136,7 +136,7 @@ func TestServeHostInjectWhitelist(t *testing.T) {
 }
 
 func TestServeHostInjectNoHostLeavesPlaceholder(t *testing.T) {
-	body := []byte(`u="https://mb3admin.co/x"`)
+	body := []byte(`u="https://mb3admin.com/x"`)
 	tree := buildFixture(t, fixtureOpts{Files: []fixtureFile{
 		{Path: "manifest.json", Data: []byte(`{}`)},
 		{Path: "index.html", Data: []byte(`<!doctype html>`)},
