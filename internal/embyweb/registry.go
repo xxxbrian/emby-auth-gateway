@@ -13,15 +13,17 @@ type catalogDeclaration struct {
 }
 
 // catalogRegistry is an immutable index of trusted catalogs by ID and full
-// digest. Lookups never mutate the registry. Production uses an empty registry.
+// digest. Lookups never mutate the registry. Production is built from embedded
+// package-private catalog declarations only (no runtime injection).
 type catalogRegistry struct {
 	byDigest  map[string]*trustedCatalog
 	byID      map[string]*trustedCatalog
 	byRelease map[string]*trustedCatalog
 }
 
-// productionRegistry is empty: no official catalog ships until legal/reproduction
-// gates pass. Public New always uses this registry.
+// productionRegistry is the immutable built-in catalog set used by public New,
+// Install, and InspectInstallation. It is constructed once from embedded
+// metadata pins (see production_catalogs.go).
 var (
 	productionRegistry     *catalogRegistry
 	productionRegistryOnce sync.Once
@@ -29,9 +31,9 @@ var (
 
 func getProductionRegistry() *catalogRegistry {
 	productionRegistryOnce.Do(func() {
-		reg, err := newCatalogRegistry(nil)
+		reg, err := newCatalogRegistry(productionCatalogDeclarations())
 		if err != nil {
-			panic("embyweb: empty production registry construction failed: " + err.Error())
+			panic("embyweb: production registry construction failed: " + err.Error())
 		}
 		productionRegistry = reg
 	})
@@ -83,7 +85,7 @@ func newCatalogRegistry(decls []catalogDeclaration) (*catalogRegistry, error) {
 }
 
 // lookupByDigest returns the trusted catalog for a full 64-hex digest, or
-// ErrUntrustedCatalog when unknown (including empty production registry).
+// ErrUntrustedCatalog when the digest is not in the registry.
 func (r *catalogRegistry) lookupByDigest(digest string) (*trustedCatalog, error) {
 	if r == nil {
 		return nil, ErrUntrustedCatalog
@@ -96,7 +98,7 @@ func (r *catalogRegistry) lookupByDigest(digest string) (*trustedCatalog, error)
 }
 
 // lookupByID returns the trusted catalog for a catalog ID, or ErrCatalogLegalGate
-// when the production/empty registry has no such ID.
+// when the ID is not present in the registry.
 func (r *catalogRegistry) lookupByID(id string) (*trustedCatalog, error) {
 	if r == nil {
 		return nil, ErrCatalogLegalGate

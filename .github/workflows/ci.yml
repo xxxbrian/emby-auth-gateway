@@ -26,7 +26,7 @@ jobs:
           cache: true
 
       # Hermetic Web install→serve→scripts/smoke.sh path (synthetic catalog only;
-      # production registry remains empty; no official bytes).
+      # no official asset bytes).
       # -json + assertion ensures the named test actually ran (not a silent
       # zero-match pass from a mistyped -run regex).
       - name: Web deployment smoke

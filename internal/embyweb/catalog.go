@@ -22,13 +22,13 @@ const (
 )
 
 // ErrUntrustedCatalog is returned when a pointer/install catalog_sha256 is not
-// present in the active immutable registry (including the empty production
-// registry). Readers map this to StateCorrupt.
+// present in the active immutable registry. Readers map this to StateCorrupt.
 var ErrUntrustedCatalog = errors.New("embyweb: untrusted catalog digest")
 
-// ErrCatalogLegalGate is the sentinel for the empty production registry when a
-// catalog ID is requested before legal/reproduction approval. Lane 1 exposes it
-// for registry lookup-by-ID; the reader uses ErrUntrustedCatalog for digests.
+// ErrCatalogLegalGate is returned when a catalog ID is not present in the
+// active registry (unknown or unpublished ID). Public Install maps unknown IDs
+// to this sentinel before any filesystem or network side effects. Readers use
+// ErrUntrustedCatalog for unknown digests.
 var ErrCatalogLegalGate = errors.New("embyweb: catalog not available (legal/reproduction gate)")
 
 // catalog is the package-private schema-1 trusted catalog document.

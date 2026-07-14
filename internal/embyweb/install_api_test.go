@@ -107,6 +107,34 @@ func TestInstallPublicLegalGateNoSideEffects(t *testing.T) {
 	}
 }
 
+func TestInstallKnownProductionIDPastLegalGate(t *testing.T) {
+	// Known production catalog ID must resolve; failure must be source validation
+	// (missing prepared tree), not ErrCatalogLegalGate. No official bytes required.
+	missingRoot := filepath.Join(t.TempDir(), "assets-not-created")
+	missingSrc := filepath.Join(t.TempDir(), "prepared-source-missing")
+
+	_, err := Install(context.Background(), InstallOptions{
+		AssetsRoot: missingRoot,
+		CatalogID:  "emby-web-4.9.5.0",
+		FromDir:    missingSrc,
+	})
+	if err == nil {
+		t.Fatal("expected source failure for missing prepared tree")
+	}
+	if errors.Is(err, ErrCatalogLegalGate) {
+		t.Fatalf("known production ID must pass legal gate, got %v", err)
+	}
+	// directory source wraps missing path after catalog resolve.
+	if !strings.Contains(err.Error(), "directory source") {
+		t.Fatalf("unexpected error (want directory source validation): %v", err)
+	}
+	// Catalog resolve happens before root creation; missing source fails in
+	// newInstallSource, so assets root must still be absent.
+	if _, statErr := os.Lstat(missingRoot); !os.IsNotExist(statErr) {
+		t.Fatalf("assets root should remain absent after source failure: %v", statErr)
+	}
+}
+
 func TestInstallWithRegistryDirEndToEnd(t *testing.T) {
 	files := readyMinimalFiles()
 	tc := buildSyntheticCatalog(t, files, "facade-dir", "1.0.0")

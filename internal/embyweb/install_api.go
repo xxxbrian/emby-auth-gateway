@@ -32,7 +32,7 @@ type InstallResult struct {
 	Reactivated   bool
 }
 
-// Install installs a trusted catalog release into AssetsRoot using the empty
+// Install installs a trusted catalog release into AssetsRoot using the immutable
 // production registry. Unknown CatalogID returns/wraps ErrCatalogLegalGate
 // before any root creation, lock acquisition, source construction, or network.
 func Install(ctx context.Context, opts InstallOptions) (InstallResult, error) {

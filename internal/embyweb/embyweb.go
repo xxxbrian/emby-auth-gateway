@@ -120,9 +120,9 @@ func CanaryPaths() []string {
 	return out
 }
 
-// New constructs a Server from cfg using the empty production catalog registry.
+// New constructs a Server from cfg using the immutable production catalog registry.
 // Configured trees whose catalog_sha256 is not in the production registry are
-// StateCorrupt (untrusted) and never Ready until a reviewed catalog is shipped.
+// StateCorrupt (untrusted) and never Ready.
 //
 // Disabled (empty AssetsRoot) always succeeds. Missing and corrupt asset trees
 // also succeed construction and serve 503. An enabled configuration with a

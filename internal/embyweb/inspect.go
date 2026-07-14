@@ -30,7 +30,7 @@ type InstallationStatus struct {
 }
 
 // InspectInstallation reports installation status for assetsRoot using the
-// empty production registry. blank root => disabled. verify selects plain
+// immutable production registry. blank root => disabled. verify selects plain
 // trusted identity vs full verifier (ready).
 func InspectInstallation(assetsRoot string, verify bool) InstallationStatus {
 	return inspectInstallation(assetsRoot, verify, getProductionRegistry())

@@ -339,12 +339,12 @@ func TestInspectInstallationMatrix(t *testing.T) {
 	})
 
 	t.Run("untrusted_corrupt", func(t *testing.T) {
-		// Install with reg, inspect with empty production registry.
+		// Install with synthetic reg; inspect with production registry (digest not pinned).
 		root := t.TempDir()
 		if _, err := installTrusted(context.Background(), root, tc, &fakeSource{files: files}, installDeps{}); err != nil {
 			t.Fatal(err)
 		}
-		st := InspectInstallation(root, false) // production empty
+		st := InspectInstallation(root, false) // production registry lacks synthetic digest
 		if st.State != InstallStateCorrupt || st.Err == nil {
 			t.Fatalf("%+v", st)
 		}

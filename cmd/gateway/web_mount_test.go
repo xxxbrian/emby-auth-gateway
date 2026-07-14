@@ -79,8 +79,8 @@ func TestNewEmbyWebServerStates(t *testing.T) {
 	})
 
 	t.Run("untrusted_synthetic_corrupt", func(t *testing.T) {
-		// Production registry is empty; public New never reaches Ready for
-		// hand-written trees. Composition tests use syntheticReadyWebHandler.
+		// Hand-written trees use digests not in the production registry; public
+		// New is corrupt/untrusted. Composition tests use syntheticReadyWebHandler.
 		root := writeUntrustedWebAssets(t)
 		s, err := newEmbyWebServer("/emby", root)
 		if err != nil {
@@ -138,8 +138,8 @@ func TestMountGatewayRoutesComposition(t *testing.T) {
 	})
 
 	t.Run("ready_redirect_index_canaries_and_api", func(t *testing.T) {
-		// Production registry is empty; use a testing-safe ready double for
-		// composition (routing/CORS/guard) without registry injection.
+		// Use a testing-safe ready double for composition (routing/CORS/guard)
+		// without needing official prepared assets or registry injection.
 		web := syntheticReadyWebHandler()
 		var apiHits atomic.Int64
 		h := buildComposedHandler(t, "/emby", web, countingAPI(&apiHits, 418), true)
@@ -556,8 +556,8 @@ func countingAPI(hits *atomic.Int64, code int) http.Handler {
 }
 
 // syntheticReadyWebHandler is a testing-safe Ready double for composition tests.
-// Production embyweb.New cannot reach Ready while the built-in registry is empty
-// and registry injection is intentionally not exported. This handler mirrors the
+// Registry injection is intentionally not exported, and hermetic composition
+// tests must not require official prepared assets. This handler mirrors the
 // Ready surface needed by mount/CORS/guard composition assertions only.
 func syntheticReadyWebHandler() http.Handler {
 	assets := map[string]string{
@@ -661,7 +661,7 @@ func syntheticReadyWebHandler() http.Handler {
 }
 
 // writeUntrustedWebAssets builds a minimal schema-1 tree that is intentionally
-// not in the empty production registry (StateCorrupt / untrusted).
+// not in the production registry (StateCorrupt / untrusted).
 func writeUntrustedWebAssets(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()

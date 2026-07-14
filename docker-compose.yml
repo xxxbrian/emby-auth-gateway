@@ -19,19 +19,19 @@ services:
       - gateway_web_assets:/app/web_assets:ro
 
   # Explicit one-shot asset tool (same image/CLI). Not started by ordinary
-  # `docker compose up` / `up gateway`. Production catalog registry is empty
-  # until legal review; do not treat install as a working official catalog.
-  # No Docker socket. Assets are never baked into image layers.
+  # `docker compose up` / `up gateway`. Built-in catalog ID: emby-web-4.9.5.0
+  # (metadata only). Operators must supply a legally obtained prepared source;
+  # official asset bytes are never baked into image layers. No Docker socket.
   #
   # Status:
   #   docker compose run --rm web status
   #   docker compose run --rm web status --verify
-  # Install (after a trusted catalog ID exists; mount prepared sources as needed):
-  #   docker compose run --rm web install --catalog-id <id> --from-url https://example.invalid/tree/
+  # Install (mount prepared sources as needed):
+  #   docker compose run --rm web install --catalog-id emby-web-4.9.5.0 --from-url https://example.invalid/tree/
   #   docker compose run --rm -v /path/to/prepared:/source:ro web \
-  #     install --catalog-id <id> --from-dir /source
+  #     install --catalog-id emby-web-4.9.5.0 --from-dir /source
   #   docker compose run --rm -v /path/to/tree.tar.gz:/source/tree.tar.gz:ro web \
-  #     install --catalog-id <id> --from-archive /source/tree.tar.gz
+  #     install --catalog-id emby-web-4.9.5.0 --from-archive /source/tree.tar.gz
   web:
     profiles: ["web"]
     build: .

@@ -177,19 +177,114 @@ func TestRegistryPinAndDuplicates(t *testing.T) {
 	})
 }
 
-func TestProductionRegistryEmptyUntrusted(t *testing.T) {
-	reg := getProductionRegistry()
-	if reg.len() != 0 {
-		t.Fatalf("production registry must be empty, len=%d", reg.len())
-	}
-	if _, err := reg.lookupByDigest(strings.Repeat("ab", 32)); !errors.Is(err, ErrUntrustedCatalog) {
-		t.Fatalf("err=%v", err)
-	}
-	if _, err := reg.lookupByID("any"); !errors.Is(err, ErrCatalogLegalGate) {
-		t.Fatalf("err=%v", err)
+func TestProductionRegistryCatalog(t *testing.T) {
+	const (
+		wantID      = "emby-web-4.9.5.0"
+		wantVersion = "4.9.5.0"
+		wantDigest  = catalogEmbyWeb4950Digest
+		wantImage   = "emby/embyserver"
+		wantSrcDig  = "sha256:1e76e14a9c99507eb9f54361126f22c4658fc1588b2a710a99ba42f2335ff59a"
+		wantEntries = 868
+	)
+	wantRelease := wantVersion + "-" + wantDigest
+	runtimeHashes := map[string]string{
+		"modules/apphost.js":                            "11cb7865e7e09be7e4c89d963245dc7142a496f68c1b000b6d6edd61ca0fd9b8",
+		"modules/input/keyboard.js":                     "01871146aea79bb7f7366bbf82881acef11bcc9a06a25b596493526f45dc90ce",
+		"modules/virtual-scroller/virtual-scroller.js":  "62b53c64e031db786a8b30017061f83bce8e46dc0a33804eaab4ca9dfb41f5ee",
+		"modules/virtual-scroller/virtual-scroller.css": "66d2f49974cec517543e106e6cdb89f2a280d654a2490a44b203b0559236fb9e",
 	}
 
-	// Configured tree with synthetic bytes but public New (empty registry) is corrupt.
+	reg := getProductionRegistry()
+	if reg.len() != 1 {
+		t.Fatalf("production registry len=%d want 1", reg.len())
+	}
+
+	tc, err := reg.lookupByID(wantID)
+	if err != nil {
+		t.Fatalf("lookupByID: %v", err)
+	}
+	if tc.Digest != wantDigest {
+		t.Fatalf("digest=%s want %s", tc.Digest, wantDigest)
+	}
+	if tc.Release != wantRelease {
+		t.Fatalf("release=%s want %s", tc.Release, wantRelease)
+	}
+	if tc.Catalog.ID != wantID || tc.Catalog.Version != wantVersion {
+		t.Fatalf("id/version=%s/%s", tc.Catalog.ID, tc.Catalog.Version)
+	}
+	if tc.Catalog.SourceImage != wantImage || tc.Catalog.SourceImageDigest != wantSrcDig {
+		t.Fatalf("source=%s %s", tc.Catalog.SourceImage, tc.Catalog.SourceImageDigest)
+	}
+	if len(tc.Catalog.Entries) != wantEntries {
+		t.Fatalf("entries=%d want %d", len(tc.Catalog.Entries), wantEntries)
+	}
+	if len(tc.Catalog.Canaries) != 3 ||
+		tc.Catalog.Canaries[0] != "manifest.json" ||
+		tc.Catalog.Canaries[1] != "index.html" ||
+		tc.Catalog.Canaries[2] != "strings/en-US.json" {
+		t.Fatalf("canaries=%v", tc.Catalog.Canaries)
+	}
+
+	byPath := make(map[string]string, len(tc.Catalog.Entries))
+	for _, e := range tc.Catalog.Entries {
+		byPath[e.Path] = e.SHA256
+	}
+	for p, h := range runtimeHashes {
+		if byPath[p] != h {
+			t.Fatalf("runtime hash %s=%s want %s", p, byPath[p], h)
+		}
+	}
+
+	got, err := reg.lookupByDigest(wantDigest)
+	if err != nil || got.Catalog.ID != wantID {
+		t.Fatalf("lookupByDigest: %v %+v", err, got)
+	}
+
+	// Unknown ID still legal-gates; unknown digest is untrusted.
+	if _, err := reg.lookupByID("not-a-shipped-catalog"); !errors.Is(err, ErrCatalogLegalGate) {
+		t.Fatalf("unknown id err=%v", err)
+	}
+	if _, err := reg.lookupByDigest(strings.Repeat("ab", 32)); !errors.Is(err, ErrUntrustedCatalog) {
+		t.Fatalf("unknown digest err=%v", err)
+	}
+
+	// Pin mismatch / tamper rejection at registry construction.
+	t.Run("pin_mismatch", func(t *testing.T) {
+		_, err := newCatalogRegistry([]catalogDeclaration{{
+			Bytes:          append([]byte(nil), catalogEmbyWeb4950JSON...),
+			ExpectedDigest: strings.Repeat("00", 32),
+		}})
+		if err == nil || !strings.Contains(err.Error(), "pin mismatch") {
+			t.Fatalf("err=%v", err)
+		}
+	})
+	t.Run("tampered_bytes", func(t *testing.T) {
+		tampered := append([]byte(nil), catalogEmbyWeb4950JSON...)
+		// Flip a byte inside the JSON while keeping length; pin must fail.
+		if len(tampered) < 64 {
+			t.Fatal("catalog too small")
+		}
+		tampered[40] ^= 0x01
+		_, err := newCatalogRegistry([]catalogDeclaration{{
+			Bytes:          tampered,
+			ExpectedDigest: catalogEmbyWeb4950Digest,
+		}})
+		if err == nil || !strings.Contains(err.Error(), "pin mismatch") {
+			t.Fatalf("err=%v", err)
+		}
+	})
+	t.Run("embedded_bytes_match_pin", func(t *testing.T) {
+		if catalogDigest(catalogEmbyWeb4950JSON) != catalogEmbyWeb4950Digest {
+			t.Fatal("embedded catalog bytes do not match hard-coded digest pin")
+		}
+		// Canonical form required by parseCatalog.
+		if _, err := parseCatalog(catalogEmbyWeb4950JSON); err != nil {
+			t.Fatalf("parse embedded catalog: %v", err)
+		}
+	})
+
+	// Configured tree with synthetic bytes but public New (production registry)
+	// is corrupt/untrusted — synthetic digests are not production pins.
 	tree := buildFixture(t, fixtureOpts{Files: readyMinimalFiles()})
 	s, err := New(Config{GatewayBasePath: "/emby", AssetsRoot: tree.Root})
 	if err != nil {

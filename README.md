@@ -198,24 +198,24 @@ or `GATEWAY_WEB_ASSETS_DIR`.
 # Install: trusted built-in catalog ID + exactly one prepared source
 ./bin/gateway web install \
   --assets-dir /path/to/web_assets \
-  --catalog-id '<trusted-catalog-id>' \
+  --catalog-id 'emby-web-4.9.5.0' \
   --from-dir /path/to/prepared/files
 
 ./bin/gateway web install \
   --assets-dir /path/to/web_assets \
-  --catalog-id '<trusted-catalog-id>' \
+  --catalog-id 'emby-web-4.9.5.0' \
   --from-archive /path/to/prepared.tar.gz
 
 # Prepared static-tree URL (trailing slash required). Defaults: HTTPS + public IPs.
 ./bin/gateway web install \
   --assets-dir /path/to/web_assets \
-  --catalog-id '<trusted-catalog-id>' \
-  --from-url 'https://assets.example.com/emby-web/4.9.5/'
+  --catalog-id 'emby-web-4.9.5.0' \
+  --from-url 'https://assets.example.com/emby-web/4.9.5.0/'
 
 # Development-only URL relaxations (invalid unless --from-url is set)
 ./bin/gateway web install \
   --assets-dir /path/to/web_assets \
-  --catalog-id '<trusted-catalog-id>' \
+  --catalog-id 'emby-web-4.9.5.0' \
   --from-url 'http://127.0.0.1:8080/tree/' \
   --allow-http-url \
   --allow-private-url
@@ -228,44 +228,53 @@ Compose defines a separate named volume `gateway_web_assets` mounted at
 the profile-gated `web` one-shot). Web serving is **opt-in**: leave
 `GATEWAY_WEB_ASSETS_DIR` blank for API-only (404 on `/emby/web/`); set exactly
 `GATEWAY_WEB_ASSETS_DIR=/app/web_assets` (with `GATEWAY_BASE_PATH=/emby`) after a
-trusted install to enable serving from that volume. The production catalog
-registry is empty until legal approval, so install currently returns the legal
-gate even when the volume and CLI are wired. Do not mount a Docker socket; do not
-bake official bytes into image layers; `serve` never installs on startup.
+trusted install to enable serving from that volume. Do not mount a Docker socket;
+do not bake official bytes into image layers; `serve` never installs on startup.
 
 ```sh
 # Status against the shared volume (profile "web"; RW mount; no serve)
 docker compose run --rm web status
 docker compose run --rm web status --verify
 
-# Install after a trusted catalog ID exists — bind prepared sources read-only:
+# Install built-in catalog ID with a legally obtained prepared source (RO bind):
 docker compose run --rm \
   -v /path/to/prepared:/source:ro \
-  web install --catalog-id '<trusted-catalog-id>' --from-dir /source
+  web install --catalog-id 'emby-web-4.9.5.0' --from-dir /source
 
 docker compose run --rm \
   -v /path/to/tree.tar.gz:/source/tree.tar.gz:ro \
-  web install --catalog-id '<trusted-catalog-id>' --from-archive /source/tree.tar.gz
+  web install --catalog-id 'emby-web-4.9.5.0' --from-archive /source/tree.tar.gz
 
 docker compose run --rm web install \
-  --catalog-id '<trusted-catalog-id>' \
-  --from-url 'https://assets.example.com/emby-web/4.9.5/'
+  --catalog-id 'emby-web-4.9.5.0' \
+  --from-url 'https://assets.example.com/emby-web/4.9.5.0/'
 ```
 
-### Production catalog gate
+### Production catalog
 
 Gateway releases do **not** redistribute official Emby Web bytes. Catalogs are
-path/hash metadata only. The production built-in registry is currently
-**intentionally empty** pending independent 868-entry reproduction and legal
-approval. Until a trusted catalog ID ships:
+path/hash metadata only. The production built-in registry currently ships one
+reviewed catalog:
 
-- `gateway web install ...` returns the legal/reproduction gate error and creates
-  no assets root, lock, or network side effects.
+| Field | Value |
+| --- | --- |
+| Catalog ID | `emby-web-4.9.5.0` |
+| Version | `4.9.5.0` |
+| Source image | `emby/embyserver` (linux/arm64 child digest pinned in catalog metadata) |
+| Entries | 868 |
+
+Operators must supply a **legally obtained** prepared source tree, archive, or
+URL that matches the catalog. Official asset bytes are not in the repository,
+release archives, CI artifacts, or gateway image layers. There is no
+`--catalog-file` or digest override.
+
+- Unknown catalog IDs still return the legal/reproduction gate error with no
+  assets root, lock, or network side effects.
 - Configured trees whose digest is not in the production registry load as
   corrupt/untrusted (503), never Ready.
-
-When a trusted catalog ID is published, install only that ID (or another
-reviewed built-in ID). There is no `--catalog-file` or digest override.
+- Provenance for the shipped metadata is recorded in
+  `internal/embyweb/catalogs/PROVENANCE.md` (owner risk acceptance for metadata
+  publication; not an Emby license grant).
 
 ### Upgrade, reactivation, rollback
 
@@ -395,13 +404,13 @@ SMOKE_WEB=ready SMOKE_WEB_ONLY=1 GATEWAY_URL=http://127.0.0.1:PORT ./scripts/smo
 ```
 
 CI runs `TestSyntheticReadyDeploymentSmoke` (synthetic catalog install + local
-HTTP server + `SMOKE_WEB_ONLY=1`) before the full Go suite. That path never uses
-the production registry or official Emby Web bytes.
+HTTP server + `SMOKE_WEB_ONLY=1`) before the full Go suite. That path uses a
+test-only synthetic catalog and never downloads or embeds official Emby Web
+bytes.
 
 **Deferred:** Firefox BiDi / real browser UI login-home-logout against official
-assets remains a manual end-to-end gate until the first legally approved
-production catalog ID ships. Hermetic HTTP canary/CORS smoke is the automated
-stand-in until then.
+assets remains a manual end-to-end gate when a matching prepared source is
+available. Hermetic HTTP canary/CORS smoke is the automated stand-in in CI.
 
 ## Security Notes
 
@@ -411,7 +420,7 @@ stand-in until then.
 - Backend Emby passwords and backend Emby session tokens are stored as plaintext fields in PocketBase so administrators can configure and inspect backend records in the Admin UI. PocketBase superuser access or direct database file access is secret access.
 - Do not expose the real Emby backend directly to untrusted clients when testing gateway isolation.
 - On the public reverse proxy, expose `/emby` (and `/emby/web` when enabled) but block PocketBase `/_/` and `/api`.
-- Do not redistribute official Emby Web dashboard bytes in this project’s releases; install only trusted catalog IDs after legal/reproduction approval.
+- Do not redistribute official Emby Web dashboard bytes in this project’s releases; install only built-in trusted catalog IDs (currently `emby-web-4.9.5.0`) against a legally obtained prepared source.
 - Do not commit `.env` files or real secrets. `.env.example` contains placeholders only.
 
 ## Troubleshooting
@@ -424,5 +433,6 @@ stand-in until then.
 - `/emby/web/` returns 404: Web is disabled (`GATEWAY_WEB_ASSETS_DIR` unset/blank). Expected for API-only deployments; in Compose leave the env blank until assets are installed and you intentionally opt in with `/app/web_assets`.
 - `/emby/web/` returns 503: assets dir is set but the tree is missing, corrupt, or not in the production trusted registry; run `web status --verify` and reinstall a trusted catalog when available.
 - Gateway refuses to start with Web enabled: set `GATEWAY_BASE_PATH=/emby` or clear `GATEWAY_WEB_ASSETS_DIR`.
-- `web install` fails with legal/reproduction gate: the production catalog registry is still empty; no installable official catalog ID is shipped yet.
+- `web install` fails with legal/reproduction gate: the catalog ID is unknown; use a built-in ID such as `emby-web-4.9.5.0`.
+- `web install` fails after resolving the catalog: the prepared source is missing, incomplete, or does not match the catalog hashes; fix the source tree/archive/URL (official bytes are never shipped by this project).
 - Web install succeeded but browser still sees old assets: confirm `web status --verify` on disk, then restart the gateway so `serve` reloads `current.json`, then re-check HTTP canaries.

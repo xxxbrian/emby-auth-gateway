@@ -44,8 +44,8 @@ func TestSmokeHeaderParserSelftest(t *testing.T) {
 // TestSyntheticReadyDeploymentSmoke is the hermetic CI deployment smoke:
 // install a synthetic trusted catalog into a new assets root, serve it with the
 // real package handler + GuardHandler, and drive scripts/smoke.sh in
-// SMOKE_WEB=ready SMOKE_WEB_ONLY=1 mode. Production registry stays empty;
-// package-private registry injection is test-only.
+// SMOKE_WEB=ready SMOKE_WEB_ONLY=1 mode. Uses package-private registry injection
+// only (no official asset bytes; production registry is not required).
 func TestSyntheticReadyDeploymentSmoke(t *testing.T) {
 	if testing.Short() {
 		t.Skip("deployment smoke invokes scripts/smoke.sh")
