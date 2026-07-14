@@ -5,6 +5,7 @@
 .env.*
 !.env.example
 pb_data
+web_assets
 tmp
 bin
 dist

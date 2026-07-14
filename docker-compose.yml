@@ -1,15 +1,49 @@
 services:
   gateway:
     build: .
+    image: ${GATEWAY_IMAGE:-emby-auth-gateway:local}
     ports:
       - "${GATEWAY_PORT:-8090}:8090"
     environment:
       GATEWAY_PUBLIC_URL: "${GATEWAY_PUBLIC_URL:-http://localhost:${GATEWAY_PORT:-8090}${GATEWAY_BASE_PATH:-/emby}}"
       GATEWAY_BASE_PATH: "${GATEWAY_BASE_PATH:-/emby}"
       GATEWAY_SERVER_ID: "${GATEWAY_SERVER_ID:-emby-auth-gateway-dev}"
+      # Opt-in Web serving. Blank (default) keeps API-only mode so custom
+      # GATEWAY_BASE_PATH works. Enable only with the stable volume path:
+      #   GATEWAY_WEB_ASSETS_DIR=/app/web_assets
+      # Serve never installs; volume is always mounted read-only below.
+      GATEWAY_WEB_ASSETS_DIR: "${GATEWAY_WEB_ASSETS_DIR:-}"
     command: ["serve", "--http=0.0.0.0:8090"]
     volumes:
       - gateway_pb_data:/app/pb_data
+      - gateway_web_assets:/app/web_assets:ro
+
+  # Explicit one-shot asset tool (same image/CLI). Not started by ordinary
+  # `docker compose up` / `up gateway`. Production catalog registry is empty
+  # until legal review; do not treat install as a working official catalog.
+  # No Docker socket. Assets are never baked into image layers.
+  #
+  # Status:
+  #   docker compose run --rm web status
+  #   docker compose run --rm web status --verify
+  # Install (after a trusted catalog ID exists; mount prepared sources as needed):
+  #   docker compose run --rm web install --catalog-id <id> --from-url https://example.invalid/tree/
+  #   docker compose run --rm -v /path/to/prepared:/source:ro web \
+  #     install --catalog-id <id> --from-dir /source
+  #   docker compose run --rm -v /path/to/tree.tar.gz:/source/tree.tar.gz:ro web \
+  #     install --catalog-id <id> --from-archive /source/tree.tar.gz
+  web:
+    profiles: ["web"]
+    build: .
+    image: ${GATEWAY_IMAGE:-emby-auth-gateway:local}
+    environment:
+      GATEWAY_WEB_ASSETS_DIR: /app/web_assets
+    entrypoint: ["gateway", "web"]
+    command: ["status"]
+    restart: "no"
+    volumes:
+      - gateway_web_assets:/app/web_assets
 
 volumes:
   gateway_pb_data:
+  gateway_web_assets:

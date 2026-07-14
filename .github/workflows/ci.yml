@@ -25,6 +25,64 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # Hermetic Web install→serve→scripts/smoke.sh path (synthetic catalog only;
+      # production registry remains empty; no official bytes).
+      # -json + assertion ensures the named test actually ran (not a silent
+      # zero-match pass from a mistyped -run regex).
+      - name: Web deployment smoke
+        run: |
+          set -euo pipefail
+          go test ./internal/embyweb -run '^TestSyntheticReadyDeploymentSmoke$' -count=1 -json \
+            | tee web-deployment-smoke.json
+          python3 - <<'PY'
+          import json
+          import sys
+
+          path = "web-deployment-smoke.json"
+          saw_run = False
+          saw_pass = False
+          package_fail = False
+          events = []
+          with open(path, encoding="utf-8") as f:
+              for line in f:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  try:
+                      ev = json.loads(line)
+                  except json.JSONDecodeError as e:
+                      print(f"invalid go test -json line: {e}: {line!r}", file=sys.stderr)
+                      sys.exit(1)
+                  events.append(ev)
+                  test = ev.get("Test") or ""
+                  action = ev.get("Action") or ""
+                  if test == "TestSyntheticReadyDeploymentSmoke":
+                      if action == "run":
+                          saw_run = True
+                      if action == "pass":
+                          saw_pass = True
+                      if action == "fail":
+                          print("TestSyntheticReadyDeploymentSmoke reported fail", file=sys.stderr)
+                          sys.exit(1)
+                  if not test and action == "fail":
+                      package_fail = True
+
+          if package_fail:
+              print("package-level fail in go test -json stream", file=sys.stderr)
+              sys.exit(1)
+          if not saw_run:
+              print(
+                  "TestSyntheticReadyDeploymentSmoke did not run "
+                  "(check -run regex; refusing silent no-match pass)",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          if not saw_pass:
+              print("TestSyntheticReadyDeploymentSmoke did not pass", file=sys.stderr)
+              sys.exit(1)
+          print("ok: TestSyntheticReadyDeploymentSmoke ran and passed")
+          PY
+
       - name: Test
         run: go test ./...
 

@@ -10,4 +10,5 @@ dist/
 *.sqlite
 *.sqlite3
 coverage.out
+web_assets/
 AGENTS.md
