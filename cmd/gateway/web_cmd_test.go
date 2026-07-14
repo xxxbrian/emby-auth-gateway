@@ -80,6 +80,18 @@ func TestWebInstallOptionValidation(t *testing.T) {
 			want: "--allow-private-url",
 		},
 		{
+			name: "private_flag_with_remote_archive_ok_then_legal_gate",
+			args: []string{
+				"install",
+				"--assets-dir", t.TempDir(),
+				"--catalog-id", "x",
+				"--from-archive", "https://cdn.example.test/web.tar.gz",
+				"--allow-private-url",
+			},
+			// Options accepted; production catalog legal gate fires.
+			want: "catalog",
+		},
+		{
 			name: "extra_args",
 			args: []string{
 				"install",
@@ -474,6 +486,20 @@ func TestWebInitSourceKindMapping(t *testing.T) {
 			},
 			want: embyweb.InstallOptions{
 				AssetsRoot: assets, CatalogID: "cat", FromArchive: src + ".tar.gz",
+			},
+		},
+		{
+			name: "archive_remote_url",
+			f: webInitFlags{
+				AssetsDir: assets, CatalogID: "cat",
+				SourceKind: "archive", Source: "https://cdn.example.test/web.tar.gz",
+				AllowHTTPURL: true, AllowPrivateURL: true,
+			},
+			want: embyweb.InstallOptions{
+				AssetsRoot: assets, CatalogID: "cat",
+				FromArchive:     "https://cdn.example.test/web.tar.gz",
+				AllowHTTPURL:    true,
+				AllowPrivateURL: true,
 			},
 		},
 		{

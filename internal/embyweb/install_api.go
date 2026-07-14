@@ -19,8 +19,9 @@ type InstallOptions struct {
 	FromArchive string
 	FromURL     string
 
-	// AllowHTTPURL and AllowPrivateURL are development flags for FromURL only.
-	// They are rejected when any other source mode is selected.
+	// AllowHTTPURL and AllowPrivateURL are development flags for FromURL and
+	// remote FromArchive (http:// or https://). They are rejected for FromDir
+	// and local FromArchive paths.
 	AllowHTTPURL    bool
 	AllowPrivateURL bool
 }
@@ -117,9 +118,10 @@ func validateInstallOptions(opts InstallOptions) error {
 		return errors.New("install: exactly one of FromDir, FromArchive, or FromURL is required")
 	}
 
-	if url == "" {
-		if opts.AllowHTTPURL || opts.AllowPrivateURL {
-			return errors.New("install: AllowHTTPURL/AllowPrivateURL are only valid with FromURL")
+	if opts.AllowHTTPURL || opts.AllowPrivateURL {
+		remoteArchive := archive != "" && isRemoteArchiveRef(archive)
+		if url == "" && !remoteArchive {
+			return errors.New("install: AllowHTTPURL/AllowPrivateURL are only valid with FromURL or remote FromArchive")
 		}
 	}
 	return nil
@@ -132,7 +134,15 @@ func newInstallSource(opts InstallOptions, udeps urlSourceDeps) (acquisitionSour
 	case strings.TrimSpace(opts.FromDir) != "":
 		return newDirectorySource(strings.TrimSpace(opts.FromDir))
 	case strings.TrimSpace(opts.FromArchive) != "":
-		return newArchiveSource(strings.TrimSpace(opts.FromArchive))
+		archive := strings.TrimSpace(opts.FromArchive)
+		if isRemoteArchiveRef(archive) {
+			return newArchiveURLSource(archiveURLSourceSpec{
+				URL:          archive,
+				AllowHTTP:    opts.AllowHTTPURL,
+				AllowPrivate: opts.AllowPrivateURL,
+			}, udeps)
+		}
+		return newArchiveSource(archive)
 	case strings.TrimSpace(opts.FromURL) != "":
 		return newURLSource(urlSourceSpec{
 			BaseURL:      strings.TrimSpace(opts.FromURL),

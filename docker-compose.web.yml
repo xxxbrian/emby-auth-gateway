@@ -6,12 +6,17 @@
 #   GATEWAY_WEB_SOURCE_MOUNT=/absolute/path/to/prepared-868 \
 #   docker compose -f docker-compose.yml -f docker-compose.web.yml up --build -d
 #
-# Archive source:
+# Local archive source:
 #   GATEWAY_WEB_SOURCE_KIND=archive \
 #   GATEWAY_WEB_SOURCE_MOUNT=/absolute/path/to/tree.tar.gz \
 #   ...
 #
-# URL source (no host bind; empty named volume occupies the frozen mount path):
+# Remote archive source (HTTPS .tar.gz; no host bind needed):
+#   GATEWAY_WEB_SOURCE_KIND=archive \
+#   GATEWAY_WEB_SOURCE_VALUE=https://assets.example.com/emby-web-prepared-4.9.5.0.tar.gz \
+#   ...
+#
+# Static-tree URL source (per-file tree, trailing slash; not a .tar.gz):
 #   GATEWAY_WEB_SOURCE_KIND=url \
 #   GATEWAY_WEB_SOURCE_VALUE=https://assets.example.com/emby-web/4.9.5.0/ \
 #   ...

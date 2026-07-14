@@ -20,6 +20,15 @@ const (
 	archiveSuffix             = ".tar.gz"
 )
 
+// archiveLimits bounds a single archive extraction stream.
+type archiveLimits struct {
+	maxCompressed int64
+	maxExpanded   int64
+	maxPayload    int64
+	maxHeaders    int
+	maxNodes      int
+}
+
 // archiveSource materializes catalog files from a single local .tar.gz archive.
 // It is package-private; construction validates the path suffix only.
 type archiveSource struct {
@@ -35,9 +44,13 @@ type archiveSource struct {
 
 // newArchiveSource returns an acquisitionSource for a case-sensitive .tar.gz path.
 // The file is not opened until acquire; only the path form is checked here.
+// Remote http(s) URLs are rejected; use newArchiveURLSource via newInstallSource.
 func newArchiveSource(archivePath string) (*archiveSource, error) {
 	if archivePath == "" {
 		return nil, errors.New("archive source: empty path")
+	}
+	if isRemoteArchiveRef(archivePath) {
+		return nil, errors.New("archive source: remote URL is not a local path")
 	}
 	if !strings.HasSuffix(archivePath, archiveSuffix) {
 		return nil, fmt.Errorf("archive source: path must end with %q", archiveSuffix)
@@ -45,30 +58,38 @@ func newArchiveSource(archivePath string) (*archiveSource, error) {
 	return &archiveSource{path: archivePath}, nil
 }
 
+// isRemoteArchiveRef reports whether s is treated as a remote archive URL
+// (absolute http:// or https:// prefix). Detection is case-sensitive.
+func isRemoteArchiveRef(s string) bool {
+	return strings.HasPrefix(s, "https://") || strings.HasPrefix(s, "http://")
+}
+
 func (s *archiveSource) kind() string { return "archive" }
 
-func (s *archiveSource) limits() (compressed, expanded, payload int64, maxHeaders, maxNodes int) {
-	compressed = maxArchiveCompressedBytes
-	expanded = maxArchiveExpandedBytes
-	payload = int64(maxTotalBytes)
-	maxHeaders = maxEntries + maxDirs
-	maxNodes = maxEntries + maxDirs
+func (s *archiveSource) limits() archiveLimits {
+	lim := archiveLimits{
+		maxCompressed: maxArchiveCompressedBytes,
+		maxExpanded:   maxArchiveExpandedBytes,
+		maxPayload:    int64(maxTotalBytes),
+		maxHeaders:    maxEntries + maxDirs,
+		maxNodes:      maxEntries + maxDirs,
+	}
 	if s.testMaxCompressed > 0 {
-		compressed = s.testMaxCompressed
+		lim.maxCompressed = s.testMaxCompressed
 	}
 	if s.testMaxExpanded > 0 {
-		expanded = s.testMaxExpanded
+		lim.maxExpanded = s.testMaxExpanded
 	}
 	if s.testMaxPayload > 0 {
-		payload = s.testMaxPayload
+		lim.maxPayload = s.testMaxPayload
 	}
 	if s.testMaxHeaders > 0 {
-		maxHeaders = s.testMaxHeaders
+		lim.maxHeaders = s.testMaxHeaders
 	}
 	if s.testMaxNodes > 0 {
-		maxNodes = s.testMaxNodes
+		lim.maxNodes = s.testMaxNodes
 	}
-	return compressed, expanded, payload, maxHeaders, maxNodes
+	return lim
 }
 
 func (s *archiveSource) acquire(ctx context.Context, tc *trustedCatalog, w *stagingWriter) error {
@@ -85,7 +106,7 @@ func (s *archiveSource) acquire(ctx context.Context, tc *trustedCatalog, w *stag
 		return fmt.Errorf("archive source: path must end with %q", archiveSuffix)
 	}
 
-	maxCompressed, maxExpanded, maxPayload, maxHeaders, maxNodes := s.limits()
+	lim := s.limits()
 
 	// Atomic final-component no-follow open (O_NOFOLLOW|O_NONBLOCK) so a
 	// symlink/FIFO swap cannot hang or redirect the open. Size is taken from
@@ -103,27 +124,62 @@ func (s *archiveSource) acquire(ctx context.Context, tc *trustedCatalog, w *stag
 	if !fi.Mode().IsRegular() {
 		return errors.New("archive source: opened handle is not a regular file")
 	}
-	if fi.Size() < 0 || fi.Size() > maxCompressed {
-		return fmt.Errorf("archive source: compressed size %d exceeds limit %d", fi.Size(), maxCompressed)
+	if fi.Size() < 0 || fi.Size() > lim.maxCompressed {
+		return fmt.Errorf("archive source: compressed size %d exceeds limit %d", fi.Size(), lim.maxCompressed)
+	}
+
+	return extractArchiveStream(ctx, f, tc, w, lim)
+}
+
+// extractArchiveStream reads a gzip-compressed USTAR tar from r and writes
+// catalog-declared files into w. Compressed and expanded byte streams are
+// capped; r is not required to be seekable or fully buffered on disk.
+func extractArchiveStream(ctx context.Context, r io.Reader, tc *trustedCatalog, w *stagingWriter, lim archiveLimits) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if tc == nil {
+		return errors.New("archive source: nil catalog")
+	}
+	if w == nil {
+		return errors.New("archive source: nil staging writer")
+	}
+	if r == nil {
+		return errors.New("archive source: nil reader")
+	}
+	if lim.maxCompressed <= 0 {
+		lim.maxCompressed = maxArchiveCompressedBytes
+	}
+	if lim.maxExpanded <= 0 {
+		lim.maxExpanded = maxArchiveExpandedBytes
+	}
+	if lim.maxPayload <= 0 {
+		lim.maxPayload = int64(maxTotalBytes)
+	}
+	if lim.maxHeaders <= 0 {
+		lim.maxHeaders = maxEntries + maxDirs
+	}
+	if lim.maxNodes <= 0 {
+		lim.maxNodes = maxEntries + maxDirs
 	}
 
 	// Bound compressed reads; +1 detects growth past the declared cap.
-	compressed := &countCapReader{r: f, cap: maxCompressed}
+	compressed := &countCapReader{r: r, cap: lim.maxCompressed}
 	br := bufio.NewReader(compressed)
 
 	gz, err := gzip.NewReader(br)
 	if err != nil {
 		return fmt.Errorf("archive source: gzip: %w", err)
 	}
-	gz.Multistream(false)
 	gzClosed := false
 	defer func() {
 		if !gzClosed {
 			_ = gz.Close()
 		}
 	}()
+	gz.Multistream(false)
 
-	expanded := &countCapReader{r: gz, cap: maxExpanded}
+	expanded := &countCapReader{r: gz, cap: lim.maxExpanded}
 	tr := tar.NewReader(expanded)
 
 	requiredDirs := catalogRequiredDirs(tc)
@@ -150,8 +206,8 @@ func (s *archiveSource) acquire(ctx context.Context, tc *trustedCatalog, w *stag
 			return fmt.Errorf("archive source: tar: %w", err)
 		}
 		headers++
-		if headers > maxHeaders {
-			return fmt.Errorf("archive source: header count exceeds limit %d", maxHeaders)
+		if headers > lim.maxHeaders {
+			return fmt.Errorf("archive source: header count exceeds limit %d", lim.maxHeaders)
 		}
 
 		if err := validateArchiveHeader(hdr); err != nil {
@@ -181,13 +237,13 @@ func (s *archiveSource) acquire(ctx context.Context, tc *trustedCatalog, w *stag
 				return fmt.Errorf("archive source: %q negative size", name)
 			}
 			// Safe payload accumulation against overflow and catalog total cap.
-			if payload > maxPayload || hdr.Size > maxPayload-payload {
-				return fmt.Errorf("archive source: payload exceeds limit %d", maxPayload)
+			if payload > lim.maxPayload || hdr.Size > lim.maxPayload-payload {
+				return fmt.Errorf("archive source: payload exceeds limit %d", lim.maxPayload)
 			}
 
 			nodes++
-			if nodes > maxNodes {
-				return fmt.Errorf("archive source: node count exceeds limit %d", maxNodes)
+			if nodes > lim.maxNodes {
+				return fmt.Errorf("archive source: node count exceeds limit %d", lim.maxNodes)
 			}
 			if err := ctx.Err(); err != nil {
 				return err
@@ -216,8 +272,8 @@ func (s *archiveSource) acquire(ctx context.Context, tc *trustedCatalog, w *stag
 				return fmt.Errorf("archive source: %q declared as both file and directory", name)
 			}
 			nodes++
-			if nodes > maxNodes {
-				return fmt.Errorf("archive source: node count exceeds limit %d", maxNodes)
+			if nodes > lim.maxNodes {
+				return fmt.Errorf("archive source: node count exceeds limit %d", lim.maxNodes)
 			}
 			seenDirs[name] = struct{}{}
 
@@ -247,8 +303,8 @@ func (s *archiveSource) acquire(ctx context.Context, tc *trustedCatalog, w *stag
 		}
 		return fmt.Errorf("archive source: trailing compressed check: %w", err)
 	}
-	if compressed.read > maxCompressed {
-		return fmt.Errorf("archive source: compressed size exceeds limit %d", maxCompressed)
+	if compressed.read > lim.maxCompressed {
+		return fmt.Errorf("archive source: compressed size exceeds limit %d", lim.maxCompressed)
 	}
 
 	if len(seenFiles) != len(expectedFiles) {

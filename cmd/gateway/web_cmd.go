@@ -66,9 +66,9 @@ func newWebInitCommand() *cobra.Command {
 	cmd.Flags().StringVar(&flags.AssetsDir, "assets-dir", "", "Assets root directory (default: GATEWAY_WEB_ASSETS_DIR)")
 	cmd.Flags().StringVar(&flags.CatalogID, "catalog-id", "", "Built-in trusted catalog ID")
 	cmd.Flags().StringVar(&flags.SourceKind, "source-kind", "", "Source kind: dir, archive, or url")
-	cmd.Flags().StringVar(&flags.Source, "source", "", "Source value (directory path, archive path, or base URL)")
-	cmd.Flags().BoolVar(&flags.AllowHTTPURL, "allow-http-url", false, "Development: allow http:// URL bases (url kind only)")
-	cmd.Flags().BoolVar(&flags.AllowPrivateURL, "allow-private-url", false, "Development: allow private/loopback URL destinations (url kind only)")
+	cmd.Flags().StringVar(&flags.Source, "source", "", "Source value (directory path, local/remote .tar.gz archive, or base URL)")
+	cmd.Flags().BoolVar(&flags.AllowHTTPURL, "allow-http-url", false, "Development: allow http:// for url kind or remote archive URL")
+	cmd.Flags().BoolVar(&flags.AllowPrivateURL, "allow-private-url", false, "Development: allow private/loopback destinations for url kind or remote archive URL")
 	return cmd
 }
 
@@ -101,14 +101,17 @@ func (f webInitFlags) toInstallOptions() (embyweb.InstallOptions, error) {
 	switch kind {
 	case "dir":
 		if f.AllowHTTPURL || f.AllowPrivateURL {
-			return embyweb.InstallOptions{}, errors.New("--allow-http-url/--allow-private-url are only valid with --source-kind=url")
+			return embyweb.InstallOptions{}, errors.New("--allow-http-url/--allow-private-url are only valid with --source-kind=url or remote archive URL")
 		}
 		opts.FromDir = source
 	case "archive":
-		if f.AllowHTTPURL || f.AllowPrivateURL {
-			return embyweb.InstallOptions{}, errors.New("--allow-http-url/--allow-private-url are only valid with --source-kind=url")
+		remote := strings.HasPrefix(source, "https://") || strings.HasPrefix(source, "http://")
+		if (f.AllowHTTPURL || f.AllowPrivateURL) && !remote {
+			return embyweb.InstallOptions{}, errors.New("--allow-http-url/--allow-private-url are only valid with --source-kind=url or remote archive URL")
 		}
 		opts.FromArchive = source
+		opts.AllowHTTPURL = f.AllowHTTPURL
+		opts.AllowPrivateURL = f.AllowPrivateURL
 	case "url":
 		opts.FromURL = source
 		opts.AllowHTTPURL = f.AllowHTTPURL
@@ -140,10 +143,10 @@ func newWebInstallCommand() *cobra.Command {
 	cmd.Flags().StringVar(&flags.AssetsDir, "assets-dir", "", "Assets root directory (default: GATEWAY_WEB_ASSETS_DIR)")
 	cmd.Flags().StringVar(&flags.CatalogID, "catalog-id", "", "Built-in trusted catalog ID")
 	cmd.Flags().StringVar(&flags.FromDir, "from-dir", "", "Prepared raw files tree directory")
-	cmd.Flags().StringVar(&flags.FromArchive, "from-archive", "", "Prepared .tar.gz archive path")
+	cmd.Flags().StringVar(&flags.FromArchive, "from-archive", "", "Prepared .tar.gz archive path or https://.../*.tar.gz URL")
 	cmd.Flags().StringVar(&flags.FromURL, "from-url", "", "Prepared static-tree base URL (trailing slash required)")
-	cmd.Flags().BoolVar(&flags.AllowHTTPURL, "allow-http-url", false, "Development: allow http:// FromURL bases (FromURL only)")
-	cmd.Flags().BoolVar(&flags.AllowPrivateURL, "allow-private-url", false, "Development: allow private/loopback FromURL destinations (FromURL only)")
+	cmd.Flags().BoolVar(&flags.AllowHTTPURL, "allow-http-url", false, "Development: allow http:// for FromURL or remote FromArchive")
+	cmd.Flags().BoolVar(&flags.AllowPrivateURL, "allow-private-url", false, "Development: allow private/loopback for FromURL or remote FromArchive")
 	return cmd
 }
 
@@ -176,8 +179,9 @@ func (f webInstallFlags) toInstallOptions() (embyweb.InstallOptions, error) {
 	if n != 1 {
 		return embyweb.InstallOptions{}, errors.New("exactly one of --from-dir, --from-archive, or --from-url is required")
 	}
-	if url == "" && (f.AllowHTTPURL || f.AllowPrivateURL) {
-		return embyweb.InstallOptions{}, errors.New("--allow-http-url/--allow-private-url are only valid with --from-url")
+	remoteArchive := archive != "" && (strings.HasPrefix(archive, "https://") || strings.HasPrefix(archive, "http://"))
+	if (f.AllowHTTPURL || f.AllowPrivateURL) && url == "" && !remoteArchive {
+		return embyweb.InstallOptions{}, errors.New("--allow-http-url/--allow-private-url are only valid with --from-url or remote --from-archive")
 	}
 
 	return embyweb.InstallOptions{

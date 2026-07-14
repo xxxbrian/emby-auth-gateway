@@ -36,6 +36,7 @@ func TestValidateInstallOptions(t *testing.T) {
 		{"three_sources", InstallOptions{AssetsRoot: "/a", CatalogID: "c", FromDir: "/d", FromArchive: "/x.tar.gz", FromURL: "https://x/"}, "exactly one"},
 		{"http_flag_without_url", InstallOptions{AssetsRoot: "/a", CatalogID: "c", FromDir: "/d", AllowHTTPURL: true}, "AllowHTTPURL"},
 		{"private_flag_without_url", InstallOptions{AssetsRoot: "/a", CatalogID: "c", FromArchive: "/x.tar.gz", AllowPrivateURL: true}, "AllowPrivateURL"},
+		{"http_flag_local_archive", InstallOptions{AssetsRoot: "/a", CatalogID: "c", FromArchive: "/tmp/x.tar.gz", AllowHTTPURL: true}, "AllowHTTPURL"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -62,6 +63,26 @@ func TestValidateInstallOptions(t *testing.T) {
 		FromURL:         "https://example.com/",
 		AllowHTTPURL:    true,
 		AllowPrivateURL: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Remote FromArchive + flags OK.
+	if err := validateInstallOptions(InstallOptions{
+		AssetsRoot:      "/a",
+		CatalogID:       "c",
+		FromArchive:     "https://cdn.example.com/web.tar.gz",
+		AllowHTTPURL:    true,
+		AllowPrivateURL: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Remote FromArchive without flags OK (https default).
+	if err := validateInstallOptions(InstallOptions{
+		AssetsRoot:  "/a",
+		CatalogID:   "c",
+		FromArchive: "https://cdn.example.com/web.tar.gz",
 	}); err != nil {
 		t.Fatal(err)
 	}
