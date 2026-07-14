@@ -1411,6 +1411,109 @@ func TestPathPolicyDenyAndDefaultAllow(t *testing.T) {
 	}
 }
 
+func TestBrandingShimsAnonymousExactResponses(t *testing.T) {
+	var backendHits int
+	backend := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		backendHits++
+		t.Fatal("branding shim reached backend")
+	}))
+	defer backend.Close()
+
+	store := testStore(backend.URL + "/emby")
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	t.Run("configuration", func(t *testing.T) {
+		resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Branding/Configuration?foo=1&api_key=%ZZ", nil))
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+		if string(body) != "{}" {
+			t.Fatalf("body = %q, want exact {}", body)
+		}
+		if resp.Header.Get("Content-Type") != "application/json; charset=utf-8" {
+			t.Fatalf("Content-Type = %q", resp.Header.Get("Content-Type"))
+		}
+		if resp.Header.Get("Cache-Control") != "no-store" {
+			t.Fatalf("Cache-Control = %q", resp.Header.Get("Cache-Control"))
+		}
+	})
+
+	t.Run("css", func(t *testing.T) {
+		resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Branding/Css.css?token=ignored", nil))
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+		if len(body) != 0 {
+			t.Fatalf("body len = %d, want 0", len(body))
+		}
+		if resp.Header.Get("Content-Type") != "text/css; charset=utf-8" {
+			t.Fatalf("Content-Type = %q", resp.Header.Get("Content-Type"))
+		}
+		if resp.Header.Get("Cache-Control") != "no-store" {
+			t.Fatalf("Cache-Control = %q", resp.Header.Get("Cache-Control"))
+		}
+	})
+
+	if backendHits != 0 {
+		t.Fatalf("backend hits = %d", backendHits)
+	}
+}
+
+func TestBrandingShimsPathPolicyDenial(t *testing.T) {
+	store := NewMemoryStore()
+	store.PathPolicies = []PathPolicy{
+		{Method: http.MethodGet, Path: "/Branding/Configuration", Action: "deny", Enabled: true},
+		{Method: http.MethodGet, Path: "/Branding/Css.css", Action: "deny", Enabled: true},
+	}
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	for _, path := range []string{"/emby/Branding/Configuration", "/emby/Branding/Css.css"} {
+		resp := do(t, mustRequest(t, http.MethodGet, gw.URL+path, nil))
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("%s status = %d, want 403", path, resp.StatusCode)
+		}
+	}
+}
+
+func TestBrandingNonGETAndOtherPathsRemainAuthenticated(t *testing.T) {
+	var backendHits int
+	backend := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		backendHits++
+	}))
+	defer backend.Close()
+
+	store := testStore(backend.URL + "/emby")
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, "/emby/Branding/Configuration"},
+		{http.MethodHead, "/emby/Branding/Configuration"},
+		{http.MethodPost, "/emby/Branding/Css.css"},
+		{http.MethodGet, "/emby/Branding/Other"},
+		{http.MethodGet, "/emby/Branding/Css"},
+	} {
+		resp := do(t, mustRequest(t, tc.method, gw.URL+tc.path, nil))
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("%s %s status = %d, want 401", tc.method, tc.path, resp.StatusCode)
+		}
+	}
+	if backendHits != 0 {
+		t.Fatalf("backend hits = %d", backendHits)
+	}
+}
+
 func TestPlaybackEventsAndStateAreRecordedWithoutForwarding(t *testing.T) {
 	const gatewayToken = "gateway-token"
 	var forwarded []string

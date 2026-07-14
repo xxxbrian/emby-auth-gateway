@@ -48,19 +48,14 @@ func main() {
 			MinResumeDurationSeconds: envFloatDefault("GATEWAY_MIN_RESUME_DURATION_SECONDS", 0),
 		}, pbstore.New(e.App))
 
-		wildcardPath := basePath + "/{path...}"
-		if basePath == "/" {
-			wildcardPath = "/{path...}"
+		web, err := newEmbyWebServer(basePath, webAssetsDirFromEnv())
+		if err != nil {
+			// Enabled assets with unsupported base path fail startup.
+			return err
 		}
 
-		e.Router.Any(wildcardPath, func(re *core.RequestEvent) error {
-			gw.ServeHTTP(re.Response, re.Request)
-			return nil
-		})
-		e.Router.Any(basePath, func(re *core.RequestEvent) error {
-			gw.ServeHTTP(re.Response, re.Request)
-			return nil
-		})
+		mountGatewayRoutes(e.Router, basePath, web, gw)
+
 		go func() {
 			if err := gw.RefreshBackendServerInfo(context.Background()); err != nil {
 				e.App.Logger().Warn("Failed to refresh backend server info", "error", err)
@@ -81,7 +76,13 @@ func main() {
 			return err
 		}
 
-		return e.Next()
+		// Build the ServeMux (and set e.Server.Handler), then wrap with the
+		// package-owned raw-path guard so traversal cannot clean into API routes.
+		if err := e.Next(); err != nil {
+			return err
+		}
+		wrapServerHandler(e.Server)
+		return nil
 	})
 
 	if err := app.Start(); err != nil {

@@ -99,6 +99,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handlePublicUsers(w, r)
 	case r.Method == http.MethodGet && isSingleUserPath(rel):
 		s.handleUser(w, r, rel)
+	case r.Method == http.MethodGet && equalPath(rel, "/Branding/Configuration"):
+		s.handleBrandingConfiguration(w, r)
+	case r.Method == http.MethodGet && equalPath(rel, "/Branding/Css.css"):
+		s.handleBrandingCSS(w, r)
 	default:
 		s.handleProxy(w, r, rel)
 	}
@@ -354,6 +358,22 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("Emby Server is running"))
+}
+
+// handleBrandingConfiguration serves the anonymous Emby web branding JSON shim.
+// Body is exactly "{}" with no trailing newline.
+func (s *Server) handleBrandingConfiguration(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("{}"))
+}
+
+// handleBrandingCSS serves the anonymous Emby web branding CSS shim.
+func (s *Server) handleBrandingCSS(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Server) handleUser(w http.ResponseWriter, r *http.Request, rel string) {
