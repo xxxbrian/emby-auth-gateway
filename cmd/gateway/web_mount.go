@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/xxxbrian/emby-auth-gateway/internal/embyweb"
+	"github.com/xxxbrian/emby-auth-gateway/internal/gateway"
 
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
@@ -17,13 +18,17 @@ import (
 const (
 	fixedWebExact = "/emby/web"
 	fixedWebWild  = "/emby/web/{path...}"
+
+	// Host-root mb3admin-compatible stubs (used after Emby Web host injection).
+	fixedRegistrationWild = "/admin/service/registration/{path}"
 )
 
-// mountGatewayRoutes registers Emby Web and API catch-all routes on the
-// PocketBase router. Web routes are always fixed at /emby/web (methodless Any),
-// outrank an /emby API catch-all by path specificity, and unbind global pbCors so
-// embyweb owns canary OPTIONS/CORS. API routes remain derived from basePath.
-// The request is forwarded untouched.
+// mountGatewayRoutes registers Emby Web, registration stubs, and API catch-all
+// routes on the PocketBase router. Web routes are always fixed at /emby/web
+// (methodless Any), outrank an /emby API catch-all by path specificity, and
+// unbind global pbCors so embyweb owns canary OPTIONS/CORS. Registration stubs
+// are fixed at host-root /admin/service/registration/* (not under basePath).
+// API routes remain derived from basePath. The request is forwarded untouched.
 func mountGatewayRoutes(
 	r *router.Router[*core.RequestEvent],
 	basePath string,
@@ -40,6 +45,7 @@ func mountGatewayRoutes(
 	if api == nil {
 		api = http.NotFoundHandler()
 	}
+	reg := gateway.RegistrationHandler{}
 
 	webAction := func(re *core.RequestEvent) error {
 		web.ServeHTTP(re.Response, re.Request)
@@ -49,6 +55,10 @@ func mountGatewayRoutes(
 		api.ServeHTTP(re.Response, re.Request)
 		return nil
 	}
+	regAction := func(re *core.RequestEvent) error {
+		reg.ServeHTTP(re.Response, re.Request)
+		return nil
+	}
 
 	apiExact, apiWild := apiRoutePatterns(basePath)
 
@@ -56,6 +66,7 @@ func mountGatewayRoutes(
 	// registration order) decides /emby/web vs /emby/{path...} when base is /emby.
 	r.Any(fixedWebExact, webAction).Unbind(apis.DefaultCorsMiddlewareId)
 	r.Any(fixedWebWild, webAction).Unbind(apis.DefaultCorsMiddlewareId)
+	r.Any(fixedRegistrationWild, regAction)
 	r.Any(apiWild, apiAction)
 	r.Any(apiExact, apiAction)
 }

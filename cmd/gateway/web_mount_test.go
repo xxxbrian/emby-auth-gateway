@@ -379,6 +379,33 @@ func TestMountGatewayRoutesComposition(t *testing.T) {
 		}
 	})
 
+	t.Run("registration_stubs_host_root", func(t *testing.T) {
+		web, err := newEmbyWebServer("/emby", "", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var apiHits atomic.Int64
+		h := buildComposedHandler(t, "/emby", web, countingAPI(&apiHits, 418), true)
+		for _, path := range []string{
+			"/admin/service/registration/validateDevice",
+			"/admin/service/registration/validate",
+			"/admin/service/registration/getStatus",
+		} {
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, path, nil)
+			h.ServeHTTP(rr, req)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("%s: code=%d body=%q", path, rr.Code, rr.Body.String())
+			}
+			if rr.Header().Get("Content-Type") != "application/json" {
+				t.Fatalf("%s: content-type %q", path, rr.Header().Get("Content-Type"))
+			}
+		}
+		if apiHits.Load() != 0 {
+			t.Fatalf("registration must not hit API, hits=%d", apiHits.Load())
+		}
+	})
+
 	t.Run("blank_env_api_only_non_emby_base", func(t *testing.T) {
 		// Blank assets: disabled Web is allowed with any base for API-only deploys.
 		web, err := newEmbyWebServer("/custom", "", "")
