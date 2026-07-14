@@ -11,13 +11,14 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// newWebCommand returns the pure `gateway web` subtree (install|status).
+// newWebCommand returns the pure `gateway web` subtree (init|install|status).
 // Commands never bootstrap PocketBase and never expose registry injection.
 func newWebCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "web",
 		Short: "Manage Emby Web asset installation",
 	}
+	cmd.AddCommand(newWebInitCommand())
 	cmd.AddCommand(newWebInstallCommand())
 	cmd.AddCommand(newWebStatusCommand())
 	return cmd
@@ -31,6 +32,91 @@ type webInstallFlags struct {
 	FromURL         string
 	AllowHTTPURL    bool
 	AllowPrivateURL bool
+}
+
+// webInitFlags is the structured facade for `gateway web init`.
+// Source kind is an explicit enum; values are never shell-parsed.
+type webInitFlags struct {
+	AssetsDir       string
+	CatalogID       string
+	SourceKind      string
+	Source          string
+	AllowHTTPURL    bool
+	AllowPrivateURL bool
+}
+
+func newWebInitCommand() *cobra.Command {
+	var flags webInitFlags
+	cmd := &cobra.Command{
+		Use:   "init",
+		Short: "Initialize Emby Web assets from a structured source kind (Compose-friendly)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			opts, err := flags.toInstallOptions()
+			if err != nil {
+				return err
+			}
+			res, err := embyweb.Install(cmd.Context(), opts)
+			if err != nil {
+				return err
+			}
+			return writeInstallResult(cmd.OutOrStdout(), res)
+		},
+	}
+	cmd.Flags().StringVar(&flags.AssetsDir, "assets-dir", "", "Assets root directory (default: GATEWAY_WEB_ASSETS_DIR)")
+	cmd.Flags().StringVar(&flags.CatalogID, "catalog-id", "", "Built-in trusted catalog ID")
+	cmd.Flags().StringVar(&flags.SourceKind, "source-kind", "", "Source kind: dir, archive, or url")
+	cmd.Flags().StringVar(&flags.Source, "source", "", "Source value (directory path, archive path, or base URL)")
+	cmd.Flags().BoolVar(&flags.AllowHTTPURL, "allow-http-url", false, "Development: allow http:// URL bases (url kind only)")
+	cmd.Flags().BoolVar(&flags.AllowPrivateURL, "allow-private-url", false, "Development: allow private/loopback URL destinations (url kind only)")
+	return cmd
+}
+
+func (f webInitFlags) toInstallOptions() (embyweb.InstallOptions, error) {
+	assets := strings.TrimSpace(f.AssetsDir)
+	if assets == "" {
+		assets = webAssetsDirFromEnv()
+	}
+	if assets == "" {
+		return embyweb.InstallOptions{}, errors.New("--assets-dir is required (or set GATEWAY_WEB_ASSETS_DIR)")
+	}
+	catalogID := strings.TrimSpace(f.CatalogID)
+	if catalogID == "" {
+		return embyweb.InstallOptions{}, errors.New("--catalog-id is required")
+	}
+	kind := strings.TrimSpace(f.SourceKind)
+	if kind == "" {
+		return embyweb.InstallOptions{}, errors.New("--source-kind is required (dir|archive|url)")
+	}
+	// Source is used as a literal path/URL; do not shell-expand or split.
+	source := strings.TrimSpace(f.Source)
+	if source == "" {
+		return embyweb.InstallOptions{}, errors.New("--source is required")
+	}
+
+	opts := embyweb.InstallOptions{
+		AssetsRoot: assets,
+		CatalogID:  catalogID,
+	}
+	switch kind {
+	case "dir":
+		if f.AllowHTTPURL || f.AllowPrivateURL {
+			return embyweb.InstallOptions{}, errors.New("--allow-http-url/--allow-private-url are only valid with --source-kind=url")
+		}
+		opts.FromDir = source
+	case "archive":
+		if f.AllowHTTPURL || f.AllowPrivateURL {
+			return embyweb.InstallOptions{}, errors.New("--allow-http-url/--allow-private-url are only valid with --source-kind=url")
+		}
+		opts.FromArchive = source
+	case "url":
+		opts.FromURL = source
+		opts.AllowHTTPURL = f.AllowHTTPURL
+		opts.AllowPrivateURL = f.AllowPrivateURL
+	default:
+		return embyweb.InstallOptions{}, fmt.Errorf("--source-kind must be dir, archive, or url (got %q)", kind)
+	}
+	return opts, nil
 }
 
 func newWebInstallCommand() *cobra.Command {

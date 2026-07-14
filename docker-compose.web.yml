@@ -1,0 +1,72 @@
+# Opt-in one-command Emby Web deployment overlay.
+#
+# Usage (directory source):
+#   GATEWAY_WEB_CATALOG_ID=emby-web-4.9.5.0 \
+#   GATEWAY_WEB_SOURCE_KIND=dir \
+#   GATEWAY_WEB_SOURCE_MOUNT=/absolute/path/to/prepared-868 \
+#   docker compose -f docker-compose.yml -f docker-compose.web.yml up --build -d
+#
+# Archive source:
+#   GATEWAY_WEB_SOURCE_KIND=archive \
+#   GATEWAY_WEB_SOURCE_MOUNT=/absolute/path/to/tree.tar.gz \
+#   ...
+#
+# URL source (no host bind; empty named volume occupies the frozen mount path):
+#   GATEWAY_WEB_SOURCE_KIND=url \
+#   GATEWAY_WEB_SOURCE_VALUE=https://assets.example.com/emby-web/4.9.5.0/ \
+#   ...
+#
+# web-init must exit 0 before gateway is created. serve never installs.
+# Official asset bytes are not baked into the image. No Docker socket.
+
+services:
+  web-init:
+    build: .
+    image: ${GATEWAY_IMAGE:-emby-auth-gateway:local}
+    restart: "no"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    environment:
+      GATEWAY_WEB_ASSETS_DIR: /app/web_assets
+    # Default entrypoint is `gateway`. Exec-form argv only; no shell.
+    # PocketBase still resolves a data dir for the process; point it at the
+    # tmpfs so read_only rootfs does not break pure web commands.
+    command:
+      - --dir
+      - /tmp/pb_data
+      - web
+      - init
+      - --catalog-id
+      - ${GATEWAY_WEB_CATALOG_ID:?GATEWAY_WEB_CATALOG_ID is required}
+      - --source-kind
+      - ${GATEWAY_WEB_SOURCE_KIND:?GATEWAY_WEB_SOURCE_KIND must be dir, archive, or url}
+      - --source
+      - ${GATEWAY_WEB_SOURCE_VALUE:-/source/input.tar.gz}
+    volumes:
+      - gateway_web_assets:/app/web_assets
+      # Frozen container path. Host value is either a prepared dir/archive path
+      # (bind) or the default named volume for URL mode.
+      - ${GATEWAY_WEB_SOURCE_MOUNT:-gateway_web_source_empty}:/source/input.tar.gz:ro
+
+  gateway:
+    depends_on:
+      web-init:
+        condition: service_completed_successfully
+    environment:
+      # Web v1 requires /emby. Override any custom base from the base compose file.
+      GATEWAY_BASE_PATH: /emby
+      GATEWAY_WEB_ASSETS_DIR: /app/web_assets
+      # Re-default public URL so it cannot retain a non-/emby base from host env
+      # that was interpolated only in the base file.
+      GATEWAY_PUBLIC_URL: ${GATEWAY_PUBLIC_URL:-http://localhost:${GATEWAY_PORT:-8090}/emby}
+    volumes:
+      - gateway_web_assets:/app/web_assets:ro
+
+volumes:
+  gateway_web_assets:
+  gateway_web_source_empty:

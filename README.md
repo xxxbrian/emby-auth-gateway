@@ -225,11 +225,51 @@ or `GATEWAY_WEB_ASSETS_DIR`.
 
 Compose defines a separate named volume `gateway_web_assets` mounted at
 `/app/web_assets` (read-only on the long-running `gateway` service; read-write on
-the profile-gated `web` one-shot). Web serving is **opt-in**: leave
-`GATEWAY_WEB_ASSETS_DIR` blank for API-only (404 on `/emby/web/`); set exactly
-`GATEWAY_WEB_ASSETS_DIR=/app/web_assets` (with `GATEWAY_BASE_PATH=/emby`) after a
-trusted install to enable serving from that volume. Do not mount a Docker socket;
-do not bake official bytes into image layers; `serve` never installs on startup.
+installer services). Web serving is **opt-in**. Do not mount a Docker socket; do
+not bake official bytes into image layers; `serve` never installs on startup.
+
+#### One-command Web deployment (`docker-compose.web.yml`)
+
+The overlay runs an unprofiled `web-init` service that must complete successfully
+before `gateway` is created. It uses the same image/CLI, a read-write assets
+volume, a frozen read-only source mount at `/source/input.tar.gz`, and
+`gateway web init` (structured source selection; no shell). The one-shot service
+uses a read-only root filesystem with `/tmp` tmpfs and points PocketBase
+`--dir /tmp/pb_data` there so pure web commands do not need a persistent PB
+volume.
+
+```sh
+# Directory source
+GATEWAY_WEB_CATALOG_ID=emby-web-4.9.5.0 \
+GATEWAY_WEB_SOURCE_KIND=dir \
+GATEWAY_WEB_SOURCE_MOUNT=/absolute/path/to/prepared-868 \
+docker compose -f docker-compose.yml -f docker-compose.web.yml up --build -d
+
+# Archive source
+GATEWAY_WEB_CATALOG_ID=emby-web-4.9.5.0 \
+GATEWAY_WEB_SOURCE_KIND=archive \
+GATEWAY_WEB_SOURCE_MOUNT=/absolute/path/to/tree.tar.gz \
+docker compose -f docker-compose.yml -f docker-compose.web.yml up --build -d
+
+# Prepared HTTPS static-tree URL (default source mount is an empty named volume)
+GATEWAY_WEB_CATALOG_ID=emby-web-4.9.5.0 \
+GATEWAY_WEB_SOURCE_KIND=url \
+GATEWAY_WEB_SOURCE_VALUE=https://assets.example.com/emby-web/4.9.5.0/ \
+docker compose -f docker-compose.yml -f docker-compose.web.yml up --build -d
+```
+
+Semantics:
+
+- Clean first deploy: if `web-init` fails, Compose does not start `gateway`.
+- Upgrade: rerun the same overlay so `web-init` installs/reactivates, then
+  recreate `gateway` so it pins the new release. A later failed upgrade may leave
+  an already-running gateway serving its previously pinned release.
+- Overlay forces `GATEWAY_BASE_PATH=/emby` and
+  `GATEWAY_WEB_ASSETS_DIR=/app/web_assets`. Set `GATEWAY_PUBLIC_URL` to a URL that
+  ends in `/emby`.
+- Base `docker compose up` without the overlay remains API-only.
+
+#### Manual one-shot tool (profile `web`)
 
 ```sh
 # Status against the shared volume (profile "web"; RW mount; no serve)
@@ -248,6 +288,11 @@ docker compose run --rm \
 docker compose run --rm web install \
   --catalog-id 'emby-web-4.9.5.0' \
   --from-url 'https://assets.example.com/emby-web/4.9.5.0/'
+
+# Structured equivalent used by the overlay:
+docker compose run --rm \
+  -v /path/to/prepared:/source/input.tar.gz:ro \
+  web init --catalog-id 'emby-web-4.9.5.0' --source-kind dir --source /source/input.tar.gz
 ```
 
 ### Production catalog

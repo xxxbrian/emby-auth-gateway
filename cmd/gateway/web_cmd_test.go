@@ -350,27 +350,271 @@ func TestWriteInstallResult(t *testing.T) {
 
 func TestWebCommandHasNoRegistryInjectionFlags(t *testing.T) {
 	cmd := newWebCommand()
-	// Walk install flags; none may expose test-only registry/catalog injection.
-	install, _, err := cmd.Find([]string{"install"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Walk install/init flags; none may expose test-only registry/catalog injection.
 	forbidden := []string{
 		"catalog-file", "registry", "catalog-bytes", "digest-override",
 		"trusted-catalog", "inject-registry", "catalog-sha256",
 	}
-	for _, name := range forbidden {
-		if install.Flags().Lookup(name) != nil {
-			t.Fatalf("forbidden flag present: %s", name)
+	for _, sub := range []string{"install", "init", "status"} {
+		c, _, err := cmd.Find([]string{sub})
+		if err != nil {
+			t.Fatalf("find %s: %v", sub, err)
+		}
+		for _, name := range forbidden {
+			if c.Flags().Lookup(name) != nil {
+				t.Fatalf("forbidden %s flag present: %s", sub, name)
+			}
 		}
 	}
-	status, _, err := cmd.Find([]string{"status"})
+}
+
+func TestWebInitOptionValidation(t *testing.T) {
+	t.Setenv("GATEWAY_WEB_ASSETS_DIR", "")
+	assets := t.TempDir()
+
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "missing_assets",
+			args: []string{"init", "--catalog-id", "x", "--source-kind", "dir", "--source", "/tmp/src"},
+			want: "--assets-dir",
+		},
+		{
+			name: "missing_catalog",
+			args: []string{"init", "--assets-dir", assets, "--source-kind", "dir", "--source", "/tmp/src"},
+			want: "--catalog-id",
+		},
+		{
+			name: "missing_source_kind",
+			args: []string{"init", "--assets-dir", assets, "--catalog-id", "x", "--source", "/tmp/src"},
+			want: "--source-kind",
+		},
+		{
+			name: "missing_source",
+			args: []string{"init", "--assets-dir", assets, "--catalog-id", "x", "--source-kind", "dir"},
+			want: "--source",
+		},
+		{
+			name: "bad_source_kind",
+			args: []string{"init", "--assets-dir", assets, "--catalog-id", "x", "--source-kind", "tarball", "--source", "/tmp/x"},
+			want: "dir, archive, or url",
+		},
+		{
+			name: "http_flag_with_dir",
+			args: []string{
+				"init", "--assets-dir", assets, "--catalog-id", "x",
+				"--source-kind", "dir", "--source", "/tmp/a", "--allow-http-url",
+			},
+			want: "--allow-http-url",
+		},
+		{
+			name: "private_flag_with_archive",
+			args: []string{
+				"init", "--assets-dir", assets, "--catalog-id", "x",
+				"--source-kind", "archive", "--source", "/tmp/a.tar.gz", "--allow-private-url",
+			},
+			want: "--allow-private-url",
+		},
+		{
+			name: "extra_args",
+			args: []string{
+				"init", "--assets-dir", assets, "--catalog-id", "x",
+				"--source-kind", "dir", "--source", "/tmp/a", "extra",
+			},
+			want: "unknown command",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := newWebCommand()
+			var out, errBuf bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(&errBuf)
+			cmd.SetArgs(tc.args)
+			err := cmd.Execute()
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			msg := err.Error() + errBuf.String()
+			if !strings.Contains(msg, tc.want) {
+				t.Fatalf("err=%q want substring %q", msg, tc.want)
+			}
+		})
+	}
+}
+
+func TestWebInitSourceKindMapping(t *testing.T) {
+	assets := "/assets/root"
+	src := "/prepared/source"
+	url := "https://assets.example.test/tree/"
+
+	cases := []struct {
+		name string
+		f    webInitFlags
+		want embyweb.InstallOptions
+	}{
+		{
+			name: "dir",
+			f: webInitFlags{
+				AssetsDir: assets, CatalogID: "cat",
+				SourceKind: "dir", Source: src,
+			},
+			want: embyweb.InstallOptions{
+				AssetsRoot: assets, CatalogID: "cat", FromDir: src,
+			},
+		},
+		{
+			name: "archive",
+			f: webInitFlags{
+				AssetsDir: assets, CatalogID: "cat",
+				SourceKind: "archive", Source: src + ".tar.gz",
+			},
+			want: embyweb.InstallOptions{
+				AssetsRoot: assets, CatalogID: "cat", FromArchive: src + ".tar.gz",
+			},
+		},
+		{
+			name: "url",
+			f: webInitFlags{
+				AssetsDir: assets, CatalogID: "cat",
+				SourceKind: "url", Source: url,
+				AllowHTTPURL: true, AllowPrivateURL: true,
+			},
+			want: embyweb.InstallOptions{
+				AssetsRoot: assets, CatalogID: "cat", FromURL: url,
+				AllowHTTPURL: true, AllowPrivateURL: true,
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.f.toInstallOptions()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("got %+v want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWebInitMetacharactersLiteral(t *testing.T) {
+	// Source values must be treated as literal paths/URLs (no shell parsing).
+	literal := `/tmp/prepared; rm -rf / $(whoami) | tee & "quotes" 'x'`
+	f := webInitFlags{
+		AssetsDir:  "/assets",
+		CatalogID:  "cat",
+		SourceKind: "dir",
+		Source:     literal,
+	}
+	got, err := f.toInstallOptions()
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range forbidden {
-		if status.Flags().Lookup(name) != nil {
-			t.Fatalf("forbidden status flag: %s", name)
+	if got.FromDir != literal {
+		t.Fatalf("FromDir=%q want exact literal", got.FromDir)
+	}
+	if got.FromArchive != "" || got.FromURL != "" {
+		t.Fatalf("unexpected other sources: %+v", got)
+	}
+
+	urlLit := `https://example.test/tree/;$(id)/`
+	f = webInitFlags{
+		AssetsDir:  "/assets",
+		CatalogID:  "cat",
+		SourceKind: "url",
+		Source:     urlLit,
+	}
+	got, err = f.toInstallOptions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FromURL != urlLit {
+		t.Fatalf("FromURL=%q want exact literal", got.FromURL)
+	}
+}
+
+func TestWebInitAssetsDirFromEnv(t *testing.T) {
+	assetsRoot := filepath.Join(t.TempDir(), "from-env-init")
+	t.Setenv("GATEWAY_WEB_ASSETS_DIR", "  "+assetsRoot+"  ")
+
+	cmd := newWebCommand()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{
+		"init",
+		"--catalog-id", "env-catalog",
+		"--source-kind", "dir",
+		"--source", filepath.Join(t.TempDir(), "src"),
+	})
+	err := cmd.Execute()
+	if !errors.Is(err, embyweb.ErrCatalogLegalGate) {
+		t.Fatalf("err=%v want legal gate (proves options accepted)", err)
+	}
+	if _, statErr := os.Lstat(assetsRoot); !os.IsNotExist(statErr) {
+		t.Fatal("env assets root must remain absent after legal gate")
+	}
+}
+
+func TestWebInitLegalGateNoSideEffects(t *testing.T) {
+	t.Setenv("GATEWAY_WEB_ASSETS_DIR", "")
+
+	assetsRoot := filepath.Join(t.TempDir(), "assets-not-created-init")
+	srcDir := filepath.Join(t.TempDir(), "src-not-created-init")
+
+	cmd := newWebCommand()
+	var out, errBuf bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errBuf)
+	cmd.SetArgs([]string{
+		"init",
+		"--assets-dir", assetsRoot,
+		"--catalog-id", "any-production-id",
+		"--source-kind", "dir",
+		"--source", srcDir,
+	})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected legal-gate error")
+	}
+	if !errors.Is(err, embyweb.ErrCatalogLegalGate) {
+		t.Fatalf("err=%v want ErrCatalogLegalGate", err)
+	}
+	if !strings.Contains(err.Error(), "any-production-id") {
+		t.Fatalf("err should mention catalog id: %v", err)
+	}
+	if _, statErr := os.Lstat(assetsRoot); !os.IsNotExist(statErr) {
+		t.Fatalf("assets root must remain absent: %v", statErr)
+	}
+	parentEntries, _ := os.ReadDir(filepath.Dir(assetsRoot))
+	for _, e := range parentEntries {
+		if strings.Contains(e.Name(), "install") || strings.Contains(e.Name(), "lock") {
+			t.Fatalf("unexpected install artifact %q under parent", e.Name())
 		}
+	}
+
+	// URL kind also gates before network/root creation.
+	cmd = newWebCommand()
+	out.Reset()
+	errBuf.Reset()
+	cmd.SetOut(&out)
+	cmd.SetErr(&errBuf)
+	cmd.SetArgs([]string{
+		"init",
+		"--assets-dir", assetsRoot,
+		"--catalog-id", "url-catalog-id",
+		"--source-kind", "url",
+		"--source", "https://example.invalid/",
+	})
+	err = cmd.Execute()
+	if !errors.Is(err, embyweb.ErrCatalogLegalGate) {
+		t.Fatalf("url mode err=%v", err)
+	}
+	if _, statErr := os.Lstat(assetsRoot); !os.IsNotExist(statErr) {
+		t.Fatal("assets root created despite legal gate (url)")
 	}
 }

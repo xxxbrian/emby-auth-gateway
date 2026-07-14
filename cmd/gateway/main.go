@@ -86,8 +86,38 @@ func main() {
 		return nil
 	})
 
+	// PocketBase's Start/Execute discard cobra command errors (exit 0 on failure).
+	// Pure offline commands must propagate nonzero process status so Compose
+	// service_completed_successfully and scripts can trust failure.
+	if isPureOfflineCLI(app, os.Args[1:]) {
+		if err := app.RootCmd.Execute(); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+
 	if err := app.Start(); err != nil {
 		log.Fatal(err)
+	}
+}
+
+// isPureOfflineCLI reports whether args select a command that must not depend on
+// PocketBase bootstrap and must return a real process exit code. Currently:
+// `version` and the entire `web` subtree (init|install|status).
+func isPureOfflineCLI(app *pocketbase.PocketBase, args []string) bool {
+	cmd, _, err := app.RootCmd.Find(args)
+	if err != nil || cmd == nil {
+		return false
+	}
+	// Walk to the top-level command under RootCmd.
+	for cmd.HasParent() && cmd.Parent() != app.RootCmd {
+		cmd = cmd.Parent()
+	}
+	switch cmd.Name() {
+	case "web", "version":
+		return true
+	default:
+		return false
 	}
 }
 
