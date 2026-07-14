@@ -298,6 +298,29 @@ func TestBufferedPreHeaderReadFailureMatrix(t *testing.T) {
 	}
 }
 
+func TestCookieMediaBufferedPreHeaderReadFailureCachePolicy(t *testing.T) {
+	for _, tt := range []struct {
+		name, path, contentType string
+		err                     error
+		want                    int
+	}{
+		{"generic hls", "/Videos/item/master.m3u8", "application/vnd.apple.mpegurl", errors.New("read failed"), http.StatusBadGateway},
+		{"timeout json", "/Videos/item/metadata", "application/json", timeoutMediaError{}, http.StatusGatewayTimeout},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := NewServer(Config{}, NewMemoryStore())
+			ctx := context.WithValue(context.Background(), resourceCookieContextKey{}, resourceRouteMedia)
+			req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby"+tt.path, nil).WithContext(ctx)
+			writer := httptest.NewRecorder()
+			resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{tt.contentType}, "Cache-Control": []string{"public"}, "Vary": []string{"Origin"}}, Body: io.NopCloser(errorMediaReader{err: tt.err}), ContentLength: -1, Request: req}
+			server.writeProxyResponse(writer, req, tt.path, resp, &Session{}, "", "")
+			if writer.Code != tt.want || writer.Header().Get("Cache-Control") != "private, no-store" || writer.Header().Get("Vary") != "Origin, Cookie" {
+				t.Fatalf("status/cache/vary = %d/%q/%q", writer.Code, writer.Header().Get("Cache-Control"), writer.Header().Get("Vary"))
+			}
+		})
+	}
+}
+
 func TestImageInitialReadFailureMatrix(t *testing.T) {
 	for _, partial := range []bool{false, true} {
 		for _, failure := range []struct {

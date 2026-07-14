@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"net/http"
+	"path"
 	"strings"
 	"time"
 )
@@ -29,8 +30,53 @@ func (s *Server) clearResourceCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{Name: resourceCookieName, Value: "", Path: s.resourceCookiePath(), MaxAge: -1, Expires: time.Unix(1, 0), Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode})
 }
 
-func resourceImagePath(rel string) bool {
-	parts := strings.Split(strings.Trim(rel, "/"), "/")
+type resourceRouteKind uint8
+
+const (
+	resourceRouteNone resourceRouteKind = iota
+	resourceRouteImage
+	resourceRouteMedia
+)
+
+type resourceCookieContextKey struct{}
+
+func resourceRoute(r *http.Request, rel string) resourceRouteKind {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return resourceRouteNone
+	}
+	if isUpgradeRequest(r) {
+		return resourceRouteNone
+	}
+	if !canonicalResourceRoute(r, rel) {
+		return resourceRouteNone
+	}
+	parts := strings.Split(rel[1:], "/")
+	if resourceImageParts(parts) {
+		return resourceRouteImage
+	}
+	if len(parts) >= 3 && (strings.EqualFold(parts[0], "Videos") || strings.EqualFold(parts[0], "Audio")) && parts[1] != "" {
+		for _, part := range parts[2:] {
+			if part == "" {
+				return resourceRouteNone
+			}
+		}
+		return resourceRouteMedia
+	}
+	if len(parts) == 3 && strings.EqualFold(parts[0], "Items") && parts[1] != "" && strings.EqualFold(parts[2], "Download") {
+		return resourceRouteMedia
+	}
+	return resourceRouteNone
+}
+
+func canonicalResourceRoute(r *http.Request, rel string) bool {
+	if len(rel) < 2 || rel[0] != '/' || rel[1] == '/' || path.Clean(rel) != rel || strings.HasSuffix(rel, "/") || strings.Contains(rel, "\\") || hasURLControls(rel) {
+		return false
+	}
+	escaped := strings.ToLower(r.URL.EscapedPath())
+	return !strings.Contains(escaped, "%2f") && !strings.Contains(escaped, "%5c") && !strings.Contains(escaped, "%2e")
+}
+
+func resourceImageParts(parts []string) bool {
 	if len(parts) != 4 && len(parts) != 5 {
 		return false
 	}
@@ -69,9 +115,10 @@ func hasExplicitCredentialInput(r *http.Request) bool {
 	return false
 }
 
-func resourceCookieToken(r *http.Request, rel string) (string, bool) {
-	if (r.Method != http.MethodGet && r.Method != http.MethodHead) || !resourceImagePath(rel) || hasExplicitCredentialInput(r) {
-		return "", false
+func resourceCookieToken(r *http.Request, rel string) (string, resourceRouteKind, bool) {
+	kind := resourceRoute(r, rel)
+	if kind == resourceRouteNone || hasExplicitCredentialInput(r) {
+		return "", resourceRouteNone, false
 	}
 	var token string
 	for _, cookie := range r.Cookies() {
@@ -79,11 +126,70 @@ func resourceCookieToken(r *http.Request, rel string) (string, bool) {
 			continue
 		}
 		if token != "" || strings.TrimSpace(cookie.Value) == "" {
-			return "", false
+			return "", resourceRouteNone, false
 		}
 		token = cookie.Value
 	}
-	return token, token != ""
+	return token, kind, token != ""
+}
+
+func resourceRouteFromContext(r *http.Request) resourceRouteKind {
+	kind, _ := r.Context().Value(resourceCookieContextKey{}).(resourceRouteKind)
+	return kind
+}
+
+func applyResourceCachePolicy(h http.Header, kind resourceRouteKind, status int) {
+	if kind == resourceRouteNone {
+		return
+	}
+	mergeVaryCookie(h)
+	if kind == resourceRouteImage || (status != http.StatusOK && status != http.StatusPartialContent && status != http.StatusNotModified) {
+		h.Set("Cache-Control", "private, no-store")
+		return
+	}
+	if hasNoStoreDirective(h.Values("Cache-Control")) {
+		h.Set("Cache-Control", "private, no-store")
+		return
+	}
+	h.Set("Cache-Control", "private")
+}
+
+func hasNoStoreDirective(values []string) bool {
+	for _, value := range values {
+		for _, directive := range strings.Split(value, ",") {
+			name, _, _ := strings.Cut(strings.TrimSpace(directive), "=")
+			if strings.EqualFold(strings.TrimSpace(name), "no-store") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func mergeVaryCookie(h http.Header) {
+	values := h.Values("Vary")
+	for _, value := range values {
+		if strings.TrimSpace(value) == "*" {
+			return
+		}
+	}
+	seen := map[string]bool{}
+	parts := []string{}
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" || seen[strings.ToLower(part)] {
+				continue
+			}
+			seen[strings.ToLower(part)] = true
+			parts = append(parts, part)
+		}
+	}
+	if !seen["cookie"] {
+		parts = append(parts, "Cookie")
+	}
+	h.Del("Vary")
+	h.Set("Vary", strings.Join(parts, ", "))
 }
 
 func resourceCookieMatches(r *http.Request, token string) bool {

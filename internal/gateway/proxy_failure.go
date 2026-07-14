@@ -51,6 +51,7 @@ func (s *Server) handlePreHeaderProxyFailure(w http.ResponseWriter, r *http.Requ
 		status = http.StatusGatewayTimeout
 		errorKind = "upstream_timeout"
 	}
+	applyResourceCachePolicy(w.Header(), resourceRouteFromContext(r), status)
 	s.audit(r.Context(), AuditLog{
 		GatewayUserID:     sessionGatewayUserID(session),
 		SyntheticUserID:   sessionSyntheticUserID(session),

@@ -249,3 +249,15 @@ func TestMalformedPercentEscapeFailsClosedBeforeTokenDecoding(t *testing.T) {
 		t.Fatalf("unsafe HLS URI attribute = %q", playlist)
 	}
 }
+
+func TestCookieResponseRewriteDoesNotExposeGatewayToken(t *testing.T) {
+	session := testSession("https://backend.example.com/emby")
+	manifest := string(rewriteM3U8MediaReferences([]byte("https://backend.example.com/emby/Videos/a/seg.ts?api_key=backend-token\n#EXT-X-KEY:URI=\"https://backend.example.com/emby/Videos/a/key?api_key=backend-token\""), "/Videos/a/master.m3u8", session, "", "https://media.example.com/emby", "gateway-server"))
+	if strings.Contains(manifest, session.BackendToken) || strings.Contains(manifest, "gateway-token") || !strings.Contains(manifest, "api_key=") {
+		t.Fatalf("cookie manifest = %q", manifest)
+	}
+	location := rewriteResponseLocation("https://backend.example.com/emby/Videos/a/seg.ts?api_key=backend-token", "/Videos/a/master.m3u8", session, "", "https://media.example.com/emby", "gateway-server")
+	if strings.Contains(location, session.BackendToken) || strings.Contains(location, "gateway-token") || !strings.Contains(location, "api_key=") {
+		t.Fatalf("cookie location = %q", location)
+	}
+}

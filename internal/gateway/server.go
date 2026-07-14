@@ -398,12 +398,13 @@ func (s *Server) handleUser(w http.ResponseWriter, r *http.Request, rel string) 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string) {
 	gatewayToken := ExtractToken(r)
 	cookieAuthenticated := false
+	cookieRoute := resourceRouteNone
 	if gatewayToken == "" {
-		gatewayToken, cookieAuthenticated = resourceCookieToken(r, rel)
+		gatewayToken, cookieRoute, cookieAuthenticated = resourceCookieToken(r, rel)
 	}
 	if cookieAuthenticated {
-		w.Header().Set("Cache-Control", "private, no-store")
-		w.Header().Set("Vary", "Cookie")
+		r = r.WithContext(context.WithValue(r.Context(), resourceCookieContextKey{}, cookieRoute))
+		applyResourceCachePolicy(w.Header(), cookieRoute, http.StatusUnauthorized)
 	}
 	session, ok := s.activeSession(w, r, gatewayToken)
 	if !ok {
@@ -516,7 +517,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 		s.playbackGuards.clearIfGeneration(guardKey, guardGeneration)
 	}
 
-	s.writeProxyResponse(w, r, rel, resp, session, gatewayToken, s.gatewayBaseForRequest(r))
+	rewriteToken := gatewayToken
+	if cookieAuthenticated {
+		rewriteToken = ""
+	}
+	s.writeProxyResponse(w, r, rel, resp, session, rewriteToken, s.gatewayBaseForRequest(r))
 }
 
 const concurrentPlaybackResponse = `{"error":"playback_access_denied","message":"Playback denied because the concurrent playback limit was exceeded.","reason_code":"max_concurrent_sessions_exceeded"}`
@@ -1170,8 +1175,13 @@ func playbackEventName(rel string) string {
 
 func (s *Server) writeProxyResponse(w http.ResponseWriter, r *http.Request, rel string, resp *http.Response, session *Session, gatewayToken, publicGatewayBase string) {
 	ct := resp.Header.Get("Content-Type")
+	cookieRoute := resourceRouteFromContext(r)
 	if !responseAllowsBody(r.Method, resp.StatusCode) {
+		if cookieRoute != resourceRouteNone {
+			w.Header().Del("Cache-Control")
+		}
 		copyResponseHeaders(w.Header(), resp.Header, rel, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
+		applyResourceCachePolicy(w.Header(), cookieRoute, resp.StatusCode)
 		setContentLength(w.Header(), resp.ContentLength)
 		w.WriteHeader(resp.StatusCode)
 		return
@@ -1182,7 +1192,11 @@ func (s *Server) writeProxyResponse(w http.ResponseWriter, r *http.Request, rel 
 		return
 	}
 
+	if cookieRoute != resourceRouteNone {
+		w.Header().Del("Cache-Control")
+	}
 	copyResponseHeaders(w.Header(), resp.Header, rel, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
+	applyResourceCachePolicy(w.Header(), cookieRoute, resp.StatusCode)
 	if isM3U8ContentType(ct) || strings.HasSuffix(strings.ToLower(resp.Request.URL.Path), ".m3u8") {
 		readStarted := time.Now()
 		data, err := readLimited(resp.Body, proxyM3U8Limit)
@@ -1399,7 +1413,12 @@ func (s *Server) abortProxyBody(r *http.Request, rel string, session *Session, e
 }
 
 func (s *Server) rejectInvalidImageResponse(w http.ResponseWriter, r *http.Request, rel string, session *Session, message string) {
-	w.Header().Set("Cache-Control", "no-store")
+	if resourceRouteFromContext(r) == resourceRouteImage {
+		w.Header().Set("Cache-Control", "private, no-store")
+		mergeVaryCookie(w.Header())
+	} else {
+		w.Header().Set("Cache-Control", "no-store")
+	}
 	w.Header().Del("ETag")
 	w.Header().Del("Last-Modified")
 	s.audit(r.Context(), AuditLog{GatewayUserID: sessionGatewayUserID(session), SyntheticUserID: sessionSyntheticUserID(session), Event: "proxy_invalid_image", Message: message, RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
