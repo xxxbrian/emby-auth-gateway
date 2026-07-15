@@ -41,7 +41,14 @@ type upstreamOptions struct {
 }
 
 func newUpstreamCommand(app core.App) *cobra.Command {
-	cmd := &cobra.Command{Use: "upstream", Short: "Prepare singleton upstream configuration"}
+	cmd := &cobra.Command{
+		Use:   "upstream",
+		Short: "Prepare singleton upstream configuration",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cmd.Help()
+		},
+	}
 	cmd.AddCommand(newUpstreamCreateCommand(app))
 	return cmd
 }

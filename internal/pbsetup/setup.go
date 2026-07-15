@@ -17,6 +17,7 @@ func NewCommand(app core.App) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "setup",
 		Short: "Creates or updates gateway user, backend account, and mapping records",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := opts.validate(); err != nil {
 				return err
@@ -27,6 +28,7 @@ func NewCommand(app core.App) *cobra.Command {
 			return run(app, opts)
 		},
 	}
+	cmd.FParseErrWhitelist.UnknownFlags = false
 	defaults := gateway.DefaultBackendClientIdentity()
 
 	cmd.Flags().StringVar(&opts.GatewayUsername, "gateway-username", "", "Gateway username exposed to Emby clients")

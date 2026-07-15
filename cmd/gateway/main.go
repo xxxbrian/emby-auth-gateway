@@ -19,15 +19,48 @@ import (
 	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/plugins/migratecmd"
+	"github.com/spf13/cobra"
 )
 
 func main() {
+	if code := runGateway(os.Args[1:]); code != 0 {
+		os.Exit(code)
+	}
+}
+
+func runGateway(args []string) int {
+	app := newGatewayApp()
+	app.RootCmd.SetArgs(args)
+
+	// PocketBase's Start/Execute discard cobra command errors (exit 0 on failure).
+	// Commands that execute directly must propagate a nonzero process status so
+	// Compose service_completed_successfully and scripts can trust failure.
+	if selectsDirectExecution(app, args) {
+		if err := app.RootCmd.Execute(); err != nil {
+			return 1
+		}
+		return 0
+	}
+
+	if err := app.Start(); err != nil {
+		log.Print(err)
+		return 1
+	}
+	return 0
+}
+
+func newGatewayApp() *pocketbase.PocketBase {
 	app := pocketbase.New()
 	app.RootCmd.Version = version.Version
 	migratecmd.MustRegister(app, app.RootCmd, migratecmd.Config{})
 	app.RootCmd.AddCommand(pbsetup.NewCommand(app))
-	app.RootCmd.AddCommand(newVersionCommand())
-	app.RootCmd.AddCommand(newWebCommand())
+	versionCommand := newVersionCommand()
+	versionCommand.Args = cobra.NoArgs
+	versionCommand.FParseErrWhitelist.UnknownFlags = false
+	app.RootCmd.AddCommand(versionCommand)
+	webCommand := newWebCommand()
+	configureDirectCommandGroup(webCommand)
+	app.RootCmd.AddCommand(webCommand)
 	registerBackendIdentityDefaults(app)
 	registerMappingSessionRevocation(app)
 	registerActivityLogTokenRedaction(app)
@@ -99,19 +132,7 @@ func main() {
 		return nil
 	})
 
-	// PocketBase's Start/Execute discard cobra command errors (exit 0 on failure).
-	// Pure offline commands must propagate nonzero process status so Compose
-	// service_completed_successfully and scripts can trust failure.
-	if isPureOfflineCLI(app, os.Args[1:]) {
-		if err := app.RootCmd.Execute(); err != nil {
-			os.Exit(1)
-		}
-		return
-	}
-
-	if err := app.Start(); err != nil {
-		log.Fatal(err)
-	}
+	return app
 }
 
 type anonymousImageConfig struct {
@@ -160,23 +181,64 @@ func startAnonymousImageNamespace(validator anonymousImageNamespaceValidator, mo
 	return transient, nil
 }
 
-// isPureOfflineCLI reports whether args select a command that must not depend on
-// PocketBase bootstrap and must return a real process exit code. Currently:
-// `version` and the entire `web` subtree (init|install|status).
-func isPureOfflineCLI(app *pocketbase.PocketBase, args []string) bool {
-	cmd, _, err := app.RootCmd.Find(args)
-	if err != nil || cmd == nil {
+// selectsDirectExecution reports whether args identify a direct command subtree.
+// Once Cobra resolves a direct top-level command, later malformed arguments must
+// still execute RootCmd directly so its error reaches the process status.
+func selectsDirectExecution(app *pocketbase.PocketBase, args []string) bool {
+	cmd, _, _ := app.RootCmd.Find(args)
+	if isDirectCommand(cmd, app.RootCmd) {
+		return true
+	}
+
+	// Find normally handles root persistent flags. This fallback only covers the
+	// supported --dir spellings before a top-level command.
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--dir" {
+			i++
+			if i == len(args) {
+				return false
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--dir=") {
+			continue
+		}
+		if strings.HasPrefix(arg, "-") {
+			return false
+		}
+		return isDirectCommandName(arg)
+	}
+	return false
+}
+
+func isDirectCommand(cmd, root *cobra.Command) bool {
+	if cmd == nil {
 		return false
 	}
-	// Walk to the top-level command under RootCmd.
-	for cmd.HasParent() && cmd.Parent() != app.RootCmd {
+	for cmd.HasParent() && cmd.Parent() != root {
 		cmd = cmd.Parent()
 	}
-	switch cmd.Name() {
-	case "web", "version":
+	return isDirectCommandName(cmd.Name())
+}
+
+func isDirectCommandName(name string) bool {
+	switch name {
+	case "setup", "web", "version":
 		return true
 	default:
 		return false
+	}
+}
+
+// configureDirectCommandGroup makes a command group safe for direct execution:
+// no-argument invocations render help, while unresolved children are rejected
+// by Cobra before any subcommand can run.
+func configureDirectCommandGroup(cmd *cobra.Command) {
+	cmd.Args = cobra.NoArgs
+	cmd.FParseErrWhitelist.UnknownFlags = false
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		return cmd.Help()
 	}
 }
 

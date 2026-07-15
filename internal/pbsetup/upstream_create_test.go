@@ -66,8 +66,12 @@ func establishedUpstream(t *testing.T) (core.App, *httptest.Server, upstreamOpti
 func TestSetupCommandAddsSingletonChildrenWithoutChangingLegacyRunE(t *testing.T) {
 	app := newTestApp(t)
 	setup := NewCommand(app)
-	if setup.RunE == nil || setup.Args != nil {
-		t.Fatal("legacy setup command wiring changed")
+	if setup.RunE == nil || setup.Args == nil {
+		t.Fatal("legacy setup command must reject positional arguments")
+	}
+	upstreamGroup, _, err := setup.Find([]string{"upstream"})
+	if err != nil || upstreamGroup.Name() != "upstream" || upstreamGroup.RunE == nil || upstreamGroup.Args == nil {
+		t.Fatalf("missing safe upstream command group: %v", err)
 	}
 	upstream, _, err := setup.Find([]string{"upstream", "create"})
 	if err != nil || upstream.Name() != "create" || upstream.Args == nil {
