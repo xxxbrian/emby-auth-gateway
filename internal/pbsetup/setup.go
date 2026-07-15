@@ -7,6 +7,7 @@ import (
 
 	"github.com/xxxbrian/emby-auth-gateway/internal/gateway"
 
+	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/spf13/cobra"
 )
@@ -77,36 +78,44 @@ func (o options) validate() error {
 }
 
 func run(app core.App, opts options) error {
-	server, err := upsertServer(app, opts)
-	if err != nil {
-		return err
-	}
-	account, err := upsertBackendAccount(app, server.Id, opts)
-	if err != nil {
-		return err
-	}
-	user, err := upsertGatewayUser(app, opts)
-	if err != nil {
-		return err
-	}
-	if err := upsertMapping(app, user.Id, account.Id); err != nil {
+	if err := app.RunInTransaction(func(txApp core.App) error {
+		server, baseURLChanged, err := upsertServer(txApp, opts)
+		if err != nil {
+			return err
+		}
+		if baseURLChanged {
+			if err := invalidateBackendAccountsForServer(txApp, server.Id); err != nil {
+				return err
+			}
+		}
+		account, err := upsertBackendAccount(txApp, server.Id, opts)
+		if err != nil {
+			return err
+		}
+		user, err := upsertGatewayUser(txApp, opts)
+		if err != nil {
+			return err
+		}
+		return upsertMapping(txApp, user.Id, account.Id)
+	}); err != nil {
 		return err
 	}
 	fmt.Printf("configured gateway user %q -> backend account %q (%s)\n", opts.GatewayUsername, opts.BackendAccountName, opts.EmbyBaseURL)
 	return nil
 }
 
-func upsertServer(app core.App, opts options) (*core.Record, error) {
+func upsertServer(app core.App, opts options) (*core.Record, bool, error) {
 	record, err := app.FindFirstRecordByData("emby_servers", "name", opts.EmbyServerName)
 	if err != nil {
 		collection, findErr := app.FindCollectionByNameOrId("emby_servers")
 		if findErr != nil {
-			return nil, findErr
+			return nil, false, findErr
 		}
 		record = core.NewRecord(collection)
 	}
 	baseURL := strings.TrimRight(opts.EmbyBaseURL, "/")
-	if record.Id != "" && strings.TrimRight(record.GetString("base_url"), "/") != baseURL {
+	baseURLChanged := record.Id != "" && strings.TrimRight(record.GetString("base_url"), "/") != baseURL
+	if baseURLChanged {
 		record.Set("server_id", "")
 		record.Set("server_name", "")
 		record.Set("server_version", "")
@@ -120,7 +129,7 @@ func upsertServer(app core.App, opts options) (*core.Record, error) {
 		var err error
 		deviceID, err = newBackendDeviceID()
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
 	record.Set("backend_user_agent", identity.UserAgent)
@@ -130,9 +139,30 @@ func upsertServer(app core.App, opts options) (*core.Record, error) {
 	record.Set("backend_authorization_version", identity.Version)
 	record.Set("enabled", true)
 	if err := app.Save(record); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return record, nil
+	return record, baseURLChanged, nil
+}
+
+func invalidateBackendAccountsForServer(app core.App, serverID string) error {
+	accounts, err := app.FindRecordsByFilter(
+		"backend_accounts",
+		"server = {:server}",
+		"",
+		0,
+		0,
+		dbx.Params{"server": serverID},
+	)
+	if err != nil {
+		return err
+	}
+	for _, account := range accounts {
+		clearBackendAccountAuthState(account)
+		if err := app.Save(account); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func upsertBackendAccount(app core.App, serverID string, opts options) (*core.Record, error) {
@@ -150,16 +180,21 @@ func upsertBackendAccount(app core.App, serverID string, opts options) (*core.Re
 	record.Set("backend_username", opts.BackendUsername)
 	record.Set("backend_password", opts.BackendPassword)
 	if credentialsChanged {
-		record.Set("backend_user_id", "")
-		record.Set("backend_token", "")
-		record.Set("token_updated_at", nil)
-		record.Set("last_login_error", "")
+		clearBackendAccountAuthState(record)
 	}
 	record.Set("enabled", true)
 	if err := app.Save(record); err != nil {
 		return nil, err
 	}
 	return record, nil
+}
+
+func clearBackendAccountAuthState(record *core.Record) {
+	record.Set("backend_user_id", "")
+	record.Set("backend_token", "")
+	record.Set("token_updated_at", nil)
+	record.Set("last_login_at", nil)
+	record.Set("last_login_error", "")
 }
 
 func (o options) backendClientIdentity() gateway.BackendClientIdentity {
