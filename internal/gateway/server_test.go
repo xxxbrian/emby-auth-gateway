@@ -1891,8 +1891,14 @@ func TestUserDataVirtualizationIsGatewayUserScoped(t *testing.T) {
 	if u2["Played"] != true || int(u2["PlaybackPositionTicks"].(float64)) != 8800 || u2["PlayedPercentage"].(float64) != 100 || int(u2["PlayCount"].(float64)) != 3 || u2["LastPlayedDate"] == "" {
 		t.Fatalf("unexpected u2 user data: %#v", u2)
 	}
-	if u3["Played"] != false || int(u3["PlaybackPositionTicks"].(float64)) != 0 || u3["PlayedPercentage"] != nil || int(u3["PlayCount"].(float64)) != 0 || u3["LastPlayedDate"] != nil {
+	if u3["Played"] != false || int(u3["PlaybackPositionTicks"].(float64)) != 0 || int(u3["PlayCount"].(float64)) != 0 {
 		t.Fatalf("missing state should not leak backend user data: %#v", u3)
+	}
+	if _, ok := u3["PlayedPercentage"]; ok {
+		t.Fatalf("missing state PlayedPercentage should be omitted: %#v", u3)
+	}
+	if _, ok := u3["LastPlayedDate"]; ok {
+		t.Fatalf("missing state LastPlayedDate should be omitted: %#v", u3)
 	}
 }
 
@@ -1930,8 +1936,13 @@ func TestCompressedJSONUserDataIsVirtualized(t *testing.T) {
 	decodeJSON(t, resp.Body, &body)
 	items := body["Items"].([]any)
 	userData := items[0].(map[string]any)["UserData"].(map[string]any)
-	if userData["Played"] != false || int(userData["PlaybackPositionTicks"].(float64)) != 0 || userData["PlayedPercentage"] != nil || int(userData["PlayCount"].(float64)) != 0 || userData["IsFavorite"] != true || userData["UnplayedItemCount"] != nil {
+	if userData["Played"] != false || int(userData["PlaybackPositionTicks"].(float64)) != 0 || int(userData["PlayCount"].(float64)) != 0 || userData["IsFavorite"] != true {
 		t.Fatalf("compressed JSON UserData was not virtualized: %#v", userData)
+	}
+	for _, key := range []string{"PlayedPercentage", "UnplayedItemCount"} {
+		if _, ok := userData[key]; ok {
+			t.Fatalf("compressed JSON %s should be omitted: %#v", key, userData)
+		}
 	}
 }
 
@@ -1976,6 +1987,136 @@ func TestProxyUserDataOverlayUsesBatchLookup(t *testing.T) {
 	}
 }
 
+func TestProxyUserDataOverlaySelectsOnlyDirectBaseItems(t *testing.T) {
+	base := NewMemoryStore()
+	store := &countingPlaybackStore{MemoryStore: base}
+	session := testSession("http://backend.invalid/emby")
+	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", ItemID: "movie-1", IsFavorite: true})
+	server := NewServer(Config{GatewayBasePath: "/emby"}, store)
+
+	metadata := map[string]any{
+		"People":       []any{map[string]any{"Id": "person-1", "Name": "Person", "Type": "Person", "UserData": map[string]any{"Played": true}}},
+		"MediaSources": []any{map[string]any{"Id": "source-1", "Type": "Default", "UserData": map[string]any{"Played": true}}},
+		"MediaStreams": []any{map[string]any{"Id": "stream-1", "Type": "Video", "UserData": map[string]any{"Played": true}}},
+		"Studios":      []any{map[string]any{"Id": "studio-1", "Name": "Studio", "UserData": map[string]any{"Played": true}}},
+		"GenreItems":   []any{map[string]any{"Id": "genre-1", "Name": "Genre", "UserData": map[string]any{"Played": true}}},
+		"SearchHints":  []any{map[string]any{"Id": "hint-1", "Name": "Hint", "UserData": map[string]any{"Played": true}}},
+	}
+	metadataBefore := mustJSON(t, metadata)
+	root := map[string]any{"Id": "movie-1", "Name": "Movie", "Type": "Movie", "UserData": map[string]any{}, "Metadata": metadata}
+	rewritten := server.rewriteProxyJSONValue(context.Background(), root, session, "token", "http://gateway/emby").(map[string]any)
+	if got := strings.Join(store.batchItemIDs, ","); got != "movie-1" {
+		t.Fatalf("batched item ids = %q, want movie-1", got)
+	}
+	if rewritten["UserData"].(map[string]any)["IsFavorite"] != true {
+		t.Fatalf("root item was not overlaid: %#v", rewritten)
+	}
+	if got := mustJSON(t, rewritten["Metadata"]); got != metadataBefore {
+		t.Fatalf("nested metadata was modified: got %s, want %s", got, metadataBefore)
+	}
+}
+
+func TestIsBaseItemJSONRecognizesEstablishedTypes(t *testing.T) {
+	validTypes := []string{
+		"AdultVideo", "AggregateFolder", "Audio", "AudioBook", "BasePluginFolder", "Book", "BoxSet", "Channel", "ChannelFolderItem", "CollectionFolder", "Episode", "Folder", "Game", "GameSystem", "Genre", "LiveTvChannel", "LiveTvProgram", "ManualPlaylistsFolder", "Movie", "MusicAlbum", "MusicArtist", "MusicGenre", "MusicVideo", "Person", "Photo", "PhotoAlbum", "Playlist", "Program", "Recording", "Season", "Series", "Studio", "Trailer", "TvChannel", "TvProgram", "UserRootFolder", "UserView", "Video", "Year",
+	}
+	for _, itemType := range validTypes {
+		t.Run(itemType, func(t *testing.T) {
+			item := map[string]any{"Id": "item-1", "Name": "Item", "Type": strings.ToLower(itemType)}
+			if !isBaseItemJSON(item) {
+				t.Fatalf("%s should qualify", itemType)
+			}
+		})
+	}
+	for _, itemType := range []string{"Actor", "Director", "Session", "MediaSource"} {
+		t.Run(itemType, func(t *testing.T) {
+			item := map[string]any{"Id": "item-1", "Name": "Item", "Type": itemType}
+			if isBaseItemJSON(item) {
+				t.Fatalf("%s should not qualify", itemType)
+			}
+		})
+	}
+}
+
+func TestIsBaseItemJSONRejectsWeakFallbackFields(t *testing.T) {
+	for _, fieldName := range []string{"DateCreated", "ParentId", "IndexNumber", "ParentIndexNumber", "ProductionYear"} {
+		t.Run(fieldName, func(t *testing.T) {
+			item := map[string]any{"Id": "dto-1", "Name": "DTO", fieldName: "value"}
+			if isBaseItemJSON(item) {
+				t.Fatalf("%s alone should not qualify: %#v", fieldName, item)
+			}
+		})
+	}
+}
+
+func TestProxyUserDataOverlaySelectsItemAndItemsWrappers(t *testing.T) {
+	store := &countingPlaybackStore{MemoryStore: NewMemoryStore()}
+	session := testSession("http://backend.invalid/emby")
+	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", ItemID: "item-1", IsFavorite: true})
+	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", ItemID: "item-2", IsFavorite: true})
+	value := map[string]any{
+		"Item":  map[string]any{"Id": "item-1", "Type": "Movie", "UserData": map[string]any{}, "People": []any{map[string]any{"Id": "person-1", "Type": "Person", "UserData": map[string]any{"Played": true}}}},
+		"Items": []any{map[string]any{"Id": "item-2", "Type": "Episode", "UserData": map[string]any{}, "MediaSources": []any{map[string]any{"Id": "source-1", "Type": "Video", "UserData": map[string]any{"Played": true}}}}},
+	}
+	rewritten := NewServer(Config{}, store).rewriteProxyJSONValue(context.Background(), value, session, "token", "http://gateway/emby").(map[string]any)
+	if got := strings.Join(store.batchItemIDs, ","); got != "item-1,item-2" {
+		t.Fatalf("batched item ids = %q, want item-1,item-2", got)
+	}
+	if rewritten["Item"].(map[string]any)["UserData"].(map[string]any)["IsFavorite"] != true || rewritten["Items"].([]any)[0].(map[string]any)["UserData"].(map[string]any)["IsFavorite"] != true {
+		t.Fatalf("wrapper items were not overlaid: %#v", rewritten)
+	}
+	if rewritten["Item"].(map[string]any)["People"].([]any)[0].(map[string]any)["UserData"].(map[string]any)["Played"] != true || rewritten["Items"].([]any)[0].(map[string]any)["MediaSources"].([]any)[0].(map[string]any)["UserData"].(map[string]any)["Played"] != true {
+		t.Fatalf("wrapper metadata was modified: %#v", rewritten)
+	}
+}
+
+func TestProxyUserDataOverlaySelectsMediaRootArraysButNotSessions(t *testing.T) {
+	store := &countingPlaybackStore{MemoryStore: NewMemoryStore()}
+	session := testSession("http://backend.invalid/emby")
+	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", ItemID: "movie-1", IsFavorite: true})
+	server := NewServer(Config{}, store)
+	media := server.rewriteProxyJSONValue(context.Background(), []any{map[string]any{"Id": "movie-1", "Type": "Movie", "UserData": map[string]any{}}}, session, "token", "http://gateway/emby").([]any)
+	if media[0].(map[string]any)["UserData"].(map[string]any)["IsFavorite"] != true {
+		t.Fatalf("media root array was not overlaid: %#v", media)
+	}
+	sessions := []any{map[string]any{"Id": "session-1", "Name": "Session", "Type": "Session"}}
+	rewritten := server.rewriteProxyJSONValue(context.Background(), sessions, session, "token", "http://gateway/emby").([]any)
+	if _, ok := rewritten[0].(map[string]any)["UserData"]; ok {
+		t.Fatalf("session root array was modified: %#v", rewritten)
+	}
+}
+
+func TestPlaybackStateOverlayOmitsUnavailableValuesAndPreservesKnownValues(t *testing.T) {
+	unknown := map[string]any{"PlayedPercentage": 12.0, "LastPlayedDate": "upstream", "Rating": 4.0, "UnplayedItemCount": 3.0, "Likes": true}
+	applyPlaybackStateToUserData(unknown, &PlaybackState{ItemID: "item-1"}, map[string]any{"Id": "item-1"}, nil)
+	for _, key := range []string{"PlayedPercentage", "LastPlayedDate", "Rating", "UnplayedItemCount", "Likes"} {
+		if _, ok := unknown[key]; ok {
+			t.Fatalf("unknown state %s should be omitted: %#v", key, unknown)
+		}
+	}
+	date := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	likes := false
+	known := map[string]any{}
+	applyPlaybackStateToUserData(known, &PlaybackState{ItemID: "item-1", Played: true, LastPlayedDate: &date, Likes: &likes}, map[string]any{"Id": "item-1"}, nil)
+	if known["PlayedPercentage"] != 100.0 || known["LastPlayedDate"] == nil || known["Likes"] != false || known["UnplayedItemCount"] != 0 {
+		t.Fatalf("known local values were not preserved: %#v", known)
+	}
+	percentage := 42.0
+	applyPlaybackStateToUserData(known, &PlaybackState{ItemID: "item-1", PlayedPercentage: &percentage, LastPlayedDate: &date, Likes: &likes}, map[string]any{"Id": "item-1"}, nil)
+	if known["PlayedPercentage"] != percentage || known["LastPlayedDate"] == nil || known["Likes"] != false {
+		t.Fatalf("known resumable values were not preserved: %#v", known)
+	}
+	aggregate := PlaybackAggregate{PlayedCount: 1, TotalItemCount: 2, LastPlayedDate: &date}
+	applyPlaybackStateToUserData(known, &PlaybackState{ItemID: "series-1"}, map[string]any{"Id": "series-1", "Type": "Series", "ChildCount": 2}, &aggregate)
+	if known["PlayedPercentage"] != 50.0 || known["UnplayedItemCount"] != 1 || known["LastPlayedDate"] == nil {
+		t.Fatalf("aggregate values were not preserved: %#v", known)
+	}
+	applyAggregateUserData(known, map[string]any{"ChildCount": 2}, &PlaybackAggregate{TotalItemCount: 2})
+	if _, ok := known["PlayedPercentage"]; ok {
+		t.Fatalf("zero-progress aggregate percentage should be omitted: %#v", known)
+	}
+}
+
 func TestProxyUserDataOverlayIgnoresOrphanedState(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		item := map[string]any{"Id": "episode-1", "Name": "Episode 1", "Type": "Episode", "UserData": map[string]any{"Played": true, "PlaybackPositionTicks": float64(9999), "PlayedPercentage": float64(99)}}
@@ -1991,8 +2132,11 @@ func TestProxyUserDataOverlayIgnoresOrphanedState(t *testing.T) {
 	defer gw.Close()
 
 	userData := fetchUserData(t, gw.URL+"/emby/Items/episode-1?api_key=gateway-token")
-	if userData["Played"] != false || int(userData["PlaybackPositionTicks"].(float64)) != 0 || userData["PlayedPercentage"] != nil {
+	if userData["Played"] != false || int(userData["PlaybackPositionTicks"].(float64)) != 0 {
 		t.Fatalf("orphaned state should not overlay backend data: %#v", userData)
+	}
+	if _, ok := userData["PlayedPercentage"]; ok {
+		t.Fatalf("orphaned state PlayedPercentage should be omitted: %#v", userData)
 	}
 }
 
@@ -2754,8 +2898,11 @@ func TestAggregateWithoutTrustedChildCountDoesNotReportComplete(t *testing.T) {
 	var body map[string]any
 	decodeJSON(t, resp.Body, &body)
 	userData := body["Items"].([]any)[0].(map[string]any)["UserData"].(map[string]any)
-	if userData["Played"] == true || userData["UnplayedItemCount"] != nil {
+	if userData["Played"] == true {
 		t.Fatalf("aggregate without trusted total should not report complete: %#v", userData)
+	}
+	if _, ok := userData["UnplayedItemCount"]; ok {
+		t.Fatalf("untrusted aggregate UnplayedItemCount should be omitted: %#v", userData)
 	}
 }
 

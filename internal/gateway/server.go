@@ -1490,23 +1490,25 @@ func (s *Server) rewriteProxyJSONValueForRequest(ctx context.Context, r *http.Re
 	if session == nil {
 		return rewritten
 	}
-	itemIDs := collectUserDataItemIDs(rewritten)
+	items := selectBaseItems(rewritten)
+	itemIDs := itemIDsFromBaseItems(items)
 	states, err := s.store.ListPlaybackStatesByItemIDs(ctx, session.GatewayUserID, itemIDs)
 	if err != nil {
 		states = map[string]*PlaybackState{}
 	}
-	seriesIDs, seasonIDs := collectAggregateItemIDs(rewritten)
+	seriesIDs, seasonIDs := aggregateItemIDs(items)
 	aggregates, err := s.store.ListPlaybackAggregates(ctx, session.GatewayUserID, seriesIDs, seasonIDs)
 	if err != nil {
 		aggregates = PlaybackAggregates{Series: map[string]PlaybackAggregate{}, Seasons: map[string]PlaybackAggregate{}}
 	}
-	s.applyChildCountsToAggregates(ctx, r, session, gatewayToken, rewritten, &aggregates)
-	s.overlayUserData(rewritten, session, states, aggregates)
+	s.applyChildCountsToAggregates(ctx, r, session, gatewayToken, items, &aggregates)
+	s.overlayUserData(items, session, states, aggregates)
 	return rewritten
 }
 
-func (s *Server) applyChildCountsToAggregates(ctx context.Context, r *http.Request, session *Session, gatewayToken string, value any, aggregates *PlaybackAggregates) {
-	ids := aggregateIDsFromValue(value)
+func (s *Server) applyChildCountsToAggregates(ctx context.Context, r *http.Request, session *Session, gatewayToken string, items []map[string]any, aggregates *PlaybackAggregates) {
+	seriesIDs, seasonIDs := aggregateItemIDs(items)
+	ids := append(seriesIDs, seasonIDs...)
 	counts, err := s.store.ListItemChildCounts(ctx, session.BackendAccountID, ids)
 	if err != nil {
 		counts = map[string]ItemChildCount{}
@@ -1547,14 +1549,6 @@ func (s *Server) fetchItemChildCount(ctx context.Context, r *http.Request, sessi
 	return len(extractItems(value))
 }
 
-func aggregateIDsFromValue(value any) []string {
-	seriesIDs, seasonIDs := collectAggregateItemIDs(value)
-	ids := make([]string, 0, len(seriesIDs)+len(seasonIDs))
-	ids = append(ids, seriesIDs...)
-	ids = append(ids, seasonIDs...)
-	return ids
-}
-
 func applyAggregateTotal(aggregates *PlaybackAggregates, itemID string, count int) {
 	if aggregate, ok := aggregates.Series[itemID]; ok {
 		aggregate.TotalItemCount = count
@@ -1566,103 +1560,117 @@ func applyAggregateTotal(aggregates *PlaybackAggregates, itemID string, count in
 	}
 }
 
-func collectUserDataItemIDs(v any) []string {
-	seen := map[string]struct{}{}
-	var itemIDs []string
-	var walk func(any)
-	walk = func(value any) {
-		switch x := value.(type) {
-		case map[string]any:
-			if itemID, ok := stringField(x, "Id"); ok && isItemLikeJSON(x) {
-				if _, exists := seen[itemID]; !exists {
-					seen[itemID] = struct{}{}
-					itemIDs = append(itemIDs, itemID)
+func selectBaseItems(v any) []map[string]any {
+	if item, ok := v.(map[string]any); ok {
+		if isBaseItemJSON(item) {
+			return []map[string]any{item}
+		}
+		items := make([]map[string]any, 0)
+		if wrapped, ok := mapField(item, "Item"); ok && isBaseItemJSON(wrapped) {
+			items = append(items, wrapped)
+		}
+		if values, ok := field(item, "Items"); ok {
+			if array, ok := values.([]any); ok {
+				for _, value := range array {
+					if item, ok := value.(map[string]any); ok && isBaseItemJSON(item) {
+						items = append(items, item)
+					}
 				}
 			}
-			for _, child := range x {
-				walk(child)
-			}
-		case []any:
-			for _, child := range x {
-				walk(child)
-			}
+		}
+		return items
+	}
+	array, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	items := make([]map[string]any, 0, len(array))
+	for _, value := range array {
+		if item, ok := value.(map[string]any); ok && isBaseItemJSON(item) {
+			items = append(items, item)
 		}
 	}
-	walk(v)
+	return items
+}
+
+func itemIDsFromBaseItems(items []map[string]any) []string {
+	seen := map[string]struct{}{}
+	itemIDs := make([]string, 0, len(items))
+	for _, item := range items {
+		itemID, _ := stringField(item, "Id")
+		if _, exists := seen[itemID]; !exists {
+			seen[itemID] = struct{}{}
+			itemIDs = append(itemIDs, itemID)
+		}
+	}
 	return itemIDs
 }
 
-func collectAggregateItemIDs(v any) ([]string, []string) {
+func aggregateItemIDs(items []map[string]any) ([]string, []string) {
 	seriesSeen := map[string]struct{}{}
 	seasonSeen := map[string]struct{}{}
 	var seriesIDs []string
 	var seasonIDs []string
-	var walk func(any)
-	walk = func(value any) {
-		switch x := value.(type) {
-		case map[string]any:
-			itemID, hasID := stringField(x, "Id")
-			itemType, _ := stringField(x, "Type")
-			if hasID && strings.EqualFold(itemType, "Series") {
-				if _, exists := seriesSeen[itemID]; !exists {
-					seriesSeen[itemID] = struct{}{}
-					seriesIDs = append(seriesIDs, itemID)
-				}
+	for _, item := range items {
+		itemID, _ := stringField(item, "Id")
+		itemType, _ := stringField(item, "Type")
+		if strings.EqualFold(itemType, "Series") {
+			if _, exists := seriesSeen[itemID]; !exists {
+				seriesSeen[itemID] = struct{}{}
+				seriesIDs = append(seriesIDs, itemID)
 			}
-			if hasID && strings.EqualFold(itemType, "Season") {
-				if _, exists := seasonSeen[itemID]; !exists {
-					seasonSeen[itemID] = struct{}{}
-					seasonIDs = append(seasonIDs, itemID)
-				}
-			}
-			for _, child := range x {
-				walk(child)
-			}
-		case []any:
-			for _, child := range x {
-				walk(child)
+		}
+		if strings.EqualFold(itemType, "Season") {
+			if _, exists := seasonSeen[itemID]; !exists {
+				seasonSeen[itemID] = struct{}{}
+				seasonIDs = append(seasonIDs, itemID)
 			}
 		}
 	}
-	walk(v)
 	return seriesIDs, seasonIDs
 }
 
-func (s *Server) overlayUserData(v any, session *Session, states map[string]*PlaybackState, aggregates PlaybackAggregates) {
-	switch x := v.(type) {
-	case map[string]any:
-		if itemID, ok := stringField(x, "Id"); ok && isItemLikeJSON(x) {
-			userData, ok := mapField(x, "UserData")
-			if !ok {
-				userData = map[string]any{}
-				x["UserData"] = userData
-			}
-			state := states[itemID]
-			if state == nil {
-				state = &PlaybackState{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, ItemID: itemID}
-			}
-			applyPlaybackStateToUserData(userData, state, x, aggregateForItem(x, itemID, aggregates))
+func (s *Server) overlayUserData(items []map[string]any, session *Session, states map[string]*PlaybackState, aggregates PlaybackAggregates) {
+	for _, item := range items {
+		itemID, _ := stringField(item, "Id")
+		userData, ok := mapField(item, "UserData")
+		if !ok {
+			userData = map[string]any{}
+			item["UserData"] = userData
 		}
-		for _, child := range x {
-			s.overlayUserData(child, session, states, aggregates)
+		state := states[itemID]
+		if state == nil {
+			state = &PlaybackState{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, ItemID: itemID}
 		}
-	case []any:
-		for _, child := range x {
-			s.overlayUserData(child, session, states, aggregates)
-		}
+		applyPlaybackStateToUserData(userData, state, item, aggregateForItem(item, itemID, aggregates))
 	}
 }
 
-func isItemLikeJSON(obj map[string]any) bool {
+func isBaseItemJSON(obj map[string]any) bool {
+	if itemID, ok := stringField(obj, "Id"); !ok || itemID == "" {
+		return false
+	}
 	if _, ok := field(obj, "UserData"); ok {
 		return true
 	}
-	for _, name := range []string{"Type", "MediaType", "Name", "RunTimeTicks", "IndexNumber", "ParentIndexNumber", "SeriesId", "SeasonId"} {
+	if itemType, ok := stringField(obj, "Type"); ok && isBaseItemType(itemType) {
+		return true
+	}
+	for _, name := range []string{"MediaType", "RunTimeTicks", "SeriesId", "SeasonId", "ProviderIds", "MediaSources"} {
 		if _, ok := field(obj, name); ok {
 			return true
 		}
 	}
 	return false
+}
+
+func isBaseItemType(itemType string) bool {
+	switch strings.ToLower(itemType) {
+	case "adultvideo", "aggregatefolder", "audio", "audiobook", "basepluginfolder", "book", "boxset", "channel", "channelfolderitem", "collectionfolder", "episode", "folder", "game", "gamesystem", "genre", "livetvchannel", "livetvprogram", "manualplaylistsfolder", "movie", "musicalbum", "musicartist", "musicgenre", "musicvideo", "person", "photo", "photoalbum", "playlist", "program", "recording", "season", "series", "studio", "trailer", "tvchannel", "tvprogram", "userrootfolder", "userview", "video", "year":
+		return true
+	default:
+		return false
+	}
 }
 
 func applyPlaybackStateToUserData(userData map[string]any, state *PlaybackState, item map[string]any, aggregate *PlaybackAggregate) {
@@ -1675,28 +1683,28 @@ func applyPlaybackStateToUserData(userData map[string]any, state *PlaybackState,
 	} else if state.PlayedPercentage != nil {
 		userData["PlayedPercentage"] = *state.PlayedPercentage
 	} else {
-		userData["PlayedPercentage"] = nil
+		delete(userData, "PlayedPercentage")
 	}
 	if state.LastPlayedDate != nil {
 		userData["LastPlayedDate"] = state.LastPlayedDate.UTC().Format(time.RFC3339)
 	} else {
-		userData["LastPlayedDate"] = nil
+		delete(userData, "LastPlayedDate")
 	}
 	userData["PlayCount"] = state.PlayCount
 	userData["IsFavorite"] = state.IsFavorite
 	userData["ItemId"] = state.ItemID
 	userData["Key"] = state.ItemID
-	userData["Rating"] = nil
+	delete(userData, "Rating")
 	if state.Played {
 		userData["UnplayedItemCount"] = 0
 	} else {
-		userData["UnplayedItemCount"] = nil
+		delete(userData, "UnplayedItemCount")
 	}
 	applyAggregateUserData(userData, item, aggregate)
 	if state.Likes != nil {
 		userData["Likes"] = *state.Likes
 	} else {
-		userData["Likes"] = nil
+		delete(userData, "Likes")
 	}
 }
 
@@ -1736,7 +1744,7 @@ func applyAggregateUserData(userData map[string]any, item map[string]any, aggreg
 	if played > 0 {
 		userData["PlayedPercentage"] = (float64(played) / float64(total)) * 100
 	} else {
-		userData["PlayedPercentage"] = nil
+		delete(userData, "PlayedPercentage")
 	}
 	if aggregate.LastPlayedDate != nil {
 		userData["LastPlayedDate"] = aggregate.LastPlayedDate.UTC().Format(time.RFC3339)
