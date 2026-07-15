@@ -107,6 +107,88 @@ func TestSetupClearsBackendTokenWhenCredentialsChange(t *testing.T) {
 	}
 }
 
+func TestSetupResetsServerIdentityOnlyWhenBaseURLChanges(t *testing.T) {
+	app := newTestApp(t)
+	opts := options{
+		GatewayUsername:    "alice",
+		GatewayPassword:    "gateway-pass",
+		SyntheticUserID:    "gateway-alice",
+		EmbyServerName:     "server",
+		EmbyBaseURL:        "https://emby.example.com/emby",
+		BackendAccountName: "backend",
+		BackendUsername:    "real-alice",
+		BackendPassword:    "backend-pass",
+	}
+	if err := run(app, opts); err != nil {
+		t.Fatalf("run setup: %v", err)
+	}
+
+	server, err := app.FindFirstRecordByData("emby_servers", "name", opts.EmbyServerName)
+	if err != nil {
+		t.Fatalf("find server: %v", err)
+	}
+	checkedAt := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	server.Set("server_id", "upstream-server")
+	server.Set("server_name", "Upstream Emby")
+	server.Set("server_version", "4.9.0")
+	server.Set("version_checked_at", checkedAt)
+	server.Set("backend_authorization_device_id", "preserved-device-id")
+	if err := app.Save(server); err != nil {
+		t.Fatalf("save server identity: %v", err)
+	}
+	account, err := app.FindFirstRecordByData("backend_accounts", "name", opts.BackendAccountName)
+	if err != nil {
+		t.Fatalf("find backend account: %v", err)
+	}
+	account.Set("backend_user_id", "upstream-user")
+	account.Set("backend_token", "preserved-token")
+	account.Set("token_updated_at", checkedAt)
+	if err := app.Save(account); err != nil {
+		t.Fatalf("save backend account: %v", err)
+	}
+
+	assertServerIdentity := func(t *testing.T, wantPresent bool) {
+		t.Helper()
+		server, err = app.FindFirstRecordByData("emby_servers", "name", opts.EmbyServerName)
+		if err != nil {
+			t.Fatalf("find server: %v", err)
+		}
+		if wantPresent && (server.GetString("server_id") != "upstream-server" || server.GetString("server_name") != "Upstream Emby" || server.GetString("server_version") != "4.9.0" || !server.GetDateTime("version_checked_at").Time().Equal(checkedAt)) {
+			t.Fatalf("server identity was not preserved: %#v", server)
+		}
+		if !wantPresent && (server.GetString("server_id") != "" || server.GetString("server_name") != "" || server.GetString("server_version") != "" || !server.GetDateTime("version_checked_at").IsZero()) {
+			t.Fatalf("server identity was not cleared: %#v", server)
+		}
+		if server.GetString("backend_authorization_device_id") != "preserved-device-id" || !server.GetBool("enabled") {
+			t.Fatalf("unrelated server fields changed: %#v", server)
+		}
+		account, err = app.FindFirstRecordByData("backend_accounts", "name", opts.BackendAccountName)
+		if err != nil {
+			t.Fatalf("find backend account: %v", err)
+		}
+		if account.GetString("backend_user_id") != "upstream-user" || account.GetString("backend_token") != "preserved-token" || !account.GetDateTime("token_updated_at").Time().Equal(checkedAt) {
+			t.Fatalf("unrelated backend account fields changed: %#v", account)
+		}
+	}
+
+	if err := run(app, opts); err != nil {
+		t.Fatalf("run setup unchanged URL: %v", err)
+	}
+	assertServerIdentity(t, true)
+
+	opts.EmbyBaseURL += "/"
+	if err := run(app, opts); err != nil {
+		t.Fatalf("run setup normalization-equivalent URL: %v", err)
+	}
+	assertServerIdentity(t, true)
+
+	opts.EmbyBaseURL = "https://new-emby.example.com/emby"
+	if err := run(app, opts); err != nil {
+		t.Fatalf("run setup changed URL: %v", err)
+	}
+	assertServerIdentity(t, false)
+}
+
 func TestSetupAllowsCustomBackendClientIdentity(t *testing.T) {
 	app := newTestApp(t)
 	opts := options{

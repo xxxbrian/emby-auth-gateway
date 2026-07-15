@@ -105,8 +105,15 @@ func upsertServer(app core.App, opts options) (*core.Record, error) {
 		}
 		record = core.NewRecord(collection)
 	}
+	baseURL := strings.TrimRight(opts.EmbyBaseURL, "/")
+	if record.Id != "" && strings.TrimRight(record.GetString("base_url"), "/") != baseURL {
+		record.Set("server_id", "")
+		record.Set("server_name", "")
+		record.Set("server_version", "")
+		record.Set("version_checked_at", nil)
+	}
 	record.Set("name", opts.EmbyServerName)
-	record.Set("base_url", strings.TrimRight(opts.EmbyBaseURL, "/"))
+	record.Set("base_url", baseURL)
 	identity := opts.backendClientIdentity().WithDefaults()
 	deviceID := strings.TrimSpace(record.GetString("backend_authorization_device_id"))
 	if deviceID == "" {
