@@ -39,23 +39,21 @@ func main() {
 	})
 
 	app.OnServe().BindFunc(func(e *core.ServeEvent) error {
-		basePath := normalizeGatewayBasePath(envDefault("GATEWAY_BASE_PATH", "/emby"))
 		gw := gateway.NewServer(gateway.Config{
 			PublicBaseURL:            strings.TrimRight(os.Getenv("GATEWAY_PUBLIC_URL"), "/"),
-			GatewayBasePath:          basePath,
+			GatewayBasePath:          fixedGatewayBasePath,
 			GatewayServerID:          envDefault("GATEWAY_SERVER_ID", "emby-auth-gateway"),
 			MinResumePct:             envFloatDefault("GATEWAY_MIN_RESUME_PCT", 0),
 			MaxResumePct:             envFloatDefault("GATEWAY_MAX_RESUME_PCT", 0),
 			MinResumeDurationSeconds: envFloatDefault("GATEWAY_MIN_RESUME_DURATION_SECONDS", 0),
 		}, pbstore.New(e.App))
 
-		web, err := newEmbyWebServer(basePath, webAssetsDirFromEnv(), os.Getenv("GATEWAY_PUBLIC_URL"))
+		web, err := newEmbyWebServer(webAssetsDirFromEnv(), os.Getenv("GATEWAY_PUBLIC_URL"))
 		if err != nil {
-			// Enabled assets with unsupported base path fail startup.
 			return err
 		}
 
-		mountGatewayRoutes(e.Router, basePath, web, gw)
+		mountGatewayRoutes(e.Router, web, gw)
 
 		go func() {
 			if err := gw.RefreshBackendServerInfo(context.Background()); err != nil {
@@ -257,18 +255,4 @@ func envFloatDefault(name string, fallback float64) float64 {
 		return fallback
 	}
 	return parsed
-}
-
-func normalizeGatewayBasePath(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return "/emby"
-	}
-	if !strings.HasPrefix(value, "/") {
-		value = "/" + value
-	}
-	if trimmed := strings.TrimRight(value, "/"); trimmed != "" {
-		return trimmed
-	}
-	return "/"
 }

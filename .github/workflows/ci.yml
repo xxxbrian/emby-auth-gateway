@@ -174,9 +174,6 @@ jobs:
                   print(f"{label}: web-init dependency must be required", file=sys.stderr)
                   sys.exit(1)
               env = gw.get("environment") or {}
-              if env.get("GATEWAY_BASE_PATH") != "/emby":
-                  print(f"{label}: gateway base path must be /emby", file=sys.stderr)
-                  sys.exit(1)
               if env.get("GATEWAY_WEB_ASSETS_DIR") != "/app/web_assets":
                   print(f"{label}: gateway assets dir must be /app/web_assets", file=sys.stderr)
                   sys.exit(1)

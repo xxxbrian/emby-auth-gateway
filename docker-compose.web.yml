@@ -63,11 +63,8 @@ services:
       web-init:
         condition: service_completed_successfully
     environment:
-      # Web v1 requires /emby. Override any custom base from the base compose file.
-      GATEWAY_BASE_PATH: /emby
       GATEWAY_WEB_ASSETS_DIR: /app/web_assets
-      # Re-default public URL so it cannot retain a non-/emby base from host env
-      # that was interpolated only in the base file.
+      # Re-default public URL so host env cannot omit the fixed /emby base path.
       GATEWAY_PUBLIC_URL: ${GATEWAY_PUBLIC_URL:-http://localhost:${GATEWAY_PORT:-8090}/emby}
     volumes:
       - gateway_web_assets:/app/web_assets:ro

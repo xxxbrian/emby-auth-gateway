@@ -4,7 +4,7 @@ Emby Auth Gateway is a PocketBase-backed reverse proxy for Emby clients. Clients
 
 ## Architecture
 
-- `cmd/gateway` embeds PocketBase and registers Emby-compatible gateway routes under the configured `GATEWAY_BASE_PATH`, which defaults to `/emby`.
+- `cmd/gateway` embeds PocketBase and registers Emby-compatible gateway routes under the fixed path `/emby`.
 - PocketBase stores gateway users, backend Emby servers, backend accounts, gateway-to-backend mappings, sessions, and audit logs in `pb_data`.
 - The gateway exposes Emby-compatible endpoints for clients and proxies authenticated requests to the real Emby server.
 - The real Emby server remains private to the gateway network in the recommended deployment shape.
@@ -17,10 +17,9 @@ Gateway environment variables:
 
 | Name | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `GATEWAY_PUBLIC_URL` | No, but set it in production | Request host/proxy headers | Externally reachable gateway Emby base URL, including `GATEWAY_BASE_PATH`, for example `https://media.example.com/emby`. Without it, URL rewriting follows the inbound request host, which can produce unusable `127.0.0.1` URLs behind some proxies. |
-| `GATEWAY_BASE_PATH` | No | `/emby` | Path where Emby-compatible gateway routes are served. When Emby Web is enabled, this must be `/emby`. |
+| `GATEWAY_PUBLIC_URL` | No, but set it in production | Request host/proxy headers | Externally reachable gateway Emby base URL, including the fixed `/emby` path, for example `https://media.example.com/emby`. Without it, URL rewriting follows the inbound request host, which can produce unusable `127.0.0.1` URLs behind some proxies. |
 | `GATEWAY_SERVER_ID` | No | `emby-auth-gateway` | Synthetic server id returned to clients instead of the backend Emby server id. |
-| `GATEWAY_WEB_ASSETS_DIR` | No | unset (Web disabled) | Absolute or relative path to the Web assets root. Blank/unset disables Web: `/emby/web` returns 404 and never falls through to the authenticated API. When set, `GATEWAY_BASE_PATH` must be `/emby` or the process fails at startup. |
+| `GATEWAY_WEB_ASSETS_DIR` | No | unset (Web disabled) | Absolute or relative path to the Web assets root. Blank/unset disables Web: `/emby/web` returns 404 and never falls through to the authenticated API. |
 
 PocketBase runtime flags you will commonly use:
 
@@ -127,9 +126,7 @@ docker compose run --rm gateway setup \
 Run directly:
 
 ```sh
-GATEWAY_BASE_PATH="${GATEWAY_BASE_PATH:-/emby}"
-GATEWAY_BASE_PATH="$GATEWAY_BASE_PATH" \
-GATEWAY_PUBLIC_URL="http://localhost:8090$GATEWAY_BASE_PATH" \
+GATEWAY_PUBLIC_URL="http://localhost:8090/emby" \
 ./bin/gateway serve --http=127.0.0.1:8090
 ```
 
@@ -157,7 +154,6 @@ Docker socket, or installs on startup.
 | Condition | Behavior |
 | --- | --- |
 | `GATEWAY_WEB_ASSETS_DIR` unset/blank | Web disabled: canonical `/emby/web/` (and descendants) return **404**. |
-| Assets dir set, `GATEWAY_BASE_PATH` not `/emby` | Startup error (enabled Web requires `/emby`). |
 | Assets dir set, tree missing/corrupt/untrusted | Web configured but unavailable: **503** on Web paths. |
 | Assets dir set, verified trusted release | Ready: serves pinned files; `/emby/web` → **308** `/emby/web/`. |
 
@@ -270,9 +266,8 @@ Semantics:
 - Upgrade: rerun the same overlay so `web-init` installs/reactivates, then
   recreate `gateway` so it pins the new release. A later failed upgrade may leave
   an already-running gateway serving its previously pinned release.
-- Overlay forces `GATEWAY_BASE_PATH=/emby` and
-  `GATEWAY_WEB_ASSETS_DIR=/app/web_assets`. Set `GATEWAY_PUBLIC_URL` to a URL that
-  ends in `/emby`.
+- Overlay forces `GATEWAY_WEB_ASSETS_DIR=/app/web_assets`. Set `GATEWAY_PUBLIC_URL`
+  to a URL that ends in `/emby`.
 - Base `docker compose up` without the overlay remains API-only.
 
 #### Manual one-shot tool (profile `web`)
@@ -383,11 +378,10 @@ Publishing a GitHub Release automatically builds the Docker image and release bi
 
 ## Verification
 
-Anonymous public server info should be available through the gateway. The examples below use the default gateway base path:
+Anonymous public server info should be available through the gateway under fixed `/emby`:
 
 ```sh
-GATEWAY_BASE_PATH="${GATEWAY_BASE_PATH:-/emby}"
-curl -i "http://localhost:8090$GATEWAY_BASE_PATH/System/Info/Public"
+curl -i "http://localhost:8090/emby/System/Info/Public"
 ```
 
 PocketBase internal gateway collections should not be anonymously readable:
@@ -404,16 +398,15 @@ curl -i http://localhost:8090/api/collections/audit_logs/records
 Login through the gateway and use the returned gateway token:
 
 ```sh
-GATEWAY_BASE_PATH="${GATEWAY_BASE_PATH:-/emby}"
-TOKEN="$(curl -sS "http://localhost:8090$GATEWAY_BASE_PATH/Users/AuthenticateByName" \
+TOKEN="$(curl -sS "http://localhost:8090/emby/Users/AuthenticateByName" \
   -H 'Content-Type: application/json' \
   -H 'X-Emby-Authorization: Emby Client="curl", Device="shell", DeviceId="smoke", Version="1"' \
   --data '{"Username":"alice","Pw":"gateway-client-password"}' \
   | jq -r '.AccessToken')"
 
-curl -i "http://localhost:8090$GATEWAY_BASE_PATH/System/Info" -H "X-Emby-Token: $TOKEN"
-curl -i -X POST "http://localhost:8090$GATEWAY_BASE_PATH/Sessions/Logout" -H "X-Emby-Token: $TOKEN"
-curl -i "http://localhost:8090$GATEWAY_BASE_PATH/System/Info" -H "X-Emby-Token: $TOKEN"
+curl -i "http://localhost:8090/emby/System/Info" -H "X-Emby-Token: $TOKEN"
+curl -i -X POST "http://localhost:8090/emby/Sessions/Logout" -H "X-Emby-Token: $TOKEN"
+curl -i "http://localhost:8090/emby/System/Info" -H "X-Emby-Token: $TOKEN"
 ```
 
 The final request should return `401` after logout.
@@ -428,7 +421,7 @@ Useful smoke variables:
 
 - `GATEWAY_URL` defaults to `http://127.0.0.1:8090`.
 - `PB_URL` defaults to `GATEWAY_URL`.
-- `GATEWAY_BASE_PATH` defaults to `/emby`.
+- Emby-compatible routes are always under fixed `/emby`.
 - `USERNAME` / `PASSWORD` (or `SMOKE_USERNAME` / `SMOKE_PASSWORD`) are required gateway credentials unless `SMOKE_WEB_ONLY=1`.
 - `SMOKE_OPTIONAL_MEDIA=1` enables optional Items verification and requires `SYNTHETIC_USER_ID`.
 - `SMOKE_M3U8_PATH` optionally verifies an m3u8 path when optional media checks are enabled.
@@ -479,11 +472,10 @@ available. Hermetic HTTP canary/CORS smoke is the automated stand-in in CI.
 - Login returns `401`: verify the gateway username and password created by `setup`, confirm the `users` record is enabled, and confirm `user_mappings`, `backend_accounts`, and `emby_servers` records exist and are enabled.
 - Login returns `502 backend authentication failed`: verify `--emby-url`, backend username, backend password, and network reachability from the gateway to Emby. In Compose, the backend URL should be `http://emby:8096/emby`.
 - Proxied requests return `401`: the gateway token may be missing, expired, revoked, or sent under an unsupported header/query name. Supported inputs include `X-Emby-Token`, `X-MediaBrowser-Token`, Emby authorization headers, `api_key`, `access_token`, and `token`.
-- URLs in Emby responses point at the backend: set `GATEWAY_PUBLIC_URL` to the public gateway base URL including the configured `GATEWAY_BASE_PATH`.
+- URLs in Emby responses point at the backend: set `GATEWAY_PUBLIC_URL` to the public gateway base URL including `/emby`.
 - The smoke script fails on PB side-door checks with `2xx`: lock down the PocketBase collection API rules before treating the deployment as safe.
 - `/emby/web/` returns 404: Web is disabled (`GATEWAY_WEB_ASSETS_DIR` unset/blank). Expected for API-only deployments; in Compose leave the env blank until assets are installed and you intentionally opt in with `/app/web_assets`.
 - `/emby/web/` returns 503: assets dir is set but the tree is missing, corrupt, or not in the production trusted registry; run `web status --verify` and reinstall a trusted catalog when available.
-- Gateway refuses to start with Web enabled: set `GATEWAY_BASE_PATH=/emby` or clear `GATEWAY_WEB_ASSETS_DIR`.
 - `web install` fails with legal/reproduction gate: the catalog ID is unknown; use a built-in ID such as `emby-web-4.9.5.0`.
 - `web install` fails after resolving the catalog: the prepared source is missing, incomplete, or does not match the catalog hashes; fix the source tree/archive/URL (official bytes are never shipped by this project).
 - Web install succeeded but browser still sees old assets: confirm `web status --verify` on disk, then restart the gateway so `serve` reloads `current.json`, then re-check HTTP canaries.

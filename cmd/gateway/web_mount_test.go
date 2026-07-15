@@ -26,7 +26,7 @@ const testAllowedCORSOrigin = "https://app.emby.media"
 
 func TestNewEmbyWebServerStates(t *testing.T) {
 	t.Run("blank_disabled", func(t *testing.T) {
-		s, err := newEmbyWebServer("/emby", "", "")
+		s, err := newEmbyWebServer("", "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -36,7 +36,7 @@ func TestNewEmbyWebServerStates(t *testing.T) {
 	})
 
 	t.Run("whitespace_disabled", func(t *testing.T) {
-		s, err := newEmbyWebServer("/api", "  \t  ", "")
+		s, err := newEmbyWebServer("  \t  ", "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -45,17 +45,9 @@ func TestNewEmbyWebServerStates(t *testing.T) {
 		}
 	})
 
-	t.Run("enabled_non_emby_error", func(t *testing.T) {
-		root := t.TempDir()
-		_, err := newEmbyWebServer("/api", root, "")
-		if err == nil {
-			t.Fatal("expected constructor error for non-/emby base")
-		}
-	})
-
 	t.Run("missing_no_startup_error", func(t *testing.T) {
 		missing := filepath.Join(t.TempDir(), "absent")
-		s, err := newEmbyWebServer("/emby", missing, "")
+		s, err := newEmbyWebServer(missing, "")
 		if err != nil {
 			t.Fatalf("missing must not fail construction: %v", err)
 		}
@@ -69,7 +61,7 @@ func TestNewEmbyWebServerStates(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(root, "current.json"), []byte(`{`), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		s, err := newEmbyWebServer("/emby", root, "")
+		s, err := newEmbyWebServer(root, "")
 		if err != nil {
 			t.Fatalf("corrupt must not fail construction: %v", err)
 		}
@@ -82,7 +74,7 @@ func TestNewEmbyWebServerStates(t *testing.T) {
 		// Hand-written trees use digests not in the production registry; public
 		// New is corrupt/untrusted. Composition tests use syntheticReadyWebHandler.
 		root := writeUntrustedWebAssets(t)
-		s, err := newEmbyWebServer("/emby", root, "")
+		s, err := newEmbyWebServer(root, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -97,13 +89,13 @@ func TestNewEmbyWebServerStates(t *testing.T) {
 
 func TestMountGatewayRoutesComposition(t *testing.T) {
 	t.Run("disabled_web_404_never_api", func(t *testing.T) {
-		web, err := newEmbyWebServer("/emby", "", "")
+		web, err := newEmbyWebServer("", "")
 		if err != nil {
 			t.Fatal(err)
 		}
 		var apiHits atomic.Int64
 		api := countingAPI(&apiHits, http.StatusUnauthorized)
-		h := buildComposedHandler(t, "/emby", web, api, true)
+		h := buildComposedHandler(t, web, api, true)
 
 		for _, path := range []string{"/emby/web", "/emby/web/", "/emby/web/nope.js"} {
 			rr := httptest.NewRecorder()
@@ -121,12 +113,12 @@ func TestMountGatewayRoutesComposition(t *testing.T) {
 	})
 
 	t.Run("missing_web_503", func(t *testing.T) {
-		web, err := newEmbyWebServer("/emby", filepath.Join(t.TempDir(), "missing"), "")
+		web, err := newEmbyWebServer(filepath.Join(t.TempDir(), "missing"), "")
 		if err != nil {
 			t.Fatal(err)
 		}
 		var apiHits atomic.Int64
-		h := buildComposedHandler(t, "/emby", web, countingAPI(&apiHits, 401), true)
+		h := buildComposedHandler(t, web, countingAPI(&apiHits, 401), true)
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/emby/web/", nil))
 		if rr.Code != http.StatusServiceUnavailable {
@@ -142,7 +134,7 @@ func TestMountGatewayRoutesComposition(t *testing.T) {
 		// without needing official prepared assets or registry injection.
 		web := syntheticReadyWebHandler()
 		var apiHits atomic.Int64
-		h := buildComposedHandler(t, "/emby", web, countingAPI(&apiHits, 418), true)
+		h := buildComposedHandler(t, web, countingAPI(&apiHits, 418), true)
 
 		// Redirect root without slash.
 		rr := httptest.NewRecorder()
@@ -181,7 +173,7 @@ func TestMountGatewayRoutesComposition(t *testing.T) {
 
 	t.Run("unknown_web_methods", func(t *testing.T) {
 		web := syntheticReadyWebHandler()
-		h := buildComposedHandler(t, "/emby", web, countingAPI(new(atomic.Int64), 401), true)
+		h := buildComposedHandler(t, web, countingAPI(new(atomic.Int64), 401), true)
 
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/emby/web/missing.js", nil))
@@ -213,7 +205,7 @@ func TestMountGatewayRoutesComposition(t *testing.T) {
 
 	t.Run("canary_cors_unbinds_pbCors", func(t *testing.T) {
 		web := syntheticReadyWebHandler()
-		h := buildComposedHandler(t, "/emby", web, countingAPI(new(atomic.Int64), 401), true)
+		h := buildComposedHandler(t, web, countingAPI(new(atomic.Int64), 401), true)
 
 		// Allowed origin simple GET.
 		rr := httptest.NewRecorder()
@@ -279,8 +271,7 @@ func TestMountGatewayRoutesComposition(t *testing.T) {
 		app := newTestApp(t)
 		pbRouter := newTestRouter(t, app, true)
 		// Reverse of mountGatewayRoutes registration order.
-		base := "/emby"
-		webExact, webWild, apiExact, apiWild := gatewayRoutePatterns(base)
+		webExact, webWild, apiExact, apiWild := gatewayRoutePatterns()
 		apiAction := func(re *core.RequestEvent) error {
 			api.ServeHTTP(re.Response, re.Request)
 			return nil
@@ -322,7 +313,7 @@ func TestMountGatewayRoutesComposition(t *testing.T) {
 			webHits.Add(1)
 			web.ServeHTTP(w, r)
 		})
-		h := buildComposedHandler(t, "/emby", countingWeb, api, true)
+		h := buildComposedHandler(t, countingWeb, api, true)
 
 		// Literal traversal under web prefix: guard 404 no-store, no downstream.
 		for _, path := range []string{
@@ -380,12 +371,12 @@ func TestMountGatewayRoutesComposition(t *testing.T) {
 	})
 
 	t.Run("registration_stubs_host_root", func(t *testing.T) {
-		web, err := newEmbyWebServer("/emby", "", "")
+		web, err := newEmbyWebServer("", "")
 		if err != nil {
 			t.Fatal(err)
 		}
 		var apiHits atomic.Int64
-		h := buildComposedHandler(t, "/emby", web, countingAPI(&apiHits, 418), true)
+		h := buildComposedHandler(t, web, countingAPI(&apiHits, 418), true)
 		for _, path := range []string{
 			"/admin/service/registration/validateDevice",
 			"/admin/service/registration/validate",
@@ -406,30 +397,20 @@ func TestMountGatewayRoutesComposition(t *testing.T) {
 		}
 	})
 
-	t.Run("blank_env_api_only_non_emby_base", func(t *testing.T) {
-		// Blank assets: disabled Web is allowed with any base for API-only deploys.
-		web, err := newEmbyWebServer("/custom", "", "")
+	t.Run("blank_env_api_only", func(t *testing.T) {
+		web, err := newEmbyWebServer("", "")
 		if err != nil {
 			t.Fatal(err)
 		}
 		var apiHits atomic.Int64
-		h := buildComposedHandler(t, "/custom", web, countingAPI(&apiHits, 200), true)
+		h := buildComposedHandler(t, web, countingAPI(&apiHits, 200), true)
 		rr := httptest.NewRecorder()
-		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/custom/System/Info", nil))
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/emby/System/Info", nil))
 		if rr.Code != 200 {
 			t.Fatalf("code=%d", rr.Code)
 		}
 		if apiHits.Load() != 1 {
 			t.Fatalf("api hits=%d", apiHits.Load())
-		}
-		// Fixed Web is always /emby/web; /custom/web/... remains API catch-all.
-		rr = httptest.NewRecorder()
-		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/custom/web/", nil))
-		if rr.Code != 200 {
-			t.Fatalf("/custom/web/ should hit API, code=%d", rr.Code)
-		}
-		if apiHits.Load() != 2 {
-			t.Fatalf("api hits=%d want 2", apiHits.Load())
 		}
 		// Fixed /emby/web is disabled => 404, never API.
 		apiBefore := apiHits.Load()
@@ -454,7 +435,7 @@ func TestMountGatewayRoutesComposition(t *testing.T) {
 			webHits.Add(1)
 			web.ServeHTTP(w, r)
 		})
-		h := buildComposedHandler(t, "/emby", countingWeb, api, true)
+		h := buildComposedHandler(t, countingWeb, api, true)
 
 		rr := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "http://example.test/", nil)
@@ -562,11 +543,11 @@ func newTestRouter(t *testing.T, app core.App, withCORS bool) *router.Router[*co
 	return pbRouter
 }
 
-func buildComposedHandler(t *testing.T, basePath string, web, api http.Handler, withCORS bool) http.Handler {
+func buildComposedHandler(t *testing.T, web, api http.Handler, withCORS bool) http.Handler {
 	t.Helper()
 	app := newTestApp(t)
 	pbRouter := newTestRouter(t, app, withCORS)
-	mountGatewayRoutes(pbRouter, basePath, web, api)
+	mountGatewayRoutes(pbRouter, web, api)
 	mux, err := pbRouter.BuildMux()
 	if err != nil {
 		t.Fatalf("BuildMux: %v", err)

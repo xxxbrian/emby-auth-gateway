@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-// Registration paths are host-root (not under GATEWAY_BASE_PATH). After Emby Web
+// Registration paths are host-root (not under /emby). After Emby Web
 // host injection, clients call these instead of mb3admin.com.
 const registrationPrefix = "/admin/service/registration/"
 

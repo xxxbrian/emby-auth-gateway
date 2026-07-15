@@ -4,7 +4,7 @@ set -euo pipefail
 # Required (unless SMOKE_WEB_ONLY=1 or SMOKE_HEADER_SELFTEST=1):
 #   SMOKE_USERNAME/SMOKE_PASSWORD (USERNAME/PASSWORD still accepted)
 # Optional:
-#   GATEWAY_URL, PB_URL, GATEWAY_BASE_PATH, SYNTHETIC_USER_ID,
+#   GATEWAY_URL, PB_URL, SYNTHETIC_USER_ID,
 #   SMOKE_OPTIONAL_MEDIA, SMOKE_M3U8_PATH, CURL_OPTS,
 #   SMOKE_WEB (disabled|ready),
 #   SMOKE_WEB_ONLY=1 (test-only: Web checks alone; requires SMOKE_WEB),
@@ -14,7 +14,8 @@ set -euo pipefail
 
 GATEWAY_URL="${GATEWAY_URL:-http://127.0.0.1:8090}"
 PB_URL="${PB_URL:-$GATEWAY_URL}"
-GATEWAY_BASE_PATH="${GATEWAY_BASE_PATH:-/emby}"
+# Emby-compatible routes are fixed under /emby.
+GATEWAY_BASE_PATH="/emby"
 USERNAME="${SMOKE_USERNAME:-${USERNAME:-}}"
 PASSWORD="${SMOKE_PASSWORD:-${PASSWORD:-}}"
 SYNTHETIC_USER_ID="${SYNTHETIC_USER_ID:-}"
@@ -71,10 +72,8 @@ fi
 
 GATEWAY_URL="${GATEWAY_URL%/}"
 PB_URL="${PB_URL%/}"
-GATEWAY_BASE_PATH="/${GATEWAY_BASE_PATH#/}"
-GATEWAY_BASE_PATH="${GATEWAY_BASE_PATH%/}"
 
-# Fixed Web v1 mount (independent of GATEWAY_BASE_PATH for API routes).
+# Fixed Web mount under the fixed /emby gateway base path.
 WEB_PREFIX="/emby/web"
 WEB_CORS_ORIGIN="https://app.emby.media"
 WEB_CANARIES=(
