@@ -115,6 +115,28 @@ func hasExplicitCredentialInput(r *http.Request) bool {
 	return false
 }
 
+// hasAuthControlOccurrence preserves authentication precedence for anonymous
+// routes: an empty reserved control is still an explicit authentication attempt.
+func hasAuthControlOccurrence(r *http.Request) bool {
+	for key := range r.Header {
+		for _, name := range []string{"X-Emby-Token", "X-MediaBrowser-Token", "X-Emby-Authorization", "Authorization"} {
+			if strings.EqualFold(key, name) {
+				return true
+			}
+		}
+	}
+	q, err := parseRawQuery(r.URL.RawQuery)
+	if err != nil {
+		return true
+	}
+	for _, name := range append(append([]string{}, strictQueryAuthKeys...), genericQueryAuthKey) {
+		if _, ok := q[name]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 func resourceCookieToken(r *http.Request, rel string) (string, resourceRouteKind, bool) {
 	kind := resourceRoute(r, rel)
 	if kind == resourceRouteNone || hasExplicitCredentialInput(r) {

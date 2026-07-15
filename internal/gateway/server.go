@@ -40,6 +40,7 @@ type Server struct {
 	mediaDeadlineWarning  atomic.Bool
 	anonymousImages       anonymousImageNamespaceState
 	anonymousImageNow     func() time.Time
+	anonymousImageSlots   chan struct{}
 }
 
 func NewServer(cfg Config, store Store) *Server {
@@ -66,7 +67,7 @@ func NewServer(cfg Config, store Store) *Server {
 		client = &http.Client{Timeout: backendAuthTimeout}
 	}
 	proxyClient := newProxyClient(cfg.HTTPClient)
-	return &Server{cfg: cfg, store: store, client: client, proxyClient: proxyClient, logins: newLoginFailureLimiter(), backendAuthFailures: map[string]backendLoginFailure{}, playbackGuards: newPlaybackGuardTracker(), anonymousImageNow: time.Now}
+	return &Server{cfg: cfg, store: store, client: client, proxyClient: proxyClient, logins: newLoginFailureLimiter(), backendAuthFailures: map[string]backendLoginFailure{}, playbackGuards: newPlaybackGuardTracker(), anonymousImageNow: time.Now, anonymousImageSlots: make(chan struct{}, anonymousImageValidationConcurrency)}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -79,12 +80,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Credential-accepting routes reject malformed query encoding before any
 	// store operation (path policy, session, audit, etc.).
 	if acceptsClientCredentials(r.Method, rel) {
+		if isAnonymousItemImageRoute(r, rel) {
+			w.Header().Set("Cache-Control", "no-store")
+		}
 		if err := validateRawQuery(r.URL.RawQuery); err != nil {
 			writeCredentialQueryError(w, err)
 			return
 		}
 	}
 	if !s.pathPolicyAllows(w, r, rel) {
+		return
+	}
+	if isAnonymousItemImageRoute(r, rel) && !hasAuthControlOccurrence(r) && !hasReservedResourceCookie(r) && s.anonymousImageConfigEnabled() {
+		s.handleAnonymousItemImage(w, r, rel)
 		return
 	}
 
