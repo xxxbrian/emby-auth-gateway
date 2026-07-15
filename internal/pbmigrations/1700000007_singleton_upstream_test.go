@@ -22,7 +22,7 @@ func TestSingletonUpstreamSchema(t *testing.T) {
 		"backend_username", "backend_password", "backend_user_id", "backend_token", "token_updated_at",
 		"last_login_at", "last_login_error", "backend_user_agent", "backend_authorization_client",
 		"backend_authorization_device", "backend_authorization_device_id", "backend_authorization_version",
-		"created", "updated",
+		"created", "updated", "auth_generation_id",
 	})
 	assertSelectField(t, sources, "key", true, 1, []string{"default"})
 	assertTextField(t, sources, "server_id", true, 255)
@@ -41,6 +41,7 @@ func TestSingletonUpstreamSchema(t *testing.T) {
 	assertTextField(t, sources, "backend_authorization_device", true, 255)
 	assertTextField(t, sources, "backend_authorization_device_id", true, 255)
 	assertTextField(t, sources, "backend_authorization_version", true, 80)
+	assertTextField(t, sources, "auth_generation_id", false, 128)
 	assertAutodateFields(t, sources)
 	assertIndexes(t, sources, []string{
 		"CREATE UNIQUE INDEX `idx_upstream_sources_key` ON `upstream_sources` (key)",
@@ -162,6 +163,9 @@ func TestSingletonUpstreamBootstrapAndCompatibility(t *testing.T) {
 	if err := app.RunAllMigrations(); err != nil {
 		t.Fatalf("repeat migrations: %v", err)
 	}
+	if err := upstreamAuthGenerationDown(app); err != nil {
+		t.Fatalf("restore 1700000007 schema: %v", err)
+	}
 	if err := upstreamCollectionsUp(app); err != nil {
 		t.Fatalf("accept compatible existing collections: %v", err)
 	}
@@ -256,6 +260,9 @@ func TestSingletonUpstreamRejectsIncompatibleExistingCollections(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			app := newMigrationTestApp(t)
+			if err := upstreamAuthGenerationDown(app); err != nil {
+				t.Fatalf("restore 1700000007 schema: %v", err)
+			}
 			tc.mutate(t, app)
 			if err := upstreamCollectionsUp(app); err == nil {
 				t.Fatal("accepted incompatible existing collections")
