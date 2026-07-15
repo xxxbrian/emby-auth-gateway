@@ -200,7 +200,7 @@ func init() {
 }
 
 func gatewayCollectionNames() []string {
-	return []string{"users", "emby_servers", "backend_accounts", "user_mappings", "gateway_sessions", "audit_logs", "playback_events", "user_item_data", "item_child_counts", "display_preferences", "path_policies"}
+	return []string{"users", "emby_servers", "backend_accounts", "user_mappings", "gateway_sessions", "audit_logs", "playback_events", "user_item_data", "item_child_counts", "display_preferences", "path_policies", upstreamSourcesCollection, upstreamEndpointsCollection}
 }
 
 func lockCollection(collection *core.Collection) {
