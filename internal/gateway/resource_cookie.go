@@ -138,6 +138,20 @@ func resourceRouteFromContext(r *http.Request) resourceRouteKind {
 	return kind
 }
 
+func isResourceRedirectPath(rel string) bool {
+	if len(rel) < 2 || rel[0] != '/' || strings.Contains(rel, "\\") || hasURLControls(rel) {
+		return false
+	}
+	parts := strings.Split(rel[1:], "/")
+	if resourceImageParts(parts) {
+		return true
+	}
+	if len(parts) >= 3 && (strings.EqualFold(parts[0], "Videos") || strings.EqualFold(parts[0], "Audio")) && parts[1] != "" {
+		return true
+	}
+	return len(parts) == 3 && strings.EqualFold(parts[0], "Items") && parts[1] != "" && strings.EqualFold(parts[2], "Download")
+}
+
 func applyResourceCachePolicy(h http.Header, kind resourceRouteKind, status int) {
 	if kind == resourceRouteNone {
 		return

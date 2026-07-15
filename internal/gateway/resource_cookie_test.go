@@ -297,6 +297,70 @@ func TestResourceCookieCachePolicy(t *testing.T) {
 	}
 }
 
+func TestResourceCachePolicyAppliesToEveryCredentialSource(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/forbidden") {
+			w.Header().Set("Cache-Control", "public, max-age=3600")
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		if strings.Contains(r.URL.Path, "/Images/") {
+			w.Header().Set("Content-Type", "image/gif")
+			w.Header().Set("Cache-Control", "public, max-age=3600")
+			_, _ = w.Write([]byte("image"))
+			return
+		}
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		_, _ = w.Write([]byte("media"))
+	}))
+	defer backend.Close()
+	store := NewMemoryStore()
+	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	for _, auth := range []struct {
+		name  string
+		apply func(*http.Request)
+	}{
+		{"query", func(r *http.Request) { r.URL.RawQuery = "api_key=gateway-token" }},
+		{"header", func(r *http.Request) { r.Header.Set("X-Emby-Token", "gateway-token") }},
+		{"cookie", func(r *http.Request) { r.AddCookie(&http.Cookie{Name: resourceCookieName, Value: "gateway-token"}) }},
+	} {
+		for _, resource := range []struct {
+			path, wantCache string
+		}{
+			{"/Items/item/Images/Primary", "private, no-store"},
+			{"/Videos/item/stream", "private"},
+		} {
+			t.Run(auth.name+resource.path, func(t *testing.T) {
+				req := mustRequest(t, http.MethodGet, gw.URL+"/emby"+resource.path, nil)
+				auth.apply(req)
+				resp := do(t, req)
+				_ = resp.Body.Close()
+				if resp.StatusCode != http.StatusOK || resp.Header.Get("Cache-Control") != resource.wantCache {
+					t.Fatalf("status/cache = %d/%q", resp.StatusCode, resp.Header.Get("Cache-Control"))
+				}
+			})
+		}
+	}
+	for _, path := range []string{"/Items/item/Images/Primary", "/Videos/item/stream"} {
+		req := mustRequest(t, http.MethodGet, gw.URL+"/emby"+path, nil)
+		resp := do(t, req)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized || resp.Header.Get("Cache-Control") != "private, no-store" {
+			t.Fatalf("unauthenticated %s status/cache = %d/%q", path, resp.StatusCode, resp.Header.Get("Cache-Control"))
+		}
+	}
+	forbidden := mustRequest(t, http.MethodGet, gw.URL+"/emby/Videos/item/forbidden?api_key=gateway-token", nil)
+	forbiddenResp := do(t, forbidden)
+	_ = forbiddenResp.Body.Close()
+	if forbiddenResp.StatusCode != http.StatusForbidden || forbiddenResp.Header.Get("Cache-Control") != "private, no-store" {
+		t.Fatalf("forbidden status/cache = %d/%q", forbiddenResp.StatusCode, forbiddenResp.Header.Get("Cache-Control"))
+	}
+}
+
 func TestCookieOnlyManifestAndChildrenDoNotExposeTokens(t *testing.T) {
 	var backendURL string
 	var childHits int

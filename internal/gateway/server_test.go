@@ -2049,6 +2049,51 @@ func TestIsBaseItemJSONRejectsWeakFallbackFields(t *testing.T) {
 	}
 }
 
+func TestPlaybackInfoBareSignedDirectStreamURLRoundTrip(t *testing.T) {
+	var backendURL string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/emby/Items/item-1/PlaybackInfo":
+			writeTestJSON(w, map[string]any{"MediaSources": []any{map[string]any{"DirectStreamUrl": backendURL + "/emby/Videos/item-1/stream?sig=a%2Bb&exp=1"}}})
+		case "/emby/Videos/item-1/stream":
+			if r.Header.Get("X-Emby-Token") != "backend-token" || r.URL.Query().Get("sig") != "a+b" || r.URL.Query().Get("exp") != "1" || r.URL.Query().Get("api_key") != "backend-token" || r.Header.Get("Range") != "bytes=0-" {
+				t.Fatalf("stream request auth/query/range = %q/%q/%q", r.Header.Get("X-Emby-Token"), r.URL.RawQuery, r.Header.Get("Range"))
+			}
+			w.Header().Set("Content-Type", "video/mp4")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte("stream"))
+		default:
+			t.Fatalf("unexpected backend path %q", r.URL.Path)
+		}
+	}))
+	defer backend.Close()
+	backendURL = backend.URL
+	store := NewMemoryStore()
+	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	playback := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Items/item-1/PlaybackInfo?api_key=gateway-token", nil))
+	defer playback.Body.Close()
+	var payload map[string]any
+	decodeJSON(t, playback.Body, &payload)
+	direct := payload["MediaSources"].([]any)[0].(map[string]any)["DirectStreamUrl"].(string)
+	if direct != "/Videos/item-1/stream?sig=a%2Bb&exp=1&api_key=gateway-token" {
+		t.Fatalf("DirectStreamUrl = %q", direct)
+	}
+	parsed, err := url.Parse(gw.URL + "/emby" + direct)
+	if err != nil {
+		t.Fatalf("parse returned DirectStreamUrl: %v", err)
+	}
+	stream := mustRequest(t, http.MethodGet, parsed.String(), nil)
+	stream.Header.Set("Range", "bytes=0-")
+	streamResp := do(t, stream)
+	_ = streamResp.Body.Close()
+	if streamResp.StatusCode != http.StatusPartialContent {
+		t.Fatalf("stream status = %d", streamResp.StatusCode)
+	}
+}
+
 func TestProxyUserDataOverlaySelectsItemAndItemsWrappers(t *testing.T) {
 	store := &countingPlaybackStore{MemoryStore: NewMemoryStore()}
 	session := testSession("http://backend.invalid/emby")

@@ -406,15 +406,15 @@ func (s *Server) handleCurrentUser(w http.ResponseWriter, r *http.Request, rel s
 }
 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string) {
+	resourceKind := resourceRoute(r, rel)
+	if resourceKind != resourceRouteNone {
+		r = r.WithContext(context.WithValue(r.Context(), resourceCookieContextKey{}, resourceKind))
+		applyResourceCachePolicy(w.Header(), resourceKind, http.StatusUnauthorized)
+	}
 	gatewayToken := ExtractToken(r)
 	cookieAuthenticated := false
-	cookieRoute := resourceRouteNone
 	if gatewayToken == "" {
-		gatewayToken, cookieRoute, cookieAuthenticated = resourceCookieToken(r, rel)
-	}
-	if cookieAuthenticated {
-		r = r.WithContext(context.WithValue(r.Context(), resourceCookieContextKey{}, cookieRoute))
-		applyResourceCachePolicy(w.Header(), cookieRoute, http.StatusUnauthorized)
+		gatewayToken, _, cookieAuthenticated = resourceCookieToken(r, rel)
 	}
 	session, ok := s.activeSession(w, r, gatewayToken)
 	if !ok {
