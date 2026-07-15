@@ -25,6 +25,14 @@ func (s *Server) ensureBackendSession(ctx context.Context, session *Session) err
 }
 
 func (s *Server) refreshBackendSession(ctx context.Context, session *Session, failedToken string) error {
+	return s.refreshBackendSessionWithKnownUnauthorized(ctx, session, failedToken, false)
+}
+
+func (s *Server) refreshBackendSessionKnownUnauthorized(ctx context.Context, session *Session, failedToken string) error {
+	return s.refreshBackendSessionWithKnownUnauthorized(ctx, session, failedToken, true)
+}
+
+func (s *Server) refreshBackendSessionWithKnownUnauthorized(ctx context.Context, session *Session, failedToken string, knownUnauthorized bool) error {
 	if session == nil {
 		return ErrNotFound
 	}
@@ -42,8 +50,10 @@ func (s *Server) refreshBackendSession(ctx context.Context, session *Session, fa
 	} else {
 		account = &session.BackendAccount
 	}
-	if stale, err := s.backendTokenIsUnauthorized(ctx, session, failedToken); err != nil || !stale {
-		return ErrUnauthorized
+	if !knownUnauthorized {
+		if stale, err := s.backendTokenIsUnauthorized(ctx, session, failedToken); err != nil || !stale {
+			return ErrUnauthorized
+		}
 	}
 	if account != nil && tokenRefreshTooSoon(*account, failedToken, time.Now().UTC()) {
 		return ErrUnauthorized

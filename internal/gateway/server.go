@@ -438,6 +438,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 		http.Error(w, "backend authentication failed", http.StatusBadGateway)
 		return
 	}
+	if isUpgradeRequest(r) {
+		s.prepareBackendUpgrade(r.Context(), r, rel, session)
+	}
 	proxyURL, err := s.proxyURL(session, rel, r.URL.RawQuery, gatewayToken)
 	if err != nil {
 		if errors.Is(err, errMalformedQuery) || errors.Is(err, errCredentialConflict) || errors.Is(err, errCredentialStore) {
@@ -658,10 +661,11 @@ func (s *Server) writeConcurrentPlaybackDenied(w http.ResponseWriter, r *http.Re
 
 func (s *Server) handleUpgradeProxy(w http.ResponseWriter, r *http.Request, proxyURL *url.URL, session *Session, gatewayToken, rel string) {
 	started := time.Now()
+	inbound := r
 	r = r.WithContext(withRedirectCredentialTokens(r.Context(), gatewayToken, session.BackendToken))
 	trackedWriter := &upgradeResponseWriter{ResponseWriter: w}
 	proxy := &httputil.ReverseProxy{
-		Transport: s.proxyClient.Transport,
+		Transport: &upgradeRetryTransport{base: s.proxyClient.Transport, server: s, original: inbound, session: session, gatewayToken: gatewayToken, rel: rel},
 		Director: func(req *http.Request) {
 			req.URL = proxyURL
 			req.Host = proxyURL.Host
@@ -675,6 +679,21 @@ func (s *Server) handleUpgradeProxy(w http.ResponseWriter, r *http.Request, prox
 		},
 	}
 	proxy.ServeHTTP(trackedWriter, r)
+}
+
+// prepareBackendUpgrade is best-effort: a failed validity probe must not block
+// a usable websocket handshake.
+func (s *Server) prepareBackendUpgrade(ctx context.Context, r *http.Request, rel string, session *Session) {
+	failedToken := session.BackendToken
+	stale, err := s.backendTokenIsUnauthorized(ctx, session, failedToken)
+	if err != nil || !stale {
+		return
+	}
+	if err := s.refreshBackendSessionKnownUnauthorized(ctx, session, failedToken); err == nil {
+		s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh", "backend token refreshed before upgrade", http.StatusOK)
+	} else if !errors.Is(err, ErrUnauthorized) {
+		s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh_failure", "backend token refresh failed before upgrade", http.StatusUnauthorized)
+	}
 }
 
 func (s *Server) activeSession(w http.ResponseWriter, r *http.Request, token string) (*Session, bool) {

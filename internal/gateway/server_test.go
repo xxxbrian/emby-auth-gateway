@@ -476,6 +476,8 @@ func TestGatewayWebSocketUpgradeProxy(t *testing.T) {
 					"Name": "shared",
 				},
 			})
+		case "/emby/System/Info":
+			w.WriteHeader(http.StatusOK)
 		case "/emby/embywebsocket":
 			if r.URL.Query().Get("api_key") == backendToken && r.Header.Get("X-Emby-Token") == backendToken {
 				sawBackendToken = true
@@ -614,6 +616,128 @@ func TestEmbyWebSocketRejectsBadCredentialsWithoutDial(t *testing.T) {
 				t.Fatalf("status/hits = %d/%d", writer.Code, transport.hits)
 			}
 		})
+	}
+}
+
+func TestEmbyWebSocketPreflightRefreshesStaleBackendToken(t *testing.T) {
+	var probes, logins, handshakes int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/emby/System/Info":
+			probes++
+			if r.Header.Get("X-Emby-Token") != "old-backend-token" {
+				t.Fatalf("probe token = %q", r.Header.Get("X-Emby-Token"))
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/emby/Users/AuthenticateByName":
+			logins++
+			writeTestJSON(w, map[string]any{"AccessToken": "new-backend-token", "User": map[string]any{"Id": "backend-user", "Name": "shared"}})
+		case "/emby/Sessions/Logout":
+			w.WriteHeader(http.StatusOK)
+		case "/emby/embywebsocket":
+			handshakes++
+			if r.Header.Get("X-Emby-Token") != "new-backend-token" || r.URL.Query().Get("api_key") != "new-backend-token" {
+				t.Fatalf("handshake token/query = %q/%q", r.Header.Get("X-Emby-Token"), r.URL.RawQuery)
+			}
+			hj := w.(http.Hijacker)
+			conn, rw, err := hj.Hijack()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+			_ = rw.Flush()
+		default:
+			t.Fatalf("unexpected backend path %q", r.URL.Path)
+		}
+	}))
+	defer backend.Close()
+	store := testStore(backend.URL + "/emby")
+	mapping := store.Mappings["u1"]
+	mapping.BackendAccount.BackendToken = "old-backend-token"
+	mapping.BackendAccount.BackendUserID = "backend-user"
+	store.Mappings["u1"] = mapping
+	session := testSession(backend.URL + "/emby")
+	session.BackendToken = "old-backend-token"
+	session.BackendUserID = "backend-user"
+	session.BackendAccount = mapping.BackendAccount
+	store.Sessions[HashToken("gateway-token")] = session
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+	gwURL, _ := url.Parse(gw.URL)
+	conn, err := net.Dial("tcp", gwURL.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_, _ = conn.Write([]byte("GET /emby/embywebsocket?api_key=gateway-token&deviceId=device HTTP/1.1\r\nHost: " + gwURL.Host + "\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: key\r\nSec-WebSocket-Version: 13\r\n\r\n"))
+	status, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil || !strings.Contains(status, "101") || probes != 1 || logins != 1 || handshakes != 1 || session.BackendToken != "new-backend-token" {
+		t.Fatalf("status/probe/login/handshake/token = %q/%d/%d/%d/%q err=%v", status, probes, logins, handshakes, session.BackendToken, err)
+	}
+}
+
+func TestEmbyWebSocketRetriesOneHandshakeUnauthorized(t *testing.T) {
+	var probes, logins, handshakes int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/emby/System/Info":
+			probes++
+			if probes == 1 {
+				w.WriteHeader(http.StatusOK) // Upgrade preflight.
+			} else {
+				w.WriteHeader(http.StatusUnauthorized) // Refresh confirmation.
+			}
+		case "/emby/Users/AuthenticateByName":
+			logins++
+			writeTestJSON(w, map[string]any{"AccessToken": "new-backend-token", "User": map[string]any{"Id": "backend-user"}})
+		case "/emby/Sessions/Logout":
+			w.WriteHeader(http.StatusOK)
+		case "/emby/embywebsocket":
+			handshakes++
+			if handshakes == 1 {
+				if r.Header.Get("X-Emby-Token") != "old-backend-token" {
+					t.Fatalf("first handshake token = %q", r.Header.Get("X-Emby-Token"))
+				}
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			if handshakes != 2 || r.Header.Get("X-Emby-Token") != "new-backend-token" || r.URL.Query().Get("api_key") != "new-backend-token" || r.URL.Query().Get("deviceId") != "device" || r.Header.Get("Cookie") != "other=keep" || !headerHasToken(r.Header, "Connection", "upgrade") || r.Header.Get("Upgrade") != "websocket" || r.Header.Get("Sec-WebSocket-Key") != "key" || r.Header.Get("Sec-WebSocket-Version") != "13" {
+				t.Fatalf("retry handshake = headers=%#v query=%q count=%d", r.Header, r.URL.RawQuery, handshakes)
+			}
+			hj := w.(http.Hijacker)
+			conn, rw, err := hj.Hijack()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+			_ = rw.Flush()
+		default:
+			t.Fatalf("unexpected backend path %q", r.URL.Path)
+		}
+	}))
+	defer backend.Close()
+	store := testStore(backend.URL + "/emby")
+	mapping := store.Mappings["u1"]
+	mapping.BackendAccount.BackendToken = "old-backend-token"
+	mapping.BackendAccount.BackendUserID = "backend-user"
+	store.Mappings["u1"] = mapping
+	session := testSession(backend.URL + "/emby")
+	session.BackendToken, session.BackendUserID, session.BackendAccount = "old-backend-token", "backend-user", mapping.BackendAccount
+	store.Sessions[HashToken("gateway-token")] = session
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+	gwURL, _ := url.Parse(gw.URL)
+	conn, err := net.Dial("tcp", gwURL.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_, _ = conn.Write([]byte("GET /emby/embywebsocket?api_key=gateway-token&deviceId=device HTTP/1.1\r\nHost: " + gwURL.Host + "\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nCookie: " + resourceCookieName + "=gateway-token; other=keep\r\nSec-WebSocket-Key: key\r\nSec-WebSocket-Version: 13\r\n\r\n"))
+	status, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil || !strings.Contains(status, "101") || probes != 2 || logins != 1 || handshakes != 2 {
+		t.Fatalf("status/probes/logins/handshakes = %q/%d/%d/%d err=%v", status, probes, logins, handshakes, err)
 	}
 }
 
@@ -3439,6 +3563,8 @@ func TestCredentialQueryWebSocketGuardAndAPIKey(t *testing.T) {
 					"ServerId":    "backend-server",
 					"User":        map[string]any{"Id": "backend-user", "Name": "shared"},
 				})
+			case "/emby/System/Info":
+				w.WriteHeader(http.StatusOK)
 			case "/emby/socket":
 				if r.URL.Query().Get("api_key") == "backend-token" && r.Header.Get("X-Emby-Token") == "backend-token" {
 					sawBackend = true
