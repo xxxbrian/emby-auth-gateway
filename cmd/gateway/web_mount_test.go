@@ -424,6 +424,84 @@ func TestMountGatewayRoutesComposition(t *testing.T) {
 		}
 	})
 
+	t.Run("root_redirect_when_web_ready", func(t *testing.T) {
+		web := syntheticReadyWebHandler()
+		var apiHits atomic.Int64
+		h := buildComposedHandlerWithRootRedirect(t, web, countingAPI(&apiHits, 418), true, true)
+
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+		if rr.Code != http.StatusPermanentRedirect {
+			t.Fatalf("GET / code=%d want 308", rr.Code)
+		}
+		if loc := rr.Header().Get("Location"); loc != "/emby/web/" {
+			t.Fatalf("Location=%q", loc)
+		}
+
+		rr = httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/?x=1", nil))
+		if rr.Code != http.StatusPermanentRedirect {
+			t.Fatalf("GET /?x=1 code=%d want 308", rr.Code)
+		}
+		if loc := rr.Header().Get("Location"); loc != "/emby/web/?x=1" {
+			t.Fatalf("Location=%q", loc)
+		}
+
+		rr = httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodHead, "/", nil))
+		if rr.Code != http.StatusPermanentRedirect {
+			t.Fatalf("HEAD / code=%d want 308", rr.Code)
+		}
+		if loc := rr.Header().Get("Location"); loc != "/emby/web/" {
+			t.Fatalf("HEAD Location=%q", loc)
+		}
+
+		rr = httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/", nil))
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("POST / code=%d want 404", rr.Code)
+		}
+		if apiHits.Load() != 0 {
+			t.Fatalf("root must not hit API, hits=%d", apiHits.Load())
+		}
+	})
+
+	t.Run("root_no_redirect_when_web_disabled", func(t *testing.T) {
+		web, err := newEmbyWebServer("", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if webReadyForRootRedirect(web) {
+			t.Fatal("disabled web must not enable root redirect")
+		}
+		var apiHits atomic.Int64
+		h := buildComposedHandlerWithRootRedirect(t, web, countingAPI(&apiHits, 418), true, false)
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+		if rr.Code == http.StatusPermanentRedirect {
+			t.Fatalf("disabled web must not redirect /, Location=%q", rr.Header().Get("Location"))
+		}
+		if apiHits.Load() != 0 {
+			t.Fatalf("root must not hit API, hits=%d", apiHits.Load())
+		}
+	})
+
+	t.Run("root_no_redirect_when_web_missing", func(t *testing.T) {
+		web, err := newEmbyWebServer(filepath.Join(t.TempDir(), "missing"), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if webReadyForRootRedirect(web) {
+			t.Fatal("missing web must not enable root redirect")
+		}
+		h := buildComposedHandlerWithRootRedirect(t, web, countingAPI(new(atomic.Int64), 418), true, false)
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+		if rr.Code == http.StatusPermanentRedirect {
+			t.Fatalf("missing web must not redirect /, Location=%q", rr.Header().Get("Location"))
+		}
+	})
+
 	t.Run("guard_encoded_web_prefix_composed", func(t *testing.T) {
 		web := syntheticReadyWebHandler()
 		var apiHits, webHits atomic.Int64
@@ -545,9 +623,14 @@ func newTestRouter(t *testing.T, app core.App, withCORS bool) *router.Router[*co
 
 func buildComposedHandler(t *testing.T, web, api http.Handler, withCORS bool) http.Handler {
 	t.Helper()
+	return buildComposedHandlerWithRootRedirect(t, web, api, withCORS, false)
+}
+
+func buildComposedHandlerWithRootRedirect(t *testing.T, web, api http.Handler, withCORS, rootRedirect bool) http.Handler {
+	t.Helper()
 	app := newTestApp(t)
 	pbRouter := newTestRouter(t, app, withCORS)
-	mountGatewayRoutes(pbRouter, web, api)
+	mountGatewayRoutes(pbRouter, web, api, rootRedirect)
 	mux, err := pbRouter.BuildMux()
 	if err != nil {
 		t.Fatalf("BuildMux: %v", err)

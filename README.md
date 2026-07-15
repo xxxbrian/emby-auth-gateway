@@ -155,7 +155,7 @@ Docker socket, or installs on startup.
 | --- | --- |
 | `GATEWAY_WEB_ASSETS_DIR` unset/blank | Web disabled: canonical `/emby/web/` (and descendants) return **404**. |
 | Assets dir set, tree missing/corrupt/untrusted | Web configured but unavailable: **503** on Web paths. |
-| Assets dir set, verified trusted release | Ready: serves pinned files; `/emby/web` → **308** `/emby/web/`. |
+| Assets dir set, verified trusted release | Ready: serves pinned files; `/emby/web` → **308** `/emby/web/`; host-root `/` → **308** `/emby/web/`. |
 
 `serve` loads one release into memory at process start. Changing the on-disk
 pointer or installing a new release does not hot-reload; restart the gateway to

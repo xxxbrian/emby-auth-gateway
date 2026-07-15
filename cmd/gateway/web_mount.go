@@ -18,6 +18,7 @@ const (
 	fixedGatewayBasePath = "/emby"
 
 	fixedWebExact = "/emby/web"
+	fixedWebSlash = "/emby/web/"
 	fixedWebWild  = "/emby/web/{path...}"
 
 	fixedAPIExact = "/emby"
@@ -32,11 +33,13 @@ const (
 // (methodless Any), outrank an /emby API catch-all by path specificity, and
 // unbind global pbCors so embyweb owns canary OPTIONS/CORS. Registration stubs
 // are fixed at host-root /admin/service/registration/* (not under /emby).
+// When redirectRootToWeb is true (Web ready), GET/HEAD / 308 to /emby/web/.
 // The request is forwarded untouched.
 func mountGatewayRoutes(
 	r *router.Router[*core.RequestEvent],
 	web http.Handler,
 	api http.Handler,
+	redirectRootToWeb bool,
 ) {
 	if r == nil {
 		return
@@ -69,6 +72,34 @@ func mountGatewayRoutes(
 	r.Any(fixedRegistrationWild, regAction)
 	r.Any(fixedAPIWild, apiAction)
 	r.Any(fixedAPIExact, apiAction)
+
+	if redirectRootToWeb {
+		r.Any("/", rootRedirectToWebAction)
+	}
+}
+
+// rootRedirectToWebAction sends GET/HEAD / to the canonical Emby Web root.
+// Other methods return 404 so host-root stays inert for non-browser traffic.
+func rootRedirectToWebAction(re *core.RequestEvent) error {
+	req := re.Request
+	switch req.Method {
+	case http.MethodGet, http.MethodHead:
+		target := fixedWebSlash
+		if req.URL.RawQuery != "" {
+			target = target + "?" + req.URL.RawQuery
+		}
+		re.Response.Header().Set("Location", target)
+		re.Response.WriteHeader(http.StatusPermanentRedirect) // 308
+		return nil
+	default:
+		http.NotFound(re.Response, req)
+		return nil
+	}
+}
+
+// webReadyForRootRedirect reports whether Web is ready for host-root redirect.
+func webReadyForRootRedirect(web *embyweb.Server) bool {
+	return web != nil && web.Status().State == embyweb.StateReady
 }
 
 // gatewayRoutePatterns returns fixed Web and API patterns for tests.

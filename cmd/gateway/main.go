@@ -53,7 +53,7 @@ func main() {
 			return err
 		}
 
-		mountGatewayRoutes(e.Router, web, gw)
+		mountGatewayRoutes(e.Router, web, gw, webReadyForRootRedirect(web))
 
 		go func() {
 			if err := gw.RefreshBackendServerInfo(context.Background()); err != nil {
