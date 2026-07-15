@@ -38,6 +38,8 @@ type Server struct {
 	backendAuthFailures   map[string]backendLoginFailure
 	playbackGuards        *playbackGuardTracker
 	mediaDeadlineWarning  atomic.Bool
+	anonymousImages       anonymousImageNamespaceState
+	anonymousImageNow     func() time.Time
 }
 
 func NewServer(cfg Config, store Store) *Server {
@@ -64,7 +66,7 @@ func NewServer(cfg Config, store Store) *Server {
 		client = &http.Client{Timeout: backendAuthTimeout}
 	}
 	proxyClient := newProxyClient(cfg.HTTPClient)
-	return &Server{cfg: cfg, store: store, client: client, proxyClient: proxyClient, logins: newLoginFailureLimiter(), backendAuthFailures: map[string]backendLoginFailure{}, playbackGuards: newPlaybackGuardTracker()}
+	return &Server{cfg: cfg, store: store, client: client, proxyClient: proxyClient, logins: newLoginFailureLimiter(), backendAuthFailures: map[string]backendLoginFailure{}, playbackGuards: newPlaybackGuardTracker(), anonymousImageNow: time.Now}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {

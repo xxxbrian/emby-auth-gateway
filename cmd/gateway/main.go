@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -39,21 +40,35 @@ func main() {
 	})
 
 	app.OnServe().BindFunc(func(e *core.ServeEvent) error {
+		anonymousImageConfig, err := anonymousImageConfigFromEnv()
+		if err != nil {
+			return err
+		}
 		gw := gateway.NewServer(gateway.Config{
-			PublicBaseURL:            strings.TrimRight(os.Getenv("GATEWAY_PUBLIC_URL"), "/"),
-			GatewayBasePath:          fixedGatewayBasePath,
-			GatewayServerID:          envDefault("GATEWAY_SERVER_ID", "emby-auth-gateway"),
-			MinResumePct:             envFloatDefault("GATEWAY_MIN_RESUME_PCT", 0),
-			MaxResumePct:             envFloatDefault("GATEWAY_MAX_RESUME_PCT", 0),
-			MinResumeDurationSeconds: envFloatDefault("GATEWAY_MIN_RESUME_DURATION_SECONDS", 0),
+			PublicBaseURL:                 strings.TrimRight(os.Getenv("GATEWAY_PUBLIC_URL"), "/"),
+			GatewayBasePath:               fixedGatewayBasePath,
+			GatewayServerID:               envDefault("GATEWAY_SERVER_ID", "emby-auth-gateway"),
+			MinResumePct:                  envFloatDefault("GATEWAY_MIN_RESUME_PCT", 0),
+			MaxResumePct:                  envFloatDefault("GATEWAY_MAX_RESUME_PCT", 0),
+			MinResumeDurationSeconds:      envFloatDefault("GATEWAY_MIN_RESUME_DURATION_SECONDS", 0),
+			AnonymousImageServerRecordID:  anonymousImageConfig.serverRecordID,
+			AnonymousImageBackendServerID: anonymousImageConfig.backendServerID,
+			AnonymousImageConfigured:      anonymousImageConfig.configured,
 		}, pbstore.New(e.App))
-
 		web, err := newEmbyWebServer(webAssetsDirFromEnv(), os.Getenv("GATEWAY_PUBLIC_URL"))
 		if err != nil {
 			return err
 		}
 
-		mountGatewayRoutes(e.Router, web, gw, webReadyForRootRedirect(web))
+		transient, err := startAnonymousImageNamespace(gw, func() {
+			mountGatewayRoutes(e.Router, web, gw, webReadyForRootRedirect(web))
+		})
+		if err != nil {
+			return err
+		}
+		if transient {
+			e.App.Logger().Warn("Anonymous image namespace unavailable", "error", "probe unavailable")
+		}
 
 		go func() {
 			if err := gw.RefreshBackendServerInfo(context.Background()); err != nil {
@@ -97,6 +112,52 @@ func main() {
 	if err := app.Start(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+type anonymousImageConfig struct {
+	serverRecordID  string
+	backendServerID string
+	configured      bool
+}
+
+func anonymousImageConfigFromEnv() (anonymousImageConfig, error) {
+	recordID, hasRecordID := os.LookupEnv("GATEWAY_ANONYMOUS_IMAGE_SERVER_RECORD_ID")
+	backendID, hasBackendID := os.LookupEnv("GATEWAY_ANONYMOUS_IMAGE_BACKEND_SERVER_ID")
+	return anonymousImageConfigFromValues(recordID, hasRecordID, backendID, hasBackendID)
+}
+
+func anonymousImageConfigFromValues(recordID string, hasRecordID bool, backendID string, hasBackendID bool) (anonymousImageConfig, error) {
+	if !hasRecordID && !hasBackendID {
+		return anonymousImageConfig{}, nil
+	}
+	if !hasRecordID || !hasBackendID || strings.TrimSpace(recordID) == "" || strings.TrimSpace(backendID) == "" {
+		return anonymousImageConfig{}, fmt.Errorf("GATEWAY_ANONYMOUS_IMAGE_SERVER_RECORD_ID and GATEWAY_ANONYMOUS_IMAGE_BACKEND_SERVER_ID must both be set to non-empty values")
+	}
+	return anonymousImageConfig{serverRecordID: strings.TrimSpace(recordID), backendServerID: strings.TrimSpace(backendID), configured: true}, nil
+}
+
+type anonymousImageNamespaceValidator interface {
+	ValidateAnonymousImageNamespace(context.Context) error
+}
+
+func validateAnonymousImageStartup(validator anonymousImageNamespaceValidator) (bool, error) {
+	err := validator.ValidateAnonymousImageNamespace(context.Background())
+	if err == nil {
+		return false, nil
+	}
+	if gateway.IsAnonymousImageNamespaceTransient(err) {
+		return true, nil
+	}
+	return false, err
+}
+
+func startAnonymousImageNamespace(validator anonymousImageNamespaceValidator, mount func()) (bool, error) {
+	transient, err := validateAnonymousImageStartup(validator)
+	if err != nil {
+		return false, err
+	}
+	mount()
+	return transient, nil
 }
 
 // isPureOfflineCLI reports whether args select a command that must not depend on

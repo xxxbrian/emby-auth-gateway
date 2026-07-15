@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +28,87 @@ func TestVersionCommandPrintsBuildMetadata(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf("version output missing %q: %s", want, text)
 		}
+	}
+}
+
+func TestAnonymousImageConfigFromEnvRequiresPair(t *testing.T) {
+	for _, tc := range []struct {
+		name                      string
+		recordID, backendID       string
+		hasRecordID, hasBackendID bool
+		wantErr                   bool
+	}{
+		{"compose absent disabled", "", "", false, false, false},
+		{"explicit blank pair", "", "", true, true, true},
+		{"record only", "record", "", true, false, true},
+		{"record plus blank backend", "record", "", true, true, true},
+		{"backend only", "", "server", false, true, true},
+		{"valid", " record ", " server ", true, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config, err := anonymousImageConfigFromValues(tc.recordID, tc.hasRecordID, tc.backendID, tc.hasBackendID)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if !tc.wantErr && tc.hasRecordID && (!config.configured || config.serverRecordID != "record" || config.backendServerID != "server") {
+				t.Fatalf("config = %#v", config)
+			}
+		})
+	}
+}
+
+type anonymousImageStartupValidatorStub struct{ err error }
+
+func (s anonymousImageStartupValidatorStub) ValidateAnonymousImageNamespace(context.Context) error {
+	return s.err
+}
+
+func TestValidateAnonymousImageStartup(t *testing.T) {
+	staticErr := &gateway.AnonymousImageNamespaceError{Kind: gateway.AnonymousImageNamespaceStaticError, Err: errors.New("static")}
+	mismatchErr := &gateway.AnonymousImageNamespaceError{Kind: gateway.AnonymousImageNamespaceMismatchError, Err: errors.New("mismatch")}
+	transientErr := &gateway.AnonymousImageNamespaceError{Kind: gateway.AnonymousImageNamespaceTransientError, Err: errors.New("transient")}
+	for _, tc := range []struct {
+		name          string
+		err           error
+		wantTransient bool
+		wantError     bool
+	}{
+		{"available", nil, false, false},
+		{"transient mounts authenticated gateway", transientErr, true, false},
+		{"static prevents mount", staticErr, false, true},
+		{"mismatch prevents mount", mismatchErr, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			transient, err := validateAnonymousImageStartup(anonymousImageStartupValidatorStub{err: tc.err})
+			if transient != tc.wantTransient || (err != nil) != tc.wantError {
+				t.Fatalf("transient/error = %v/%v", transient, err)
+			}
+		})
+	}
+}
+
+func TestStartAnonymousImageNamespaceMountsOnlyWhenAllowed(t *testing.T) {
+	staticErr := &gateway.AnonymousImageNamespaceError{Kind: gateway.AnonymousImageNamespaceStaticError, Err: errors.New("static")}
+	mismatchErr := &gateway.AnonymousImageNamespaceError{Kind: gateway.AnonymousImageNamespaceMismatchError, Err: errors.New("mismatch")}
+	transientErr := &gateway.AnonymousImageNamespaceError{Kind: gateway.AnonymousImageNamespaceTransientError, Err: errors.New("transient")}
+	for _, tc := range []struct {
+		name          string
+		err           error
+		wantMount     int
+		wantTransient bool
+	}{
+		{"success", nil, 1, false},
+		{"transient", transientErr, 1, true},
+		{"static", staticErr, 0, false},
+		{"mismatch", mismatchErr, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mounts := 0
+			transient, err := startAnonymousImageNamespace(anonymousImageStartupValidatorStub{err: tc.err}, func() { mounts++ })
+			if mounts != tc.wantMount || transient != tc.wantTransient || ((err != nil) != (tc.wantMount == 0)) {
+				t.Fatalf("mounts/transient/error = %d/%v/%v", mounts, transient, err)
+			}
+		})
 	}
 }
 

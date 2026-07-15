@@ -20,6 +20,9 @@ func (s *Server) RefreshBackendServerInfo(ctx context.Context) error {
 			firstErr = err
 		}
 	}
+	// Namespace validation is read-only and must not make ordinary authenticated
+	// server-info refresh unavailable when an anonymous ingress is transiently down.
+	_ = s.ValidateAnonymousImageNamespace(ctx)
 	return firstErr
 }
 

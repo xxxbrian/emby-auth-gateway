@@ -20,6 +20,8 @@ Gateway environment variables:
 | `GATEWAY_PUBLIC_URL` | No, but set it in production | Request host/proxy headers | Externally reachable gateway Emby base URL, including the fixed `/emby` path, for example `https://media.example.com/emby`. Without it, URL rewriting follows the inbound request host, which can produce unusable `127.0.0.1` URLs behind some proxies. |
 | `GATEWAY_SERVER_ID` | No | `emby-auth-gateway` | Synthetic server id returned to clients instead of the backend Emby server id. |
 | `GATEWAY_WEB_ASSETS_DIR` | No | unset (Web disabled) | Absolute or relative path to the Web assets root. Blank/unset disables Web: `/emby/web` returns 404 and never falls through to the authenticated API. |
+| `GATEWAY_ANONYMOUS_IMAGE_SERVER_RECORD_ID` | No, paired | unset | PocketBase `emby_servers` record ID for the canonical anonymous-image ingress. Must be set with `GATEWAY_ANONYMOUS_IMAGE_BACKEND_SERVER_ID`. This Phase 2B setting validates namespace only; it does not enable anonymous image routes. |
+| `GATEWAY_ANONYMOUS_IMAGE_BACKEND_SERVER_ID` | No, paired | unset | Immutable upstream Emby `ServerId` expected for every enabled `emby_servers` record. The gateway probes each enabled ingress tokenlessly and rejects mismatched namespaces at startup. |
 
 PocketBase runtime flags you will commonly use:
 
@@ -38,6 +40,18 @@ Backend client identity defaults written by `setup` into `emby_servers` records:
 | `backend_authorization_device` | `Mac` |
 | `backend_authorization_device_id` | Generated once by `setup` and saved as a UUID |
 | `backend_authorization_version` | `6.1.3` |
+
+Anonymous-image namespace validation never selects an arbitrary/default server or tries all servers for a request. Every enabled `emby_servers` record must share the configured upstream `ServerId`; multiple HK/CF-style ingress records are allowed when they expose that same namespace. Anonymous image dispatch is not enabled until Phase 3.
+
+To opt into Phase 2B namespace validation under Compose, set both nonempty values and add the dedicated overlay:
+
+```sh
+GATEWAY_ANONYMOUS_IMAGE_SERVER_RECORD_ID="<emby_servers-record-id>" \
+GATEWAY_ANONYMOUS_IMAGE_BACKEND_SERVER_ID="<upstream-Emby-ServerId>" \
+docker compose -f docker-compose.yml -f docker-compose.anonymous-images.yml up --build
+```
+
+The base Compose file deliberately omits both variables. The overlay fails configuration when either value is absent or blank.
 
 ## Local Compose
 

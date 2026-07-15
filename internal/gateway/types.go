@@ -11,13 +11,18 @@ import (
 )
 
 type Config struct {
-	PublicBaseURL            string
-	GatewayBasePath          string
-	GatewayServerID          string
-	HTTPClient               *http.Client
-	MinResumePct             float64
-	MaxResumePct             float64
-	MinResumeDurationSeconds float64
+	PublicBaseURL                 string
+	GatewayBasePath               string
+	GatewayServerID               string
+	HTTPClient                    *http.Client
+	MinResumePct                  float64
+	MaxResumePct                  float64
+	MinResumeDurationSeconds      float64
+	AnonymousImageServerRecordID  string
+	AnonymousImageBackendServerID string
+	// AnonymousImageConfigured preserves explicit empty environment values so
+	// startup validation can reject a malformed paired configuration.
+	AnonymousImageConfigured bool
 }
 
 type Store interface {
