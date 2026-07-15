@@ -2,6 +2,7 @@ package pbsetup
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
@@ -29,6 +30,9 @@ const (
 // afterUpstreamProbe is a test hook for deterministic cancellation/drift tests.
 var afterUpstreamProbe func()
 var afterUpstreamSourceSave func()
+var readProtectedTokenAccounts = func(app core.App) ([]*core.Record, error) {
+	return app.FindRecordsByFilter("backend_accounts", "", "", 0, 0, nil)
+}
 
 type upstreamOptions struct {
 	EmbyBaseURL                 string
@@ -40,6 +44,72 @@ type upstreamOptions struct {
 	BackendAuthorizationVersion string
 }
 
+func protectedTokens(app core.App) (map[string]struct{}, error) {
+	accounts, err := readProtectedTokenAccounts(app)
+	if err != nil {
+		return nil, err
+	}
+	set := map[string]struct{}{}
+	for _, account := range accounts {
+		if token := account.GetString("backend_token"); token != "" {
+			set[token] = struct{}{}
+		}
+	}
+	source, err := app.FindFirstRecordByData(upstreamSources, "key", defaultUpstreamKey)
+	if err != nil && !isNotFound(err) {
+		return nil, err
+	}
+	if err == nil {
+		if token := source.GetString("backend_token"); token != "" {
+			set[token] = struct{}{}
+		}
+	}
+	return set, nil
+}
+
+type tokenOwnership int
+
+const (
+	tokenOwnershipUnknown tokenOwnership = iota
+	tokenOwnershipProtected
+	tokenOwnershipInvocation
+)
+
+type tokenOwnershipError struct{ outcome tokenOwnership }
+
+func (e *tokenOwnershipError) Error() string { return "upstream token ownership cannot be established" }
+
+func classifyTokenOwnership(app core.App, token string) (tokenOwnership, error) {
+	if token == "" {
+		return tokenOwnershipUnknown, nil
+	}
+	set, err := protectedTokens(app)
+	if err != nil {
+		return tokenOwnershipUnknown, &tokenOwnershipError{tokenOwnershipUnknown}
+	}
+	if _, found := set[token]; found {
+		return tokenOwnershipProtected, &tokenOwnershipError{tokenOwnershipProtected}
+	}
+	return tokenOwnershipInvocation, nil
+}
+
+func cleanupInvocationToken(ctx context.Context, app core.App, baseURL string, identity gateway.BackendClientIdentity, deviceID, userID, token string) error {
+	if token == "" {
+		return nil
+	}
+	owned, err := classifyTokenOwnership(app, token)
+	if err != nil || owned != tokenOwnershipInvocation {
+		return err
+	}
+	logoutUpstream(ctx, baseURL, identity, deviceID, userID, token)
+	return nil
+}
+
+func isTokenOwnershipError(err error) bool {
+	var ownershipErr *tokenOwnershipError
+	return errors.As(err, &ownershipErr)
+}
+
 func newUpstreamCommand(app core.App) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "upstream",
@@ -49,7 +119,7 @@ func newUpstreamCommand(app core.App) *cobra.Command {
 			return cmd.Help()
 		},
 	}
-	cmd.AddCommand(newUpstreamCreateCommand(app))
+	cmd.AddCommand(newUpstreamCreateCommand(app), newUpstreamImportLegacyCommand(app))
 	return cmd
 }
 
@@ -102,6 +172,14 @@ func (o upstreamOptions) identity() gateway.BackendClientIdentity {
 	return gateway.BackendClientIdentity{UserAgent: o.BackendUserAgent, Client: o.BackendAuthorizationClient, Device: o.BackendAuthorizationDevice, Version: o.BackendAuthorizationVersion}.WithDefaults()
 }
 
+func newAuthGenerationID() (string, error) {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", value), nil
+}
+
 type upstreamState struct {
 	source       *core.Record
 	endpoints    []*core.Record
@@ -143,7 +221,7 @@ func isNotFound(err error) bool {
 
 func upstreamFingerprint(state upstreamState) string {
 	type sourceSnapshot struct {
-		ID, Key, ServerID, ServerName, ServerVersion, VersionCheckedAt, BackendUsername, BackendPassword, BackendUserID, BackendToken, TokenUpdatedAt, LastLoginAt, LastLoginError, UserAgent, Client, Device, DeviceID, Version, Updated string
+		ID, Key, ServerID, ServerName, ServerVersion, VersionCheckedAt, BackendUsername, BackendPassword, BackendUserID, BackendToken, AuthGenerationID, TokenUpdatedAt, LastLoginAt, LastLoginError, UserAgent, Client, Device, DeviceID, Version, Updated string
 	}
 	type endpointSnapshot struct {
 		ID, Source, Key, BaseURL, Updated string
@@ -155,7 +233,7 @@ func upstreamFingerprint(state upstreamState) string {
 	}
 	s := snapshot{}
 	if state.source != nil {
-		s.Source = &sourceSnapshot{state.source.Id, state.source.GetString("key"), state.source.GetString("server_id"), state.source.GetString("server_name"), state.source.GetString("server_version"), state.source.GetDateTime("version_checked_at").String(), state.source.GetString("backend_username"), state.source.GetString("backend_password"), state.source.GetString("backend_user_id"), state.source.GetString("backend_token"), state.source.GetDateTime("token_updated_at").String(), state.source.GetDateTime("last_login_at").String(), state.source.GetString("last_login_error"), state.source.GetString("backend_user_agent"), state.source.GetString("backend_authorization_client"), state.source.GetString("backend_authorization_device"), state.source.GetString("backend_authorization_device_id"), state.source.GetString("backend_authorization_version"), state.source.GetDateTime("updated").String()}
+		s.Source = &sourceSnapshot{state.source.Id, state.source.GetString("key"), state.source.GetString("server_id"), state.source.GetString("server_name"), state.source.GetString("server_version"), state.source.GetDateTime("version_checked_at").String(), state.source.GetString("backend_username"), state.source.GetString("backend_password"), state.source.GetString("backend_user_id"), state.source.GetString("backend_token"), state.source.GetString("auth_generation_id"), state.source.GetDateTime("token_updated_at").String(), state.source.GetDateTime("last_login_at").String(), state.source.GetString("last_login_error"), state.source.GetString("backend_user_agent"), state.source.GetString("backend_authorization_client"), state.source.GetString("backend_authorization_device"), state.source.GetString("backend_authorization_device_id"), state.source.GetString("backend_authorization_version"), state.source.GetDateTime("updated").String()}
 	}
 	for _, endpoint := range state.allEndpoints {
 		s.Endpoints = append(s.Endpoints, endpointSnapshot{endpoint.Id, endpoint.GetString("source"), endpoint.GetString("key"), endpoint.GetString("base_url"), endpoint.GetDateTime("updated").String(), endpoint.GetBool("active")})
@@ -197,10 +275,11 @@ func runUpstreamCreate(parent context.Context, app core.App, opts upstreamOption
 	}
 	identity := opts.identity()
 	var deviceID string
-	var oldToken, oldURL, oldUserID string
+	var active *core.Record
+	var oldToken, oldURL, oldUserID, oldDeviceID, oldGeneration string
 	var oldIdentity gateway.BackendClientIdentity
 	if state.source != nil {
-		active, err := activeEndpoint(state.endpoints)
+		active, err = activeEndpoint(state.endpoints)
 		if err != nil {
 			return err
 		}
@@ -208,20 +287,13 @@ func runUpstreamCreate(parent context.Context, app core.App, opts upstreamOption
 		if deviceID == "" {
 			return fmt.Errorf("refusing setup: stored source has no device ID")
 		}
-		oldToken, oldURL, oldUserID = state.source.GetString("backend_token"), active.GetString("base_url"), state.source.GetString("backend_user_id")
+		oldToken, oldURL, oldUserID, oldDeviceID, oldGeneration = state.source.GetString("backend_token"), active.GetString("base_url"), state.source.GetString("backend_user_id"), state.source.GetString("backend_authorization_device_id"), state.source.GetString("auth_generation_id")
 		oldIdentity = gateway.BackendClientIdentity{UserAgent: state.source.GetString("backend_user_agent"), Client: state.source.GetString("backend_authorization_client"), Device: state.source.GetString("backend_authorization_device"), Version: state.source.GetString("backend_authorization_version")}.WithDefaults()
 		if err := rejectEndpointCollision(app, baseURL, state.source); err != nil {
 			return err
 		}
-		if completeNoop(state.source, active, baseURL, opts, identity) {
-			return nil
-		}
-	} else {
-		deviceID, err = newBackendDeviceID()
-		if err != nil {
-			return err
-		}
 	}
+	exactNoop := state.source != nil && completeNoop(state.source, active, baseURL, opts, identity)
 	if state.source == nil {
 		if err := rejectEndpointCollision(app, baseURL, nil); err != nil {
 			return err
@@ -231,18 +303,38 @@ func runUpstreamCreate(parent context.Context, app core.App, opts upstreamOption
 	if state.source != nil {
 		expectedID = state.source.GetString("server_id")
 	}
+	if exactNoop {
+		_, _, err := probeUpstreamPublic(ctx, newUpstreamHTTPClient(), baseURL, state.source.GetString("backend_authorization_device_id"), expectedID, identity)
+		return err
+	}
+	deviceID, err = newBackendDeviceID()
+	if err != nil {
+		return err
+	}
+	generation, err := newAuthGenerationID()
+	if err != nil {
+		return err
+	}
 	probe, err := probeUpstream(ctx, baseURL, opts.BackendUsername, opts.BackendPassword, deviceID, expectedID, identity)
 	if err != nil {
 		if probe.token != "" {
-			logoutUpstream(ctx, baseURL, identity, deviceID, probe.userID, probe.token)
+			if cleanupErr := cleanupInvocationToken(ctx, app, baseURL, identity, deviceID, probe.userID, probe.token); cleanupErr != nil {
+				return cleanupErr
+			}
 		}
 		return err
+	}
+	owned, ownErr := classifyTokenOwnership(app, probe.token)
+	if ownErr != nil || owned != tokenOwnershipInvocation {
+		return ownErr
 	}
 	if afterUpstreamProbe != nil {
 		afterUpstreamProbe()
 	}
 	if err := ctx.Err(); err != nil {
-		logoutUpstream(ctx, baseURL, identity, deviceID, probe.userID, probe.token)
+		if cleanupErr := cleanupInvocationToken(ctx, app, baseURL, identity, deviceID, probe.userID, probe.token); cleanupErr != nil {
+			return cleanupErr
+		}
 		return err
 	}
 	committed := false
@@ -253,6 +345,10 @@ func runUpstreamCreate(parent context.Context, app core.App, opts upstreamOption
 		current, err := loadUpstreamState(txApp)
 		if err != nil {
 			return err
+		}
+		owned, ownErr := classifyTokenOwnership(txApp, probe.token)
+		if ownErr != nil || owned != tokenOwnershipInvocation {
+			return ownErr
 		}
 		if current.fingerprint != state.fingerprint {
 			return fmt.Errorf("upstream configuration changed during probe; retry setup")
@@ -305,6 +401,7 @@ func runUpstreamCreate(parent context.Context, app core.App, opts upstreamOption
 		source.Set("backend_authorization_device", identity.Device)
 		source.Set("backend_authorization_device_id", deviceID)
 		source.Set("backend_authorization_version", identity.Version)
+		source.Set("auth_generation_id", generation)
 		if err := txApp.Save(source); err != nil {
 			return err
 		}
@@ -320,18 +417,26 @@ func runUpstreamCreate(parent context.Context, app core.App, opts upstreamOption
 		return txApp.Save(endpoint)
 	})
 	if err != nil {
-		logoutUpstream(ctx, baseURL, identity, deviceID, probe.userID, probe.token)
+		if isTokenOwnershipError(err) {
+			return err
+		}
+		if cleanupErr := cleanupInvocationToken(ctx, app, baseURL, identity, deviceID, probe.userID, probe.token); cleanupErr != nil {
+			return cleanupErr
+		}
 		return err
 	}
 	committed = true
-	if committed && oldToken != "" && oldToken != probe.token {
-		logoutUpstream(ctx, oldURL, oldIdentity, deviceID, oldUserID, oldToken)
+	if committed && oldToken != "" && oldGeneration != "" && oldToken != probe.token {
+		owned, err := classifyTokenOwnership(app, oldToken)
+		if err == nil && owned == tokenOwnershipInvocation {
+			logoutUpstream(ctx, oldURL, oldIdentity, oldDeviceID, oldUserID, oldToken)
+		}
 	}
 	return nil
 }
 
 func completeNoop(source, endpoint *core.Record, baseURL string, opts upstreamOptions, identity gateway.BackendClientIdentity) bool {
-	return endpoint.GetString("base_url") == baseURL && source.GetString("backend_username") == opts.BackendUsername && source.GetString("backend_password") == opts.BackendPassword && source.GetString("backend_token") != "" && source.GetString("backend_user_id") != "" && source.GetString("server_id") != "" && source.GetString("backend_user_agent") == identity.UserAgent && source.GetString("backend_authorization_client") == identity.Client && source.GetString("backend_authorization_device") == identity.Device && source.GetString("backend_authorization_version") == identity.Version
+	return endpoint.GetString("base_url") == baseURL && source.GetString("backend_username") == opts.BackendUsername && source.GetString("backend_password") == opts.BackendPassword && source.GetString("backend_token") != "" && source.GetString("backend_user_id") != "" && source.GetString("auth_generation_id") != "" && source.GetString("server_id") != "" && source.GetString("backend_user_agent") == identity.UserAgent && source.GetString("backend_authorization_client") == identity.Client && source.GetString("backend_authorization_device") == identity.Device && source.GetString("backend_authorization_version") == identity.Version
 }
 
 func rejectEndpointCollision(app core.App, baseURL string, source *core.Record) error {

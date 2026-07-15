@@ -126,8 +126,8 @@ func TestUpstreamCreateProbesAndPersistsThenNoops(t *testing.T) {
 	if err := runUpstreamCreate(context.Background(), app, opts); err != nil {
 		t.Fatalf("noop upstream: %v", err)
 	}
-	if requests != 2 {
-		t.Fatalf("no-op made network requests: %d", requests)
+	if requests != 3 {
+		t.Fatalf("no-op must make only the public namespace probe: %d", requests)
 	}
 	source, _ = app.FindFirstRecordByData(upstreamSources, "key", defaultUpstreamKey)
 	if source.GetString("backend_authorization_device_id") != deviceID {
@@ -303,11 +303,12 @@ func TestUpstreamFingerprintIsTypedAndIncludesEndpointRelation(t *testing.T) {
 	}
 }
 
-func TestUpstreamCreateUpdateTriggersPreserveDeviceID(t *testing.T) {
+func TestUpstreamCreateUpdateTriggersRotateAuthTuple(t *testing.T) {
 	for _, change := range []string{"url", "username", "password", "user-agent", "client", "device", "version", "missing-token", "missing-user"} {
 		t.Run(change, func(t *testing.T) {
 			app := newTestApp(t)
 			probes := 0
+			auths := 0
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
 				case "/System/Info/Public", "/alternate/System/Info/Public":
@@ -315,7 +316,12 @@ func TestUpstreamCreateUpdateTriggersPreserveDeviceID(t *testing.T) {
 					_, _ = w.Write([]byte(`{"Id":"server"}`))
 				case "/Users/AuthenticateByName", "/alternate/Users/AuthenticateByName":
 					probes++
-					_, _ = w.Write([]byte(`{"AccessToken":"new-token","ServerId":"server","User":{"Id":"user"}}`))
+					auths++
+					token := "initial-token"
+					if auths > 1 {
+						token = "new-token"
+					}
+					_, _ = w.Write([]byte(`{"AccessToken":"` + token + `","ServerId":"server","User":{"Id":"user"}}`))
 				case "/Sessions/Logout", "/alternate/Sessions/Logout":
 				}
 			}))
@@ -356,7 +362,7 @@ func TestUpstreamCreateUpdateTriggersPreserveDeviceID(t *testing.T) {
 				t.Fatalf("trigger %s probes=%d", change, probes)
 			}
 			source, _ = app.FindFirstRecordByData(upstreamSources, "key", defaultUpstreamKey)
-			if source.GetString("backend_authorization_device_id") != deviceID || source.GetString("backend_token") != "new-token" || source.GetString("backend_user_id") != "user" {
+			if source.GetString("backend_authorization_device_id") == deviceID || source.GetString("auth_generation_id") == "" || source.GetString("backend_token") != "new-token" || source.GetString("backend_user_id") != "user" {
 				t.Fatalf("trigger %s did not preserve/refresh source", change)
 			}
 		})
@@ -396,7 +402,7 @@ func TestUpstreamCreateCancellationDuringTransactionRollsBack(t *testing.T) {
 }
 
 func TestUpstreamCreateRejectsSourceAndEndpointFingerprintDriftAndCleansNewToken(t *testing.T) {
-	for _, mutate := range []string{"source", "endpoint"} {
+	for _, mutate := range []string{"source", "generation", "endpoint"} {
 		t.Run(mutate, func(t *testing.T) {
 			app, _, opts, closeServer := establishedUpstream(t)
 			defer closeServer()
@@ -408,6 +414,9 @@ func TestUpstreamCreateRejectsSourceAndEndpointFingerprintDriftAndCleansNewToken
 			afterUpstreamProbe = func() {
 				if mutate == "source" {
 					source.Set("backend_password", "concurrent")
+					_ = app.Save(source)
+				} else if mutate == "generation" {
+					source.Set("auth_generation_id", "concurrent")
 					_ = app.Save(source)
 				} else {
 					endpoint.Set("key", "concurrent")
@@ -425,7 +434,7 @@ func TestUpstreamCreateRejectsSourceAndEndpointFingerprintDriftAndCleansNewToken
 			}
 			updatedSource, _ := app.FindFirstRecordByData(upstreamSources, "key", defaultUpstreamKey)
 			updatedEndpoint, _ := app.FindFirstRecordByData(upstreamEndpoints, "source", source.Id)
-			if updatedSource.GetString("backend_token") != "old-token" || (mutate == "source" && updatedSource.GetString("backend_password") != "concurrent") || (mutate == "endpoint" && updatedEndpoint.GetString("key") != "concurrent") {
+			if updatedSource.GetString("backend_token") != "old-token" || (mutate == "source" && updatedSource.GetString("backend_password") != "concurrent") || (mutate == "generation" && updatedSource.GetString("auth_generation_id") != "concurrent") || (mutate == "endpoint" && updatedEndpoint.GetString("key") != "concurrent") {
 				t.Fatal("concurrent singleton state was overwritten")
 			}
 			if logout != 1 {

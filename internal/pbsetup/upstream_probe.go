@@ -63,17 +63,29 @@ func upstreamURL(baseURL, suffix string) string { return strings.TrimRight(baseU
 
 func probeUpstream(ctx context.Context, baseURL, username, password, deviceID, expectedServerID string, identity gateway.BackendClientIdentity) (upstreamProbeResult, error) {
 	client := newUpstreamHTTPClient()
+	public, publicID, err := probeUpstreamPublic(ctx, client, baseURL, deviceID, expectedServerID, identity)
+	if err != nil {
+		return upstreamProbeResult{}, err
+	}
+	return authenticateUpstream(ctx, client, baseURL, username, password, deviceID, identity, public, publicID)
+}
+
+func probeUpstreamPublic(ctx context.Context, client *http.Client, baseURL, deviceID, expectedServerID string, identity gateway.BackendClientIdentity) (upstreamPublicInfo, string, error) {
 	public := upstreamPublicInfo{}
 	if err := upstreamRequest(ctx, client, http.MethodGet, upstreamURL(baseURL, "/System/Info/Public"), nil, identity, deviceID, "", "", &public, false); err != nil {
-		return upstreamProbeResult{}, fmt.Errorf("public info probe: %w", err)
+		return public, "", fmt.Errorf("public info probe: %w", err)
 	}
 	publicID := firstNonEmptyTrimmed(public.ID, public.ServerID)
 	if publicID == "" {
-		return upstreamProbeResult{}, fmt.Errorf("public info probe: response missing server ID")
+		return public, "", fmt.Errorf("public info probe: response missing server ID")
 	}
 	if expectedServerID != "" && publicID != strings.TrimSpace(expectedServerID) {
-		return upstreamProbeResult{}, fmt.Errorf("public info probe: server ID differs from the stored source")
+		return public, "", fmt.Errorf("public info probe: server ID differs from the stored source")
 	}
+	return public, publicID, nil
+}
+
+func authenticateUpstream(ctx context.Context, client *http.Client, baseURL, username, password, deviceID string, identity gateway.BackendClientIdentity, public upstreamPublicInfo, publicID string) (upstreamProbeResult, error) {
 	body, err := json.Marshal(map[string]string{"Username": username, "Pw": password})
 	if err != nil {
 		return upstreamProbeResult{}, fmt.Errorf("encode authentication request: %w", err)
