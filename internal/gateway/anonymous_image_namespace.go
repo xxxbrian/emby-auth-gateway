@@ -84,10 +84,8 @@ func (s *Server) ValidateAnonymousImageNamespace(ctx context.Context) error {
 	var selected *EmbyServer
 	for i := range servers {
 		server := &servers[i]
-		if strings.TrimSpace(server.BackendServerID) == "" {
-			return s.setAnonymousImageNamespaceFailure(AnonymousImageNamespaceStaticError, "anonymous image namespace has an enabled server without a stored backend server ID")
-		}
-		if server.BackendServerID != expectedID {
+		storedID := server.BackendServerID
+		if strings.TrimSpace(storedID) != "" && storedID != expectedID {
 			return s.setAnonymousImageNamespaceFailure(AnonymousImageNamespaceMismatchError, "anonymous image namespace stored backend server ID mismatch")
 		}
 		if _, err := validAnonymousImageBaseURL(server.BaseURL); err != nil {

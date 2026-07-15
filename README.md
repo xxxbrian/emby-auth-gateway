@@ -43,6 +43,8 @@ Backend client identity defaults written by `setup` into `emby_servers` records:
 
 Anonymous image ingress never selects an arbitrary/default server or tries all servers for a request. Every enabled `emby_servers` record must share the configured upstream `ServerId`; multiple HK/CF-style ingress records are allowed when they expose that same namespace. With the paired opt-in enabled, only canonical `GET`/`HEAD /emby/Items/{id}/Images/{type}` routes, with an optional decimal image index, are anonymous. `/Users/.../Images/...`, media, metadata, and mutations remain authenticated. Explicit credentials or the resource cookie always use the authenticated path. Anonymous responses currently use `Cache-Control: no-store`; public caching is deferred.
 
+Fresh `emby_servers` records may have an empty cached `BackendServerID`: startup probes each enabled ingress tokenlessly and accepts matching live IDs without a manual pre-refresh step. If those probes are temporarily unavailable, authenticated service still starts while anonymous item images return `503 no-store`; the normal server-info refresh and namespace revalidation recover automatically once the ingress is reachable.
+
 To opt into Phase 2B namespace validation under Compose, set both nonempty values and add the dedicated overlay:
 
 ```sh
