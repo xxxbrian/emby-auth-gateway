@@ -41,6 +41,7 @@ func NewCommand(app core.App) *cobra.Command {
 	cmd.Flags().StringVar(&opts.BackendAuthorizationClient, "backend-authorization-client", defaults.Client, "Client value sent in X-Emby-Authorization to the backend")
 	cmd.Flags().StringVar(&opts.BackendAuthorizationDevice, "backend-authorization-device", defaults.Device, "Device value sent in X-Emby-Authorization to the backend")
 	cmd.Flags().StringVar(&opts.BackendAuthorizationVersion, "backend-authorization-version", defaults.Version, "Version value sent in X-Emby-Authorization to the backend")
+	cmd.AddCommand(newUpstreamCommand(app), newUserCommand(app))
 	return cmd
 }
 
