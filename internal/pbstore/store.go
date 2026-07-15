@@ -24,6 +24,154 @@ func New(app core.App) *Store {
 	return &Store{app: app}
 }
 
+func (s *Store) LoadDefaultUpstreamRuntime(ctx context.Context) (*gateway.UpstreamRuntime, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var runtime *gateway.UpstreamRuntime
+	err := s.app.RunInTransaction(func(tx core.App) error {
+		var err error
+		runtime, err = loadDefaultUpstreamRuntime(ctx, tx)
+		if err != nil {
+			return err
+		}
+		return ctx.Err()
+	})
+	if err != nil {
+		return nil, classifyUpstreamStoreError(ctx, err)
+	}
+	return runtime, nil
+}
+
+func (s *Store) CompareAndSwapUpstreamAuth(ctx context.Context, update gateway.UpstreamAuthUpdate) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := gateway.ValidateUpstreamAuthUpdate(update); err != nil {
+		return err
+	}
+	err := s.app.RunInTransaction(func(tx core.App) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		at := update.AuthenticatedAt.UTC()
+		result, err := tx.DB().NewQuery(`UPDATE upstream_sources
+			SET auth_generation_id = {:generationID}, backend_authorization_device_id = {:deviceID}, backend_user_id = {:backendUserID}, backend_token = {:backendToken}, token_updated_at = {:authenticatedAt}, last_login_at = {:authenticatedAt}, last_login_error = ''
+			WHERE id = {:sourceID} AND key = 'default' AND auth_generation_id = {:expectedGenerationID}`).
+			WithContext(ctx).
+			Bind(dbx.Params{
+				"generationID": update.GenerationID, "deviceID": update.DeviceID, "backendUserID": update.BackendUserID,
+				"backendToken": update.BackendToken, "authenticatedAt": at, "sourceID": update.SourceID,
+				"expectedGenerationID": update.ExpectedGenerationID,
+			}).Execute()
+		if err != nil {
+			return fmt.Errorf("%w: update upstream authentication: %v", gateway.ErrStoreUnavailable, err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("%w: inspect upstream authentication update: %v", gateway.ErrStoreUnavailable, err)
+		}
+		if affected == 1 {
+			return ctx.Err()
+		}
+		runtime, loadErr := loadDefaultUpstreamRuntime(ctx, tx)
+		if loadErr != nil {
+			return loadErr
+		}
+		if runtime.Source.ID != update.SourceID {
+			return gateway.ErrUpstreamNotFound
+		}
+		return gateway.ErrUpstreamAuthConflict
+	})
+	return classifyUpstreamStoreError(ctx, err)
+}
+
+func classifyUpstreamStoreError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if contextErr := ctx.Err(); contextErr != nil {
+		return contextErr
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isGatewayDomainError(err) {
+		return err
+	}
+	return fmt.Errorf("%w: %v", gateway.ErrStoreUnavailable, err)
+}
+
+func isGatewayDomainError(err error) bool {
+	return errors.Is(err, gateway.ErrInvalidCredentials) || errors.Is(err, gateway.ErrNotFound) || errors.Is(err, gateway.ErrDisabled) || errors.Is(err, gateway.ErrUnauthorized) || errors.Is(err, gateway.ErrBadRequest) || errors.Is(err, gateway.ErrUpstreamNotFound) || errors.Is(err, gateway.ErrInvalidUpstreamTopology) || errors.Is(err, gateway.ErrUpstreamAuthConflict) || errors.Is(err, gateway.ErrStoreUnavailable)
+}
+
+func loadDefaultUpstreamRuntime(ctx context.Context, app core.App) (*gateway.UpstreamRuntime, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if _, err := app.FindCollectionByNameOrId("upstream_sources"); err != nil {
+		return nil, fmt.Errorf("%w: upstream_sources: %v", gateway.ErrStoreUnavailable, err)
+	}
+	if _, err := app.FindCollectionByNameOrId("upstream_endpoints"); err != nil {
+		return nil, fmt.Errorf("%w: upstream_endpoints: %v", gateway.ErrStoreUnavailable, err)
+	}
+	sources, err := app.FindAllRecords("upstream_sources")
+	if err != nil {
+		return nil, fmt.Errorf("%w: load upstream sources: %v", gateway.ErrStoreUnavailable, err)
+	}
+	endpoints, err := app.FindAllRecords("upstream_endpoints")
+	if err != nil {
+		return nil, fmt.Errorf("%w: load upstream endpoints: %v", gateway.ErrStoreUnavailable, err)
+	}
+	if len(sources) == 0 && len(endpoints) == 0 {
+		return nil, gateway.ErrUpstreamNotFound
+	}
+	if len(sources) == 0 {
+		return nil, fmt.Errorf("%w: endpoints without source", gateway.ErrInvalidUpstreamTopology)
+	}
+	if len(sources) != 1 {
+		return nil, fmt.Errorf("%w: expected one source", gateway.ErrInvalidUpstreamTopology)
+	}
+	source := upstreamSourceFromRecord(sources[0])
+	var active []gateway.UpstreamEndpoint
+	for _, record := range endpoints {
+		endpoint := gateway.UpstreamEndpoint{ID: record.Id, SourceID: record.GetString("source"), Key: record.GetString("key"), BaseURL: record.GetString("base_url"), Active: record.GetBool("active")}
+		if err := gateway.ValidateUpstreamEndpoint(source.ID, endpoint); err != nil {
+			return nil, err
+		}
+		if endpoint.Active {
+			active = append(active, endpoint)
+		}
+	}
+	if len(active) != 1 {
+		return nil, fmt.Errorf("%w: expected one active endpoint", gateway.ErrInvalidUpstreamTopology)
+	}
+	runtime := &gateway.UpstreamRuntime{Source: source, Endpoint: active[0]}
+	if err := gateway.ValidateUpstreamRuntime(*runtime); err != nil {
+		return nil, err
+	}
+	return runtime, nil
+}
+
+func upstreamSourceFromRecord(record *core.Record) gateway.UpstreamSource {
+	var versionCheckedAt, tokenUpdatedAt, lastLoginAt *time.Time
+	if !record.GetDateTime("version_checked_at").IsZero() {
+		t := record.GetDateTime("version_checked_at").Time()
+		versionCheckedAt = &t
+	}
+	if !record.GetDateTime("token_updated_at").IsZero() {
+		t := record.GetDateTime("token_updated_at").Time()
+		tokenUpdatedAt = &t
+	}
+	if !record.GetDateTime("last_login_at").IsZero() {
+		t := record.GetDateTime("last_login_at").Time()
+		lastLoginAt = &t
+	}
+	return gateway.UpstreamSource{
+		ID: record.Id, Key: record.GetString("key"), ServerID: record.GetString("server_id"), ServerName: record.GetString("server_name"), ServerVersion: record.GetString("server_version"), VersionCheckedAt: versionCheckedAt,
+		BackendUsername: record.GetString("backend_username"), BackendPassword: record.GetString("backend_password"), BackendUserID: record.GetString("backend_user_id"), BackendToken: record.GetString("backend_token"), AuthGenerationID: record.GetString("auth_generation_id"), TokenUpdatedAt: tokenUpdatedAt, LastLoginAt: lastLoginAt, LastLoginError: record.GetString("last_login_error"),
+		ClientIdentity: gateway.BackendClientIdentity{UserAgent: record.GetString("backend_user_agent"), Client: record.GetString("backend_authorization_client"), Device: record.GetString("backend_authorization_device"), DeviceID: record.GetString("backend_authorization_device_id"), Version: record.GetString("backend_authorization_version")},
+	}
+}
+
 func (s *Store) AuthenticateGatewayUser(ctx context.Context, username, password string) (*gateway.GatewayUser, error) {
 	record, err := s.app.FindFirstRecordByData("users", "username", username)
 	if err != nil {

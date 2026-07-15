@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -26,6 +27,8 @@ type Config struct {
 }
 
 type Store interface {
+	LoadDefaultUpstreamRuntime(ctx context.Context) (*UpstreamRuntime, error)
+	CompareAndSwapUpstreamAuth(ctx context.Context, update UpstreamAuthUpdate) error
 	AuthenticateGatewayUser(ctx context.Context, username, password string) (*GatewayUser, error)
 	FindGatewayUserByUsername(ctx context.Context, username string) (*GatewayUser, error)
 	ListPublicUsers(ctx context.Context) ([]GatewayUser, error)
@@ -55,6 +58,126 @@ type Store interface {
 	// false,nil means not found; non-nil error is an operational/store failure.
 	SessionTokenExists(ctx context.Context, tokenHash string) (bool, error)
 	RevokeSession(ctx context.Context, tokenHash string) error
+}
+
+// UpstreamSource is the singleton upstream authentication and identity configuration.
+type UpstreamSource struct {
+	ID               string
+	Key              string
+	ServerID         string
+	ServerName       string
+	ServerVersion    string
+	VersionCheckedAt *time.Time
+	BackendUsername  string
+	BackendPassword  string
+	BackendUserID    string
+	BackendToken     string
+	AuthGenerationID string
+	TokenUpdatedAt   *time.Time
+	LastLoginAt      *time.Time
+	LastLoginError   string
+	ClientIdentity   BackendClientIdentity
+}
+
+type UpstreamEndpoint struct {
+	ID       string
+	SourceID string
+	Key      string
+	BaseURL  string
+	Active   bool
+}
+
+type UpstreamRuntime struct {
+	Source   UpstreamSource
+	Endpoint UpstreamEndpoint
+}
+
+type UpstreamAuthUpdate struct {
+	SourceID             string
+	ExpectedGenerationID string
+	GenerationID         string
+	DeviceID             string
+	BackendUserID        string
+	BackendToken         string
+	AuthenticatedAt      time.Time
+}
+
+const (
+	upstreamAuthGenerationMaxLength = 128
+	upstreamDeviceIDMaxLength       = 255
+	upstreamBackendUserIDMaxLength  = 80
+)
+
+func ValidateUpstreamRuntime(runtime UpstreamRuntime) error {
+	source := runtime.Source
+	if strings.TrimSpace(source.ID) == "" || source.Key != "default" || strings.TrimSpace(source.ServerID) == "" || strings.TrimSpace(source.BackendUsername) == "" || strings.TrimSpace(source.BackendPassword) == "" {
+		return invalidUpstreamTopology("missing required source fields")
+	}
+	identity := source.ClientIdentity
+	if strings.TrimSpace(identity.UserAgent) == "" || strings.TrimSpace(identity.Client) == "" || strings.TrimSpace(identity.Device) == "" || strings.TrimSpace(identity.DeviceID) == "" || strings.TrimSpace(identity.Version) == "" {
+		return invalidUpstreamTopology("missing client identity fields")
+	}
+	if source.AuthGenerationID != "" {
+		if err := validatePersistedUpstreamAuth(source); err != nil {
+			return err
+		}
+	}
+	if !runtime.Endpoint.Active {
+		return invalidUpstreamTopology("invalid active endpoint")
+	}
+	if err := ValidateUpstreamEndpoint(source.ID, runtime.Endpoint); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ValidateUpstreamEndpoint(sourceID string, endpoint UpstreamEndpoint) error {
+	if strings.TrimSpace(endpoint.ID) == "" || endpoint.SourceID != sourceID || strings.TrimSpace(endpoint.Key) == "" {
+		return invalidUpstreamTopology("invalid endpoint")
+	}
+	parsed, err := url.Parse(endpoint.BaseURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil || parsed.ForceQuery || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return invalidUpstreamTopology("invalid endpoint URL")
+	}
+	return nil
+}
+
+func ValidateUpstreamAuthUpdate(update UpstreamAuthUpdate) error {
+	if strings.TrimSpace(update.SourceID) == "" || !validUpstreamGeneration(update.GenerationID) || (update.ExpectedGenerationID != "" && !validUpstreamGeneration(update.ExpectedGenerationID)) || update.GenerationID == update.ExpectedGenerationID || !validUpstreamDeviceID(update.DeviceID) || !validUpstreamBackendUserID(update.BackendUserID) || !validUpstreamToken(update.BackendToken) || update.AuthenticatedAt.IsZero() {
+		return fmt.Errorf("%w: invalid upstream authentication update", ErrBadRequest)
+	}
+	return nil
+}
+
+func validatePersistedUpstreamAuth(source UpstreamSource) error {
+	if !validUpstreamGeneration(source.AuthGenerationID) || !validUpstreamDeviceID(source.ClientIdentity.DeviceID) || !validUpstreamBackendUserID(source.BackendUserID) || !validUpstreamToken(source.BackendToken) || source.TokenUpdatedAt == nil || source.TokenUpdatedAt.IsZero() || source.LastLoginAt == nil || source.LastLoginAt.IsZero() {
+		return invalidUpstreamTopology("incomplete managed authentication")
+	}
+	return nil
+}
+
+func validUpstreamGeneration(value string) bool {
+	return isTrimmed(value) && len(value) <= upstreamAuthGenerationMaxLength
+}
+
+func validUpstreamDeviceID(value string) bool {
+	return isTrimmed(value) && len(value) <= upstreamDeviceIDMaxLength
+}
+
+func validUpstreamBackendUserID(value string) bool {
+	return isTrimmed(value) && len(value) <= upstreamBackendUserIDMaxLength
+}
+
+func validUpstreamToken(value string) bool {
+	return isTrimmed(value)
+}
+
+func isTrimmed(value string) bool {
+	return value != "" && strings.TrimSpace(value) == value
+}
+
+func invalidUpstreamTopology(message string) error {
+	return fmt.Errorf("%w: %s", ErrInvalidUpstreamTopology, message)
 }
 
 type AuditLog struct {

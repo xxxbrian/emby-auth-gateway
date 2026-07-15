@@ -18,6 +18,8 @@ type MemoryStore struct {
 	PlaybackStates     map[string]*PlaybackState
 	ItemChildCounts    map[string]ItemChildCount
 	DisplayPreferences map[string]*DisplayPreference
+	UpstreamSources    map[string]UpstreamSource
+	UpstreamEndpoints  map[string]UpstreamEndpoint
 }
 
 type MemoryUser struct {
@@ -33,7 +35,116 @@ func NewMemoryStore() *MemoryStore {
 		PlaybackStates:     map[string]*PlaybackState{},
 		ItemChildCounts:    map[string]ItemChildCount{},
 		DisplayPreferences: map[string]*DisplayPreference{},
+		UpstreamSources:    map[string]UpstreamSource{},
+		UpstreamEndpoints:  map[string]UpstreamEndpoint{},
 	}
+}
+
+func (m *MemoryStore) LoadDefaultUpstreamRuntime(ctx context.Context) (*UpstreamRuntime, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	runtime, _, err := loadMemoryDefaultUpstreamRuntime(m.UpstreamSources, m.UpstreamEndpoints)
+	return runtime, err
+}
+
+// loadMemoryDefaultUpstreamRuntime requires the caller to hold m.mu. It does
+// not acquire locks so CompareAndSwapUpstreamAuth can validate atomically.
+func loadMemoryDefaultUpstreamRuntime(sources map[string]UpstreamSource, endpoints map[string]UpstreamEndpoint) (*UpstreamRuntime, string, error) {
+	if len(sources) == 0 && len(endpoints) == 0 {
+		return nil, "", ErrUpstreamNotFound
+	}
+	if len(sources) == 0 {
+		return nil, "", invalidUpstreamTopology("endpoints without source")
+	}
+	if len(sources) != 1 {
+		return nil, "", invalidUpstreamTopology("expected one source")
+	}
+	var source UpstreamSource
+	var sourceKey string
+	for key, candidate := range sources {
+		if key != candidate.ID {
+			return nil, "", invalidUpstreamTopology("source map identity mismatch")
+		}
+		source, sourceKey = candidate, key
+	}
+	var active []UpstreamEndpoint
+	for key, endpoint := range endpoints {
+		if key != endpoint.ID {
+			return nil, "", invalidUpstreamTopology("endpoint map identity mismatch")
+		}
+		if err := ValidateUpstreamEndpoint(source.ID, endpoint); err != nil {
+			return nil, "", err
+		}
+		if endpoint.Active {
+			active = append(active, endpoint)
+		}
+	}
+	if len(active) != 1 {
+		return nil, "", invalidUpstreamTopology("expected one active endpoint")
+	}
+	runtime := &UpstreamRuntime{Source: cloneUpstreamSource(source), Endpoint: active[0]}
+	if err := ValidateUpstreamRuntime(*runtime); err != nil {
+		return nil, "", err
+	}
+	return runtime, sourceKey, nil
+}
+
+func cloneUpstreamSource(source UpstreamSource) UpstreamSource {
+	if source.VersionCheckedAt != nil {
+		t := *source.VersionCheckedAt
+		source.VersionCheckedAt = &t
+	}
+	if source.TokenUpdatedAt != nil {
+		t := *source.TokenUpdatedAt
+		source.TokenUpdatedAt = &t
+	}
+	if source.LastLoginAt != nil {
+		t := *source.LastLoginAt
+		source.LastLoginAt = &t
+	}
+	return source
+}
+
+func (m *MemoryStore) CompareAndSwapUpstreamAuth(ctx context.Context, update UpstreamAuthUpdate) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := ValidateUpstreamAuthUpdate(update); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	source, matched := m.UpstreamSources[update.SourceID]
+	matched = matched && source.ID == update.SourceID && source.Key == "default" && source.AuthGenerationID == update.ExpectedGenerationID
+	if !matched {
+		runtime, _, err := loadMemoryDefaultUpstreamRuntime(m.UpstreamSources, m.UpstreamEndpoints)
+		if err != nil {
+			return err
+		}
+		if runtime.Source.ID != update.SourceID {
+			return ErrUpstreamNotFound
+		}
+		return ErrUpstreamAuthConflict
+	}
+	authenticatedAt := update.AuthenticatedAt.UTC()
+	source.AuthGenerationID = update.GenerationID
+	source.ClientIdentity.DeviceID = update.DeviceID
+	source.BackendUserID = update.BackendUserID
+	source.BackendToken = update.BackendToken
+	source.TokenUpdatedAt = &authenticatedAt
+	source.LastLoginAt = &authenticatedAt
+	source.LastLoginError = ""
+	m.UpstreamSources[update.SourceID] = source
+	return nil
 }
 
 func (m *MemoryStore) AuthenticateGatewayUser(ctx context.Context, username, password string) (*GatewayUser, error) {
