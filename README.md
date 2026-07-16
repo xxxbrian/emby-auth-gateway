@@ -95,7 +95,7 @@ Use `--backend-user-agent`, `--backend-authorization-client`, `--backend-authori
 
 ### Upgrade And Rollback
 
-Do not perform a rolling upgrade. Stop the service and back up the complete PocketBase data directory. Build the transitional pre-cutover binary from source commit `dbd0d4d`, then use it to import the selected legacy records explicitly before the 0.6 `0009` bootstrap:
+Do not perform a rolling upgrade. Stop the service and back up the complete PocketBase data directory. Build the transitional pre-cutover binary from source commit `dbd0d4deb4f02cfb96c65471f1e8c60f2ac54da4`, then use it to import the selected legacy records explicitly before the 0.6 `0009` bootstrap:
 
 ```sh
 ./gateway-pre-cutover --dir /path/to/pb_data setup upstream import-legacy \
@@ -105,6 +105,16 @@ Do not perform a rolling upgrade. Stop the service and back up the complete Pock
 ```
 
 Install and start the new binary only after that command succeeds. Cutover revokes existing sessions and rebuilds runtime caches; gateway users must sign in again. To roll back, stop the new service, restore the data-directory backup, and start the old binary. Do not mix old and new binaries against the same data directory.
+
+### Release Gate
+
+Before publishing a release containing the 0.6 `0009` cutover, run the mandatory manual rehearsal from the repository root:
+
+```sh
+./scripts/rehearse-cutover.sh
+```
+
+It requires `bash`, `git`, `tar`, `sqlite3`, `curl`, and `mise`. The command archives the exact pre-cutover `dbd0d4deb4f02cfb96c65471f1e8c60f2ac54da4` revision and current `HEAD`, builds both binaries, and uses only a temporary directory and a loopback fake Emby server. It refuses to pass unless the committed candidate contains, and exactly matches, the rehearsal harness sources. It is not normal CI. A release is blocked until the `dbd0d4deb4f02cfb96c65471f1e8c60f2ac54da4` pre-cutover artifact has been published or otherwise provided to operators for the explicit import and rollback path.
 
 ## Start Commands
 
