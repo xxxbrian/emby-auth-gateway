@@ -514,6 +514,106 @@ func TestUpstreamRuntimeMissingSchemaIsUnavailable(t *testing.T) {
 	}
 }
 
+func TestSavePlaybackResolutionDoesNotClobberUserData(t *testing.T) {
+	app := newTestApp(t)
+	store := New(app)
+	userID := createGatewayUser(t, app, "alice", "gateway-user")
+	orphanedAt := time.Date(2026, 7, 17, 2, 0, 0, 0, time.UTC)
+
+	if err := store.SavePlaybackState(context.Background(), gateway.PlaybackState{
+		GatewayUserID:         userID,
+		SyntheticUserID:       "gateway-user",
+		ItemID:                "item-1",
+		ItemName:              "Old Name",
+		ItemType:              "Movie",
+		PlaybackPositionTicks: 999,
+		Played:                true,
+		IsFavorite:            true,
+		PlayCount:             4,
+		Fingerprint:           "type=Movie|name=Old Name",
+	}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+	before, err := store.FindPlaybackState(context.Background(), userID, "item-1")
+	if err != nil {
+		t.Fatalf("FindPlaybackState before: %v", err)
+	}
+	time.Sleep(25 * time.Millisecond)
+
+	if err := store.SavePlaybackResolution(context.Background(), gateway.PlaybackState{
+		GatewayUserID:         userID,
+		SyntheticUserID:       "gateway-user",
+		ItemID:                "item-1",
+		ItemName:              "New Name",
+		ItemType:              "Movie",
+		SeriesID:              "series-1",
+		SeriesName:            "Show",
+		SeasonID:              "season-1",
+		IndexNumber:           2,
+		ParentIndexNumber:     1,
+		RunTimeTicks:          5000,
+		Fingerprint:           "type=Movie|name=New Name",
+		OrphanedAt:            &orphanedAt,
+		PlaybackPositionTicks: 0,
+		Played:                false,
+		IsFavorite:            false,
+		PlayCount:             0,
+	}); err != nil {
+		t.Fatalf("SavePlaybackResolution: %v", err)
+	}
+
+	state, err := store.FindPlaybackState(context.Background(), userID, "item-1")
+	if err != nil {
+		t.Fatalf("FindPlaybackState: %v", err)
+	}
+	if !state.IsFavorite || !state.Played || state.PlaybackPositionTicks != 999 || state.PlayCount != 4 {
+		t.Fatalf("user data clobbered: %#v", state)
+	}
+	if state.ItemName != "New Name" || state.SeriesID != "series-1" || state.SeasonID != "season-1" || state.RunTimeTicks != 5000 || state.Fingerprint != "type=Movie|name=New Name" {
+		t.Fatalf("metadata not updated: %#v", state)
+	}
+	if state.OrphanedAt == nil || !state.OrphanedAt.Equal(orphanedAt) {
+		t.Fatalf("orphaned_at not updated: %#v", state.OrphanedAt)
+	}
+	if !state.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("UpdatedAt advanced by resolution save: before=%v after=%v", before.UpdatedAt, state.UpdatedAt)
+	}
+}
+
+func TestSavePlaybackResolutionCreatesMissingRow(t *testing.T) {
+	app := newTestApp(t)
+	store := New(app)
+	userID := createGatewayUser(t, app, "alice", "gateway-user")
+	if err := store.SavePlaybackResolution(context.Background(), gateway.PlaybackState{
+		GatewayUserID:   userID,
+		SyntheticUserID: "gateway-user",
+		ItemID:          "item-new",
+		ItemName:        "Fresh",
+		ItemType:        "Movie",
+		Fingerprint:     "type=Movie|name=Fresh",
+	}); err != nil {
+		t.Fatalf("SavePlaybackResolution: %v", err)
+	}
+	state, err := store.FindPlaybackState(context.Background(), userID, "item-new")
+	if err != nil || state.ItemName != "Fresh" || state.IsFavorite || state.Played || state.PlaybackPositionTicks != 0 {
+		t.Fatalf("unexpected new state: %#v err=%v", state, err)
+	}
+}
+
+func TestClassifyUpstreamStoreErrorWrapsRootCause(t *testing.T) {
+	root := errors.New("sql: connection refused")
+	err := classifyUpstreamStoreError(context.Background(), root)
+	if !errors.Is(err, gateway.ErrStoreUnavailable) {
+		t.Fatalf("error = %v, want ErrStoreUnavailable", err)
+	}
+	if !errors.Is(err, root) {
+		t.Fatalf("error = %v, want root cause %v", err, root)
+	}
+	if got := classifyUpstreamStoreError(context.Background(), gateway.ErrNotFound); !errors.Is(got, gateway.ErrNotFound) || errors.Is(got, gateway.ErrStoreUnavailable) {
+		t.Fatalf("domain error rewritten: %v", got)
+	}
+}
+
 func TestPlaybackStateIsScopedByGatewayUserAndItem(t *testing.T) {
 	app := newTestApp(t)
 	store := New(app)

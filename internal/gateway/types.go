@@ -41,6 +41,10 @@ type Store interface {
 	SaveItemChildCount(ctx context.Context, count ItemChildCount) error
 	ListPlaybackStates(ctx context.Context, gatewayUserID string, filter PlaybackStateFilter) ([]PlaybackState, error)
 	SavePlaybackState(ctx context.Context, state PlaybackState) error
+	// SavePlaybackResolution persists metadata/orphan/last-seen fields for an item
+	// without overwriting user-data fields (played, position, favorite, likes, etc.).
+	// Creates a row if missing. Used by item resolution/repair paths.
+	SavePlaybackResolution(ctx context.Context, state PlaybackState) error
 	FindDisplayPreference(ctx context.Context, gatewayUserID, preferenceID, client string) (*DisplayPreference, error)
 	SaveDisplayPreference(ctx context.Context, preference DisplayPreference) error
 	SaveSession(ctx context.Context, session *Session) error

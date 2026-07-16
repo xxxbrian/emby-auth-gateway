@@ -66,11 +66,11 @@ func (s *Store) CompareAndSwapUpstreamAuth(ctx context.Context, update gateway.U
 				"expectedGenerationID": update.ExpectedGenerationID,
 			}).Execute()
 		if err != nil {
-			return fmt.Errorf("%w: update upstream authentication: %v", gateway.ErrStoreUnavailable, err)
+			return fmt.Errorf("%w: update upstream authentication: %w", gateway.ErrStoreUnavailable, err)
 		}
 		affected, err := result.RowsAffected()
 		if err != nil {
-			return fmt.Errorf("%w: inspect upstream authentication update: %v", gateway.ErrStoreUnavailable, err)
+			return fmt.Errorf("%w: inspect upstream authentication update: %w", gateway.ErrStoreUnavailable, err)
 		}
 		if affected == 1 {
 			return ctx.Err()
@@ -110,11 +110,11 @@ func (s *Store) UpdateUpstreamServerInfo(ctx context.Context, update gateway.Ups
 				"serverVersion": update.ServerVersion, "checkedAt": checkedAt,
 			}).Execute()
 		if err != nil {
-			return fmt.Errorf("%w: update upstream server info: %v", gateway.ErrStoreUnavailable, err)
+			return fmt.Errorf("%w: update upstream server info: %w", gateway.ErrStoreUnavailable, err)
 		}
 		affected, err := result.RowsAffected()
 		if err != nil {
-			return fmt.Errorf("%w: inspect upstream server info update: %v", gateway.ErrStoreUnavailable, err)
+			return fmt.Errorf("%w: inspect upstream server info update: %w", gateway.ErrStoreUnavailable, err)
 		}
 		if affected == 1 {
 			return ctx.Err()
@@ -141,7 +141,7 @@ func classifyUpstreamStoreError(ctx context.Context, err error) error {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isGatewayDomainError(err) {
 		return err
 	}
-	return fmt.Errorf("%w: %v", gateway.ErrStoreUnavailable, err)
+	return fmt.Errorf("%w: %w", gateway.ErrStoreUnavailable, err)
 }
 
 func isGatewayDomainError(err error) bool {
@@ -153,18 +153,18 @@ func loadDefaultUpstreamRuntime(ctx context.Context, app core.App) (*gateway.Ups
 		return nil, err
 	}
 	if _, err := app.FindCollectionByNameOrId("upstream_sources"); err != nil {
-		return nil, fmt.Errorf("%w: upstream_sources: %v", gateway.ErrStoreUnavailable, err)
+		return nil, fmt.Errorf("%w: upstream_sources: %w", gateway.ErrStoreUnavailable, err)
 	}
 	if _, err := app.FindCollectionByNameOrId("upstream_endpoints"); err != nil {
-		return nil, fmt.Errorf("%w: upstream_endpoints: %v", gateway.ErrStoreUnavailable, err)
+		return nil, fmt.Errorf("%w: upstream_endpoints: %w", gateway.ErrStoreUnavailable, err)
 	}
 	sources, err := app.FindAllRecords("upstream_sources")
 	if err != nil {
-		return nil, fmt.Errorf("%w: load upstream sources: %v", gateway.ErrStoreUnavailable, err)
+		return nil, fmt.Errorf("%w: load upstream sources: %w", gateway.ErrStoreUnavailable, err)
 	}
 	endpoints, err := app.FindAllRecords("upstream_endpoints")
 	if err != nil {
-		return nil, fmt.Errorf("%w: load upstream endpoints: %v", gateway.ErrStoreUnavailable, err)
+		return nil, fmt.Errorf("%w: load upstream endpoints: %w", gateway.ErrStoreUnavailable, err)
 	}
 	if len(sources) == 0 && len(endpoints) == 0 {
 		return nil, gateway.ErrUpstreamNotFound
@@ -620,6 +620,129 @@ func (s *Store) SavePlaybackState(ctx context.Context, state gateway.PlaybackSta
 		record.Set("last_seen_at", nil)
 	}
 	return s.app.Save(record)
+}
+
+func (s *Store) SavePlaybackResolution(ctx context.Context, state gateway.PlaybackState) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	params := playbackResolutionParams(state)
+	updated, err := s.updatePlaybackResolution(ctx, params)
+	if err != nil {
+		return err
+	}
+	if updated {
+		return nil
+	}
+	if err := s.createPlaybackResolution(ctx, state); err != nil {
+		if !isUniqueConstraintError(err) {
+			return err
+		}
+		updated, retryErr := s.updatePlaybackResolution(ctx, params)
+		if retryErr != nil {
+			return retryErr
+		}
+		if updated {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func playbackResolutionParams(state gateway.PlaybackState) dbx.Params {
+	// PocketBase date columns are TEXT DEFAULT '' NOT NULL; empty string clears the value.
+	orphanedAt := ""
+	if state.OrphanedAt != nil {
+		orphanedAt = state.OrphanedAt.UTC().Truncate(time.Millisecond).Format(types.DefaultDateLayout)
+	}
+	lastSeenAt := ""
+	if state.LastSeenAt != nil {
+		lastSeenAt = state.LastSeenAt.UTC().Truncate(time.Millisecond).Format(types.DefaultDateLayout)
+	}
+	return dbx.Params{
+		"gatewayUserID":     state.GatewayUserID,
+		"itemID":            state.ItemID,
+		"syntheticUserID":   state.SyntheticUserID,
+		"itemName":          state.ItemName,
+		"itemType":          state.ItemType,
+		"seriesID":          state.SeriesID,
+		"seriesName":        state.SeriesName,
+		"seasonID":          state.SeasonID,
+		"indexNumber":       state.IndexNumber,
+		"parentIndexNumber": state.ParentIndexNumber,
+		"runTimeTicks":      state.RunTimeTicks,
+		"fingerprint":       state.Fingerprint,
+		"orphanedAt":        orphanedAt,
+		"lastSeenAt":        lastSeenAt,
+	}
+}
+
+func (s *Store) updatePlaybackResolution(ctx context.Context, params dbx.Params) (bool, error) {
+	result, err := s.app.DB().NewQuery(`UPDATE user_item_data
+		SET synthetic_user_id = {:syntheticUserID},
+			item_name = {:itemName},
+			item_type = {:itemType},
+			series_id = {:seriesID},
+			series_name = {:seriesName},
+			season_id = {:seasonID},
+			index_number = {:indexNumber},
+			parent_index_number = {:parentIndexNumber},
+			run_time_ticks = {:runTimeTicks},
+			fingerprint = {:fingerprint},
+			orphaned_at = {:orphanedAt},
+			last_seen_at = {:lastSeenAt}
+		WHERE gateway_user = {:gatewayUserID} AND item_id = {:itemID}`).
+		WithContext(ctx).
+		Bind(params).
+		Execute()
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected >= 1, nil
+}
+
+func (s *Store) createPlaybackResolution(ctx context.Context, state gateway.PlaybackState) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	collection, err := s.app.FindCollectionByNameOrId("user_item_data")
+	if err != nil {
+		return err
+	}
+	record := core.NewRecord(collection)
+	record.Set("gateway_user", state.GatewayUserID)
+	record.Set("item_id", state.ItemID)
+	record.Set("synthetic_user_id", state.SyntheticUserID)
+	record.Set("item_name", state.ItemName)
+	record.Set("item_type", state.ItemType)
+	record.Set("series_id", state.SeriesID)
+	record.Set("series_name", state.SeriesName)
+	record.Set("season_id", state.SeasonID)
+	record.Set("index_number", state.IndexNumber)
+	record.Set("parent_index_number", state.ParentIndexNumber)
+	record.Set("run_time_ticks", state.RunTimeTicks)
+	record.Set("fingerprint", state.Fingerprint)
+	if state.OrphanedAt != nil {
+		record.Set("orphaned_at", *state.OrphanedAt)
+	}
+	if state.LastSeenAt != nil {
+		record.Set("last_seen_at", *state.LastSeenAt)
+	}
+	return s.app.Save(record)
+}
+
+func isUniqueConstraintError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unique constraint failed") ||
+		(strings.Contains(msg, "constraint failed") && strings.Contains(msg, "unique"))
 }
 
 func (s *Store) FindDisplayPreference(ctx context.Context, gatewayUserID, preferenceID, client string) (*gateway.DisplayPreference, error) {

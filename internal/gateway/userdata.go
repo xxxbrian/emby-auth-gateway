@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -54,7 +56,11 @@ func (s *Server) handleLocalSessionStateRequest(w http.ResponseWriter, r *http.R
 	switch {
 	case isPlaybackReportRequest(r.Method, rel):
 		if err := s.recordPlaybackRequest(r, rel, session, gatewayToken); err != nil {
-			http.Error(w, "bad request body", http.StatusBadRequest)
+			if errors.Is(err, ErrBadRequest) {
+				http.Error(w, "bad request body", http.StatusBadRequest)
+				return true
+			}
+			http.Error(w, "playback state unavailable", http.StatusInternalServerError)
 			return true
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -78,7 +84,11 @@ func (s *Server) handlePersonalStateWrite(w http.ResponseWriter, r *http.Request
 	}
 	now := time.Now().UTC()
 	writeState := func(itemID string, update func(*PlaybackState)) {
-		state := s.stateForItem(r.Context(), session, itemID)
+		state, err := s.stateForItem(r.Context(), session, itemID)
+		if err != nil {
+			http.Error(w, "user data unavailable", http.StatusInternalServerError)
+			return
+		}
 		update(state)
 		s.enrichPlaybackStateMetadata(r.Context(), r, session, gatewayToken, state)
 		state.UpdatedAt = now
@@ -204,7 +214,11 @@ func (s *Server) writeResumeItems(w http.ResponseWriter, r *http.Request, sessio
 		return stateRecency(states[i]).After(stateRecency(states[j]))
 	})
 	ids := playbackStateIDs(states)
-	items := s.resolveItemsByID(r.Context(), r, session, gatewayToken, ids)
+	items, err := s.resolveItemsByID(r.Context(), r, session, gatewayToken, ids)
+	if err != nil {
+		http.Error(w, "resume unavailable", http.StatusInternalServerError)
+		return
+	}
 	items = groupResumeItems(items)
 	total := len(items)
 	items = pageItems(items, r.URL.Query())
@@ -450,9 +464,9 @@ func applyBoolPersonalFilter(ctx context.Context, store Store, gatewayUserID str
 	return nil
 }
 
-func (s *Server) resolveItemsByID(ctx context.Context, r *http.Request, session *Session, gatewayToken string, ids []string) []any {
+func (s *Server) resolveItemsByID(ctx context.Context, r *http.Request, session *Session, gatewayToken string, ids []string) ([]any, error) {
 	if len(ids) == 0 {
-		return []any{}
+		return []any{}, nil
 	}
 	requestQuery := cloneQuery(r.URL.Query())
 	q := queryForIDResolution(requestQuery)
@@ -478,32 +492,30 @@ func (s *Server) resolveItemsByID(ctx context.Context, r *http.Request, session 
 		}
 		for _, id := range batchIDs {
 			item, ok := byID[id]
-			state := s.stateForItem(ctx, session, id)
+			state, err := s.stateForItem(ctx, session, id)
+			if err != nil {
+				return nil, err
+			}
 			if !ok {
-				state.OrphanedAt = &now
-				_ = s.store.SavePlaybackState(ctx, *state)
+				_ = reconcileResolvedItem(state, nil, false, now)
+				_ = s.store.SavePlaybackResolution(ctx, *state)
 				continue
 			}
 			if !itemMatchesResolutionQuery(item, requestQuery) {
 				continue
 			}
-			fingerprint := itemFingerprint(item)
-			if state.Fingerprint != "" && fingerprint != "" && !fingerprintsCompatible(state.Fingerprint, fingerprint) {
-				state.OrphanedAt = &now
-				_ = s.store.SavePlaybackState(ctx, *state)
+			outcome := reconcileResolvedItem(state, item, true, now)
+			_ = s.store.SavePlaybackResolution(ctx, *state)
+			if outcome != resolutionKeep {
 				continue
 			}
-			state.OrphanedAt = nil
-			state.LastSeenAt = &now
-			mergeItemMetadata(state, item)
-			_ = s.store.SavePlaybackState(ctx, *state)
 			rewritten := s.rewriteProxyJSONValueForRequestWithSnapshot(ctx, r, item, session, upstream, gatewayToken, s.gatewayBaseForRequest(r))
 			if m, ok := rewritten.(map[string]any); ok {
 				out = append(out, m)
 			}
 		}
 	}
-	return out
+	return out, nil
 }
 
 func queryForIDResolution(q url.Values) url.Values {
@@ -628,13 +640,19 @@ func (s *Server) fetchBackendJSON(ctx context.Context, r *http.Request, rel, raw
 	return value, resp.StatusCode, upstream, nil
 }
 
-func (s *Server) stateForItem(ctx context.Context, session *Session, itemID string) *PlaybackState {
+func (s *Server) stateForItem(ctx context.Context, session *Session, itemID string) (*PlaybackState, error) {
 	state, err := s.store.FindPlaybackState(ctx, session.GatewayUserID, itemID)
 	if err == nil && state != nil {
 		state.SyntheticUserID = session.SyntheticUserID
-		return state
+		return state, nil
 	}
-	return &PlaybackState{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, ItemID: itemID}
+	if errors.Is(err, ErrNotFound) {
+		return &PlaybackState{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, ItemID: itemID}, nil
+	}
+	if err == nil {
+		return nil, fmt.Errorf("%w: find playback state returned nil", ErrStoreUnavailable)
+	}
+	return nil, err
 }
 
 func (s *Server) enrichPlaybackStateMetadata(ctx context.Context, r *http.Request, session *Session, gatewayToken string, state *PlaybackState) {

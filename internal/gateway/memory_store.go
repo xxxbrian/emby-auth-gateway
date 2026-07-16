@@ -385,6 +385,46 @@ func (m *MemoryStore) SavePlaybackState(ctx context.Context, state PlaybackState
 	return nil
 }
 
+func (m *MemoryStore) SavePlaybackResolution(ctx context.Context, state PlaybackState) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.PlaybackStates == nil {
+		m.PlaybackStates = map[string]*PlaybackState{}
+	}
+	key := playbackStateKey(state.GatewayUserID, state.ItemID)
+	if existing, ok := m.PlaybackStates[key]; ok {
+		existing.SyntheticUserID = state.SyntheticUserID
+		existing.ItemName = state.ItemName
+		existing.ItemType = state.ItemType
+		existing.SeriesID = state.SeriesID
+		existing.SeriesName = state.SeriesName
+		existing.SeasonID = state.SeasonID
+		existing.IndexNumber = state.IndexNumber
+		existing.ParentIndexNumber = state.ParentIndexNumber
+		existing.RunTimeTicks = state.RunTimeTicks
+		existing.Fingerprint = state.Fingerprint
+		if state.OrphanedAt != nil {
+			t := *state.OrphanedAt
+			existing.OrphanedAt = &t
+		} else {
+			existing.OrphanedAt = nil
+		}
+		if state.LastSeenAt != nil {
+			t := *state.LastSeenAt
+			existing.LastSeenAt = &t
+		} else {
+			existing.LastSeenAt = nil
+		}
+		return nil
+	}
+	if state.UpdatedAt.IsZero() {
+		state.UpdatedAt = time.Now().UTC()
+	}
+	copyState := state
+	m.PlaybackStates[key] = &copyState
+	return nil
+}
+
 func (m *MemoryStore) ListPlaybackStates(ctx context.Context, gatewayUserID string, filter PlaybackStateFilter) ([]PlaybackState, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

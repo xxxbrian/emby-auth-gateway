@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -204,6 +205,10 @@ func (s *Server) writePositivePersonalItems(w http.ResponseWriter, r *http.Reque
 	ids := playbackStateIDs(candidates)
 	resolved, err := s.resolvePersonalItemsByID(r.Context(), r, session, gatewayToken, ids, pq)
 	if err != nil {
+		if errors.Is(err, ErrStoreUnavailable) {
+			http.Error(w, "items unavailable", http.StatusInternalServerError)
+			return
+		}
 		http.Error(w, "backend unavailable", http.StatusBadGateway)
 		return
 	}
@@ -328,25 +333,23 @@ func (s *Server) resolvePersonalItemsByID(ctx context.Context, r *http.Request, 
 		}
 		for _, id := range batchIDs {
 			item, ok := byID[id]
-			state := s.stateForItem(ctx, session, id)
+			state, err := s.stateForItem(ctx, session, id)
+			if err != nil {
+				return nil, fmt.Errorf("%w: load playback state: %w", ErrStoreUnavailable, err)
+			}
 			if !ok {
-				state.OrphanedAt = &now
-				_ = s.store.SavePlaybackState(ctx, *state)
+				_ = reconcileResolvedItem(state, nil, false, now)
+				_ = s.store.SavePlaybackResolution(ctx, *state)
 				continue
 			}
 			if !itemMatchesResolutionQuery(item, pq.raw) || !pq.matchesResolvedPath(item) {
 				continue
 			}
-			fingerprint := itemFingerprint(item)
-			if state.Fingerprint != "" && fingerprint != "" && !fingerprintsCompatible(state.Fingerprint, fingerprint) {
-				state.OrphanedAt = &now
-				_ = s.store.SavePlaybackState(ctx, *state)
+			outcome := reconcileResolvedItem(state, item, true, now)
+			_ = s.store.SavePlaybackResolution(ctx, *state)
+			if outcome != resolutionKeep {
 				continue
 			}
-			state.OrphanedAt = nil
-			state.LastSeenAt = &now
-			mergeItemMetadata(state, item)
-			_ = s.store.SavePlaybackState(ctx, *state)
 			rewritten := s.rewriteProxyJSONValueForRequestWithSnapshot(ctx, r, item, session, upstream, gatewayToken, s.gatewayBaseForRequest(r))
 			if m, ok := rewritten.(map[string]any); ok {
 				out = append(out, resolvedPersonalItem{item: m, state: *state})

@@ -884,7 +884,7 @@ func (s *Server) recordPlaybackRequest(r *http.Request, rel string, session *Ses
 		data, err = io.ReadAll(http.MaxBytesReader(nilResponseWriter{}, r.Body, 10<<20))
 		r.Body = io.NopCloser(bytes.NewReader(data))
 		if err != nil {
-			return err
+			return fmt.Errorf("%w: read playback body: %w", ErrBadRequest, err)
 		}
 	}
 	details, ok := playbackDetailsFromRequest(r, data)
@@ -900,7 +900,7 @@ func (s *Server) recordPlaybackRequest(r *http.Request, rel string, session *Ses
 	}
 	now := time.Now().UTC()
 	eventName := playbackEventName(rel)
-	_ = s.store.RecordPlaybackEvent(r.Context(), PlaybackEvent{
+	if err := s.store.RecordPlaybackEvent(r.Context(), PlaybackEvent{
 		GatewayUserID:    session.GatewayUserID,
 		SyntheticUserID:  session.SyntheticUserID,
 		ItemID:           details.ItemID,
@@ -910,12 +910,21 @@ func (s *Server) recordPlaybackRequest(r *http.Request, rel string, session *Ses
 		PlayedPercentage: details.PlayedPercentage,
 		RemoteIP:         remoteIP(r),
 		CreatedAt:        now,
-	})
-	state, err := s.store.FindPlaybackState(r.Context(), session.GatewayUserID, details.ItemID)
-	if err != nil || state == nil {
-		state = &PlaybackState{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, ItemID: details.ItemID}
+	}); err != nil {
+		s.audit(r.Context(), AuditLog{
+			GatewayUserID:   session.GatewayUserID,
+			SyntheticUserID: session.SyntheticUserID,
+			Event:           "playback_event_persist_failed",
+			Message:         "playback event persist failed",
+			RemoteIP:        remoteIP(r),
+			Method:          r.Method,
+			Path:            rel,
+		})
 	}
-	state.SyntheticUserID = session.SyntheticUserID
+	state, err := s.stateForItem(r.Context(), session, details.ItemID)
+	if err != nil {
+		return err
+	}
 	if details.ItemName != "" {
 		state.ItemName = details.ItemName
 	}
@@ -961,7 +970,9 @@ func (s *Server) recordPlaybackRequest(r *http.Request, rel string, session *Ses
 		applyStoppedPlaybackState(state, now, wasPlayed, s.resumePolicyForState(state))
 	}
 	state.UpdatedAt = now
-	_ = s.store.SavePlaybackState(r.Context(), *state)
+	if err := s.store.SavePlaybackState(r.Context(), *state); err != nil {
+		return err
+	}
 	return nil
 }
 
