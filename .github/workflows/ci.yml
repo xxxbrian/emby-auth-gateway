@@ -17,10 +17,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
           cache: true
@@ -105,17 +105,343 @@ jobs:
             echo "pack should reject symlink" >&2
             exit 1
           fi
+          rm -f "$ROOT/evil-link"
+          # Hardlink must be refused
+          printf 'shared\n' >"$ROOT/a.txt"
+          ln "$ROOT/a.txt" "$ROOT/b.txt"
+          if tools/emby-web-static/pack.sh --version 0.0.0 --date 20260103 --src "$ROOT" --out "$OUT-hard"; then
+            echo "pack should reject hardlink" >&2
+            exit 1
+          fi
+          rm -f "$ROOT/a.txt" "$ROOT/b.txt"
           echo "ok: pack fixture"
+
+      - name: Extract script fixture (mocked docker/curl)
+        run: |
+          set -euo pipefail
+          chmod +x tools/emby-web-static/extract.sh
+          FIX="$RUNNER_TEMP/extract-fixture"
+          BIN="$FIX/bin"
+          TREE="$FIX/tree"
+          OUT="$FIX/out"
+          mkdir -p "$BIN" "$TREE/strings" "$TREE/modules"
+
+          # Minimal canary tree used by mock docker cp.
+          # Include runtime modules so success path does not need a live server.
+          mkdir -p "$TREE/modules/input" "$TREE/modules/virtual-scroller"
+          printf '%s\n' '<!doctype html>' >"$TREE/index.html"
+          printf '%s\n' '{}' >"$TREE/manifest.json"
+          printf '%s\n' '{}' >"$TREE/strings/en-US.json"
+          printf '%s\n' '/* apphost mock module body padding xxxxxxxxxxxxxxxxxxxxxxxx */' >"$TREE/modules/apphost.js"
+          printf '%s\n' '/* keyboard mock module body padding xxxxxxxxxxxxxxxxxxxxxxxx */' >"$TREE/modules/input/keyboard.js"
+          printf '%s\n' '/* virtual-scroller mock module body padding xxxxxxxxxxxxxxxx */' >"$TREE/modules/virtual-scroller/virtual-scroller.js"
+          printf '%s\n' '/* css */' >"$TREE/modules/virtual-scroller/virtual-scroller.css"
+
+          GOOD_DIGEST="emby/embyserver@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          GOOD_ID="sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+          cat >"$BIN/docker" <<'MOCK'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          cmd="${1:-}"
+          case "$cmd" in
+            pull)
+              exit 0
+              ;;
+            image)
+              # docker image inspect --format '...' REF
+              shift
+              if [[ "${1:-}" != "inspect" ]]; then
+                echo "mock docker: unexpected image subcommand: $*" >&2
+                exit 1
+              fi
+              shift
+              fmt=""
+              while [[ $# -gt 0 ]]; do
+                case "$1" in
+                  --format|-f)
+                    fmt="${2:-}"
+                    shift 2
+                    ;;
+                  *)
+                    shift
+                    ;;
+                esac
+              done
+              case "$fmt" in
+                '{{.Id}}')
+                  printf '%s\n' "${MOCK_IMAGE_ID:-sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}"
+                  ;;
+                '{{index .RepoDigests 0}}')
+                  printf '%s\n' "${MOCK_IMAGE_DIGEST:-emby/embyserver@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
+                  ;;
+                *)
+                  echo "mock docker: unexpected inspect format: $fmt" >&2
+                  exit 1
+                  ;;
+              esac
+              ;;
+            create)
+              echo "mock-copy-cid"
+              ;;
+            cp)
+              # docker cp CID:/system/dashboard-ui/. OUT/
+              src="${2:-}"
+              dest="${3:-}"
+              if [[ -z "$dest" ]]; then
+                echo "mock docker cp: missing dest" >&2
+                exit 1
+              fi
+              # Copy fixture tree into dest.
+              if [[ ! -d "${MOCK_TREE:-}" ]]; then
+                echo "mock docker cp: MOCK_TREE unset" >&2
+                exit 1
+              fi
+              cp -a "${MOCK_TREE}/." "$dest/"
+              # Optional: plant a symlink after copy for refuse-before-write tests.
+              if [[ "${MOCK_PLANT_SYMLINK:-}" == "1" ]]; then
+                ln -s /etc/hosts "$dest/evil-link"
+              fi
+              if [[ "${MOCK_PLANT_HARDLINK:-}" == "1" ]]; then
+                printf 'shared\n' >"$dest/a.txt"
+                ln "$dest/a.txt" "$dest/b.txt"
+              fi
+              # Plant a directory at a runtime module path so install must refuse.
+              if [[ "${MOCK_PLANT_MODULE_DIR:-}" == "1" ]]; then
+                mkdir -p "$dest/modules/apphost.js"
+              fi
+              ;;
+            rm)
+              exit 0
+              ;;
+            run)
+              echo "mock-run-cid"
+              ;;
+            port)
+              echo "127.0.0.1:18096"
+              ;;
+            logs)
+              exit 0
+              ;;
+            *)
+              echo "mock docker: unexpected command: $*" >&2
+              exit 1
+              ;;
+          esac
+          MOCK
+          chmod +x "$BIN/docker"
+
+          cat >"$BIN/curl" <<'MOCK'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          # Support readiness probe and module downloads.
+          out=""
+          url=""
+          args=("$@")
+          i=0
+          while [[ $i -lt ${#args[@]} ]]; do
+            a="${args[$i]}"
+            case "$a" in
+              -o)
+                i=$((i + 1))
+                out="${args[$i]:-}"
+                ;;
+              http://*|https://*)
+                url="$a"
+                ;;
+            esac
+            i=$((i + 1))
+          done
+          if [[ -n "$out" ]]; then
+            # Module download: write a padded JS/CSS body.
+            if [[ "$url" == *.css ]]; then
+              printf '/* mock css padding */\n' >"$out"
+            else
+              printf '/* mock js module body padding xxxxxxxxxxxxxxxxxxxxxxxxxxxx */\n' >"$out"
+            fi
+            exit 0
+          fi
+          # Readiness / other probes succeed.
+          exit 0
+          MOCK
+          chmod +x "$BIN/curl"
+
+          export PATH="$BIN:$PATH"
+          export MOCK_TREE="$TREE"
+          export MOCK_IMAGE_DIGEST="$GOOD_DIGEST"
+          export MOCK_IMAGE_ID="$GOOD_ID"
+
+          # --- success path with matching expect-digest (full RepoDigest) ---
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+          tools/emby-web-static/extract.sh \
+            --version 4.9.5.0 \
+            --out "$OUT" \
+            --expect-digest "$GOOD_DIGEST"
+          test -f "$OUT/index.html"
+          test -s "$OUT/SOURCE_DIGEST"
+          got="$(tr -d '\n' <"$OUT/SOURCE_DIGEST")"
+          test "$got" = "$GOOD_DIGEST"
+          echo "ok: extract success + digest match"
+
+          # --- success path with bare full 64-hex sha256 (matches RepoDigest hash) ---
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+          tools/emby-web-static/extract.sh \
+            --version 4.9.5.0 \
+            --out "$OUT" \
+            --expect-digest "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          test -f "$OUT/index.html"
+          echo "ok: extract bare sha256:64hex match"
+
+          # --- success path matching image ID hash ---
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+          tools/emby-web-static/extract.sh \
+            --version 4.9.5.0 \
+            --out "$OUT" \
+            --expect-digest "$GOOD_ID"
+          test -f "$OUT/index.html"
+          echo "ok: extract image-id digest match"
+
+          # --- expect-digest mismatch fails closed before copy content matters ---
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+          if tools/emby-web-static/extract.sh \
+            --version 4.9.5.0 \
+            --out "$OUT" \
+            --expect-digest "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"; then
+            echo "extract should fail on digest mismatch" >&2
+            exit 1
+          fi
+          # OUT must remain empty (fail before copy).
+          if [[ -n "$(ls -A "$OUT" 2>/dev/null || true)" ]]; then
+            echo "digest mismatch must not write into out dir" >&2
+            exit 1
+          fi
+          echo "ok: extract digest mismatch"
+
+          # --- malformed expect digests rejected (no partial/substring bypass) ---
+          # empty, bare prefix, short, non-hex, whitespace-only, whitespace-altered,
+          # 63-hex (one short), and short prefix of a real hash.
+          bad_digests=(
+            ""
+            "   "
+            $'\t'
+            "sha256:"
+            "sha256:b"
+            "sha256:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"
+            "sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            "sha256:aaaaaaaa"
+          )
+          for bad in "${bad_digests[@]}"; do
+            rm -rf "$OUT"
+            mkdir -p "$OUT"
+            if tools/emby-web-static/extract.sh \
+              --version 4.9.5.0 \
+              --out "$OUT" \
+              --expect-digest "$bad"; then
+              echo "extract should reject malformed expect-digest: [$bad]" >&2
+              exit 1
+            fi
+            if [[ -n "$(ls -A "$OUT" 2>/dev/null || true)" ]]; then
+              echo "malformed expect-digest must not write into out dir: [$bad]" >&2
+              exit 1
+            fi
+          done
+          echo "ok: extract rejects malformed expect-digest"
+
+          # --- post-cp symlink refused before canary/module writes ---
+          # Use a tree missing a runtime module so a buggy extract would try to write modules.
+          TREE_SYM="$FIX/tree-symlink"
+          rm -rf "$TREE_SYM"
+          mkdir -p "$TREE_SYM/strings"
+          printf '%s\n' '<!doctype html>' >"$TREE_SYM/index.html"
+          printf '%s\n' '{}' >"$TREE_SYM/manifest.json"
+          printf '%s\n' '{}' >"$TREE_SYM/strings/en-US.json"
+          # No runtime modules present.
+          export MOCK_TREE="$TREE_SYM"
+          export MOCK_PLANT_SYMLINK=1
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+          # Marker that must not appear if refuse happens before module install.
+          MODULE_MARKER="$OUT/modules/apphost.js"
+          if tools/emby-web-static/extract.sh \
+            --version 4.9.5.0 \
+            --out "$OUT" \
+            --expect-digest "$GOOD_DIGEST"; then
+            echo "extract should refuse symlink tree" >&2
+            exit 1
+          fi
+          if [[ -e "$MODULE_MARKER" ]]; then
+            echo "symlink refuse must happen before module path writes" >&2
+            exit 1
+          fi
+          unset MOCK_PLANT_SYMLINK
+          echo "ok: extract symlink refuse before module write"
+
+          # --- hardlink refused ---
+          export MOCK_TREE="$TREE"
+          export MOCK_PLANT_HARDLINK=1
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+          if tools/emby-web-static/extract.sh \
+            --version 4.9.5.0 \
+            --out "$OUT" \
+            --expect-digest "$GOOD_DIGEST"; then
+            echo "extract should refuse hardlink tree" >&2
+            exit 1
+          fi
+          unset MOCK_PLANT_HARDLINK
+          echo "ok: extract hardlink refuse"
+
+          # --- runtime module download path + dest-is-directory refuse ---
+          TREE_MOD="$FIX/tree-modules-missing"
+          rm -rf "$TREE_MOD"
+          mkdir -p "$TREE_MOD/strings"
+          printf '%s\n' '<!doctype html>' >"$TREE_MOD/index.html"
+          printf '%s\n' '{}' >"$TREE_MOD/manifest.json"
+          printf '%s\n' '{}' >"$TREE_MOD/strings/en-US.json"
+          # Modules missing so curl install path runs.
+          export MOCK_TREE="$TREE_MOD"
+          unset MOCK_PLANT_SYMLINK MOCK_PLANT_HARDLINK MOCK_PLANT_MODULE_DIR
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+          tools/emby-web-static/extract.sh \
+            --version 4.9.5.0 \
+            --out "$OUT" \
+            --expect-digest "$GOOD_DIGEST"
+          test -f "$OUT/modules/apphost.js"
+          test -s "$OUT/modules/apphost.js"
+          echo "ok: extract runtime module download path"
+
+          # Dest planted as directory must refuse (not overwrite via mv into dir).
+          export MOCK_PLANT_MODULE_DIR=1
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+          if tools/emby-web-static/extract.sh \
+            --version 4.9.5.0 \
+            --out "$OUT" \
+            --expect-digest "$GOOD_DIGEST"; then
+            echo "extract should refuse runtime module dest that is a directory" >&2
+            exit 1
+          fi
+          unset MOCK_PLANT_MODULE_DIR
+          echo "ok: extract runtime module dest-is-directory refuse"
+
+          echo "ok: extract fixture"
 
   docker:
     name: Docker Build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Compose config contracts
         run: |
@@ -181,7 +507,7 @@ jobs:
           PY
 
       - name: Build image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           push: false

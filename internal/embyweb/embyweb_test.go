@@ -203,6 +203,8 @@ func TestServeReadyBasics(t *testing.T) {
 	writeReadyTree(t, root, map[string]string{
 		"modules/emby-apiclient/connectionmanager.js": `u="https://mb3admin.com/api"`,
 		"embypremiere/embypremiere.js":                `h="mb3admin.com"`,
+		"modules/app.js":                              "console.log(1)",
+		"css/site.css":                                "body{}",
 	})
 	s, err := New(Config{
 		GatewayBasePath: "/emby",
@@ -334,6 +336,27 @@ func TestServeReadyBasics(t *testing.T) {
 		}
 		if ct := rr.Header().Get("Content-Type"); !strings.Contains(ct, "javascript") {
 			t.Fatalf("content-type=%q", ct)
+		}
+	})
+
+	t.Run("non_document_assets_revalidate_not_immutable", func(t *testing.T) {
+		// Emby uses stable names; JS/CSS must not get year-long immutable cache.
+		for _, path := range []string{
+			"/emby/web/modules/app.js",
+			"/emby/web/css/site.css",
+		} {
+			rr := httptest.NewRecorder()
+			s.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+			if rr.Code != http.StatusOK {
+				t.Fatalf("%s: code=%d", path, rr.Code)
+			}
+			got := rr.Header().Get("Cache-Control")
+			if got != "no-cache" {
+				t.Fatalf("%s: cache-control=%q want no-cache (revalidate)", path, got)
+			}
+			if strings.Contains(got, "immutable") {
+				t.Fatalf("%s: must not use immutable cache: %q", path, got)
+			}
 		}
 	})
 }

@@ -45,17 +45,11 @@ func contentTypeFor(assetPath string) string {
 	return "application/octet-stream"
 }
 
-func cacheClassFor(assetPath string) string {
-	if needsHostInject(assetPath) {
-		return cacheRevalidate
-	}
-	ext := strings.ToLower(path.Ext(assetPath))
-	switch ext {
-	case ".html", ".json", ".webmanifest", ".txt", ".xml", ".md":
-		return cacheRevalidate
-	default:
-		return cacheImmutable
-	}
+func cacheClassFor(_ string) string {
+	// Emby Web uses stable filenames without content hashes. Year-long
+	// immutable caching is unsafe across package updates, so all assets
+	// (including JS/CSS and host-injected modules) revalidate.
+	return cacheRevalidate
 }
 
 func validAssetPath(p string) bool {

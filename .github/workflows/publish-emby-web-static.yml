@@ -7,6 +7,10 @@ on:
         description: Emby Server (mbServer) version tag, e.g. 4.9.5.0
         required: true
         type: string
+      emby_image_digest:
+        description: Full RepoDigest or sha256 of emby/embyserver image to pin (e.g. emby/embyserver@sha256:… or sha256:…)
+        required: true
+        type: string
       platform:
         description: Optional docker platform (e.g. linux/amd64). Empty = default.
         required: false
@@ -23,11 +27,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Validate version
         env:
           EMBY_VERSION: ${{ inputs.emby_version }}
+          EMBY_DIGEST: ${{ inputs.emby_image_digest }}
         run: |
           set -euo pipefail
           if [[ ! "$EMBY_VERSION" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -36,6 +41,15 @@ jobs:
           fi
           if [[ "$EMBY_VERSION" == "latest" ]]; then
             echo "emby_version must not be 'latest'" >&2
+            exit 1
+          fi
+          if [[ -z "${EMBY_DIGEST// }" ]]; then
+            echo "emby_image_digest is required" >&2
+            exit 1
+          fi
+          # Require full 64-hex sha256 pin before extract (no short/partial pins).
+          if [[ ! "$EMBY_DIGEST" =~ ^(sha256:[0-9a-fA-F]{64}|[^@[:space:]]+@sha256:[0-9a-fA-F]{64})$ ]]; then
+            echo "emby_image_digest must be sha256:<64hex> or name@sha256:<64hex> (full 64 hex)" >&2
             exit 1
           fi
 
@@ -69,12 +83,18 @@ jobs:
       - name: Extract dashboard-ui
         env:
           EMBY_VERSION: ${{ inputs.emby_version }}
+          EMBY_DIGEST: ${{ inputs.emby_image_digest }}
           PLATFORM: ${{ inputs.platform }}
         run: |
           set -euo pipefail
           chmod +x tools/emby-web-static/extract.sh tools/emby-web-static/pack.sh
-          # Publication is pinned to the official Emby image only.
-          ARGS=(--version "$EMBY_VERSION" --out "$RUNNER_TEMP/web-root" --image emby/embyserver)
+          # Publication is pinned to the official Emby image only, with digest pin.
+          ARGS=(
+            --version "$EMBY_VERSION"
+            --out "$RUNNER_TEMP/web-root"
+            --image emby/embyserver
+            --expect-digest "$EMBY_DIGEST"
+          )
           if [[ -n "$PLATFORM" ]]; then
             ARGS+=(--platform "$PLATFORM")
           fi
@@ -98,6 +118,7 @@ jobs:
           TAG: ${{ steps.meta.outputs.tag }}
           NAME: ${{ steps.meta.outputs.name }}
           EMBY_VERSION: ${{ inputs.emby_version }}
+          EMBY_DIGEST: ${{ inputs.emby_image_digest }}
           PLATFORM: ${{ inputs.platform }}
         run: |
           set -euo pipefail
@@ -109,10 +130,18 @@ jobs:
           if [[ -n "$PLATFORM" ]]; then
             NOTES="${NOTES} (platform ${PLATFORM})"
           fi
+          NOTES="${NOTES}."$'\n\n'
+          NOTES="${NOTES}**Pinned expect-digest input:** \`${EMBY_DIGEST}\`"$'\n'
           if [[ -n "$DIGEST" ]]; then
-            NOTES="${NOTES}"$'\n'"Resolved image: \`${DIGEST}\`"
+            NOTES="${NOTES}**Resolved SOURCE_DIGEST:** \`${DIGEST}\`"$'\n'
           fi
-          NOTES="${NOTES}."$'\n\n'"Unpack onto a host path and set \`GATEWAY_WEB_ASSETS_DIR\` to that directory."
+          NOTES="${NOTES}"$'\n'"### Operator verify before deploy"$'\n'
+          NOTES="${NOTES}"$'\n'"1. Download the tarball and \`SHA256SUMS\`; verify checksums before unpack."$'\n'
+          NOTES="${NOTES}"$'\n'"2. Inspect \`SOURCE_DIGEST\` inside the unpacked tree; confirm it matches the pin you expect."$'\n'
+          NOTES="${NOTES}"$'\n'"3. Unpack into a **fresh** host directory (do not merge over a live tree)."$'\n'
+          NOTES="${NOTES}"$'\n'"4. Mount the web root **read-only** into the gateway (\`GATEWAY_WEB_ASSETS_DIR\` / compose overlay)."$'\n'
+          NOTES="${NOTES}"$'\n'"5. Restart the gateway after the mount is in place."$'\n'
+          NOTES="${NOTES}"$'\n'"6. Keep PocketBase admin (\`/_/\`, \`/api\`) on a **private management origin/network** — not the public Emby Web origin. Path blocks alone are insufficient against same-origin JS."$'\n'
           # Pin the auto-created tag to this workflow's checked-out commit, not a
           # later main tip. Keep this release off the floating "latest" label.
           gh release create "$TAG" \

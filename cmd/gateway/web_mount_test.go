@@ -377,13 +377,12 @@ func TestMountGatewayRoutesComposition(t *testing.T) {
 		}
 	})
 
-	t.Run("registration_stubs_host_root", func(t *testing.T) {
-		web, err := newEmbyWebServer("", "")
-		if err != nil {
-			t.Fatal(err)
-		}
+	t.Run("registration_stubs_when_web_ready", func(t *testing.T) {
+		// Host-root registration stubs mount only when Web is ready
+		// (same condition as root redirect).
+		web := syntheticReadyWebHandler()
 		var apiHits atomic.Int64
-		h := buildComposedHandler(t, web, countingAPI(&apiHits, 418), true)
+		h := buildComposedHandlerWithRootRedirect(t, web, countingAPI(&apiHits, 418), true, true)
 		for _, path := range []string{
 			"/admin/service/registration/validateDevice",
 			"/admin/service/registration/validate",
@@ -401,6 +400,45 @@ func TestMountGatewayRoutesComposition(t *testing.T) {
 		}
 		if apiHits.Load() != 0 {
 			t.Fatalf("registration must not hit API, hits=%d", apiHits.Load())
+		}
+	})
+
+	t.Run("registration_stubs_absent_when_web_disabled", func(t *testing.T) {
+		web, err := newEmbyWebServer("", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// rootRedirect=false mirrors production when Web is not ready.
+		var apiHits atomic.Int64
+		h := buildComposedHandler(t, web, countingAPI(&apiHits, 418), true)
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/admin/service/registration/validateDevice", nil))
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("disabled web: registration code=%d want 404", rr.Code)
+		}
+		if apiHits.Load() != 0 {
+			t.Fatalf("registration must not hit API when unmounted, hits=%d", apiHits.Load())
+		}
+	})
+
+	t.Run("registration_stubs_absent_when_web_missing", func(t *testing.T) {
+		missing := filepath.Join(t.TempDir(), "absent")
+		web, err := newEmbyWebServer(missing, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if webReadyForRootRedirect(web) {
+			t.Fatal("missing web must not be ready for root redirect")
+		}
+		var apiHits atomic.Int64
+		h := buildComposedHandlerWithRootRedirect(t, web, countingAPI(&apiHits, 418), true, false)
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/admin/service/registration/getStatus", nil))
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("missing web: registration code=%d want 404", rr.Code)
+		}
+		if apiHits.Load() != 0 {
+			t.Fatalf("registration must not hit API when unmounted, hits=%d", apiHits.Load())
 		}
 	})
 

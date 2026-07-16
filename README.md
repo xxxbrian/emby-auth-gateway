@@ -156,21 +156,33 @@ Static assets are produced by a separate workflow (not the Gateway binary releas
 
 1. Actions → **Publish Emby Web Static**
 2. Input `emby_version` = Emby Server / mbServer version (for example `4.9.5.0`)
-3. Workflow pulls `emby/embyserver:<version>`, extracts `/system/dashboard-ui`, packs a tarball
-4. Creates a GitHub Release named `emby-web-static-<version>-YYYYMMDD` (no `latest` label)
-5. Same name already exists → workflow fails (no overwrite)
+3. Input `emby_image_digest` = **required** pin: full RepoDigest (`emby/embyserver@sha256:…`), bare `sha256:…`, or image ID of the `emby/embyserver` image to extract
+4. Workflow pulls `emby/embyserver:<version>`, verifies the resolved image matches the pin (fail closed), extracts `/system/dashboard-ui`, packs a tarball
+5. Creates a GitHub Release named `emby-web-static-<version>-YYYYMMDD` (no `latest` label)
+6. Same name already exists → workflow fails (no overwrite)
 
 Local equivalent:
 
 ```sh
-tools/emby-web-static/extract.sh --version 4.9.5.0 --out /tmp/web-root
+tools/emby-web-static/extract.sh \
+  --version 4.9.5.0 \
+  --out /tmp/web-root \
+  --expect-digest 'emby/embyserver@sha256:…'
 tools/emby-web-static/pack.sh --version 4.9.5.0 --src /tmp/web-root --out /tmp/dist
 ```
 
+(`EMBY_WEB_EXPECT_DIGEST` may be used instead of `--expect-digest`.)
+
 ### Deploy with Compose
 
+Before pointing the gateway at a release package:
+
+1. Verify `SHA256SUMS` against the downloaded tarball.
+2. Unpack into a **fresh** directory; inspect `SOURCE_DIGEST` and confirm it matches the image pin you expect.
+3. Mount that directory **read-only** into the gateway; restart after the mount is in place.
+
 ```sh
-# Unpack a release onto the host, then:
+# After verify + unpack onto the host:
 GATEWAY_WEB_ASSETS_HOST=/absolute/path/to/web-root docker compose -f docker-compose.yml -f docker-compose.web.yml up --build -d
 ```
 
@@ -202,11 +214,18 @@ on-disk files are never modified.
 
 ### Public reverse proxy
 
-Expose the Emby surface (`/emby`, including `/emby/web` when enabled) to clients.
-**Block** public access to PocketBase admin and API paths `/_/` and `/api` so
-same-origin browser JS cannot reach administrator credentials. Redact sensitive
-query tokens (`api_key`, `access_token`, `token`, `X-Emby-Token`) from access
-logs case-insensitively.
+Expose the Emby surface (`/emby`, including `/emby/web` when enabled) to clients
+on the **public Emby Web origin**.
+
+PocketBase admin must live on a **separate private management origin or network**
+(not merely a path block on the same host). Hosting `/_/` and `/api` on the same
+origin as Emby Web is unsafe even if a reverse proxy “blocks” those paths:
+same-origin browser JS from the Web surface can still target them if they are
+reachable under that origin. Put PocketBase Admin UI and collection APIs on a
+private management hostname/VPN only.
+
+Redact sensitive query tokens (`api_key`, `access_token`, `token`, `X-Emby-Token`)
+from access logs case-insensitively.
 
 ## Releases
 
@@ -311,7 +330,7 @@ Hermetic HTTP canary/CORS smoke is the automated stand-in in CI.
 - Gateway tokens are stored only as SHA-256 hashes.
 - Backend Emby passwords and backend Emby session tokens are stored as plaintext fields in PocketBase so administrators can configure and inspect backend records in the Admin UI. PocketBase superuser access or direct database file access is secret access.
 - Do not expose the real Emby backend directly to untrusted clients when testing gateway isolation.
-- On the public reverse proxy, expose `/emby` (and `/emby/web` when enabled) but block PocketBase `/_/` and `/api`.
+- On the public reverse proxy, expose `/emby` (and `/emby/web` when enabled). Keep PocketBase `/_/` and `/api` on a private management origin/network — path blocks on the public Emby Web origin alone are insufficient against same-origin JS.
 - Do not commit `.env` files or real secrets. `.env.example` contains placeholders only.
 
 ## Troubleshooting

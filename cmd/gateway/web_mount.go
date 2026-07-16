@@ -31,8 +31,14 @@ const (
 // mountGatewayRoutes registers Emby Web, registration stubs, and API catch-all
 // routes on the PocketBase router. Web routes are always fixed at /emby/web
 // (methodless Any), outrank an /emby API catch-all by path specificity, and
-// unbind global pbCors so embyweb owns canary OPTIONS/CORS. Registration stubs
-// are fixed at host-root /admin/service/registration/* (not under /emby).
+// unbind global pbCors so embyweb owns canary OPTIONS/CORS.
+//
+// Host-root mb3admin registration stubs (/admin/service/registration/*) are
+// mounted only when redirectRootToWeb is true (Web ready) — the same condition
+// as the host-root / → /emby/web/ redirect. Without a ready Web surface there is
+// no browser client that needs those stubs, and leaving them mounted on an
+// API-only process widens the host-root attack surface unnecessarily.
+//
 // When redirectRootToWeb is true (Web ready), GET/HEAD / 308 to /emby/web/.
 // The request is forwarded untouched.
 func mountGatewayRoutes(
@@ -69,11 +75,12 @@ func mountGatewayRoutes(
 	// registration order) decides /emby/web vs /emby/{path...}.
 	r.Any(fixedWebExact, webAction).Unbind(apis.DefaultCorsMiddlewareId)
 	r.Any(fixedWebWild, webAction).Unbind(apis.DefaultCorsMiddlewareId)
-	r.Any(fixedRegistrationWild, regAction)
 	r.Any(fixedAPIWild, apiAction)
 	r.Any(fixedAPIExact, apiAction)
 
 	if redirectRootToWeb {
+		// Registration stubs only when Web is ready (same gate as root redirect).
+		r.Any(fixedRegistrationWild, regAction)
 		r.Any("/", rootRedirectToWebAction)
 	}
 }

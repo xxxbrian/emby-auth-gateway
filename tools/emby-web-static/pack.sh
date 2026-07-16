@@ -17,6 +17,49 @@ Archive members are rooted at the web root (index.html at archive root).
 EOF
 }
 
+# find_first prints the first matching path (or empty). Avoids find|grep -q
+# pipelines that can SIGPIPE and leak non-zero status under pipefail.
+# Fail-closed: nonzero find status is propagated (do not || true).
+find_first() {
+  find "$@" -print -quit
+}
+
+# refuse_unsafe_tree rejects symlinks, special nodes, and hardlinks under root.
+# If find itself fails (unreadable tree, etc.), refuse rather than treating as clean.
+refuse_unsafe_tree() {
+  local root="$1"
+  local hit
+
+  if ! hit="$(find_first "$root" \( -type l -o -type p -o -type s -o -type b -o -type c \))"; then
+    echo "find failed while scanning for unsafe nodes under: $root; refusing" >&2
+    return 1
+  fi
+  if [[ -n "$hit" ]]; then
+    echo "src contains non-regular nodes (symlink/fifo/socket/device); refusing (first: $hit)" >&2
+    find "$root" \( -type l -o -type p -o -type s -o -type b -o -type c \) 2>/dev/null >&2 || true
+    return 1
+  fi
+  if ! hit="$(find_first "$root" ! -type d ! -type f)"; then
+    echo "find failed while scanning for unexpected nodes under: $root; refusing" >&2
+    return 1
+  fi
+  if [[ -n "$hit" ]]; then
+    echo "src contains unexpected non-file/non-dir nodes; refusing (first: $hit)" >&2
+    find "$root" ! -type d ! -type f 2>/dev/null >&2 || true
+    return 1
+  fi
+  if ! hit="$(find_first "$root" -type f -links +1)"; then
+    echo "find failed while scanning for hardlinks under: $root; refusing" >&2
+    return 1
+  fi
+  if [[ -n "$hit" ]]; then
+    echo "hardlink refused: $hit" >&2
+    find "$root" -type f -links +1 2>/dev/null >&2 || true
+    return 1
+  fi
+  return 0
+}
+
 VERSION=""
 SRC=""
 OUT_DIR=""
@@ -97,17 +140,8 @@ if [[ -e "$ARCHIVE" ]]; then
   exit 1
 fi
 
-# Defense at the archive boundary: refuse non-regular nodes (symlink/fifo/etc).
-if find "$SRC" \( -type l -o -type p -o -type s -o -type b -o -type c \) | grep -q .; then
-  echo "src contains non-regular nodes (symlink/fifo/socket/device); refusing" >&2
-  find "$SRC" \( -type l -o -type p -o -type s -o -type b -o -type c \) >&2
-  exit 1
-fi
-if find "$SRC" ! -type d ! -type f | grep -q .; then
-  echo "src contains unexpected non-file/non-dir nodes; refusing" >&2
-  find "$SRC" ! -type d ! -type f >&2
-  exit 1
-fi
+# Defense at the archive boundary: refuse non-regular nodes and hardlinks.
+refuse_unsafe_tree "$SRC"
 
 # Portable tar: store files relative to SRC so extract is a flat web root.
 tar -czf "$ARCHIVE" -C "$SRC" .
