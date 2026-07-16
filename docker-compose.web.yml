@@ -1,74 +1,18 @@
-# Opt-in one-command Emby Web deployment overlay.
+# Opt-in Emby Web serving overlay.
 #
-# Usage (directory source):
-#   GATEWAY_WEB_CATALOG_ID=emby-web-4.9.5.0 \
-#   GATEWAY_WEB_SOURCE_KIND=dir \
-#   GATEWAY_WEB_SOURCE_MOUNT=/absolute/path/to/prepared-868 \
+# Mount a prepared web root (from an emby-web-static Release) and enable serve:
+#
+#   GATEWAY_WEB_ASSETS_HOST=/absolute/path/to/web-root \
 #   docker compose -f docker-compose.yml -f docker-compose.web.yml up --build -d
 #
-# Local archive source:
-#   GATEWAY_WEB_SOURCE_KIND=archive \
-#   GATEWAY_WEB_SOURCE_MOUNT=/absolute/path/to/tree.tar.gz \
-#   ...
-#
-# Remote archive source (HTTPS .tar.gz; no host bind needed):
-#   GATEWAY_WEB_SOURCE_KIND=archive \
-#   GATEWAY_WEB_SOURCE_VALUE=https://assets.example.com/emby-web-prepared-4.9.5.0.tar.gz \
-#   ...
-#
-# Static-tree URL source (per-file tree, trailing slash; not a .tar.gz):
-#   GATEWAY_WEB_SOURCE_KIND=url \
-#   GATEWAY_WEB_SOURCE_VALUE=https://assets.example.com/emby-web/4.9.5.0/ \
-#   ...
-#
-# web-init must exit 0 before gateway is created. serve never installs.
-# Official asset bytes are not baked into the image. No Docker socket.
+# The host directory must already contain index.html, manifest.json, and
+# strings/en-US.json at its root. Gateway never installs or verifies hashes.
 
 services:
-  web-init:
-    build: .
-    image: ${GATEWAY_IMAGE:-emby-auth-gateway:local}
-    restart: "no"
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    tmpfs:
-      - /tmp
-    environment:
-      GATEWAY_WEB_ASSETS_DIR: /app/web_assets
-    # Default entrypoint is `gateway`. Exec-form argv only; no shell.
-    # PocketBase still resolves a data dir for the process; point it at the
-    # tmpfs so read_only rootfs does not break pure web commands.
-    command:
-      - --dir
-      - /tmp/pb_data
-      - web
-      - init
-      - --catalog-id
-      - ${GATEWAY_WEB_CATALOG_ID:?GATEWAY_WEB_CATALOG_ID is required}
-      - --source-kind
-      - ${GATEWAY_WEB_SOURCE_KIND:?GATEWAY_WEB_SOURCE_KIND must be dir, archive, or url}
-      - --source
-      - ${GATEWAY_WEB_SOURCE_VALUE:-/source/input.tar.gz}
-    volumes:
-      - gateway_web_assets:/app/web_assets
-      # Frozen container path. Host value is either a prepared dir/archive path
-      # (bind) or the default named volume for URL mode.
-      - ${GATEWAY_WEB_SOURCE_MOUNT:-gateway_web_source_empty}:/source/input.tar.gz:ro
-
   gateway:
-    depends_on:
-      web-init:
-        condition: service_completed_successfully
     environment:
       GATEWAY_WEB_ASSETS_DIR: /app/web_assets
       # Re-default public URL so host env cannot omit the fixed /emby base path.
       GATEWAY_PUBLIC_URL: ${GATEWAY_PUBLIC_URL:-http://localhost:${GATEWAY_PORT:-8090}/emby}
     volumes:
-      - gateway_web_assets:/app/web_assets:ro
-
-volumes:
-  gateway_web_assets:
-  gateway_web_source_empty:
+      - ${GATEWAY_WEB_ASSETS_HOST:?GATEWAY_WEB_ASSETS_HOST must be an absolute path to a web root}:/app/web_assets:ro

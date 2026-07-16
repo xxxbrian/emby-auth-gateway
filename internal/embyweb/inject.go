@@ -13,7 +13,7 @@ import (
 // Disk release contents are never modified.
 var injectHostPlaceholder = []byte("mb3admin.com")
 
-// hostInjectPaths are catalog-relative paths that receive host injection.
+// hostInjectPaths are web-root-relative paths that receive host injection.
 var hostInjectPaths = map[string]struct{}{
 	"modules/emby-apiclient/connectionmanager.js": {},
 	"embypremiere/embypremiere.js":                {},

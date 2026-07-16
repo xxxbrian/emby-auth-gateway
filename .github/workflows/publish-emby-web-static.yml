@@ -1,0 +1,120 @@
+name: Publish Emby Web Static
+
+on:
+  workflow_dispatch:
+    inputs:
+      emby_version:
+        description: Emby Server (mbServer) version tag, e.g. 4.9.5.0
+        required: true
+        type: string
+      image:
+        description: Container image repository
+        required: false
+        default: emby/embyserver
+        type: string
+      platform:
+        description: Optional docker platform (e.g. linux/amd64). Empty = default.
+        required: false
+        default: ""
+        type: string
+
+# Never attach or move the floating "latest" label.
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Extract and release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Validate version
+        env:
+          EMBY_VERSION: ${{ inputs.emby_version }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$EMBY_VERSION" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "invalid emby_version: $EMBY_VERSION" >&2
+            exit 1
+          fi
+          if [[ "$EMBY_VERSION" == "latest" ]]; then
+            echo "emby_version must not be 'latest'" >&2
+            exit 1
+          fi
+
+      - name: Compute release name
+        id: meta
+        env:
+          EMBY_VERSION: ${{ inputs.emby_version }}
+        run: |
+          set -euo pipefail
+          DATE_STAMP="$(date -u +%Y%m%d)"
+          NAME="emby-web-static-${EMBY_VERSION}-${DATE_STAMP}"
+          echo "date=$DATE_STAMP" >>"$GITHUB_OUTPUT"
+          echo "name=$NAME" >>"$GITHUB_OUTPUT"
+          echo "tag=$NAME" >>"$GITHUB_OUTPUT"
+
+      - name: Refuse existing release or tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release already exists: $TAG (refusing overwrite)" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "tag already exists on origin: $TAG (refusing overwrite)" >&2
+            exit 1
+          fi
+
+      - name: Extract dashboard-ui
+        env:
+          EMBY_VERSION: ${{ inputs.emby_version }}
+          IMAGE: ${{ inputs.image }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+          chmod +x tools/emby-web-static/extract.sh tools/emby-web-static/pack.sh
+          ARGS=(--version "$EMBY_VERSION" --out "$RUNNER_TEMP/web-root" --image "$IMAGE")
+          if [[ -n "$PLATFORM" ]]; then
+            ARGS+=(--platform "$PLATFORM")
+          fi
+          tools/emby-web-static/extract.sh "${ARGS[@]}"
+
+      - name: Pack archive
+        env:
+          EMBY_VERSION: ${{ inputs.emby_version }}
+          DATE_STAMP: ${{ steps.meta.outputs.date }}
+        run: |
+          set -euo pipefail
+          tools/emby-web-static/pack.sh \
+            --version "$EMBY_VERSION" \
+            --date "$DATE_STAMP" \
+            --src "$RUNNER_TEMP/web-root" \
+            --out "$RUNNER_TEMP/dist"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          NAME: ${{ steps.meta.outputs.name }}
+          EMBY_VERSION: ${{ inputs.emby_version }}
+          IMAGE: ${{ inputs.image }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+          NOTES="Emby Web static assets extracted from \`${IMAGE}:${EMBY_VERSION}\`"
+          if [[ -n "$PLATFORM" ]]; then
+            NOTES="${NOTES} (platform ${PLATFORM})"
+          fi
+          NOTES="${NOTES}."$'\n\n'"Unpack onto a host path and set \`GATEWAY_WEB_ASSETS_DIR\` to that directory."
+          # Explicitly do not pass --latest.
+          gh release create "$TAG" \
+            --title "$NAME" \
+            --notes "$NOTES" \
+            "$RUNNER_TEMP/dist/${NAME}.tar.gz" \
+            "$RUNNER_TEMP/dist/SHA256SUMS"

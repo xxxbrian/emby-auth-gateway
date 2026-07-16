@@ -165,9 +165,6 @@ func newGatewayApp() *pocketbase.PocketBase {
 	versionCommand.Args = cobra.NoArgs
 	versionCommand.FParseErrWhitelist.UnknownFlags = false
 	app.RootCmd.AddCommand(versionCommand)
-	webCommand := newWebCommand()
-	configureDirectCommandGroup(webCommand)
-	app.RootCmd.AddCommand(webCommand)
 	registerActivityLogTokenRedaction(app)
 
 	app.OnBootstrap().BindFunc(func(e *core.BootstrapEvent) error {
@@ -226,17 +223,6 @@ func newGatewayApp() *pocketbase.PocketBase {
 	})
 
 	return app
-}
-
-// configureDirectCommandGroup makes a command group safe for direct execution:
-// no-argument invocations render help, while unresolved children are rejected
-// by Cobra before any subcommand can run.
-func configureDirectCommandGroup(cmd *cobra.Command) {
-	cmd.Args = cobra.NoArgs
-	cmd.FParseErrWhitelist.UnknownFlags = false
-	cmd.RunE = func(cmd *cobra.Command, args []string) error {
-		return cmd.Help()
-	}
 }
 
 func cleanupPlaybackEvents(app core.App, now time.Time) error {

@@ -25,8 +25,7 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # Hermetic Web install→serve→scripts/smoke.sh path (synthetic catalog only;
-      # no official asset bytes).
+      # Hermetic Web serve→scripts/smoke.sh path (fixture tree only).
       # -json + assertion ensures the named test actually ran (not a silent
       # zero-match pass from a mistyped -run regex).
       - name: Web deployment smoke
@@ -42,7 +41,6 @@ jobs:
           saw_run = False
           saw_pass = False
           package_fail = False
-          events = []
           with open(path, encoding="utf-8") as f:
               for line in f:
                   line = line.strip()
@@ -53,7 +51,6 @@ jobs:
                   except json.JSONDecodeError as e:
                       print(f"invalid go test -json line: {e}: {line!r}", file=sys.stderr)
                       sys.exit(1)
-                  events.append(ev)
                   test = ev.get("Test") or ""
                   action = ev.get("Action") or ""
                   if test == "TestSyntheticReadyDeploymentSmoke":
@@ -86,6 +83,9 @@ jobs:
       - name: Test
         run: go test ./...
 
+      - name: Vet
+        run: go vet ./...
+
   docker:
     name: Docker Build
     runs-on: ubuntu-latest
@@ -101,18 +101,8 @@ jobs:
           set -euo pipefail
           docker compose -f docker-compose.yml config --format json >/tmp/compose-base.json
           docker compose -f docker-compose.yml -f docker-compose.dev.yml config --format json >/tmp/compose-dev.json
-          GATEWAY_WEB_CATALOG_ID=emby-web-4.9.5.0 \
-          GATEWAY_WEB_SOURCE_KIND=dir \
-          GATEWAY_WEB_SOURCE_MOUNT=/tmp/prepared-web \
-          docker compose -f docker-compose.yml -f docker-compose.web.yml config --format json >/tmp/compose-web-dir.json
-          GATEWAY_WEB_CATALOG_ID=emby-web-4.9.5.0 \
-          GATEWAY_WEB_SOURCE_KIND=archive \
-          GATEWAY_WEB_SOURCE_MOUNT=/tmp/tree.tar.gz \
-          docker compose -f docker-compose.yml -f docker-compose.web.yml config --format json >/tmp/compose-web-archive.json
-          GATEWAY_WEB_CATALOG_ID=emby-web-4.9.5.0 \
-          GATEWAY_WEB_SOURCE_KIND=url \
-          GATEWAY_WEB_SOURCE_VALUE=https://assets.example.com/emby-web/4.9.5.0/ \
-          docker compose -f docker-compose.yml -f docker-compose.web.yml config --format json >/tmp/compose-web-url.json
+          GATEWAY_WEB_ASSETS_HOST=/tmp/prepared-web \
+          docker compose -f docker-compose.yml -f docker-compose.web.yml config --format json >/tmp/compose-web.json
           python3 - <<'PY'
           import json
           import sys
@@ -124,95 +114,48 @@ jobs:
           def mounts(svc):
               return svc.get("volumes") or []
 
-          def has_mount(svc, target, *, read_only=None, source=None):
+          def has_mount(svc, target, *, read_only=None):
               for m in mounts(svc):
                   if m.get("target") != target:
                       continue
                   if read_only is not None and bool(m.get("read_only")) != read_only:
                       continue
-                  if source is not None and m.get("source") != source:
-                      continue
                   return True
               return False
 
           def any_sock(cfg):
-              blob = json.dumps(cfg)
-              return "docker.sock" in blob
+              return "docker.sock" in json.dumps(cfg)
 
           base = load("/tmp/compose-base.json")
           if "web-init" in base.get("services", {}):
               print("base compose must not include web-init", file=sys.stderr)
               sys.exit(1)
+          if "web" in base.get("services", {}):
+              print("base compose must not include web installer service", file=sys.stderr)
+              sys.exit(1)
           if any_sock(base):
               print("base compose must not mount docker.sock", file=sys.stderr)
               sys.exit(1)
 
-          modes = {
-              "dir": ("/tmp/compose-web-dir.json", "dir", "/source/input.tar.gz", "/tmp/prepared-web"),
-              "archive": ("/tmp/compose-web-archive.json", "archive", "/source/input.tar.gz", "/tmp/tree.tar.gz"),
-              "url": ("/tmp/compose-web-url.json", "url", "https://assets.example.com/emby-web/4.9.5.0/", None),
-          }
-          for label, (path, kind, source_value, host_source) in modes.items():
-              cfg = load(path)
-              if any_sock(cfg):
-                  print(f"{label}: docker.sock forbidden", file=sys.stderr)
-                  sys.exit(1)
-              services = cfg.get("services") or {}
-              if set(services) < {"gateway", "web-init"}:
-                  print(f"{label}: expected gateway and web-init", file=sys.stderr)
-                  sys.exit(1)
-              gw = services["gateway"]
-              init = services["web-init"]
-              if gw.get("image") != init.get("image"):
-                  print(f"{label}: gateway/web-init image mismatch", file=sys.stderr)
-                  sys.exit(1)
-              dep = ((gw.get("depends_on") or {}).get("web-init") or {})
-              if dep.get("condition") != "service_completed_successfully":
-                  print(f"{label}: gateway must depend on web-init completed successfully", file=sys.stderr)
-                  sys.exit(1)
-              if dep.get("required") is False:
-                  print(f"{label}: web-init dependency must be required", file=sys.stderr)
-                  sys.exit(1)
-              env = gw.get("environment") or {}
-              if env.get("GATEWAY_WEB_ASSETS_DIR") != "/app/web_assets":
-                  print(f"{label}: gateway assets dir must be /app/web_assets", file=sys.stderr)
-                  sys.exit(1)
-              if not has_mount(gw, "/app/web_assets", read_only=True):
-                  print(f"{label}: gateway assets mount must be read-only", file=sys.stderr)
-                  sys.exit(1)
-              if has_mount(gw, "/source/input.tar.gz"):
-                  print(f"{label}: gateway must not receive source mount", file=sys.stderr)
-                  sys.exit(1)
-              if has_mount(init, "/app/pb_data") or has_mount(gw, "/app/pb_data") and False:
-                  pass
-              if has_mount(init, "/app/pb_data"):
-                  print(f"{label}: web-init must not mount pb_data", file=sys.stderr)
-                  sys.exit(1)
-              if not has_mount(init, "/app/web_assets", read_only=False):
-                  print(f"{label}: web-init assets mount must be read-write", file=sys.stderr)
-                  sys.exit(1)
-              if not has_mount(init, "/source/input.tar.gz", read_only=True, source=host_source if host_source else None):
-                  # URL mode uses a named volume; source name may be project-prefixed.
-                  if kind != "url" or not has_mount(init, "/source/input.tar.gz", read_only=True):
-                      print(f"{label}: frozen RO source mount missing/wrong", file=sys.stderr)
-                      sys.exit(1)
-              cmd = init.get("command") or []
-              want_prefix = ["--dir", "/tmp/pb_data", "web", "init", "--catalog-id", "emby-web-4.9.5.0", "--source-kind", kind, "--source", source_value]
-              if cmd != want_prefix:
-                  print(f"{label}: command argv mismatch:\n  got {cmd}\n  want {want_prefix}", file=sys.stderr)
-                  sys.exit(1)
-              if init.get("restart") not in ("no", "disabled", False, "False"):
-                  # compose json may normalize restart
-                  if str(init.get("restart")) != "no":
-                      print(f"{label}: web-init restart must be no, got {init.get('restart')!r}", file=sys.stderr)
-                      sys.exit(1)
-              if init.get("read_only") is not True:
-                  print(f"{label}: web-init read_only rootfs required", file=sys.stderr)
-                  sys.exit(1)
-              caps = init.get("cap_drop") or []
-              if "ALL" not in caps:
-                  print(f"{label}: web-init must cap_drop ALL", file=sys.stderr)
-                  sys.exit(1)
+          web = load("/tmp/compose-web.json")
+          if any_sock(web):
+              print("web overlay: docker.sock forbidden", file=sys.stderr)
+              sys.exit(1)
+          services = web.get("services") or {}
+          if "web-init" in services:
+              print("web overlay must not include web-init", file=sys.stderr)
+              sys.exit(1)
+          gw = services.get("gateway")
+          if not gw:
+              print("web overlay missing gateway", file=sys.stderr)
+              sys.exit(1)
+          env = gw.get("environment") or {}
+          if env.get("GATEWAY_WEB_ASSETS_DIR") != "/app/web_assets":
+              print("gateway assets dir must be /app/web_assets", file=sys.stderr)
+              sys.exit(1)
+          if not has_mount(gw, "/app/web_assets", read_only=True):
+              print("gateway assets mount must be read-only", file=sys.stderr)
+              sys.exit(1)
           print("ok: compose config contracts")
           PY
 
@@ -229,27 +172,3 @@ jobs:
             BUILD_DATE=unknown
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      - name: Unknown catalog failure ordering
-        run: |
-          set -euo pipefail
-          PROJECT="webinit-fail-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          SRC=$(mktemp -d)
-          export GATEWAY_IMAGE=emby-auth-gateway:ci
-          export GATEWAY_WEB_CATALOG_ID=does-not-exist
-          export GATEWAY_WEB_SOURCE_KIND=dir
-          export GATEWAY_WEB_SOURCE_MOUNT="$SRC"
-          cleanup() {
-            docker compose -p "$PROJECT" -f docker-compose.yml -f docker-compose.web.yml down -v --remove-orphans >/dev/null 2>&1 || true
-            rm -rf "$SRC"
-          }
-          trap cleanup EXIT
-          set +e
-          docker compose -p "$PROJECT" -f docker-compose.yml -f docker-compose.web.yml up -d --no-build
-          rc=$?
-          set -e
-          running=$(docker compose -p "$PROJECT" ps --status running -q | wc -l | tr -d ' ')
-          echo "up_exit=$rc running=$running"
-          test "$rc" -ne 0
-          test "$running" = "0"
-          echo "ok: unknown catalog prevents gateway start"

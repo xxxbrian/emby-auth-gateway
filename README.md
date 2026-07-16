@@ -122,201 +122,67 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build gatewa
 
 Emby Web is an optional, read-only static surface at fixed paths `/emby/web` and
 `/emby/web/...`. It is independent of the authenticated reverse proxy: Web routes
-never fall through to API auth, and `serve` never downloads assets, mounts a
-Docker socket, or installs on startup.
+never fall through to API auth, and `serve` never downloads or installs assets.
 
 ### Enablement
 
 | Condition | Behavior |
 | --- | --- |
-| `GATEWAY_WEB_ASSETS_DIR` unset/blank | Web disabled: canonical `/emby/web/` (and descendants) return **404**. |
-| Assets dir set, tree missing/corrupt/untrusted | Web configured but unavailable: **503** on Web paths. |
-| Assets dir set, verified trusted release | Ready: serves pinned files; `/emby/web` → **308** `/emby/web/`; host-root `/` → **308** `/emby/web/`. |
+| `GATEWAY_WEB_ASSETS_DIR` unset/blank | Web disabled: `/emby/web` returns **404**. |
+| Assets dir set, missing or incomplete canaries | **503** on Web paths. |
+| Assets dir set, canaries present | Ready: serves files from disk; `/emby/web` → **308** `/emby/web/`; host-root `/` → **308** `/emby/web/`. |
 
-`serve` loads one release into memory at process start. Changing the on-disk
-pointer or installing a new release does not hot-reload; restart the gateway to
-activate what is currently pointed at.
+Gateway trusts the directory you point at. There is no catalog, installer CLI, or
+per-file hash verification at runtime.
 
 ### Asset layout
 
-Installer and server share one assets root (example path `/app/web_assets`):
+`GATEWAY_WEB_ASSETS_DIR` is the web root itself:
 
 ```text
-web_assets/
-  current.json                          # atomic pointer (schema, release, catalog digest)
-  releases/<version>-<catalog-digest>/
-    install.json
-    files/...                           # immutable verified tree
-  staging/                              # install workspace
-  install.lock
+web-root/
+  index.html
+  manifest.json
+  strings/en-US.json
+  modules/...
+  ...
 ```
 
-Releases are immutable. Activation only rewrites `current.json`. V1 does not
-garbage-collect old releases.
+Required canaries: `index.html`, `manifest.json`, `strings/en-US.json`.
 
-### Install and status CLI
+### Publishing static packages
 
-Commands are pure filesystem tools: no PocketBase bootstrap, no registry
-override, and no arbitrary catalog files. Assets root comes from `--assets-dir`
-or `GATEWAY_WEB_ASSETS_DIR`.
+Static assets are produced by a separate workflow (not the Gateway binary release):
+
+1. Actions → **Publish Emby Web Static**
+2. Input `emby_version` = Emby Server / mbServer version (for example `4.9.5.0`)
+3. Workflow pulls `emby/embyserver:<version>`, extracts `/system/dashboard-ui`, packs a tarball
+4. Creates a GitHub Release named `emby-web-static-<version>-YYYYMMDD` (no `latest` label)
+5. Same name already exists → workflow fails (no overwrite)
+
+Local equivalent:
 
 ```sh
-# Status (plain trusted identity; exit 0 only for installed/ready)
-./bin/gateway web status --assets-dir /path/to/web_assets
-
-# Full shared verifier (ready when verified:true)
-./bin/gateway web status --assets-dir /path/to/web_assets --verify
-
-# Install: trusted built-in catalog ID + exactly one prepared source
-./bin/gateway web install \
-  --assets-dir /path/to/web_assets \
-  --catalog-id 'emby-web-4.9.5.0' \
-  --from-dir /path/to/prepared/files
-
-./bin/gateway web install \
-  --assets-dir /path/to/web_assets \
-  --catalog-id 'emby-web-4.9.5.0' \
-  --from-archive /path/to/prepared.tar.gz
-
-# Prepared static-tree URL (trailing slash required). Defaults: HTTPS + public IPs.
-./bin/gateway web install \
-  --assets-dir /path/to/web_assets \
-  --catalog-id 'emby-web-4.9.5.0' \
-  --from-url 'https://assets.example.com/emby-web/4.9.5.0/'
-
-# Development-only URL relaxations (invalid unless --from-url is set)
-./bin/gateway web install \
-  --assets-dir /path/to/web_assets \
-  --catalog-id 'emby-web-4.9.5.0' \
-  --from-url 'http://127.0.0.1:8080/tree/' \
-  --allow-http-url \
-  --allow-private-url
+tools/emby-web-static/extract.sh --version 4.9.5.0 --out /tmp/web-root
+tools/emby-web-static/pack.sh --version 4.9.5.0 --src /tmp/web-root --out /tmp/dist
 ```
 
-### Compose volume and one-shot installer
-
-Compose defines a separate named volume `gateway_web_assets` mounted at
-`/app/web_assets` (read-only on the long-running `gateway` service; read-write on
-installer services). Web serving is **opt-in**. Do not mount a Docker socket; do
-not bake official bytes into image layers; `serve` never installs on startup.
-
-#### One-command Web deployment (`docker-compose.web.yml`)
-
-The overlay runs an unprofiled `web-init` service that must complete successfully
-before `gateway` is created. It uses the same image/CLI, a read-write assets
-volume, a frozen read-only source mount at `/source/input.tar.gz`, and
-`gateway web init` (structured source selection; no shell). The one-shot service
-uses a read-only root filesystem with `/tmp` tmpfs and points PocketBase
-`--dir /tmp/pb_data` there so pure web commands do not need a persistent PB
-volume.
+### Deploy with Compose
 
 ```sh
-# Directory source
-GATEWAY_WEB_CATALOG_ID=emby-web-4.9.5.0 \
-GATEWAY_WEB_SOURCE_KIND=dir \
-GATEWAY_WEB_SOURCE_MOUNT=/absolute/path/to/prepared-868 \
-docker compose -f docker-compose.yml -f docker-compose.web.yml up --build -d
-
-# Local archive source
-GATEWAY_WEB_CATALOG_ID=emby-web-4.9.5.0 \
-GATEWAY_WEB_SOURCE_KIND=archive \
-GATEWAY_WEB_SOURCE_MOUNT=/absolute/path/to/tree.tar.gz \
-docker compose -f docker-compose.yml -f docker-compose.web.yml up --build -d
-
-# Remote archive source (HTTPS .tar.gz; no host bind mount)
-GATEWAY_WEB_CATALOG_ID=emby-web-4.9.5.0 \
-GATEWAY_WEB_SOURCE_KIND=archive \
-GATEWAY_WEB_SOURCE_VALUE=https://assets.example.com/emby-web-prepared-4.9.5.0.tar.gz \
-docker compose -f docker-compose.yml -f docker-compose.web.yml up --build -d
-
-# Prepared HTTPS static-tree URL (per-file tree with trailing slash; not a .tar.gz)
-GATEWAY_WEB_CATALOG_ID=emby-web-4.9.5.0 \
-GATEWAY_WEB_SOURCE_KIND=url \
-GATEWAY_WEB_SOURCE_VALUE=https://assets.example.com/emby-web/4.9.5.0/ \
-docker compose -f docker-compose.yml -f docker-compose.web.yml up --build -d
+# Unpack a release onto the host, then:
+GATEWAY_WEB_ASSETS_HOST=/absolute/path/to/web-root docker compose -f docker-compose.yml -f docker-compose.web.yml up --build -d
 ```
 
-Semantics:
+Base `docker compose up` without the overlay remains API-only.
 
-- Clean first deploy: if `web-init` fails, Compose does not start `gateway`.
-- Upgrade: rerun the same overlay so `web-init` installs/reactivates, then
-  recreate `gateway` so it pins the new release. A later failed upgrade may leave
-  an already-running gateway serving its previously pinned release.
-- Overlay forces `GATEWAY_WEB_ASSETS_DIR=/app/web_assets`. Set `GATEWAY_PUBLIC_URL`
-  to a URL that ends in `/emby`.
-- Base `docker compose up` without the overlay remains API-only.
-
-#### Manual one-shot tool (profile `web`)
+### Local binary
 
 ```sh
-# Status against the shared volume (profile "web"; RW mount; no serve)
-docker compose run --rm web status
-docker compose run --rm web status --verify
-
-# Install built-in catalog ID with a legally obtained prepared source (RO bind):
-docker compose run --rm \
-  -v /path/to/prepared:/source:ro \
-  web install --catalog-id 'emby-web-4.9.5.0' --from-dir /source
-
-docker compose run --rm \
-  -v /path/to/tree.tar.gz:/source/tree.tar.gz:ro \
-  web install --catalog-id 'emby-web-4.9.5.0' --from-archive /source/tree.tar.gz
-
-docker compose run --rm web install \
-  --catalog-id 'emby-web-4.9.5.0' \
-  --from-url 'https://assets.example.com/emby-web/4.9.5.0/'
-
-# Structured equivalent used by the overlay:
-docker compose run --rm \
-  -v /path/to/prepared:/source/input.tar.gz:ro \
-  web init --catalog-id 'emby-web-4.9.5.0' --source-kind dir --source /source/input.tar.gz
+export GATEWAY_WEB_ASSETS_DIR=/path/to/web-root
+export GATEWAY_PUBLIC_URL=http://localhost:8090/emby
+./bin/gateway serve --http=127.0.0.1:8090
 ```
-
-### Production catalog
-
-Gateway releases do **not** redistribute official Emby Web bytes. Catalogs are
-path/hash metadata only. The production built-in registry currently ships one
-reviewed catalog:
-
-| Field | Value |
-| --- | --- |
-| Catalog ID | `emby-web-4.9.5.0` |
-| Version | `4.9.5.0` |
-| Source image | `emby/embyserver` (linux/arm64 child digest pinned in catalog metadata) |
-| Entries | 868 |
-
-Operators must supply a **legally obtained** prepared source tree, archive, or
-URL that matches the catalog. Official asset bytes are not in the repository,
-release archives, CI artifacts, or gateway image layers. There is no
-`--catalog-file` or digest override.
-
-- Unknown catalog IDs still return the legal/reproduction gate error with no
-  assets root, lock, or network side effects.
-- Configured trees whose digest is not in the production registry load as
-  corrupt/untrusted (503), never Ready.
-- Provenance for the shipped metadata is recorded in
-  `internal/embyweb/catalogs/PROVENANCE.md` (owner risk acceptance for metadata
-  publication; not an Emby license grant).
-
-### Upgrade, reactivation, rollback
-
-1. Prepare a source tree/archive/URL that matches the target trusted catalog.
-2. Run `web install --catalog-id <trusted-id> --from-...` against the assets root.
-   - New release: stages, verifies every declared file, publishes under
-     `releases/<version>-<digest>/`, then atomically updates `current.json`.
-   - Identical existing release: verifies and **reactivates** the pointer
-     (`reactivated: true`).
-3. Confirm on disk **before** restart:
-   `web status --verify` (expect `state: ready`, `verified: true`).
-4. **Restart** the gateway process so `serve` pins the new `current.json` release
-   (no hot reload).
-5. Confirm the running process with anonymous HTTP canaries (or
-   `SMOKE_WEB=ready` against the live gateway).
-
-Rollback is the same path with a **previous trusted catalog ID** and matching
-prepared source (or reactivation of an already-published release still present
-under `releases/`). Only trusted catalog IDs are accepted; do not hand-edit
-digests or drop unreviewed trees into the assets root.
 
 ### Browser canaries and CORS
 
@@ -330,6 +196,9 @@ Only those canaries grant CORS, and only to origin `https://app.emby.media`
 (simple GET/HEAD: `Access-Control-Allow-Origin` + `Vary: Origin`; OPTIONS
 preflight: `204`, methods `GET, HEAD`, no credentials). Ordinary Web assets do
 not grant CORS.
+
+Two JS modules receive serve-time host injection (`mb3admin.com` → request host);
+on-disk files are never modified.
 
 ### Public reverse proxy
 
@@ -420,21 +289,20 @@ USERNAME=alice PASSWORD='gateway-client-password' ./scripts/smoke.sh
 # Expect Web disabled (404 on /emby/web/)
 SMOKE_WEB=disabled USERNAME=alice PASSWORD='gateway-client-password' ./scripts/smoke.sh
 
-# Expect ready Web canaries + CORS (gateway already serving a verified tree)
+# Expect ready Web canaries + CORS (gateway already serving a web root)
 SMOKE_WEB=ready USERNAME=alice PASSWORD='gateway-client-password' ./scripts/smoke.sh
 
-# Test-only Web surface (no credentials; CI synthetic server)
+# Test-only Web surface (no credentials; CI fixture server)
 SMOKE_WEB=ready SMOKE_WEB_ONLY=1 GATEWAY_URL=http://127.0.0.1:PORT ./scripts/smoke.sh
 ```
 
-CI runs `TestSyntheticReadyDeploymentSmoke` (synthetic catalog install + local
-HTTP server + `SMOKE_WEB_ONLY=1`) before the full Go suite. That path uses a
-test-only synthetic catalog and never downloads or embeds official Emby Web
-bytes.
+CI runs `TestSyntheticReadyDeploymentSmoke` (fixture web root + local HTTP
+server + `SMOKE_WEB_ONLY=1`) before the full Go suite. That path never downloads
+or embeds official Emby Web bytes.
 
 **Deferred:** Firefox BiDi / real browser UI login-home-logout against official
-assets remains a manual end-to-end gate when a matching prepared source is
-available. Hermetic HTTP canary/CORS smoke is the automated stand-in in CI.
+assets remains a manual end-to-end gate when a matching web root is available.
+Hermetic HTTP canary/CORS smoke is the automated stand-in in CI.
 
 ## Security Notes
 
@@ -444,7 +312,6 @@ available. Hermetic HTTP canary/CORS smoke is the automated stand-in in CI.
 - Backend Emby passwords and backend Emby session tokens are stored as plaintext fields in PocketBase so administrators can configure and inspect backend records in the Admin UI. PocketBase superuser access or direct database file access is secret access.
 - Do not expose the real Emby backend directly to untrusted clients when testing gateway isolation.
 - On the public reverse proxy, expose `/emby` (and `/emby/web` when enabled) but block PocketBase `/_/` and `/api`.
-- Do not redistribute official Emby Web dashboard bytes in this project’s releases; install only built-in trusted catalog IDs (currently `emby-web-4.9.5.0`) against a legally obtained prepared source.
 - Do not commit `.env` files or real secrets. `.env.example` contains placeholders only.
 
 ## Troubleshooting
@@ -454,8 +321,5 @@ available. Hermetic HTTP canary/CORS smoke is the automated stand-in in CI.
 - Proxied requests return `401`: the gateway token may be missing, expired, revoked, or sent under an unsupported header/query name. Supported inputs include `X-Emby-Token`, `X-MediaBrowser-Token`, Emby authorization headers, `api_key`, `access_token`, and `token`.
 - URLs in Emby responses point at the backend: set `GATEWAY_PUBLIC_URL` to the public gateway base URL including `/emby`.
 - The smoke script fails on PB side-door checks with `2xx`: lock down the PocketBase collection API rules before treating the deployment as safe.
-- `/emby/web/` returns 404: Web is disabled (`GATEWAY_WEB_ASSETS_DIR` unset/blank). Expected for API-only deployments; in Compose leave the env blank until assets are installed and you intentionally opt in with `/app/web_assets`.
-- `/emby/web/` returns 503: assets dir is set but the tree is missing, corrupt, or not in the production trusted registry; run `web status --verify` and reinstall a trusted catalog when available.
-- `web install` fails with legal/reproduction gate: the catalog ID is unknown; use a built-in ID such as `emby-web-4.9.5.0`.
-- `web install` fails after resolving the catalog: the prepared source is missing, incomplete, or does not match the catalog hashes; fix the source tree/archive/URL (official bytes are never shipped by this project).
-- Web install succeeded but browser still sees old assets: confirm `web status --verify` on disk, then restart the gateway so `serve` reloads `current.json`, then re-check HTTP canaries.
+- `/emby/web/` returns 404: Web is disabled (`GATEWAY_WEB_ASSETS_DIR` unset/blank). Expected for API-only deployments.
+- `/emby/web/` returns 503: assets dir is set but missing, not a directory, or missing canaries (`index.html`, `manifest.json`, `strings/en-US.json`).

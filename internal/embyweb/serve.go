@@ -2,9 +2,15 @@ package embyweb
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -163,51 +169,114 @@ func (s *Server) serveReady(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	a := s.assets[assetPath]
-	if a == nil {
+	s.serveDiskAsset(w, r, assetPath, canary)
+}
+
+func (s *Server) serveDiskAsset(w http.ResponseWriter, r *http.Request, assetPath string, canary bool) {
+	full, err := s.resolveAssetPath(assetPath)
+	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
 
-	s.serveAsset(w, r, a, canary)
-}
-
-func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request, a *asset, canary bool) {
-	data := a.data
-	etag := a.etag
-	cacheClass := a.cacheClass
-
-	// Host injection is serve-time only: verified assets stay catalog-original.
-	if needsHostInject(a.path) {
-		host := injectHostForRequest(r, s.fallbackHost)
-		if patched := rewriteHostPlaceholder(a.data, host); !bytes.Equal(patched, a.data) {
-			data = patched
-			etag = etagForBytes(data)
+	// Host injection is serve-time only: on-disk bytes are never modified.
+	if needsHostInject(assetPath) {
+		data, err := readRegularFileLimited(full, maxInjectFileBytes)
+		if err != nil {
+			http.NotFound(w, r)
+			return
 		}
-		// Per-host body must not be cached as immutable shared content.
-		cacheClass = cacheRevalidate
-		w.Header().Set("Vary", "Host")
+		host := injectHostForRequest(r, s.fallbackHost)
+		body := rewriteHostPlaceholder(data, host)
+		etag := etagForBytes(body)
+
+		h := w.Header()
+		h.Set("Content-Type", contentTypeFor(assetPath))
+		h.Set("ETag", etag)
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Cache-Control", "no-cache")
+		h.Set("Vary", "Host")
+		if canary {
+			applySimpleCORS(w, r)
+		}
+		http.ServeContent(w, r, path.Base(assetPath), time.Time{}, bytes.NewReader(body))
+		return
+	}
+
+	f, err := openRegularFileNoFollow(full)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer f.Close()
+
+	st, err := f.Stat()
+	if err != nil || !st.Mode().IsRegular() {
+		http.NotFound(w, r)
+		return
 	}
 
 	h := w.Header()
-	h.Set("Content-Type", a.mediaType)
-	h.Set("ETag", etag)
+	h.Set("Content-Type", contentTypeFor(assetPath))
+	h.Set("ETag", etagForFileInfo(st))
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Referrer-Policy", "no-referrer")
-	switch cacheClass {
+	switch cacheClassFor(assetPath) {
 	case cacheImmutable:
 		h.Set("Cache-Control", "public, max-age=31536000, immutable")
 	default:
 		h.Set("Cache-Control", "no-cache")
 	}
-
 	if canary {
 		applySimpleCORS(w, r)
 	}
 
 	// ServeContent handles Range, If-Range, If-None-Match, HEAD, Accept-Ranges.
-	// Zero modtime suppresses Last-Modified.
-	http.ServeContent(w, r, path.Base(a.path), time.Time{}, bytes.NewReader(data))
+	http.ServeContent(w, r, path.Base(assetPath), st.ModTime(), f)
+}
+
+// resolveAssetPath joins a validated relative asset path under the ready root.
+func (s *Server) resolveAssetPath(assetPath string) (string, error) {
+	if s == nil || s.root == "" || !validAssetPath(assetPath) {
+		return "", os.ErrNotExist
+	}
+	full := filepath.Join(s.root, filepath.FromSlash(assetPath))
+	// filepath.Join cleaned the path; require it still lives under root.
+	rel, err := filepath.Rel(s.root, full)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", os.ErrNotExist
+	}
+	return full, nil
+}
+
+func readRegularFileLimited(path string, limit int64) ([]byte, error) {
+	f, err := openRegularFileNoFollow(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if st.Size() > limit {
+		return nil, fmt.Errorf("file exceeds size limit")
+	}
+	data, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("file exceeds size limit")
+	}
+	return data, nil
+}
+
+func etagForFileInfo(st os.FileInfo) string {
+	// Weak ETag from size + mtime; content is trusted operator-supplied disk.
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d:%d", st.Size(), st.ModTime().UnixNano())))
+	return `W/"` + hex.EncodeToString(sum[:8]) + `"`
 }
 
 // canaryPreflightVary lists Vary tokens required on every canary OPTIONS so

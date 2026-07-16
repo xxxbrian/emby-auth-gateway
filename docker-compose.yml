@@ -8,42 +8,13 @@ services:
       GATEWAY_PUBLIC_URL: "${GATEWAY_PUBLIC_URL:-http://localhost:${GATEWAY_PORT:-8090}/emby}"
       GATEWAY_SERVER_ID: "${GATEWAY_SERVER_ID:-emby-auth-gateway-dev}"
       # Opt-in Web serving. Blank (default) keeps API-only mode.
-      # Emby-compatible routes are always under fixed /emby. Enable only with
-      # the stable volume path:
-      #   GATEWAY_WEB_ASSETS_DIR=/app/web_assets
-      # Serve never installs; volume is always mounted read-only below.
+      # Point at a directory that already contains Emby Web files (web root).
+      # With docker-compose.web.yml, set GATEWAY_WEB_ASSETS_HOST on the host and
+      # the overlay forces GATEWAY_WEB_ASSETS_DIR=/app/web_assets.
       GATEWAY_WEB_ASSETS_DIR: "${GATEWAY_WEB_ASSETS_DIR:-}"
     command: ["serve", "--http=0.0.0.0:8090"]
     volumes:
       - gateway_pb_data:/app/pb_data
-      - gateway_web_assets:/app/web_assets:ro
-
-  # Explicit one-shot asset tool (same image/CLI). Not started by ordinary
-  # `docker compose up` / `up gateway`. Built-in catalog ID: emby-web-4.9.5.0
-  # (metadata only). Operators must supply a legally obtained prepared source;
-  # official asset bytes are never baked into image layers. No Docker socket.
-  #
-  # Status:
-  #   docker compose run --rm web status
-  #   docker compose run --rm web status --verify
-  # Install (mount prepared sources as needed):
-  #   docker compose run --rm web install --catalog-id emby-web-4.9.5.0 --from-url https://example.invalid/tree/
-  #   docker compose run --rm -v /path/to/prepared:/source:ro web \
-  #     install --catalog-id emby-web-4.9.5.0 --from-dir /source
-  #   docker compose run --rm -v /path/to/tree.tar.gz:/source/tree.tar.gz:ro web \
-  #     install --catalog-id emby-web-4.9.5.0 --from-archive /source/tree.tar.gz
-  web:
-    profiles: ["web"]
-    build: .
-    image: ${GATEWAY_IMAGE:-emby-auth-gateway:local}
-    environment:
-      GATEWAY_WEB_ASSETS_DIR: /app/web_assets
-    entrypoint: ["gateway", "web"]
-    command: ["status"]
-    restart: "no"
-    volumes:
-      - gateway_web_assets:/app/web_assets
 
 volumes:
   gateway_pb_data:
-  gateway_web_assets:

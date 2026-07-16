@@ -1,19 +1,18 @@
-// Package embyweb serves a validated, read-only Emby Web asset tree.
+// Package embyweb serves a trusted-on-disk Emby Web asset tree under /emby/web.
 //
-// The package loads an immutable snapshot at construction time and never
-// reopens disk files while serving. Composition layers mount the handler under
-// the exact /emby/web prefix; this package independently validates request paths.
+// The operator supplies the static files (for example from an emby-web-static
+// Release). This package does not install, catalog, or hash-verify assets; it
+// only checks canary presence at construction and serves files read-only.
 package embyweb
 
 import (
 	"fmt"
+	"io/fs"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 )
-
-// SchemaVersion is the only supported current.json / install.json schema.
-const SchemaVersion = 1
 
 // Config configures a Web asset server.
 //
@@ -33,11 +32,11 @@ type State uint8
 const (
 	// StateDisabled means no assets root was configured.
 	StateDisabled State = iota
-	// StateMissing means a required path is absent.
+	// StateMissing means the root or required canary files are absent.
 	StateMissing
-	// StateCorrupt means assets are present but unsafe, malformed, or inconsistent.
+	// StateCorrupt means the root exists but is not a usable directory.
 	StateCorrupt
-	// StateReady means a verified immutable snapshot is pinned in memory.
+	// StateReady means canaries are present and files may be served from disk.
 	StateReady
 )
 
@@ -56,28 +55,18 @@ func (s State) String() string {
 	}
 }
 
-// Status reports the pinned load outcome.
+// Status reports the construction-time readiness outcome.
 type Status struct {
-	State         State
-	Release       string
-	CatalogSHA256 string
-	Err           error
+	State State
+	Root  string
+	Err   error
 }
 
-// Server is an immutable, read-only Emby Web asset handler.
+// Server is a read-only Emby Web asset handler backed by a directory on disk.
 type Server struct {
 	status       Status
-	assets       map[string]*asset // path relative to files/, no leading slash
-	fallbackHost string            // host[:port] from PublicBaseURL, may be empty
-}
-
-type asset struct {
-	path       string
-	data       []byte
-	sha256     string
-	mediaType  string
-	cacheClass string
-	etag       string
+	root         string // absolute assets root when Ready
+	fallbackHost string // host[:port] from PublicBaseURL, may be empty
 }
 
 // canaryRelativePaths are the app.emby.media manual-server validation paths,
@@ -89,32 +78,17 @@ var canaryRelativePaths = []string{
 }
 
 const (
-	webPrefix       = "/emby/web"
-	webPrefixSlash  = "/emby/web/"
-	requiredBase    = "/emby"
+	webPrefix      = "/emby/web"
+	webPrefixSlash = "/emby/web/"
+	requiredBase   = "/emby"
 	allowedCORSOrig = "https://app.emby.media"
 
 	cacheRevalidate = "revalidate"
 	cacheImmutable  = "immutable"
 
-	maxPointerBytes  = 64 << 10 // 64 KiB
-	maxManifestBytes = 4 << 20  // 4 MiB
-	maxEntries       = 4096
-	maxFileBytes     = 64 << 20  // 64 MiB
-	maxTotalBytes    = 256 << 20 // 256 MiB
-
-	// Tree inventory bounds sized for the known ~868-file Emby Web tree with
-	// headroom, not attacker-controlled directory growth. Inventory allocates
-	// only manifest-derived expected sets plus a fixed ReadDir batch.
-	//
-	// maxPathBytes: max UTF-8 length of a relative asset path.
-	// maxPathDepth: max slash-separated segments in an asset path.
-	// maxDirs: max distinct parent directories implied by entries (plus root).
-	// readDirBatch: fixed batch size for directory reads (never ReadDir(-1)).
-	maxPathBytes = 512
-	maxPathDepth = 24
-	maxDirs      = 2048
-	readDirBatch = 128
+	maxPathBytes       = 512
+	maxPathDepth       = 24
+	maxInjectFileBytes = 8 << 20 // 8 MiB; inject targets are small JS
 )
 
 // CanaryPaths returns a defensive copy of the relative canary paths under /web/.
@@ -124,27 +98,18 @@ func CanaryPaths() []string {
 	return out
 }
 
-// New constructs a Server from cfg using the immutable production catalog registry.
-// Configured trees whose catalog_sha256 is not in the production registry are
-// StateCorrupt (untrusted) and never Ready.
+// New constructs a Server from cfg.
 //
-// Disabled (empty AssetsRoot) always succeeds. Missing and corrupt asset trees
-// also succeed construction and serve 503. An enabled configuration with a
-// non-/emby base path returns an error.
+// Disabled (empty AssetsRoot) always succeeds. Missing and corrupt trees also
+// succeed construction and serve 503 (or 404 when disabled). An enabled
+// configuration with a non-/emby base path returns an error.
 func New(cfg Config) (*Server, error) {
-	return newWithRegistry(cfg, getProductionRegistry())
-}
-
-// newWithRegistry is the package-private constructor used by tests to inject a
-// synthetic trusted catalog registry. Production code must call New.
-func newWithRegistry(cfg Config, reg *catalogRegistry) (*Server, error) {
 	fallbackHost := hostFromPublicURL(cfg.PublicBaseURL)
 
 	root := strings.TrimSpace(cfg.AssetsRoot)
 	if root == "" {
 		return &Server{
 			status:       Status{State: StateDisabled},
-			assets:       nil,
 			fallbackHost: fallbackHost,
 		}, nil
 	}
@@ -162,14 +127,63 @@ func newWithRegistry(cfg Config, reg *catalogRegistry) (*Server, error) {
 		}, nil
 	}
 
-	if reg == nil {
-		reg = getProductionRegistry()
+	st, err := os.Lstat(abs)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &Server{
+				status:       Status{State: StateMissing, Root: abs, Err: err},
+				fallbackHost: fallbackHost,
+			}, nil
+		}
+		return &Server{
+			status:       Status{State: StateCorrupt, Root: abs, Err: err},
+			fallbackHost: fallbackHost,
+		}, nil
 	}
-	status, assets := loadAssets(abs, reg)
-	return &Server{status: status, assets: assets, fallbackHost: fallbackHost}, nil
+	// Reject non-directories and symlink roots (Lstat of a symlink is never IsDir).
+	if !st.IsDir() || st.Mode()&fs.ModeSymlink != 0 {
+		return &Server{
+			status: Status{
+				State: StateCorrupt,
+				Root:  abs,
+				Err:   fmt.Errorf("assets root is not a directory"),
+			},
+			fallbackHost: fallbackHost,
+		}, nil
+	}
+
+	if err := checkCanaries(abs); err != nil {
+		return &Server{
+			status:       Status{State: StateMissing, Root: abs, Err: err},
+			fallbackHost: fallbackHost,
+		}, nil
+	}
+
+	return &Server{
+		status:       Status{State: StateReady, Root: abs},
+		root:         abs,
+		fallbackHost: fallbackHost,
+	}, nil
 }
 
-// Status returns the pinned load status.
+func checkCanaries(root string) error {
+	for _, rel := range canaryRelativePaths {
+		full := filepath.Join(root, filepath.FromSlash(rel))
+		st, err := os.Lstat(full)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("missing canary %q", rel)
+			}
+			return fmt.Errorf("canary %q: %w", rel, err)
+		}
+		if st.Mode()&fs.ModeSymlink != 0 || !st.Mode().IsRegular() {
+			return fmt.Errorf("canary %q is not a regular file", rel)
+		}
+	}
+	return nil
+}
+
+// Status returns the construction-time readiness status.
 func (s *Server) Status() Status {
 	if s == nil {
 		return Status{State: StateDisabled}

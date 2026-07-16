@@ -1,10 +1,6 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -56,12 +52,13 @@ func TestNewEmbyWebServerStates(t *testing.T) {
 		}
 	})
 
-	t.Run("corrupt_no_startup_error", func(t *testing.T) {
+	t.Run("corrupt_file_root_no_startup_error", func(t *testing.T) {
 		root := t.TempDir()
-		if err := os.WriteFile(filepath.Join(root, "current.json"), []byte(`{`), 0o644); err != nil {
+		p := filepath.Join(root, "not-a-dir")
+		if err := os.WriteFile(p, []byte(`x`), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		s, err := newEmbyWebServer(root, "")
+		s, err := newEmbyWebServer(p, "")
 		if err != nil {
 			t.Fatalf("corrupt must not fail construction: %v", err)
 		}
@@ -70,19 +67,29 @@ func TestNewEmbyWebServerStates(t *testing.T) {
 		}
 	})
 
-	t.Run("untrusted_synthetic_corrupt", func(t *testing.T) {
-		// Hand-written trees use digests not in the production registry; public
-		// New is corrupt/untrusted. Composition tests use syntheticReadyWebHandler.
-		root := writeUntrustedWebAssets(t)
+	t.Run("incomplete_tree_missing", func(t *testing.T) {
+		// Directory without canaries is missing (not ready), not a construction error.
+		root := t.TempDir()
+		if err := os.WriteFile(filepath.Join(root, "index.html"), []byte("<html>"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 		s, err := newEmbyWebServer(root, "")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if s.Status().State != embyweb.StateCorrupt {
-			t.Fatalf("state=%s err=%v want corrupt", s.Status().State, s.Status().Err)
+		if s.Status().State != embyweb.StateMissing {
+			t.Fatalf("state=%s err=%v want missing", s.Status().State, s.Status().Err)
 		}
-		if s.Status().Err == nil || !errors.Is(s.Status().Err, embyweb.ErrUntrustedCatalog) {
-			t.Fatalf("err=%v want ErrUntrustedCatalog", s.Status().Err)
+	})
+
+	t.Run("ready_fixture_tree", func(t *testing.T) {
+		root := writeReadyWebAssets(t)
+		s, err := newEmbyWebServer(root, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.Status().State != embyweb.StateReady {
+			t.Fatalf("state=%s err=%v", s.Status().State, s.Status().Err)
 		}
 	})
 }
@@ -646,10 +653,30 @@ func countingAPI(hits *atomic.Int64, code int) http.Handler {
 	})
 }
 
+// writeReadyWebAssets builds a minimal on-disk web root with required canaries.
+func writeReadyWebAssets(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	files := map[string]string{
+		"index.html":         "<!doctype html><title>t</title>",
+		"manifest.json":      `{"name":"test"}`,
+		"strings/en-US.json": `{"Hello":"Hello"}`,
+		"modules/app.js":     "console.log(1)",
+	}
+	for rel, body := range files {
+		full := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
 // syntheticReadyWebHandler is a testing-safe Ready double for composition tests.
-// Registry injection is intentionally not exported, and hermetic composition
-// tests must not require official prepared assets. This handler mirrors the
-// Ready surface needed by mount/CORS/guard composition assertions only.
+// It mirrors the Ready surface needed by mount/CORS/guard composition assertions.
 func syntheticReadyWebHandler() http.Handler {
 	assets := map[string]string{
 		"index.html":         "<!doctype html><title>t</title>",
@@ -751,75 +778,4 @@ func syntheticReadyWebHandler() http.Handler {
 	})
 }
 
-// writeUntrustedWebAssets builds a minimal schema-1 tree that is intentionally
-// not in the production registry (StateCorrupt / untrusted).
-func writeUntrustedWebAssets(t *testing.T) string {
-	t.Helper()
-	root := t.TempDir()
-	release := "1.0.0-test"
-	catalog := sha256Hex([]byte("cmd-gateway-synthetic-catalog"))
 
-	files := []struct {
-		path string
-		data []byte
-		mt   string
-		cc   string
-	}{
-		{"index.html", []byte("<!doctype html><title>t</title>"), "text/html; charset=utf-8", "revalidate"},
-		{"manifest.json", []byte(`{"name":"test"}`), "application/json", "revalidate"},
-		{"strings/en-US.json", []byte(`{"Hello":"Hello"}`), "application/json", "revalidate"},
-		{"modules/app.js", []byte("console.log(1)"), "text/javascript; charset=utf-8", "immutable"},
-	}
-
-	filesDir := filepath.Join(root, "releases", release, "files")
-	entries := make([]map[string]any, 0, len(files))
-	for _, f := range files {
-		full := filepath.Join(filesDir, filepath.FromSlash(f.path))
-		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(full, f.data, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		entries = append(entries, map[string]any{
-			"path":        f.path,
-			"size":        len(f.data),
-			"sha256":      sha256Hex(f.data),
-			"media_type":  f.mt,
-			"cache_class": f.cc,
-		})
-	}
-
-	writeJSONFile(t, filepath.Join(root, "current.json"), map[string]any{
-		"schema":         1,
-		"release":        release,
-		"catalog_sha256": catalog,
-	})
-	writeJSONFile(t, filepath.Join(root, "releases", release, "install.json"), map[string]any{
-		"schema":         1,
-		"release":        release,
-		"catalog_sha256": catalog,
-		"entries":        entries,
-	})
-	return root
-}
-
-func writeJSONFile(t *testing.T, path string, v any) {
-	t.Helper()
-	data, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		t.Fatal(err)
-	}
-	data = append(data, '\n')
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func sha256Hex(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
-}

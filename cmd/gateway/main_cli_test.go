@@ -46,9 +46,6 @@ func TestClassifiesDirectExecution(t *testing.T) {
 		{name: "setup_user_unknown_short_flag", args: []string{"setup", "user", "-x"}, want: true},
 		{name: "setup_upstream_unknown_subcommand", args: []string{"setup", "upstream", "unknown"}, want: true},
 		{name: "setup_upstream_bare", args: []string{"setup", "upstream"}, want: true},
-		{name: "web_unknown_subcommand", args: []string{"web", "unknown"}, want: true},
-		{name: "web_unknown_flag", args: []string{"web", "init", "--unknown"}, want: true},
-		{name: "web_missing_flag_value", args: []string{"web", "init", "--catalog-id"}, want: true},
 		{name: "version_extra_arg", args: []string{"version", "extra"}, want: true},
 		{name: "version_unknown_flag", args: []string{"version", "--unknown"}, want: true},
 		{name: "serve", args: []string{"serve"}, want: false},
@@ -77,9 +74,6 @@ func TestMalformedDirectCLIExitStatus(t *testing.T) {
 		{name: "setup_user_missing_flag_value", args: []string{"setup", "user", "--gateway-username"}},
 		{name: "setup_user_unknown_short_flag", args: []string{"setup", "user", "-x"}},
 		{name: "setup_upstream_unknown_subcommand", args: []string{"setup", "upstream", "unknown"}},
-		{name: "web_unknown_subcommand", args: []string{"web", "unknown"}},
-		{name: "web_unknown_flag", args: []string{"web", "init", "--unknown"}},
-		{name: "web_missing_flag_value", args: []string{"web", "init", "--catalog-id"}},
 		{name: "version_extra_arg", args: []string{"version", "extra"}},
 		{name: "version_unknown_flag", args: []string{"version", "--unknown"}},
 	}
@@ -154,13 +148,11 @@ func TestHelpAndVersionRequestsDoNotBootstrap(t *testing.T) {
 		{"root_long_version", []string{"--version"}, ""},
 		{"root_short_version", []string{"-v"}, ""},
 		{"setup_help", []string{"setup", "--help"}, "Configure gateway upstreams and users"},
-		{"web_help", []string{"web", "--help"}, "Manage Emby Web"},
 		{"version_help", []string{"version", "--help"}, "Print gateway build version metadata"},
 		{"serve_help", []string{"serve", "--help"}, "Starts the web server"},
 		{"superuser_help", []string{"superuser", "--help"}, "Manage superusers"},
 		{"superuser_nested_help", []string{"superuser", "create", "--help"}, "Creates a new superuser"},
 		{"setup_nested_help", []string{"setup", "upstream", "--help"}, "Prepare singleton upstream configuration"},
-		{"web_nested_help", []string{"web", "init", "--help"}, "Initialize"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
