@@ -93,6 +93,30 @@ func TestRetiredCommandDoesNotBootstrapOrMutate(t *testing.T) {
 	}
 }
 
+func TestRetiredWebCommandsDoNotBootstrap(t *testing.T) {
+	// Serve-only 0.8: web install/catalog CLI is retired. Unknown/retired web
+	// commands must exit nonzero without creating the PocketBase data dir.
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{name: "web", args: []string{"web"}},
+		{name: "web_init", args: []string{"web", "init"}},
+		{name: "web_install", args: []string{"web", "install"}},
+		{name: "web_status", args: []string{"web", "status"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir := filepath.Join(t.TempDir(), "data")
+			args := append([]string{"--dir", dataDir}, tc.args...)
+			assertGatewayCLIExitCode(t, 1, args...)
+			if _, err := os.Stat(dataDir); !os.IsNotExist(err) {
+				t.Fatalf("args=%v bootstrapped data dir: %v", args, err)
+			}
+		})
+	}
+}
+
 func TestSuperuserCreateBootstrapsCanonicalSchema(t *testing.T) {
 	dataDir := filepath.Join(t.TempDir(), "data")
 	email := "admin@example.test"

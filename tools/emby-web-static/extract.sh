@@ -12,9 +12,13 @@ usage() {
   cat <<'EOF'
 Usage: extract.sh --version <emby_version> --out <dir> [--image emby/embyserver] [--platform linux/amd64]
 
-Pulls IMAGE:VERSION (or IMAGE@digest if VERSION looks like sha256:...), copies
+Pulls IMAGE:VERSION (Emby Server / mbServer tag only, e.g. 4.9.5.0), copies
 /system/dashboard-ui into OUT_DIR as a flat web root (index.html at top level),
 then materializes known runtime-only modules from a temporary server instance.
+
+VERSION must be an Emby image tag (letters, digits, dots, hyphens, underscores).
+Digest refs (sha256:...) and the floating tag "latest" are not accepted; align
+with pack.sh release naming and the publish-emby-web-static workflow.
 EOF
 }
 
@@ -71,6 +75,15 @@ if [[ "$VERSION" == "latest" ]]; then
   echo "version must not be 'latest'; pass an explicit Emby Server version" >&2
   exit 1
 fi
+# Reject digests and any other colon form; version is Emby tag only (pack/workflow).
+if [[ "$VERSION" == *:* ]]; then
+  echo "version must be an Emby Server tag only (no digests or colons): $VERSION" >&2
+  exit 1
+fi
+if [[ ! "$VERSION" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "invalid version for image tag / release name: $VERSION" >&2
+  exit 1
+fi
 
 command -v docker >/dev/null 2>&1 || {
   echo "docker is required" >&2
@@ -82,9 +95,6 @@ command -v curl >/dev/null 2>&1 || {
 }
 
 REF="${IMAGE}:${VERSION}"
-if [[ "$VERSION" == sha256:* ]]; then
-  REF="${IMAGE}@${VERSION}"
-fi
 
 PULL_ARGS=(pull)
 if [[ -n "$PLATFORM" ]]; then
@@ -175,6 +185,7 @@ if [[ "$need_runtime" -eq 1 ]]; then
     if [[ -f "$OUT_DIR/$rel" ]]; then
       continue
     fi
+    # Fixed allowlist only; never fetch arbitrary URLs.
     dest="$OUT_DIR/$rel"
     mkdir -p "$(dirname "$dest")"
     echo "  GET /web/$rel"
@@ -189,6 +200,28 @@ if [[ "$need_runtime" -eq 1 ]]; then
       echo "runtime module empty: $rel" >&2
       exit 1
     fi
+    # Reject HTML error pages and tiny JS stubs mistaken for modules.
+    lower_head="$(head -c 512 "$dest" | tr '[:upper:]' '[:lower:]' || true)"
+    size="$(wc -c <"$dest" | tr -d ' ')"
+    case "$rel" in
+      *.js)
+        if [[ "$lower_head" == *"<!doctype"* || "$lower_head" == *"<html"* ]]; then
+          echo "runtime module looks like HTML (not JS): $rel" >&2
+          exit 1
+        fi
+        if [[ "$size" -lt 50 ]]; then
+          echo "runtime JS module too small (${size} bytes): $rel" >&2
+          exit 1
+        fi
+        ;;
+      *.css)
+        if [[ "$lower_head" == *"<!doctype"* || "$lower_head" == *"<html"* ]]; then
+          echo "runtime module looks like HTML (not CSS): $rel" >&2
+          exit 1
+        fi
+        # Small CSS is allowed (e.g. a few rules).
+        ;;
+    esac
   done
 
   docker rm -f "$RUN_CID" >/dev/null

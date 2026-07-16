@@ -10,6 +10,9 @@ Creates:
   <out>/emby-web-static-<version>-<date>.tar.gz
   <out>/SHA256SUMS
 
+VERSION must be an Emby Server tag only (letters, digits, dots, hyphens,
+underscores); digests (sha256:...) and "latest" are not accepted.
+
 Archive members are rooted at the web root (index.html at archive root).
 EOF
 }
@@ -67,7 +70,15 @@ if [[ -z "$DATE_STAMP" ]]; then
   DATE_STAMP="$(date -u +%Y%m%d)"
 fi
 
-# Sanitize version for release names (allow digits, dots, letters, hyphen, underscore).
+# Sanitize version for release names (Emby tag only; no digests/colons).
+if [[ "$VERSION" == "latest" ]]; then
+  echo "version must not be 'latest'" >&2
+  exit 1
+fi
+if [[ "$VERSION" == *:* ]]; then
+  echo "version must be an Emby Server tag only (no digests or colons): $VERSION" >&2
+  exit 1
+fi
 if [[ ! "$VERSION" =~ ^[A-Za-z0-9._-]+$ ]]; then
   echo "invalid version for release name: $VERSION" >&2
   exit 1
