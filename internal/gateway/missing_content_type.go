@@ -12,7 +12,7 @@ import (
 
 const missingContentTypeSniffSize = 512
 
-func (s *Server) writeMissingContentTypeResponse(w http.ResponseWriter, r *http.Request, rel string, resp *http.Response, session *Session, gatewayToken, publicGatewayBase string) {
+func (s *Server) writeMissingContentTypeResponse(w http.ResponseWriter, r *http.Request, rel string, resp *http.Response, session *Session, upstream upstreamRequestSnapshot, gatewayToken, publicGatewayBase string) {
 	started := time.Now()
 	reader, jsonCandidate, err := sniffMissingContentType(resp.Body)
 	if err != nil {
@@ -28,7 +28,7 @@ func (s *Server) writeMissingContentTypeResponse(w http.ResponseWriter, r *http.
 		var value any
 		if json.Unmarshal(data, &value) == nil {
 			w.Header().Del("Content-Length")
-			writeJSON(w, resp.StatusCode, s.rewriteProxyJSONValueForRequest(r.Context(), r, value, session, gatewayToken, publicGatewayBase))
+			writeJSON(w, resp.StatusCode, s.rewriteProxyJSONValueForRequestWithSnapshot(r.Context(), r, value, session, upstream, gatewayToken, publicGatewayBase))
 			return
 		}
 		reader = bufio.NewReader(bytes.NewReader(data))

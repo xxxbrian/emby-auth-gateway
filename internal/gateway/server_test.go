@@ -34,7 +34,7 @@ func TestWriteProxyResponseRejectsEmptyImage(t *testing.T) {
 	}
 	recorder := httptest.NewRecorder()
 
-	server.writeProxyResponse(recorder, req, "/Items/item-1/Images/Primary", resp, &Session{}, "", "")
+	server.writeProxyResponseWithSnapshot(recorder, req, "/Items/item-1/Images/Primary", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
 
 	if recorder.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadGateway)
@@ -71,7 +71,7 @@ func TestWriteProxyResponseAbortsTruncatedImage(t *testing.T) {
 			t.Fatalf("Content-Length = %q, want 4", got)
 		}
 	}()
-	server.writeProxyResponse(recorder, req, "/Items/item-1/Images/Primary", resp, &Session{}, "", "")
+	server.writeProxyResponseWithSnapshot(recorder, req, "/Items/item-1/Images/Primary", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
 }
 
 func TestWriteProxyResponseAllowsBodylessImageResponses(t *testing.T) {
@@ -99,7 +99,7 @@ func TestWriteProxyResponseAllowsBodylessImageResponses(t *testing.T) {
 			}
 			recorder := httptest.NewRecorder()
 
-			server.writeProxyResponse(recorder, req, "/Items/item-1/Images/Primary", resp, &Session{}, "", "")
+			server.writeProxyResponseWithSnapshot(recorder, req, "/Items/item-1/Images/Primary", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
 
 			if recorder.Code != tt.status {
 				t.Fatalf("status = %d, want %d", recorder.Code, tt.status)
@@ -152,7 +152,7 @@ func TestWriteProxyResponseValidatesCompleteImage(t *testing.T) {
 						aborted = true
 					}
 				}()
-				server.writeProxyResponse(recorder, req, "/Items/item-1/Images/Primary", resp, &Session{}, "", "")
+				server.writeProxyResponseWithSnapshot(recorder, req, "/Items/item-1/Images/Primary", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
 			}()
 
 			if aborted != tt.wantAbort {
@@ -2004,7 +2004,7 @@ func TestProxyUserDataOverlaySelectsOnlyDirectBaseItems(t *testing.T) {
 	}
 	metadataBefore := mustJSON(t, metadata)
 	root := map[string]any{"Id": "movie-1", "Name": "Movie", "Type": "Movie", "UserData": map[string]any{}, "Metadata": metadata}
-	rewritten := server.rewriteProxyJSONValue(context.Background(), root, session, "token", "http://gateway/emby").(map[string]any)
+	rewritten := server.rewriteProxyJSONValueForRequestWithSnapshot(context.Background(), nil, root, session, upstreamRequestSnapshotFromLegacySession(session), "token", "http://gateway/emby").(map[string]any)
 	if got := strings.Join(store.batchItemIDs, ","); got != "movie-1" {
 		t.Fatalf("batched item ids = %q, want movie-1", got)
 	}
@@ -2103,7 +2103,7 @@ func TestProxyUserDataOverlaySelectsItemAndItemsWrappers(t *testing.T) {
 		"Item":  map[string]any{"Id": "item-1", "Type": "Movie", "UserData": map[string]any{}, "People": []any{map[string]any{"Id": "person-1", "Type": "Person", "UserData": map[string]any{"Played": true}}}},
 		"Items": []any{map[string]any{"Id": "item-2", "Type": "Episode", "UserData": map[string]any{}, "MediaSources": []any{map[string]any{"Id": "source-1", "Type": "Video", "UserData": map[string]any{"Played": true}}}}},
 	}
-	rewritten := NewServer(Config{}, store).rewriteProxyJSONValue(context.Background(), value, session, "token", "http://gateway/emby").(map[string]any)
+	rewritten := NewServer(Config{}, store).rewriteProxyJSONValueForRequestWithSnapshot(context.Background(), nil, value, session, upstreamRequestSnapshotFromLegacySession(session), "token", "http://gateway/emby").(map[string]any)
 	if got := strings.Join(store.batchItemIDs, ","); got != "item-1,item-2" {
 		t.Fatalf("batched item ids = %q, want item-1,item-2", got)
 	}
@@ -2120,12 +2120,12 @@ func TestProxyUserDataOverlaySelectsMediaRootArraysButNotSessions(t *testing.T) 
 	session := testSession("http://backend.invalid/emby")
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", ItemID: "movie-1", IsFavorite: true})
 	server := NewServer(Config{}, store)
-	media := server.rewriteProxyJSONValue(context.Background(), []any{map[string]any{"Id": "movie-1", "Type": "Movie", "UserData": map[string]any{}}}, session, "token", "http://gateway/emby").([]any)
+	media := server.rewriteProxyJSONValueForRequestWithSnapshot(context.Background(), nil, []any{map[string]any{"Id": "movie-1", "Type": "Movie", "UserData": map[string]any{}}}, session, upstreamRequestSnapshotFromLegacySession(session), "token", "http://gateway/emby").([]any)
 	if media[0].(map[string]any)["UserData"].(map[string]any)["IsFavorite"] != true {
 		t.Fatalf("media root array was not overlaid: %#v", media)
 	}
 	sessions := []any{map[string]any{"Id": "session-1", "Name": "Session", "Type": "Session"}}
-	rewritten := server.rewriteProxyJSONValue(context.Background(), sessions, session, "token", "http://gateway/emby").([]any)
+	rewritten := server.rewriteProxyJSONValueForRequestWithSnapshot(context.Background(), nil, sessions, session, upstreamRequestSnapshotFromLegacySession(session), "token", "http://gateway/emby").([]any)
 	if _, ok := rewritten[0].(map[string]any)["UserData"]; ok {
 		t.Fatalf("session root array was modified: %#v", rewritten)
 	}

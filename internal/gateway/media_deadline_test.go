@@ -15,7 +15,7 @@ func TestMediaWriteDeadlineClearedBeforeResponseHeader(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Videos/item/stream", nil)
 	resp := mediaDeadlineResponse(req, "video/mp4", http.StatusOK)
 
-	server.writeProxyResponse(writer, req, "/Videos/item/stream", resp, &Session{}, "", "")
+	server.writeProxyResponseWithSnapshot(writer, req, "/Videos/item/stream", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
 	if len(writer.calls) < 2 || writer.calls[0] != "deadline" || writer.calls[1] != "header" {
 		t.Fatal("media deadline was not cleared before the response header")
 	}
@@ -58,7 +58,7 @@ func TestMediaWriteDeadlineResponseSelection(t *testing.T) {
 			resp := mediaDeadlineResponse(req, tt.contentType, tt.status)
 			resp.Header.Set("Content-Range", tt.contentRange)
 
-			server.writeProxyResponse(writer, req, tt.rel, resp, &Session{}, "", "")
+			server.writeProxyResponseWithSnapshot(writer, req, tt.rel, resp, &Session{}, upstreamRequestSnapshot{}, "", "")
 			got := len(writer.deadlines) == 1
 			if got != tt.want {
 				t.Fatal("unexpected write deadline behavior")
@@ -73,7 +73,7 @@ func TestMediaWriteDeadlineUnsupportedWriterAuditsOnceAndWritesResponse(t *testi
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Videos/item/stream", nil)
 	for range 2 {
 		writer := httptest.NewRecorder()
-		server.writeProxyResponse(writer, req, "/Videos/item/stream", mediaDeadlineResponse(req, "video/mp4", http.StatusOK), &Session{}, "", "")
+		server.writeProxyResponseWithSnapshot(writer, req, "/Videos/item/stream", mediaDeadlineResponse(req, "video/mp4", http.StatusOK), &Session{}, upstreamRequestSnapshot{}, "", "")
 		if writer.Code != http.StatusOK || writer.Body.Len() == 0 {
 			t.Fatal("unsupported writer did not receive the media response")
 		}
@@ -102,7 +102,7 @@ func testSlowMediaStream(t *testing.T, tls bool) {
 	httpServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body := &delayedMediaReader{chunks: [][]byte{payload[:len(payload)/2], payload[len(payload)/2:]}, delay: 450 * time.Millisecond}
 		resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"video/mp4"}}, Body: io.NopCloser(body), ContentLength: -1, Request: r}
-		server.writeProxyResponse(w, r, "/Videos/item/stream", resp, &Session{}, "", "")
+		server.writeProxyResponseWithSnapshot(w, r, "/Videos/item/stream", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
 	}))
 	httpServer.Config.WriteTimeout = 150 * time.Millisecond
 	httpServer.EnableHTTP2 = tls

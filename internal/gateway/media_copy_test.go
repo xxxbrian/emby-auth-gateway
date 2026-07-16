@@ -110,7 +110,7 @@ func TestMediaCopyFailureAuditing(t *testing.T) {
 			resp := &http.Response{StatusCode: tt.status, Header: header, Body: tt.body, ContentLength: tt.length, Request: req}
 
 			requireAbortHandler(t, func() {
-				server.writeProxyResponse(writer, req, "/Videos/item/stream", resp, &Session{}, "", "")
+				server.writeProxyResponseWithSnapshot(writer, req, "/Videos/item/stream", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
 			})
 			if len(store.AuditLogs) != tt.wantAudits {
 				t.Fatal("unexpected media failure audit count")

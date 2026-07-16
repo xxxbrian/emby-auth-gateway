@@ -119,16 +119,16 @@ func (s *Server) guardGenericQueryTokens(ctx context.Context, values []string, g
 	return nil
 }
 
-func rewriteProxyQueryValues(q url.Values, gatewayToken string, session *Session) {
+func rewriteProxyQueryValues(q url.Values, gatewayToken string, session *Session, upstream upstreamRequestSnapshot) {
 	for key, vals := range q {
 		for i, val := range vals {
 			if val == session.SyntheticUserID {
-				vals[i] = session.BackendUserID
+				vals[i] = upstream.userID
 			}
 			// Any query value exactly equal to the selected gateway token must
 			// be rewritten, including under arbitrary keys such as signature=.
 			if gatewayToken != "" && val == gatewayToken {
-				vals[i] = session.BackendToken
+				vals[i] = upstream.token
 			}
 		}
 		q[key] = vals
@@ -141,7 +141,7 @@ func rewriteProxyQueryValues(q url.Values, gatewayToken string, session *Session
 		}
 		for i, val := range vals {
 			if strings.TrimSpace(val) != "" {
-				vals[i] = session.BackendToken
+				vals[i] = upstream.token
 			}
 		}
 		q[key] = vals

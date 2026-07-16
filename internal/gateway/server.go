@@ -448,10 +448,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 		http.Error(w, "backend authentication failed", http.StatusBadGateway)
 		return
 	}
+	upstream := upstreamRequestSnapshotFromLegacySession(session)
 	if isUpgradeRequest(r) {
-		s.prepareBackendUpgrade(r.Context(), r, rel, session)
+		upstream = s.prepareBackendUpgrade(r.Context(), r, rel, session, upstream)
 	}
-	proxyURL, err := s.proxyURL(session, rel, r.URL.RawQuery, gatewayToken)
+	proxyURL, err := s.proxyURL(upstream, session, rel, r.URL.RawQuery, gatewayToken)
 	if err != nil {
 		if errors.Is(err, errMalformedQuery) || errors.Is(err, errCredentialConflict) || errors.Is(err, errCredentialStore) {
 			writeCredentialQueryError(w, err)
@@ -462,15 +463,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 		return
 	}
 	if isUpgradeRequest(r) {
-		s.handleUpgradeProxy(w, r, proxyURL, session, gatewayToken, rel)
+		s.handleUpgradeProxy(w, r, proxyURL, session, upstream, gatewayToken, rel)
 		return
 	}
-	body, rawBody, replayable, err := s.rewriteRequestBody(r, session, gatewayToken)
+	body, rawBody, replayable, err := s.rewriteRequestBody(r, session, upstream, gatewayToken)
 	if err != nil {
 		http.Error(w, "bad request body", http.StatusBadRequest)
 		return
 	}
-	req, err := http.NewRequestWithContext(withRedirectCredentialTokens(r.Context(), gatewayToken, session.BackendToken), r.Method, proxyURL.String(), body)
+	req, err := http.NewRequestWithContext(withRedirectCredentialTokens(r.Context(), gatewayToken, upstream.token), r.Method, proxyURL.String(), body)
 	if err != nil {
 		http.Error(w, "bad proxy request", http.StatusInternalServerError)
 		return
@@ -479,7 +480,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 		req.ContentLength = contentLength(body)
 	}
 	copyRequestHeaders(req.Header, r.Header)
-	s.rewriteRequestHeaders(req.Header, session, gatewayToken)
+	s.rewriteRequestHeaders(req.Header, upstream)
 	req.Host = proxyURL.Host
 
 	attemptStarted := time.Now()
@@ -495,11 +496,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 		return
 	}
 	if resp.StatusCode == http.StatusUnauthorized && replayable {
-		failedToken := session.BackendToken
+		failedToken := upstream.token
 		if err := s.refreshBackendSession(r.Context(), session, failedToken); err == nil {
+			upstream = upstreamRequestSnapshotFromLegacySession(session)
 			s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh", "backend token refreshed after unauthorized response", http.StatusOK)
 			_ = resp.Body.Close()
-			retryURL, retryErr := s.proxyURL(session, rel, r.URL.RawQuery, gatewayToken)
+			retryURL, retryErr := s.proxyURL(upstream, session, rel, r.URL.RawQuery, gatewayToken)
 			if retryErr != nil {
 				s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "proxy_backend_unavailable", Message: "backend url unavailable", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
 				http.Error(w, "bad backend url", http.StatusBadGateway)
@@ -507,9 +509,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 			}
 			var retryBody io.Reader
 			if rawBody != nil {
-				retryBody = s.rewriteRequestBodyData(rawBody, session, gatewayToken)
+				retryBody = s.rewriteRequestBodyData(rawBody, session, upstream, gatewayToken)
 			}
-			retryReq, retryErr := http.NewRequestWithContext(withRedirectCredentialTokens(r.Context(), gatewayToken, session.BackendToken), r.Method, retryURL.String(), retryBody)
+			retryReq, retryErr := http.NewRequestWithContext(withRedirectCredentialTokens(r.Context(), gatewayToken, upstream.token), r.Method, retryURL.String(), retryBody)
 			if retryErr != nil {
 				http.Error(w, "bad proxy request", http.StatusInternalServerError)
 				return
@@ -518,7 +520,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 				retryReq.ContentLength = contentLength(retryBody)
 			}
 			copyRequestHeaders(retryReq.Header, r.Header)
-			s.rewriteRequestHeaders(retryReq.Header, session, gatewayToken)
+			s.rewriteRequestHeaders(retryReq.Header, upstream)
 			retryReq.Host = retryURL.Host
 			attemptStarted = time.Now()
 			resp, err = s.proxyClient.Do(retryReq)
@@ -544,7 +546,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 	if cookieAuthenticated {
 		rewriteToken = ""
 	}
-	s.writeProxyResponse(w, r, rel, resp, session, rewriteToken, s.gatewayBaseForRequest(r))
+	s.writeProxyResponseWithSnapshot(w, r, rel, resp, session, upstream, rewriteToken, s.gatewayBaseForRequest(r))
 }
 
 const concurrentPlaybackResponse = `{"error":"playback_access_denied","message":"Playback denied because the concurrent playback limit was exceeded.","reason_code":"max_concurrent_sessions_exceeded"}`
@@ -669,17 +671,17 @@ func (s *Server) writeConcurrentPlaybackDenied(w http.ResponseWriter, r *http.Re
 	_, _ = io.WriteString(w, concurrentPlaybackResponse)
 }
 
-func (s *Server) handleUpgradeProxy(w http.ResponseWriter, r *http.Request, proxyURL *url.URL, session *Session, gatewayToken, rel string) {
+func (s *Server) handleUpgradeProxy(w http.ResponseWriter, r *http.Request, proxyURL *url.URL, session *Session, upstream upstreamRequestSnapshot, gatewayToken, rel string) {
 	started := time.Now()
 	inbound := r
-	r = r.WithContext(withRedirectCredentialTokens(r.Context(), gatewayToken, session.BackendToken))
+	r = r.WithContext(withRedirectCredentialTokens(r.Context(), gatewayToken, upstream.token))
 	trackedWriter := &upgradeResponseWriter{ResponseWriter: w}
 	proxy := &httputil.ReverseProxy{
-		Transport: &upgradeRetryTransport{base: s.proxyClient.Transport, server: s, original: inbound, session: session, gatewayToken: gatewayToken, rel: rel},
+		Transport: &upgradeRetryTransport{base: s.proxyClient.Transport, server: s, original: inbound, session: session, upstream: upstream, gatewayToken: gatewayToken, rel: rel},
 		Director: func(req *http.Request) {
 			req.URL = proxyURL
 			req.Host = proxyURL.Host
-			s.rewriteRequestHeaders(req.Header, session, gatewayToken)
+			s.rewriteRequestHeaders(req.Header, upstream)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			if trackedWriter.finalResponse.Load() || trackedWriter.hijacked.Load() {
@@ -693,17 +695,19 @@ func (s *Server) handleUpgradeProxy(w http.ResponseWriter, r *http.Request, prox
 
 // prepareBackendUpgrade is best-effort: a failed validity probe must not block
 // a usable websocket handshake.
-func (s *Server) prepareBackendUpgrade(ctx context.Context, r *http.Request, rel string, session *Session) {
-	failedToken := session.BackendToken
+func (s *Server) prepareBackendUpgrade(ctx context.Context, r *http.Request, rel string, session *Session, upstream upstreamRequestSnapshot) upstreamRequestSnapshot {
+	failedToken := upstream.token
 	stale, err := s.backendTokenIsUnauthorized(ctx, session, failedToken)
 	if err != nil || !stale {
-		return
+		return upstream
 	}
 	if err := s.refreshBackendSessionKnownUnauthorized(ctx, session, failedToken); err == nil {
 		s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh", "backend token refreshed before upgrade", http.StatusOK)
+		return upstreamRequestSnapshotFromLegacySession(session)
 	} else if !errors.Is(err, ErrUnauthorized) {
 		s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh_failure", "backend token refresh failed before upgrade", http.StatusUnauthorized)
 	}
+	return upstream
 }
 
 func (s *Server) activeSession(w http.ResponseWriter, r *http.Request, token string) (*Session, bool) {
@@ -767,8 +771,8 @@ func (s *Server) auditBackendTokenRefresh(r *http.Request, rel string, session *
 	s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: event, Message: message, RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: status})
 }
 
-func (s *Server) proxyURL(session *Session, rel, rawQuery, gatewayToken string) (*url.URL, error) {
-	backend, err := backendURL(session.BackendBaseURL, rel)
+func (s *Server) proxyURL(upstream upstreamRequestSnapshot, session *Session, rel, rawQuery, gatewayToken string) (*url.URL, error) {
+	backend, err := backendURL(upstream.baseURL, rel)
 	if err != nil {
 		return nil, err
 	}
@@ -780,26 +784,26 @@ func (s *Server) proxyURL(session *Session, rel, rawQuery, gatewayToken string) 
 	if err != nil {
 		return nil, errMalformedQuery
 	}
-	rewriteProxyQueryValues(q, gatewayToken, session)
+	rewriteProxyQueryValues(q, gatewayToken, session, upstream)
 	u.RawQuery = q.Encode()
-	u.Path = strings.ReplaceAll(u.Path, session.SyntheticUserID, session.BackendUserID)
+	u.Path = strings.ReplaceAll(u.Path, session.SyntheticUserID, upstream.userID)
 	return u, nil
 }
 
-func (s *Server) rewriteRequestHeaders(h http.Header, session *Session, gatewayToken string) {
+func (s *Server) rewriteRequestHeaders(h http.Header, upstream upstreamRequestSnapshot) {
 	stripResourceCookie(h)
 	// Set replaces all values for a key, collapsing duplicate client headers.
 	for _, name := range []string{"X-Emby-Token", "X-MediaBrowser-Token"} {
 		if len(h.Values(name)) > 0 {
-			h.Set(name, session.BackendToken)
+			h.Set(name, upstream.token)
 		}
 	}
 	if len(h.Values("X-Emby-Token")) == 0 {
-		h.Set("X-Emby-Token", session.BackendToken)
+		h.Set("X-Emby-Token", upstream.token)
 	}
-	identity := session.BackendIdentity.WithDefaults()
+	identity := upstream.identity.WithDefaults()
 	h.Set("User-Agent", identity.UserAgent)
-	auth := backendAuthHeader(identity, session.BackendUserID, session.BackendToken).String()
+	auth := backendAuthHeader(identity, upstream.userID, upstream.token).String()
 	h.Set("X-Emby-Authorization", auth)
 	if len(h.Values("Authorization")) > 0 {
 		h.Set("Authorization", auth)
@@ -820,7 +824,7 @@ func backendAuthHeader(identity BackendClientIdentity, userID, token string) Aut
 	}
 }
 
-func (s *Server) rewriteRequestBody(r *http.Request, session *Session, gatewayToken string) (io.Reader, []byte, bool, error) {
+func (s *Server) rewriteRequestBody(r *http.Request, session *Session, upstream upstreamRequestSnapshot, gatewayToken string) (io.Reader, []byte, bool, error) {
 	if r.Body == nil || r.Method == http.MethodGet || r.Method == http.MethodHead {
 		return nil, nil, true, nil
 	}
@@ -831,12 +835,12 @@ func (s *Server) rewriteRequestBody(r *http.Request, session *Session, gatewayTo
 	if err != nil {
 		return nil, nil, false, err
 	}
-	return s.rewriteRequestBodyData(data, session, gatewayToken), data, true, nil
+	return s.rewriteRequestBodyData(data, session, upstream, gatewayToken), data, true, nil
 }
 
-func (s *Server) rewriteRequestBodyData(data []byte, session *Session, gatewayToken string) io.Reader {
-	text := strings.ReplaceAll(string(data), gatewayToken, session.BackendToken)
-	text = strings.ReplaceAll(text, session.SyntheticUserID, session.BackendUserID)
+func (s *Server) rewriteRequestBodyData(data []byte, session *Session, upstream upstreamRequestSnapshot, gatewayToken string) io.Reader {
+	text := strings.ReplaceAll(string(data), gatewayToken, upstream.token)
+	text = strings.ReplaceAll(text, session.SyntheticUserID, upstream.userID)
 	return strings.NewReader(text)
 }
 
@@ -1212,14 +1216,14 @@ func playbackEventName(rel string) string {
 	}
 }
 
-func (s *Server) writeProxyResponse(w http.ResponseWriter, r *http.Request, rel string, resp *http.Response, session *Session, gatewayToken, publicGatewayBase string) {
+func (s *Server) writeProxyResponseWithSnapshot(w http.ResponseWriter, r *http.Request, rel string, resp *http.Response, session *Session, upstream upstreamRequestSnapshot, gatewayToken, publicGatewayBase string) {
 	ct := resp.Header.Get("Content-Type")
 	cookieRoute := resourceRouteFromContext(r)
 	if !responseAllowsBody(r.Method, resp.StatusCode) {
 		if cookieRoute != resourceRouteNone {
 			w.Header().Del("Cache-Control")
 		}
-		copyResponseHeaders(w.Header(), resp.Header, rel, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
+		copyResponseHeadersWithSnapshot(w.Header(), resp.Header, rel, session, upstream, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
 		applyResourceCachePolicy(w.Header(), cookieRoute, resp.StatusCode)
 		setContentLength(w.Header(), resp.ContentLength)
 		w.WriteHeader(resp.StatusCode)
@@ -1234,7 +1238,7 @@ func (s *Server) writeProxyResponse(w http.ResponseWriter, r *http.Request, rel 
 	if cookieRoute != resourceRouteNone {
 		w.Header().Del("Cache-Control")
 	}
-	copyResponseHeaders(w.Header(), resp.Header, rel, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
+	copyResponseHeadersWithSnapshot(w.Header(), resp.Header, rel, session, upstream, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
 	applyResourceCachePolicy(w.Header(), cookieRoute, resp.StatusCode)
 	if isM3U8ContentType(ct) || strings.HasSuffix(strings.ToLower(resp.Request.URL.Path), ".m3u8") {
 		readStarted := time.Now()
@@ -1245,7 +1249,7 @@ func (s *Server) writeProxyResponse(w http.ResponseWriter, r *http.Request, rel 
 		}
 		w.Header().Del("Content-Length")
 		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(rewriteM3U8(data, rel, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID))
+		_, _ = w.Write(rewriteM3U8WithSnapshot(data, rel, session, upstream, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID))
 		return
 	}
 
@@ -1267,7 +1271,7 @@ func (s *Server) writeProxyResponse(w http.ResponseWriter, r *http.Request, rel 
 		return
 	}
 	if resp.StatusCode == http.StatusOK && strings.TrimSpace(ct) == "" {
-		s.writeMissingContentTypeResponse(w, r, rel, resp, session, gatewayToken, publicGatewayBase)
+		s.writeMissingContentTypeResponse(w, r, rel, resp, session, upstream, gatewayToken, publicGatewayBase)
 		return
 	}
 
@@ -1281,11 +1285,11 @@ func (s *Server) writeProxyResponse(w http.ResponseWriter, r *http.Request, rel 
 		var value any
 		if looksLikeJSON(data) && json.Unmarshal(data, &value) == nil {
 			w.Header().Del("Content-Length")
-			writeJSON(w, resp.StatusCode, s.rewriteProxyJSONValueForRequest(r.Context(), r, value, session, gatewayToken, publicGatewayBase))
+			writeJSON(w, resp.StatusCode, s.rewriteProxyJSONValueForRequestWithSnapshot(r.Context(), r, value, session, upstream, gatewayToken, publicGatewayBase))
 			return
 		}
 		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(rewriteBytes(data, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID))
+		_, _ = w.Write(rewriteBytesWithSnapshot(data, session, upstream, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID))
 		return
 	}
 
@@ -1491,12 +1495,8 @@ func sessionSyntheticUserID(session *Session) string {
 	return session.SyntheticUserID
 }
 
-func (s *Server) rewriteProxyJSONValue(ctx context.Context, v any, session *Session, gatewayToken, publicGatewayBase string) any {
-	return s.rewriteProxyJSONValueForRequest(ctx, nil, v, session, gatewayToken, publicGatewayBase)
-}
-
-func (s *Server) rewriteProxyJSONValueForRequest(ctx context.Context, r *http.Request, v any, session *Session, gatewayToken, publicGatewayBase string) any {
-	rewritten := rewriteJSONValue(v, session, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
+func (s *Server) rewriteProxyJSONValueForRequestWithSnapshot(ctx context.Context, r *http.Request, v any, session *Session, upstream upstreamRequestSnapshot, gatewayToken, publicGatewayBase string) any {
+	rewritten := rewriteJSONValueWithSnapshot(v, session, upstream, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
 	if session == nil {
 		return rewritten
 	}
@@ -1549,7 +1549,7 @@ func (s *Server) fetchItemChildCount(ctx context.Context, r *http.Request, sessi
 	q.Set("Recursive", "true")
 	q.Set("IncludeItemTypes", "Episode")
 	q.Set("Limit", "0")
-	value, status, err := s.fetchBackendJSON(ctx, r, "/Users/"+session.SyntheticUserID+"/Items", q.Encode(), session, gatewayToken)
+	value, status, _, err := s.fetchBackendJSON(ctx, r, "/Users/"+session.SyntheticUserID+"/Items", q.Encode(), session, gatewayToken)
 	if err != nil || status < 200 || status >= 300 {
 		return 0
 	}
@@ -1788,34 +1788,34 @@ func itemChildCount(item map[string]any) int {
 	return 0
 }
 
-func rewriteJSONValue(v any, session *Session, gatewayToken, publicGatewayBase, gatewayServerID string) any {
+func rewriteJSONValueWithSnapshot(v any, session *Session, upstream upstreamRequestSnapshot, gatewayToken, publicGatewayBase, gatewayServerID string) any {
 	switch x := v.(type) {
 	case map[string]any:
 		out := make(map[string]any, len(x))
 		for k, v := range x {
 			if raw, ok := v.(string); ok && session != nil && (strings.EqualFold(k, "DirectStreamUrl") || strings.EqualFold(k, "TranscodingUrl")) {
-				out[k] = rewriteMediaReference(raw, session, gatewayToken, publicGatewayBase, gatewayServerID, false)
+				out[k] = rewriteMediaReference(raw, session, upstream, gatewayToken, publicGatewayBase, gatewayServerID, false)
 			} else {
-				out[k] = rewriteJSONValue(v, session, gatewayToken, publicGatewayBase, gatewayServerID)
+				out[k] = rewriteJSONValueWithSnapshot(v, session, upstream, gatewayToken, publicGatewayBase, gatewayServerID)
 			}
 			if s, ok := out[k].(string); ok && session != nil {
 				switch strings.ToLower(k) {
 				case "accesstoken":
-					if session.BackendToken != "" && s == session.BackendToken {
+					if upstream.token != "" && s == upstream.token {
 						out[k] = gatewayToken
 					}
 				case "serverid":
-					if s == session.BackendServerID || s == "" {
+					if s == upstream.serverID || s == "" {
 						out[k] = gatewayServerID
 					}
 				case "userid":
-					if session.BackendUserID != "" && s == session.BackendUserID {
+					if upstream.userID != "" && s == upstream.userID {
 						out[k] = session.SyntheticUserID
 					}
 				case "id":
-					if session.BackendUserID != "" && s == session.BackendUserID {
+					if upstream.userID != "" && s == upstream.userID {
 						out[k] = session.SyntheticUserID
-					} else if s == session.BackendServerID {
+					} else if s == upstream.serverID {
 						out[k] = gatewayServerID
 					}
 				}
@@ -1839,47 +1839,47 @@ func rewriteJSONValue(v any, session *Session, gatewayToken, publicGatewayBase, 
 	case []any:
 		out := make([]any, len(x))
 		for i, item := range x {
-			out[i] = rewriteJSONValue(item, session, gatewayToken, publicGatewayBase, gatewayServerID)
+			out[i] = rewriteJSONValueWithSnapshot(item, session, upstream, gatewayToken, publicGatewayBase, gatewayServerID)
 		}
 		return out
 	case string:
 		if session == nil {
 			return x
 		}
-		return rewriteString(x, session, gatewayToken, publicGatewayBase, gatewayServerID)
+		return rewriteStringWithSnapshot(x, session, upstream, gatewayToken, publicGatewayBase, gatewayServerID)
 	default:
 		return v
 	}
 }
 
-func rewriteBytes(data []byte, session *Session, gatewayToken, publicGatewayBase, gatewayServerID string) []byte {
+func rewriteBytesWithSnapshot(data []byte, session *Session, upstream upstreamRequestSnapshot, gatewayToken, publicGatewayBase, gatewayServerID string) []byte {
 	if session == nil {
 		return data
 	}
-	return []byte(rewriteString(string(data), session, gatewayToken, publicGatewayBase, gatewayServerID))
+	return []byte(rewriteStringWithSnapshot(string(data), session, upstream, gatewayToken, publicGatewayBase, gatewayServerID))
 }
 
-func rewriteM3U8(data []byte, rel string, session *Session, gatewayToken, publicGatewayBase, gatewayServerID string) []byte {
+func rewriteM3U8WithSnapshot(data []byte, rel string, session *Session, upstream upstreamRequestSnapshot, gatewayToken, publicGatewayBase, gatewayServerID string) []byte {
 	if session == nil {
 		return data
 	}
-	return rewriteM3U8MediaReferences(data, rel, session, gatewayToken, publicGatewayBase, gatewayServerID)
+	return rewriteM3U8MediaReferences(data, rel, session, upstream, gatewayToken, publicGatewayBase, gatewayServerID)
 }
 
-func rewriteString(s string, session *Session, gatewayToken, publicGatewayBase, gatewayServerID string) string {
-	if session.BackendToken != "" {
-		s = strings.ReplaceAll(s, session.BackendToken, gatewayToken)
+func rewriteStringWithSnapshot(s string, session *Session, upstream upstreamRequestSnapshot, gatewayToken, publicGatewayBase, gatewayServerID string) string {
+	if upstream.token != "" {
+		s = strings.ReplaceAll(s, upstream.token, gatewayToken)
 	}
-	if session.BackendUserID != "" {
-		s = strings.ReplaceAll(s, session.BackendUserID, session.SyntheticUserID)
+	if upstream.userID != "" {
+		s = strings.ReplaceAll(s, upstream.userID, session.SyntheticUserID)
 	}
-	if session.BackendServerID != "" {
-		s = strings.ReplaceAll(s, session.BackendServerID, gatewayServerID)
+	if upstream.serverID != "" {
+		s = strings.ReplaceAll(s, upstream.serverID, gatewayServerID)
 	}
 	return s
 }
 
-func copyResponseHeaders(dst, src http.Header, rel string, session *Session, gatewayToken, publicGatewayBase, gatewayServerID string) {
+func copyResponseHeadersWithSnapshot(dst, src http.Header, rel string, session *Session, upstream upstreamRequestSnapshot, gatewayToken, publicGatewayBase, gatewayServerID string) {
 	for k, vals := range src {
 		if isHopHeader(k) || strings.EqualFold(k, "Content-Length") {
 			continue
@@ -1889,9 +1889,9 @@ func copyResponseHeaders(dst, src http.Header, rel string, session *Session, gat
 				continue
 			}
 			if strings.EqualFold(k, "Location") || strings.EqualFold(k, "Content-Location") {
-				val = rewriteResponseLocation(val, rel, session, gatewayToken, publicGatewayBase, gatewayServerID)
+				val = rewriteResponseLocation(val, rel, session, upstream, gatewayToken, publicGatewayBase, gatewayServerID)
 			} else {
-				val = rewriteString(val, session, gatewayToken, publicGatewayBase, gatewayServerID)
+				val = rewriteStringWithSnapshot(val, session, upstream, gatewayToken, publicGatewayBase, gatewayServerID)
 			}
 			dst.Add(k, val)
 		}

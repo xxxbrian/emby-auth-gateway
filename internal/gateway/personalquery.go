@@ -249,7 +249,7 @@ func (s *Server) writeNegativePersonalItems(w http.ResponseWriter, r *http.Reque
 		q := cloneQuery(pq.backend)
 		q.Set("StartIndex", strconv.Itoa(backendStart))
 		q.Set("Limit", strconv.Itoa(batchLimit))
-		value, backendStatus, err := s.fetchBackendJSON(r.Context(), r, rel, q.Encode(), session, gatewayToken)
+		value, backendStatus, upstream, err := s.fetchBackendJSON(r.Context(), r, rel, q.Encode(), session, gatewayToken)
 		if err != nil {
 			http.Error(w, "backend unavailable", http.StatusBadGateway)
 			return
@@ -273,7 +273,7 @@ func (s *Server) writeNegativePersonalItems(w http.ResponseWriter, r *http.Reque
 				skipped++
 				continue
 			}
-			rewritten := s.rewriteProxyJSONValueForRequest(r.Context(), r, item, session, gatewayToken, s.gatewayBaseForRequest(r))
+			rewritten := s.rewriteProxyJSONValueForRequestWithSnapshot(r.Context(), r, item, session, upstream, gatewayToken, s.gatewayBaseForRequest(r))
 			items = append(items, rewritten)
 			if len(items) >= limit || scanned >= personalScanItemLimit {
 				break
@@ -311,7 +311,7 @@ func (s *Server) resolvePersonalItemsByID(ctx context.Context, r *http.Request, 
 		}
 		batchIDs := ids[start:end]
 		q.Set("Ids", strings.Join(batchIDs, ","))
-		value, status, err := s.fetchBackendJSON(ctx, r, "/Users/"+session.SyntheticUserID+"/Items", q.Encode(), session, gatewayToken)
+		value, status, upstream, err := s.fetchBackendJSON(ctx, r, "/Users/"+session.SyntheticUserID+"/Items", q.Encode(), session, gatewayToken)
 		if err != nil || status < 200 || status >= 300 {
 			if err != nil {
 				return nil, err
@@ -347,7 +347,7 @@ func (s *Server) resolvePersonalItemsByID(ctx context.Context, r *http.Request, 
 			state.LastSeenAt = &now
 			mergeItemMetadata(state, item)
 			_ = s.store.SavePlaybackState(ctx, *state)
-			rewritten := s.rewriteProxyJSONValueForRequest(ctx, r, item, session, gatewayToken, s.gatewayBaseForRequest(r))
+			rewritten := s.rewriteProxyJSONValueForRequestWithSnapshot(ctx, r, item, session, upstream, gatewayToken, s.gatewayBaseForRequest(r))
 			if m, ok := rewritten.(map[string]any); ok {
 				out = append(out, resolvedPersonalItem{item: m, state: *state})
 			}
@@ -377,7 +377,7 @@ func (s *Server) filterResolvedPersonalItemsWithBackend(ctx context.Context, r *
 		}
 		q := queryForBackendIDFilter(pq.backend)
 		q.Set("Ids", strings.Join(ids[start:end], ","))
-		value, status, err := s.fetchBackendJSON(ctx, r, "/Users/"+session.SyntheticUserID+"/Items", q.Encode(), session, gatewayToken)
+		value, status, upstream, err := s.fetchBackendJSON(ctx, r, "/Users/"+session.SyntheticUserID+"/Items", q.Encode(), session, gatewayToken)
 		if err != nil || status < 200 || status >= 300 {
 			if err != nil {
 				return nil, err
@@ -388,7 +388,7 @@ func (s *Server) filterResolvedPersonalItemsWithBackend(ctx context.Context, r *
 			if id, _ := stringField(item, "Id"); id != "" {
 				allowed[id] = true
 				if existing, ok := byID[id]; ok {
-					rewritten := s.rewriteProxyJSONValueForRequest(ctx, r, item, session, gatewayToken, s.gatewayBaseForRequest(r))
+					rewritten := s.rewriteProxyJSONValueForRequestWithSnapshot(ctx, r, item, session, upstream, gatewayToken, s.gatewayBaseForRequest(r))
 					if m, ok := rewritten.(map[string]any); ok {
 						existing.item = m
 						byID[id] = existing

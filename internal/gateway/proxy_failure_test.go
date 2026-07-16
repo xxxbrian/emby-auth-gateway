@@ -190,13 +190,15 @@ func TestUpgradeProxyFailureUsesStructuredHandler(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/socket", nil).WithContext(ctx)
 			writer := httptest.NewRecorder()
 			if tt.canceled {
-				requireAbortHandler(t, func() { server.handleUpgradeProxy(writer, req, target, &Session{}, "", "/socket") })
+				requireAbortHandler(t, func() {
+					server.handleUpgradeProxy(writer, req, target, &Session{}, upstreamRequestSnapshot{}, "", "/socket")
+				})
 				if len(store.AuditLogs) != 0 || len(writer.Header()) != 0 || writer.Body.Len() != 0 {
 					t.Fatal("canceled upgrade produced an audit, headers, or body")
 				}
 				return
 			}
-			server.handleUpgradeProxy(writer, req, target, &Session{}, "", "/socket")
+			server.handleUpgradeProxy(writer, req, target, &Session{}, upstreamRequestSnapshot{}, "", "/socket")
 			if writer.Code != tt.wantStatus || len(store.AuditLogs) != 1 {
 				t.Fatal("upgrade failure response or audit was incorrect")
 			}
@@ -224,7 +226,7 @@ func TestUpgradeProxySuppressesFailureAfterSuccessfulHijack(t *testing.T) {
 	writer := &hijackFailureWriter{header: http.Header{}}
 	wrappedWriter := &unwrapOnlyResponseWriter{ResponseWriter: writer}
 
-	server.handleUpgradeProxy(wrappedWriter, req, target, &Session{}, "", "/socket")
+	server.handleUpgradeProxy(wrappedWriter, req, target, &Session{}, upstreamRequestSnapshot{}, "", "/socket")
 	if len(store.AuditLogs) != 0 || writer.writeHeaders != 0 || writer.writes != 0 || !writer.hijacked {
 		t.Fatal("post-hijack upgrade failure produced an audit or fallback response")
 	}
@@ -276,13 +278,15 @@ func TestBufferedPreHeaderReadFailureMatrix(t *testing.T) {
 				writer := httptest.NewRecorder()
 				resp := &http.Response{StatusCode: http.StatusPartialContent, Header: http.Header{"Content-Type": []string{family.contentType}}, Body: io.NopCloser(errorMediaReader{err: failure.err}), ContentLength: -1, Request: req}
 				if failure.canceled {
-					requireAbortHandler(t, func() { server.writeProxyResponse(writer, req, family.path, resp, &Session{}, "", "") })
+					requireAbortHandler(t, func() {
+						server.writeProxyResponseWithSnapshot(writer, req, family.path, resp, &Session{}, upstreamRequestSnapshot{}, "", "")
+					})
 					if len(store.AuditLogs) != 0 || len(writer.Header()) != 0 || writer.Body.Len() != 0 {
 						t.Fatal("canceled read produced an audit, headers, or body")
 					}
 					return
 				}
-				server.writeProxyResponse(writer, req, family.path, resp, &Session{}, "", "")
+				server.writeProxyResponseWithSnapshot(writer, req, family.path, resp, &Session{}, upstreamRequestSnapshot{}, "", "")
 				if writer.Code != failure.wantStatus || len(store.AuditLogs) != 1 {
 					t.Fatal("buffered read failure response or audit was incorrect")
 				}
@@ -313,7 +317,7 @@ func TestCookieMediaBufferedPreHeaderReadFailureCachePolicy(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby"+tt.path, nil).WithContext(ctx)
 			writer := httptest.NewRecorder()
 			resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{tt.contentType}, "Cache-Control": []string{"public"}, "Vary": []string{"Origin"}}, Body: io.NopCloser(errorMediaReader{err: tt.err}), ContentLength: -1, Request: req}
-			server.writeProxyResponse(writer, req, tt.path, resp, &Session{}, "", "")
+			server.writeProxyResponseWithSnapshot(writer, req, tt.path, resp, &Session{}, upstreamRequestSnapshot{}, "", "")
 			if writer.Code != tt.want || writer.Header().Get("Cache-Control") != "private, no-store" || writer.Header().Get("Vary") != "Origin, Cookie" {
 				t.Fatalf("status/cache/vary = %d/%q/%q", writer.Code, writer.Header().Get("Cache-Control"), writer.Header().Get("Vary"))
 			}
@@ -353,13 +357,15 @@ func TestImageInitialReadFailureMatrix(t *testing.T) {
 				}
 				resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"image/gif"}, "ETag": []string{"etag"}, "Last-Modified": []string{"date"}}, Body: io.NopCloser(reader), ContentLength: -1, Request: req}
 				if failure.canceled {
-					requireAbortHandler(t, func() { server.writeProxyResponse(writer, req, "/Items/item/Images/Primary", resp, &Session{}, "", "") })
+					requireAbortHandler(t, func() {
+						server.writeProxyResponseWithSnapshot(writer, req, "/Items/item/Images/Primary", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
+					})
 					if len(store.AuditLogs) != 0 || len(writer.Header()) != 0 || writer.Body.Len() != 0 {
 						t.Fatal("canceled image read produced an audit, headers, or body")
 					}
 					return
 				}
-				server.writeProxyResponse(writer, req, "/Items/item/Images/Primary", resp, &Session{}, "", "")
+				server.writeProxyResponseWithSnapshot(writer, req, "/Items/item/Images/Primary", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
 				if writer.Code != failure.wantStatus || len(store.AuditLogs) != 1 || writer.Body.Len() != len("invalid image response\n") {
 					t.Fatal("image read failure response or audit was incorrect")
 				}
@@ -381,7 +387,7 @@ func TestImagePartialReadEOFRemainsValid(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items/item/Images/Primary", nil)
 	writer := httptest.NewRecorder()
 	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"image/gif"}}, Body: io.NopCloser(partialEOFReader{}), ContentLength: 1, Request: req}
-	server.writeProxyResponse(writer, req, "/Items/item/Images/Primary", resp, &Session{}, "", "")
+	server.writeProxyResponseWithSnapshot(writer, req, "/Items/item/Images/Primary", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
 	if writer.Code != http.StatusOK || writer.Body.String() != "x" || len(store.AuditLogs) != 0 {
 		t.Fatal("partial image read ending in EOF was not preserved")
 	}

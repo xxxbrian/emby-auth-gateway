@@ -78,7 +78,7 @@ func TestMissingContentTypeJSONAndRawReplay(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items/item", nil)
 			writer := &deadlineRecordingWriter{ResponseRecorder: httptest.NewRecorder()}
 			resp := missingContentTypeResponse(req, strings.NewReader(tt.body), int64(len(tt.body)))
-			server.writeProxyResponse(writer, req, "/Items/item", resp, &Session{}, "", "")
+			server.writeProxyResponseWithSnapshot(writer, req, "/Items/item", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
 			if writer.Code != http.StatusOK || len(store.AuditLogs) != 0 {
 				t.Fatal("missing content type response failed")
 			}
@@ -103,7 +103,8 @@ func TestMissingContentTypeJSONUsesGatewayLocalUserData(t *testing.T) {
 	writer := &deadlineRecordingWriter{ResponseRecorder: httptest.NewRecorder()}
 	body := " \t" + `{"Id":"item-1","UserData":{"Played":true,"PlaybackPositionTicks":9999}}`
 	resp := missingContentTypeResponse(req, strings.NewReader(body), int64(len(body)))
-	server.writeProxyResponse(writer, req, "/Items/item-1", resp, &Session{GatewayUserID: "u1", SyntheticUserID: "gateway-user"}, "", "")
+	session := &Session{GatewayUserID: "u1", SyntheticUserID: "gateway-user"}
+	server.writeProxyResponseWithSnapshot(writer, req, "/Items/item-1", resp, session, upstreamRequestSnapshotFromLegacySession(session), "", "")
 	var item map[string]any
 	if writer.Code != http.StatusOK || json.Unmarshal(writer.Body.Bytes(), &item) != nil {
 		t.Fatal("missing content type json was not returned")
@@ -121,7 +122,7 @@ func TestMissingContentTypeStreamsLargeRawAndDeadlineOrder(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items/item", nil)
 	writer := &discardDeadlineWriter{}
 	resp := missingContentTypeResponse(req, bytes.NewReader(body), int64(len(body)))
-	server.writeProxyResponse(writer, req, "/Items/item", resp, &Session{}, "", "")
+	server.writeProxyResponseWithSnapshot(writer, req, "/Items/item", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
 	if writer.status != http.StatusOK || writer.bytes != int64(len(body)) || !writer.deadlineBeforeHeader || len(store.AuditLogs) != 0 {
 		t.Fatal("large raw missing content type response was not streamed")
 	}
@@ -134,7 +135,7 @@ func TestMissingContentTypeWritesDecisiveByteBeforeNextRead(t *testing.T) {
 	reader := &writeBeforeNextReadReader{}
 	writer := &writeBeforeNextReadWriter{reader: reader}
 	resp := missingContentTypeResponse(req, reader, -1)
-	server.writeProxyResponse(writer, req, "/Items/item", resp, &Session{}, "", "")
+	server.writeProxyResponseWithSnapshot(writer, req, "/Items/item", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
 	if writer.String() != "raw" || len(store.AuditLogs) != 0 {
 		t.Fatal("missing content type stream did not preserve raw ordering")
 	}
@@ -161,13 +162,15 @@ func TestMissingContentTypeJSONCandidateLimitAndPreHeaderFailures(t *testing.T) 
 			writer := httptest.NewRecorder()
 			resp := missingContentTypeResponse(req, tt.body, -1)
 			if tt.canceled {
-				requireAbortHandler(t, func() { server.writeProxyResponse(writer, req, "/Items/item", resp, &Session{}, "", "") })
+				requireAbortHandler(t, func() {
+					server.writeProxyResponseWithSnapshot(writer, req, "/Items/item", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
+				})
 				if len(store.AuditLogs) != 0 || len(writer.Header()) != 0 || writer.Body.Len() != 0 {
 					t.Fatal("canceled sniff wrote an audit, headers, or body")
 				}
 				return
 			}
-			server.writeProxyResponse(writer, req, "/Items/item", resp, &Session{}, "", "")
+			server.writeProxyResponseWithSnapshot(writer, req, "/Items/item", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
 			if writer.Code != tt.wantStatus || len(store.AuditLogs) != 1 || strings.Contains(writer.Body.String(), "backend-token") {
 				t.Fatal("missing content type pre-header failure response was incorrect")
 			}
@@ -201,20 +204,24 @@ func TestMissingContentTypeSameCallReadErrors(t *testing.T) {
 			writer := &mediaFailureWriter{}
 			resp := missingContentTypeResponse(req, &sameCallReadError{data: []byte(tt.body), err: tt.err}, -1)
 			if tt.canceled {
-				requireAbortHandler(t, func() { server.writeProxyResponse(writer, req, "/Items/item", resp, &Session{}, "", "") })
+				requireAbortHandler(t, func() {
+					server.writeProxyResponseWithSnapshot(writer, req, "/Items/item", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
+				})
 				if len(store.AuditLogs) != 0 || len(writer.Header()) != 0 {
 					t.Fatal("canceled whitespace sniff produced output")
 				}
 				return
 			}
 			if tt.preHeader {
-				server.writeProxyResponse(writer, req, "/Items/item", resp, &Session{}, "", "")
+				server.writeProxyResponseWithSnapshot(writer, req, "/Items/item", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
 				if len(store.AuditLogs) != 1 || store.AuditLogs[0].ErrorKind != tt.wantKind || store.AuditLogs[0].ResponseCommitted || store.AuditLogs[0].Status != http.StatusGatewayTimeout {
 					t.Fatal("whitespace sniff error was not pre-header timeout")
 				}
 				return
 			}
-			requireAbortHandler(t, func() { server.writeProxyResponse(writer, req, "/Items/item", resp, &Session{}, "", "") })
+			requireAbortHandler(t, func() {
+				server.writeProxyResponseWithSnapshot(writer, req, "/Items/item", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
+			})
 			if len(store.AuditLogs) != 1 {
 				t.Fatal("raw same-call read error was not audited")
 			}
@@ -232,7 +239,7 @@ func TestMissingContentTypeSameCallEOFReplaysOnce(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items/item", nil)
 	writer := &deadlineRecordingWriter{ResponseRecorder: httptest.NewRecorder()}
 	resp := missingContentTypeResponse(req, &sameCallReadError{data: []byte("raw"), err: io.EOF}, 3)
-	server.writeProxyResponse(writer, req, "/Items/item", resp, &Session{}, "", "")
+	server.writeProxyResponseWithSnapshot(writer, req, "/Items/item", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
 	if writer.Code != http.StatusOK || writer.Body.String() != "raw" || len(store.AuditLogs) != 0 {
 		t.Fatal("same-call EOF did not replay raw data exactly once")
 	}
@@ -245,7 +252,7 @@ func TestMissingContentTypeDeadlineOrderAndDispatchCompatibility(t *testing.T) {
 	sequence := []string{}
 	reader := &orderedRawReader{sequence: &sequence}
 	writer := &orderedDeadlineWriter{sequence: &sequence}
-	server.writeProxyResponse(writer, req, "/Items/item", missingContentTypeResponse(req, reader, 3), &Session{}, "", "")
+	server.writeProxyResponseWithSnapshot(writer, req, "/Items/item", missingContentTypeResponse(req, reader, 3), &Session{}, upstreamRequestSnapshot{}, "", "")
 	if strings.Join(sequence, ",") != "sniff,deadline,header,write" {
 		t.Fatal("missing content type deadline ordering was incorrect")
 	}
@@ -253,7 +260,7 @@ func TestMissingContentTypeDeadlineOrderAndDispatchCompatibility(t *testing.T) {
 	non200 := missingContentTypeResponse(req, strings.NewReader("raw"), 3)
 	non200.StatusCode = http.StatusPartialContent
 	bufferedWriter := httptest.NewRecorder()
-	server.writeProxyResponse(bufferedWriter, req, "/Items/item", non200, &Session{}, "", "")
+	server.writeProxyResponseWithSnapshot(bufferedWriter, req, "/Items/item", non200, &Session{}, upstreamRequestSnapshot{}, "", "")
 	if bufferedWriter.Code != http.StatusPartialContent || bufferedWriter.Body.String() != "raw" {
 		t.Fatal("non-200 empty content type no longer uses buffered behavior")
 	}
@@ -261,7 +268,7 @@ func TestMissingContentTypeDeadlineOrderAndDispatchCompatibility(t *testing.T) {
 	explicitJSON := missingContentTypeResponse(req, strings.NewReader(`{"Name":"value"}`), 16)
 	explicitJSON.Header.Set("Content-Type", "application/json")
 	jsonWriter := httptest.NewRecorder()
-	server.writeProxyResponse(jsonWriter, req, "/Items/item", explicitJSON, &Session{}, "", "")
+	server.writeProxyResponseWithSnapshot(jsonWriter, req, "/Items/item", explicitJSON, &Session{}, upstreamRequestSnapshot{}, "", "")
 	if jsonWriter.Code != http.StatusOK || !strings.Contains(jsonWriter.Body.String(), `"Name":"value"`) {
 		t.Fatal("explicit JSON no longer uses existing buffered path")
 	}
@@ -288,7 +295,9 @@ func TestMissingContentTypeDirectionalCopyFailures(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items/item", nil)
 			writer := &mediaFailureWriter{err: tt.writerErr}
 			resp := missingContentTypeResponse(req, tt.body, tt.length)
-			requireAbortHandler(t, func() { server.writeProxyResponse(writer, req, "/Items/item", resp, &Session{}, "", "") })
+			requireAbortHandler(t, func() {
+				server.writeProxyResponseWithSnapshot(writer, req, "/Items/item", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
+			})
 			if len(store.AuditLogs) != 1 {
 				t.Fatal("missing content type copy failure was not audited")
 			}
@@ -306,7 +315,7 @@ func TestMissingContentTypeDeadlineWarningOnlyOnce(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items/item", nil)
 	for range 2 {
 		writer := httptest.NewRecorder()
-		server.writeProxyResponse(writer, req, "/Items/item", missingContentTypeResponse(req, strings.NewReader("raw"), 3), &Session{}, "", "")
+		server.writeProxyResponseWithSnapshot(writer, req, "/Items/item", missingContentTypeResponse(req, strings.NewReader("raw"), 3), &Session{}, upstreamRequestSnapshot{}, "", "")
 		if writer.Code != http.StatusOK || writer.Body.String() != "raw" {
 			t.Fatal("unsupported deadline writer did not receive raw stream")
 		}

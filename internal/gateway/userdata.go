@@ -225,12 +225,12 @@ func (s *Server) writePersonalFilteredItems(w http.ResponseWriter, r *http.Reque
 		s.writeNegativePersonalItems(w, r, rel, session, gatewayToken, pq)
 		return
 	}
-	value, status, err := s.fetchBackendJSON(r.Context(), r, rel, pq.backend.Encode(), session, gatewayToken)
+	value, status, upstream, err := s.fetchBackendJSON(r.Context(), r, rel, pq.backend.Encode(), session, gatewayToken)
 	if err != nil {
 		http.Error(w, "backend unavailable", http.StatusBadGateway)
 		return
 	}
-	writeJSON(w, status, s.rewriteProxyJSONValueForRequest(r.Context(), r, value, session, gatewayToken, s.gatewayBaseForRequest(r)))
+	writeJSON(w, status, s.rewriteProxyJSONValueForRequestWithSnapshot(r.Context(), r, value, session, upstream, gatewayToken, s.gatewayBaseForRequest(r)))
 }
 
 func (s *Server) writeLatestItems(w http.ResponseWriter, r *http.Request, rel string, session *Session, gatewayToken string) {
@@ -254,7 +254,7 @@ func (s *Server) writeLatestItems(w http.ResponseWriter, r *http.Request, rel st
 	items := []any{}
 	for requestLimit <= latestBackfillLimit {
 		q.Set("Limit", strconv.Itoa(requestLimit))
-		value, backendStatus, err := s.fetchBackendJSON(r.Context(), r, rel, q.Encode(), session, gatewayToken)
+		value, backendStatus, upstream, err := s.fetchBackendJSON(r.Context(), r, rel, q.Encode(), session, gatewayToken)
 		if err != nil {
 			http.Error(w, "backend unavailable", http.StatusBadGateway)
 			return
@@ -268,7 +268,7 @@ func (s *Server) writeLatestItems(w http.ResponseWriter, r *http.Request, rel st
 			if id != "" && playedSet[id] {
 				continue
 			}
-			rewritten := s.rewriteProxyJSONValueForRequest(r.Context(), r, item, session, gatewayToken, s.gatewayBaseForRequest(r))
+			rewritten := s.rewriteProxyJSONValueForRequestWithSnapshot(r.Context(), r, item, session, upstream, gatewayToken, s.gatewayBaseForRequest(r))
 			kept = append(kept, rewritten)
 			if len(kept) >= limit {
 				break
@@ -284,13 +284,13 @@ func (s *Server) writeLatestItems(w http.ResponseWriter, r *http.Request, rel st
 }
 
 func (s *Server) writeFilteredSessions(w http.ResponseWriter, r *http.Request, rel string, session *Session, gatewayToken string) {
-	value, status, err := s.fetchBackendJSON(r.Context(), r, rel, r.URL.RawQuery, session, gatewayToken)
+	value, status, upstream, err := s.fetchBackendJSON(r.Context(), r, rel, r.URL.RawQuery, session, gatewayToken)
 	if err != nil {
 		http.Error(w, "backend unavailable", http.StatusBadGateway)
 		return
 	}
-	rewritten := s.rewriteProxyJSONValueForRequest(r.Context(), r, value, session, gatewayToken, s.gatewayBaseForRequest(r))
-	deviceID := session.BackendIdentity.WithDefaults().DeviceID
+	rewritten := s.rewriteProxyJSONValueForRequestWithSnapshot(r.Context(), r, value, session, upstream, gatewayToken, s.gatewayBaseForRequest(r))
+	deviceID := upstream.identity.WithDefaults().DeviceID
 	if deviceID == "" {
 		writeJSON(w, status, []any{})
 		return
@@ -319,7 +319,7 @@ func (s *Server) writeNextUpItems(w http.ResponseWriter, r *http.Request, sessio
 	items := make([]any, 0, len(series))
 	episodeQuery := queryForIDResolution(r.URL.Query())
 	for _, seriesID := range series {
-		episodeValue, status, err := s.fetchBackendJSON(r.Context(), r, "/Shows/"+seriesID+"/Episodes", episodeQuery.Encode(), session, gatewayToken)
+		episodeValue, status, upstream, err := s.fetchBackendJSON(r.Context(), r, "/Shows/"+seriesID+"/Episodes", episodeQuery.Encode(), session, gatewayToken)
 		if err != nil || status < 200 || status >= 300 {
 			continue
 		}
@@ -336,7 +336,7 @@ func (s *Server) writeNextUpItems(w http.ResponseWriter, r *http.Request, sessio
 			if id == "" || playedByID[id] || !episodeAfter(episode, last) {
 				continue
 			}
-			rewritten := s.rewriteProxyJSONValueForRequest(r.Context(), r, episode, session, gatewayToken, s.gatewayBaseForRequest(r))
+			rewritten := s.rewriteProxyJSONValueForRequestWithSnapshot(r.Context(), r, episode, session, upstream, gatewayToken, s.gatewayBaseForRequest(r))
 			if item, ok := rewritten.(map[string]any); ok {
 				items = append(items, item)
 			}
@@ -465,7 +465,7 @@ func (s *Server) resolveItemsByID(ctx context.Context, r *http.Request, session 
 		}
 		batchIDs := ids[start:end]
 		q.Set("Ids", strings.Join(batchIDs, ","))
-		value, status, err := s.fetchBackendJSON(ctx, r, "/Users/"+session.SyntheticUserID+"/Items", q.Encode(), session, gatewayToken)
+		value, status, upstream, err := s.fetchBackendJSON(ctx, r, "/Users/"+session.SyntheticUserID+"/Items", q.Encode(), session, gatewayToken)
 		if err != nil || status < 200 || status >= 300 {
 			continue
 		}
@@ -497,7 +497,7 @@ func (s *Server) resolveItemsByID(ctx context.Context, r *http.Request, session 
 			state.LastSeenAt = &now
 			mergeItemMetadata(state, item)
 			_ = s.store.SavePlaybackState(ctx, *state)
-			rewritten := s.rewriteProxyJSONValueForRequest(ctx, r, item, session, gatewayToken, s.gatewayBaseForRequest(r))
+			rewritten := s.rewriteProxyJSONValueForRequestWithSnapshot(ctx, r, item, session, upstream, gatewayToken, s.gatewayBaseForRequest(r))
 			if m, ok := rewritten.(map[string]any); ok {
 				out = append(out, m)
 			}
@@ -569,58 +569,60 @@ func lowerSet(values []string) map[string]bool {
 	return set
 }
 
-func (s *Server) fetchBackendJSON(ctx context.Context, r *http.Request, rel, rawQuery string, session *Session, gatewayToken string) (any, int, error) {
+func (s *Server) fetchBackendJSON(ctx context.Context, r *http.Request, rel, rawQuery string, session *Session, gatewayToken string) (any, int, upstreamRequestSnapshot, error) {
 	if err := s.ensureBackendSession(ctx, session); err != nil {
-		return nil, 0, err
+		return nil, 0, upstreamRequestSnapshot{}, err
 	}
-	u, err := s.proxyURL(session, rel, rawQuery, gatewayToken)
+	upstream := upstreamRequestSnapshotFromLegacySession(session)
+	u, err := s.proxyURL(upstream, session, rel, rawQuery, gatewayToken)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, upstreamRequestSnapshot{}, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, upstreamRequestSnapshot{}, err
 	}
 	copyRequestHeaders(req.Header, r.Header)
-	s.rewriteRequestHeaders(req.Header, session, gatewayToken)
+	s.rewriteRequestHeaders(req.Header, upstream)
 	req.Host = u.Host
 	resp, err := s.proxyClient.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, upstreamRequestSnapshot{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusUnauthorized {
-		failedToken := session.BackendToken
+		failedToken := upstream.token
 		if err := s.refreshBackendSession(ctx, session, failedToken); err == nil {
+			upstream = upstreamRequestSnapshotFromLegacySession(session)
 			s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh", "backend token refreshed after unauthorized response", http.StatusOK)
 			_ = resp.Body.Close()
-			u, err = s.proxyURL(session, rel, rawQuery, gatewayToken)
+			u, err = s.proxyURL(upstream, session, rel, rawQuery, gatewayToken)
 			if err != nil {
-				return nil, 0, err
+				return nil, 0, upstreamRequestSnapshot{}, err
 			}
 			req, err = http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 			if err != nil {
-				return nil, 0, err
+				return nil, 0, upstreamRequestSnapshot{}, err
 			}
 			copyRequestHeaders(req.Header, r.Header)
-			s.rewriteRequestHeaders(req.Header, session, gatewayToken)
+			s.rewriteRequestHeaders(req.Header, upstream)
 			req.Host = u.Host
 			resp, err = s.proxyClient.Do(req)
 			if err != nil {
-				return nil, 0, err
+				return nil, 0, upstreamRequestSnapshot{}, err
 			}
 			defer resp.Body.Close()
 		}
 	}
 	data, err := readLimited(resp.Body, proxyJSONLimit)
 	if err != nil {
-		return nil, resp.StatusCode, err
+		return nil, resp.StatusCode, upstream, err
 	}
 	var value any
 	if err := json.Unmarshal(data, &value); err != nil {
-		return nil, resp.StatusCode, err
+		return nil, resp.StatusCode, upstream, err
 	}
-	return value, resp.StatusCode, nil
+	return value, resp.StatusCode, upstream, nil
 }
 
 func (s *Server) stateForItem(ctx context.Context, session *Session, itemID string) *PlaybackState {
@@ -636,7 +638,7 @@ func (s *Server) enrichPlaybackStateMetadata(ctx context.Context, r *http.Reques
 	if state == nil || state.ItemID == "" {
 		return
 	}
-	value, status, err := s.fetchBackendJSON(ctx, r, "/Users/"+session.SyntheticUserID+"/Items/"+state.ItemID, "", session, gatewayToken)
+	value, status, _, err := s.fetchBackendJSON(ctx, r, "/Users/"+session.SyntheticUserID+"/Items/"+state.ItemID, "", session, gatewayToken)
 	if err != nil || status < 200 || status >= 300 {
 		return
 	}

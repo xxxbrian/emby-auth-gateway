@@ -11,7 +11,7 @@ var m3u8URIAttribute = regexp.MustCompile(`URI="([^"]*)"`)
 
 // rewriteMediaReference returns an API-relative owned media reference. A
 // specialized reference that contains the backend token is never returned.
-func rewriteMediaReference(value string, session *Session, gatewayToken, publicGatewayBase, gatewayServerID string, absolute bool) string {
+func rewriteMediaReference(value string, session *Session, upstream upstreamRequestSnapshot, gatewayToken, publicGatewayBase, gatewayServerID string, absolute bool) string {
 	if hasURLControls(value) {
 		return ""
 	}
@@ -21,30 +21,30 @@ func rewriteMediaReference(value string, session *Session, gatewayToken, publicG
 	}
 	if u.IsAbs() {
 		if u.Host == "" || u.User != nil || (!strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https")) {
-			return safeOutput(value, session.BackendToken)
+			return safeOutput(value, upstream.token)
 		}
-		if media, ok := qualifyingMediaPath(u, session, publicGatewayBase); ok {
-			query, ok := rewriteOwnedQuery(u.RawQuery, session, gatewayToken, gatewayServerID, true)
+		if media, ok := qualifyingMediaPath(u, upstream, publicGatewayBase); ok {
+			query, ok := rewriteOwnedQuery(u.RawQuery, session, upstream, gatewayToken, gatewayServerID, true)
 			if !ok {
 				return ""
 			}
 			u.RawQuery = query
-			return safeOutput(formatOwnedURL(media, u, publicGatewayBase, absolute), session.BackendToken)
+			return safeOutput(formatOwnedURL(media, u, publicGatewayBase, absolute), upstream.token)
 		}
-		return safeOutput(value, session.BackendToken)
+		return safeOutput(value, upstream.token)
 	}
 	if u.Host != "" { // Network-path references are external, never local paths.
-		return safeOutput(value, session.BackendToken)
+		return safeOutput(value, upstream.token)
 	}
 	if media, ok := relativeMediaPath(u, publicGatewayBase); ok {
-		query, ok := rewriteOwnedQuery(u.RawQuery, session, gatewayToken, gatewayServerID, true)
+		query, ok := rewriteOwnedQuery(u.RawQuery, session, upstream, gatewayToken, gatewayServerID, true)
 		if !ok {
 			return ""
 		}
 		u.RawQuery = query
-		return safeOutput(formatOwnedURL(media, u, publicGatewayBase, absolute), session.BackendToken)
+		return safeOutput(formatOwnedURL(media, u, publicGatewayBase, absolute), upstream.token)
 	}
-	return safeOutput(value, session.BackendToken)
+	return safeOutput(value, upstream.token)
 }
 
 func unsafeReference(value, backendToken string) bool {
@@ -113,9 +113,9 @@ func formatOwnedURL(mediaPath string, u *url.URL, publicGatewayBase string, abso
 	return mediaPath + queryAndFragment(u)
 }
 
-func qualifyingMediaPath(u *url.URL, session *Session, publicGatewayBase string) (string, bool) {
+func qualifyingMediaPath(u *url.URL, upstream upstreamRequestSnapshot, publicGatewayBase string) (string, bool) {
 	pathValue := u.EscapedPath()
-	if suffix, ok := configuredOriginSuffix(u, session); ok {
+	if suffix, ok := configuredOriginSuffix(u, upstream); ok {
 		if media, ok := mediaPathAfterPrefix(suffix, ""); ok {
 			return media, true
 		}
@@ -133,8 +133,8 @@ func qualifyingMediaPath(u *url.URL, session *Session, publicGatewayBase string)
 // configuredOriginSuffix recognizes backend origin path variants and returns a
 // gateway-relative suffix. Exact configured non-root bases win; conventional
 // prefixes then cover backend deployments that publish an alternate base.
-func configuredOriginSuffix(u *url.URL, session *Session) (string, bool) {
-	backend, err := url.Parse(session.BackendBaseURL)
+func configuredOriginSuffix(u *url.URL, upstream upstreamRequestSnapshot) (string, bool) {
+	backend, err := url.Parse(upstream.baseURL)
 	if err != nil || !sameOrigin(u, backend) {
 		return "", false
 	}
@@ -212,7 +212,7 @@ func mediaPathAfterPrefix(escapedPath, prefix string) (string, bool) {
 	return "/" + strings.Join(parts, "/"), true
 }
 
-func rewriteOwnedQuery(raw string, session *Session, gatewayToken, gatewayServerID string, addGatewayToken ...bool) (string, bool) {
+func rewriteOwnedQuery(raw string, session *Session, upstream upstreamRequestSnapshot, gatewayToken, gatewayServerID string, addGatewayToken ...bool) (string, bool) {
 	appendGatewayToken := len(addGatewayToken) > 0 && addGatewayToken[0]
 	parts := []string(nil)
 	if raw != "" {
@@ -237,11 +237,11 @@ func rewriteOwnedQuery(raw string, session *Session, gatewayToken, gatewayServer
 			return "", false
 		}
 		switch {
-		case session.BackendToken != "" && decoded == session.BackendToken:
+		case upstream.token != "" && decoded == upstream.token:
 			part = key + "=" + url.QueryEscape(gatewayToken)
-		case session.BackendUserID != "" && decoded == session.BackendUserID:
+		case upstream.userID != "" && decoded == upstream.userID:
 			part = key + "=" + url.QueryEscape(session.SyntheticUserID)
-		case session.BackendServerID != "" && decoded == session.BackendServerID:
+		case upstream.serverID != "" && decoded == upstream.serverID:
 			part = key + "=" + url.QueryEscape(gatewayServerID)
 		}
 		out = append(out, part)
@@ -263,7 +263,7 @@ func queryAndFragment(u *url.URL) string {
 	return result
 }
 
-func rewriteM3U8MediaReferences(data []byte, playlistRel string, session *Session, gatewayToken, publicGatewayBase, gatewayServerID string) []byte {
+func rewriteM3U8MediaReferences(data []byte, playlistRel string, session *Session, upstream upstreamRequestSnapshot, gatewayToken, publicGatewayBase, gatewayServerID string) []byte {
 	newline := "\n"
 	if strings.Contains(string(data), "\r\n") {
 		newline = "\r\n"
@@ -271,18 +271,18 @@ func rewriteM3U8MediaReferences(data []byte, playlistRel string, session *Sessio
 	lines := strings.Split(string(data), newline)
 	for i, line := range lines {
 		if !strings.HasPrefix(line, "#") {
-			lines[i] = rewriteM3U8Reference(line, playlistRel, session, gatewayToken, publicGatewayBase, gatewayServerID)
+			lines[i] = rewriteM3U8Reference(line, playlistRel, session, upstream, gatewayToken, publicGatewayBase, gatewayServerID)
 			continue
 		}
 		lines[i] = m3u8URIAttribute.ReplaceAllStringFunc(line, func(match string) string {
 			value := strings.TrimSuffix(strings.TrimPrefix(match, `URI="`), `"`)
-			return `URI="` + rewriteM3U8Reference(value, playlistRel, session, gatewayToken, publicGatewayBase, gatewayServerID) + `"`
+			return `URI="` + rewriteM3U8Reference(value, playlistRel, session, upstream, gatewayToken, publicGatewayBase, gatewayServerID) + `"`
 		})
 	}
 	return []byte(strings.Join(lines, newline))
 }
 
-func rewriteM3U8Reference(value, playlistRel string, session *Session, gatewayToken, publicGatewayBase, gatewayServerID string) string {
+func rewriteM3U8Reference(value, playlistRel string, session *Session, upstream upstreamRequestSnapshot, gatewayToken, publicGatewayBase, gatewayServerID string) string {
 	if hasURLControls(value) {
 		return ""
 	}
@@ -291,32 +291,32 @@ func rewriteM3U8Reference(value, playlistRel string, session *Session, gatewayTo
 		return ""
 	}
 	if u.Host != "" && !u.IsAbs() {
-		return safeOutput(value, session.BackendToken)
+		return safeOutput(value, upstream.token)
 	}
 	if u.IsAbs() {
-		if _, media := qualifyingMediaPath(u, session, publicGatewayBase); media {
-			return rewriteMediaReference(value, session, gatewayToken, publicGatewayBase, gatewayServerID, true)
+		if _, media := qualifyingMediaPath(u, upstream, publicGatewayBase); media {
+			return rewriteMediaReference(value, session, upstream, gatewayToken, publicGatewayBase, gatewayServerID, true)
 		}
-		if pathValue, ok := configuredOriginSuffix(u, session); ok {
-			query, ok := rewriteOwnedQuery(u.RawQuery, session, gatewayToken, gatewayServerID, true)
+		if pathValue, ok := configuredOriginSuffix(u, upstream); ok {
+			query, ok := rewriteOwnedQuery(u.RawQuery, session, upstream, gatewayToken, gatewayServerID, true)
 			if !ok {
 				return ""
 			}
 			u.RawQuery = query
-			return safeOutput(strings.TrimRight(publicGatewayBase, "/")+pathValue+queryAndFragment(u), session.BackendToken)
+			return safeOutput(strings.TrimRight(publicGatewayBase, "/")+pathValue+queryAndFragment(u), upstream.token)
 		}
-		return safeOutput(value, session.BackendToken)
+		return safeOutput(value, upstream.token)
 	}
 	resolved := resolveRelativePath(u.EscapedPath(), playlistRel, publicGatewayBase)
 	if resolved == "" {
-		return safeOutput(value, session.BackendToken)
+		return safeOutput(value, upstream.token)
 	}
-	query, ok := rewriteOwnedQuery(u.RawQuery, session, gatewayToken, gatewayServerID, true)
+	query, ok := rewriteOwnedQuery(u.RawQuery, session, upstream, gatewayToken, gatewayServerID, true)
 	if !ok {
 		return ""
 	}
 	u.RawQuery = query
-	return safeOutput(strings.TrimRight(publicGatewayBase, "/")+resolved+queryAndFragment(u), session.BackendToken)
+	return safeOutput(strings.TrimRight(publicGatewayBase, "/")+resolved+queryAndFragment(u), upstream.token)
 }
 
 func resolveRelativePath(reference, requestRel, publicGatewayBase string) string {
@@ -337,7 +337,7 @@ func resolveRelativePath(reference, requestRel, publicGatewayBase string) string
 	return path.Join(path.Dir(requestRel), reference)
 }
 
-func rewriteResponseLocation(value, requestRel string, session *Session, gatewayToken, publicGatewayBase, gatewayServerID string) string {
+func rewriteResponseLocation(value, requestRel string, session *Session, upstream upstreamRequestSnapshot, gatewayToken, publicGatewayBase, gatewayServerID string) string {
 	if hasURLControls(value) {
 		return ""
 	}
@@ -346,7 +346,7 @@ func rewriteResponseLocation(value, requestRel string, session *Session, gateway
 		return ""
 	}
 	if u.Host != "" && !u.IsAbs() {
-		return safeOutput(value, session.BackendToken)
+		return safeOutput(value, upstream.token)
 	}
 	if !u.IsAbs() {
 		resolved := resolveRelativePath(u.EscapedPath(), requestRel, publicGatewayBase)
@@ -356,25 +356,25 @@ func rewriteResponseLocation(value, requestRel string, session *Session, gateway
 		if resolved == "" {
 			return ""
 		}
-		query, ok := rewriteOwnedQuery(u.RawQuery, session, gatewayToken, gatewayServerID, isResourceRedirectPath(resolved))
+		query, ok := rewriteOwnedQuery(u.RawQuery, session, upstream, gatewayToken, gatewayServerID, isResourceRedirectPath(resolved))
 		if !ok {
 			return ""
 		}
 		u.RawQuery = query
-		return safeOutput(strings.TrimRight(publicGatewayBase, "/")+resolved+queryAndFragment(u), session.BackendToken)
+		return safeOutput(strings.TrimRight(publicGatewayBase, "/")+resolved+queryAndFragment(u), upstream.token)
 	}
-	if _, media := qualifyingMediaPath(u, session, publicGatewayBase); media {
-		return rewriteMediaReference(value, session, gatewayToken, publicGatewayBase, gatewayServerID, true)
+	if _, media := qualifyingMediaPath(u, upstream, publicGatewayBase); media {
+		return rewriteMediaReference(value, session, upstream, gatewayToken, publicGatewayBase, gatewayServerID, true)
 	}
-	if pathValue, ok := configuredOriginSuffix(u, session); ok {
-		query, ok := rewriteOwnedQuery(u.RawQuery, session, gatewayToken, gatewayServerID, isResourceRedirectPath(pathValue))
+	if pathValue, ok := configuredOriginSuffix(u, upstream); ok {
+		query, ok := rewriteOwnedQuery(u.RawQuery, session, upstream, gatewayToken, gatewayServerID, isResourceRedirectPath(pathValue))
 		if !ok {
 			return ""
 		}
 		u.RawQuery = query
-		return safeOutput(strings.TrimRight(publicGatewayBase, "/")+pathValue+queryAndFragment(u), session.BackendToken)
+		return safeOutput(strings.TrimRight(publicGatewayBase, "/")+pathValue+queryAndFragment(u), upstream.token)
 	}
-	return safeOutput(value, session.BackendToken)
+	return safeOutput(value, upstream.token)
 }
 
 func hasURLControls(value string) bool { return strings.ContainsAny(value, "\r\n") }
