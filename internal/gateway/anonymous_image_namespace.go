@@ -135,4 +135,3 @@ func (s *Server) AnonymousImageNamespaceFingerprintChanged(ctx context.Context) 
 	s.anonymousImages.mu.RUnlock()
 	return err != nil || key != snapshot.key
 }
-func anonymousImageNamespaceFingerprint(_ []EmbyServer) string { return "" }

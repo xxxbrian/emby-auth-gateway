@@ -807,27 +807,6 @@ func TestAuditAndPlaybackEventAreWritable(t *testing.T) {
 	}
 }
 
-func TestBackendAccountUsesPlainCredentialsAndClientIdentity(t *testing.T) {
-	app := newTestApp(t)
-	store := New(app)
-	accountID := createBackendAccount(t, app)
-
-	account, err := store.FindBackendAccountByID(context.Background(), accountID)
-	if err != nil {
-		t.Fatalf("default backend: %v", err)
-	}
-	if account.ID != accountID || account.Password != "backend-pass" {
-		t.Fatalf("unexpected backend account credentials: %#v", account)
-	}
-	if account.ClientIdentity.UserAgent != "Custom/1.0" || account.ClientIdentity.Client != "Custom" || account.ClientIdentity.Device != "Desktop" || account.ClientIdentity.DeviceID != "device-1" || account.ClientIdentity.Version != "1.0" {
-		t.Fatalf("unexpected backend identity: %#v", account.ClientIdentity)
-	}
-	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
-	if err := store.UpdateBackendToken(context.Background(), accountID, "backend-token", "backend-user", now); err != nil {
-		t.Fatalf("update backend token: %v", err)
-	}
-}
-
 func TestSessionPersistsGatewayOnlyFieldsAndRevokes(t *testing.T) {
 	app := newTestApp(t)
 	store := New(app)
@@ -878,49 +857,6 @@ func TestSessionPersistsGatewayOnlyFieldsAndRevokes(t *testing.T) {
 	revoked, err := store.FindSessionByTokenHash(context.Background(), "hash")
 	if err != nil || revoked.RevokedAt == nil || !revoked.RevokedAt.After(now) {
 		t.Fatalf("revoked session = %#v, %v", revoked, err)
-	}
-}
-
-func TestBackendServerIdentityFieldsAreOptionalAndDefaulted(t *testing.T) {
-	app := newTestApp(t)
-	store := New(app)
-
-	servers, err := app.FindCollectionByNameOrId("emby_servers")
-	if err != nil {
-		t.Fatalf("find emby_servers: %v", err)
-	}
-	server := core.NewRecord(servers)
-	server.Set("name", "server")
-	server.Set("base_url", "https://emby.example.com")
-	server.Set("enabled", true)
-	if err := app.Save(server); err != nil {
-		t.Fatalf("save server with empty identity fields: %v", err)
-	}
-
-	accounts, err := app.FindCollectionByNameOrId("backend_accounts")
-	if err != nil {
-		t.Fatalf("find backend_accounts: %v", err)
-	}
-	accountRecord := core.NewRecord(accounts)
-	accountRecord.Set("server", server.Id)
-	accountRecord.Set("name", "backend")
-	accountRecord.Set("backend_username", "real-alice")
-	accountRecord.Set("backend_password", "backend-pass")
-	accountRecord.Set("enabled", true)
-	if err := app.Save(accountRecord); err != nil {
-		t.Fatalf("save backend account: %v", err)
-	}
-
-	account, err := store.FindBackendAccountByID(context.Background(), accountRecord.Id)
-	if err != nil {
-		t.Fatalf("default backend: %v", err)
-	}
-	defaults := gateway.DefaultBackendClientIdentity()
-	if account.ClientIdentity.UserAgent != defaults.UserAgent || account.ClientIdentity.Client != defaults.Client || account.ClientIdentity.Device != defaults.Device || account.ClientIdentity.Version != defaults.Version {
-		t.Fatalf("backend identity defaults not applied: %#v", account.ClientIdentity)
-	}
-	if account.ClientIdentity.DeviceID != gateway.StableBackendDeviceID(server.Id) {
-		t.Fatalf("backend identity device id = %q, want stable default", account.ClientIdentity.DeviceID)
 	}
 }
 
@@ -979,71 +915,6 @@ func newTestApp(t *testing.T) core.App {
 	}
 	t.Cleanup(app.Cleanup)
 	return app
-}
-
-func TestUpdateServerInfoPreservesExistingValuesWhenInputsAreEmpty(t *testing.T) {
-	app := newTestApp(t)
-	store := New(app)
-	servers, err := app.FindCollectionByNameOrId("emby_servers")
-	if err != nil {
-		t.Fatalf("find emby_servers: %v", err)
-	}
-	server := core.NewRecord(servers)
-	server.Set("name", "server")
-	server.Set("base_url", "https://emby.example.com")
-	server.Set("server_id", "real-server")
-	server.Set("server_name", "Real Emby")
-	server.Set("server_version", "4.9.5.0")
-	server.Set("enabled", true)
-	if err := app.Save(server); err != nil {
-		t.Fatalf("save server: %v", err)
-	}
-
-	if err := store.UpdateServerInfo(context.Background(), server.Id, "", "", "", time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)); err != nil {
-		t.Fatalf("update server info: %v", err)
-	}
-	updated, err := app.FindRecordById("emby_servers", server.Id)
-	if err != nil {
-		t.Fatalf("find updated server: %v", err)
-	}
-	if updated.GetString("server_id") != "real-server" || updated.GetString("server_name") != "Real Emby" || updated.GetString("server_version") != "4.9.5.0" {
-		t.Fatalf("server info was cleared by empty update: %#v", updated)
-	}
-}
-
-func createBackendAccount(t *testing.T, app core.App) string {
-	t.Helper()
-	servers, err := app.FindCollectionByNameOrId("emby_servers")
-	if err != nil {
-		t.Fatalf("find emby_servers: %v", err)
-	}
-	server := core.NewRecord(servers)
-	server.Set("name", "server")
-	server.Set("base_url", "https://emby.example.com")
-	server.Set("backend_user_agent", "Custom/1.0")
-	server.Set("backend_authorization_client", "Custom")
-	server.Set("backend_authorization_device", "Desktop")
-	server.Set("backend_authorization_device_id", "device-1")
-	server.Set("backend_authorization_version", "1.0")
-	server.Set("enabled", true)
-	if err := app.Save(server); err != nil {
-		t.Fatalf("save server: %v", err)
-	}
-
-	accounts, err := app.FindCollectionByNameOrId("backend_accounts")
-	if err != nil {
-		t.Fatalf("find backend_accounts: %v", err)
-	}
-	account := core.NewRecord(accounts)
-	account.Set("server", server.Id)
-	account.Set("name", "backend")
-	account.Set("backend_username", "real-alice")
-	account.Set("backend_password", "backend-pass")
-	account.Set("enabled", true)
-	if err := app.Save(account); err != nil {
-		t.Fatalf("save account: %v", err)
-	}
-	return account.Id
 }
 
 func createGatewayUser(t *testing.T, app core.App, username, syntheticUserID string) string {

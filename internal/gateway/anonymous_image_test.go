@@ -117,7 +117,7 @@ func TestAnonymousItemImagePrecedenceAndAvailability(t *testing.T) {
 		t.Fatalf("credentialed requests reached anonymous upstream: %d", calls)
 	}
 
-	unavailable := NewServer(Config{}, anonymousImageTestStore(anonymousImageTestServer("one", backend.URL+"/emby", namespace)))
+	unavailable := NewServer(Config{}, anonymousImageTestStore(backend.URL+"/emby", namespace))
 	unavailableGW := httptest.NewServer(unavailable)
 	defer unavailableGW.Close()
 	resp := do(t, mustRequest(t, http.MethodGet, unavailableGW.URL+"/emby/Items/item/Images/Primary", nil))
@@ -400,7 +400,8 @@ func TestAnonymousItemImageUsesOnlySelectedIngress(t *testing.T) {
 	}))
 	defer selected.Close()
 	defer other.Close()
-	store := anonymousImageTestStore(anonymousImageTestServer("one", selected.URL+"/emby", namespace), anonymousImageTestServer("two", other.URL+"/emby", namespace))
+	store := anonymousImageTestStore(selected.URL+"/emby", namespace)
+	store.UpstreamEndpoints["inactive"] = UpstreamEndpoint{ID: "inactive", SourceID: "source", Key: "secondary", BaseURL: other.URL + "/emby", Active: false}
 	server := NewServer(Config{}, store)
 	if err := server.ValidateAnonymousImageNamespace(context.Background()); err != nil {
 		t.Fatal(err)
@@ -436,7 +437,7 @@ func TestAnonymousItemImageHTTPNamespaceMutationAndRecovery(t *testing.T) {
 		_, _ = w.Write(anonymousGIF())
 	}))
 	defer backend.Close()
-	store := anonymousImageTestStore(anonymousImageTestServer("one", backend.URL+"/emby", namespace))
+	store := anonymousImageTestStore(backend.URL+"/emby", namespace)
 	server := NewServer(Config{}, store)
 	if err := server.ValidateAnonymousImageNamespace(context.Background()); err != nil {
 		t.Fatal(err)
@@ -506,7 +507,7 @@ func TestAnonymousFullImageValidationAcceptsStdlibGIFAndMinimalWebP(t *testing.T
 
 func anonymousImageGateway(t *testing.T, baseURL, namespace string) *Server {
 	t.Helper()
-	store := anonymousImageTestStore(anonymousImageTestServer("one", baseURL, namespace))
+	store := anonymousImageTestStore(baseURL, namespace)
 	server := NewServer(Config{}, store)
 	if err := server.ValidateAnonymousImageNamespace(context.Background()); err != nil {
 		t.Fatal(err)

@@ -30,12 +30,6 @@ type Store interface {
 	FindGatewayUserByUsername(ctx context.Context, username string) (*GatewayUser, error)
 	ListPublicUsers(ctx context.Context) ([]GatewayUser, error)
 	FindUserBySyntheticID(ctx context.Context, syntheticID string) (*GatewayUser, error)
-	FindMappingByGatewayUserID(ctx context.Context, gatewayUserID string) (*UserMapping, error)
-	FindBackendAccountByID(ctx context.Context, backendAccountID string) (*BackendAccount, error)
-	ListEnabledServers(ctx context.Context) ([]EmbyServer, error)
-	UpdateBackendToken(ctx context.Context, accountID, token, backendUserID string, updatedAt time.Time) error
-	RecordBackendLoginError(ctx context.Context, accountID, message string) error
-	UpdateServerInfo(ctx context.Context, serverRecordID, serverID, serverName, serverVersion string, checkedAt time.Time) error
 	RecordAudit(ctx context.Context, entry AuditLog) error
 	CheckPathPolicy(ctx context.Context, method, relativePath string) (PathPolicyDecision, error)
 	RecordPlaybackEvent(ctx context.Context, event PlaybackEvent) error
@@ -380,34 +374,6 @@ type GatewayUser struct {
 	Enabled         bool
 }
 
-type BackendAccount struct {
-	ID             string
-	ServerID       string
-	BaseURL        string
-	Username       string
-	Password       string
-	Enabled        bool
-	BackendUserID  string
-	BackendToken   string
-	TokenUpdatedAt *time.Time
-	LastLoginAt    *time.Time
-	LastLoginError string
-	Server         EmbyServer
-	ClientIdentity BackendClientIdentity
-}
-
-type EmbyServer struct {
-	ID               string
-	Name             string
-	BaseURL          string
-	BackendServerID  string
-	ServerName       string
-	ServerVersion    string
-	VersionCheckedAt *time.Time
-	Enabled          bool
-	ClientIdentity   BackendClientIdentity
-}
-
 type BackendClientIdentity struct {
 	UserAgent string
 	Client    string
@@ -453,14 +419,6 @@ func StableBackendDeviceID(seed string) string {
 		uint16(sum[8])<<8|uint16(sum[9]),
 		uint64(sum[10])<<40|uint64(sum[11])<<32|uint64(sum[12])<<24|uint64(sum[13])<<16|uint64(sum[14])<<8|uint64(sum[15]),
 	)
-}
-
-type UserMapping struct {
-	ID               string
-	GatewayUserID    string
-	BackendAccountID string
-	BackendAccount   BackendAccount
-	Enabled          bool
 }
 
 type Session struct {

@@ -1173,37 +1173,6 @@ func TestAuthenticateByNameAcceptsJSONPasswordField(t *testing.T) {
 	}
 }
 
-func TestLoginIgnoresLegacyMappingStatus(t *testing.T) {
-	for _, name := range []string{"missing", "disabled", "corrupt"} {
-		t.Run(name, func(t *testing.T) {
-			store := testStore("http://127.0.0.1/emby")
-			switch name {
-			case "missing":
-				store.Mappings = map[string]UserMapping{}
-			case "disabled":
-				store.Mappings["u1"] = UserMapping{Enabled: false}
-			case "corrupt":
-				store.Mappings["u1"] = UserMapping{ID: "legacy", GatewayUserID: "u1", Enabled: true, BackendAccount: BackendAccount{Enabled: false}}
-			}
-			gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
-			defer gw.Close()
-
-			resp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice","Pw":"alice-pass"}`))
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				t.Fatalf("login status = %d, want 200", resp.StatusCode)
-			}
-			var result map[string]any
-			decodeJSON(t, resp.Body, &result)
-			token, _ := result["AccessToken"].(string)
-			session := store.Sessions[HashToken(token)]
-			if token == "" || session == nil || session.GatewayUserID != "u1" {
-				t.Fatalf("expected gateway-only session, got %#v", session)
-			}
-		})
-	}
-}
-
 func TestSuccessfulLoginClearsFailureCount(t *testing.T) {
 	backend := testAuthBackend(t)
 	defer backend.Close()
@@ -1305,7 +1274,6 @@ func TestAuditLogsForAuthAndLogout(t *testing.T) {
 func TestAuditLogsForAuthDependencyFailures(t *testing.T) {
 	t.Run("missing mapping does not affect gateway login", func(t *testing.T) {
 		store := testStore("http://127.0.0.1/emby")
-		store.Mappings = map[string]UserMapping{}
 		gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 		defer gw.Close()
 
@@ -3799,56 +3767,6 @@ func (c *countingSessionStore) existsHashesLocked() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]string(nil), c.existsHashes...)
-}
-
-func TestProxyDoesNotUseLegacyStoreMethods(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/emby/Items/item-1" {
-			t.Fatalf("unexpected backend path %q", r.URL.Path)
-		}
-		writeTestJSON(w, map[string]any{"Id": "item-1", "Type": "Movie"})
-	}))
-	defer backend.Close()
-
-	base := testStore(backend.URL + "/emby")
-	store := &panicLegacyStore{MemoryStore: base}
-	store.Sessions[HashToken("gateway-token")] = testSession()
-	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
-	defer gw.Close()
-
-	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Items/item-1?api_key=gateway-token", nil))
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("proxy status = %d, want 200", resp.StatusCode)
-	}
-}
-
-type panicLegacyStore struct {
-	*MemoryStore
-}
-
-func (*panicLegacyStore) FindMappingByGatewayUserID(context.Context, string) (*UserMapping, error) {
-	panic("legacy mapping store method called")
-}
-
-func (*panicLegacyStore) FindBackendAccountByID(context.Context, string) (*BackendAccount, error) {
-	panic("legacy backend account store method called")
-}
-
-func (*panicLegacyStore) ListEnabledServers(context.Context) ([]EmbyServer, error) {
-	panic("legacy server store method called")
-}
-
-func (*panicLegacyStore) UpdateBackendToken(context.Context, string, string, string, time.Time) error {
-	panic("legacy backend token store method called")
-}
-
-func (*panicLegacyStore) RecordBackendLoginError(context.Context, string, string) error {
-	panic("legacy backend login store method called")
-}
-
-func (*panicLegacyStore) UpdateServerInfo(context.Context, string, string, string, string, time.Time) error {
-	panic("legacy server info store method called")
 }
 
 type countingOpsStore struct {

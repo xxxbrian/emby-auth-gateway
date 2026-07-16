@@ -10,7 +10,6 @@ import (
 type MemoryStore struct {
 	mu                 sync.RWMutex
 	Users              map[string]MemoryUser
-	Mappings           map[string]UserMapping
 	Sessions           map[string]*Session
 	AuditLogs          []AuditLog
 	PathPolicies       []PathPolicy
@@ -30,7 +29,6 @@ type MemoryUser struct {
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
 		Users:              map[string]MemoryUser{},
-		Mappings:           map[string]UserMapping{},
 		Sessions:           map[string]*Session{},
 		PlaybackStates:     map[string]*PlaybackState{},
 		ItemChildCounts:    map[string]ItemChildCount{},
@@ -227,118 +225,6 @@ func (m *MemoryStore) FindUserBySyntheticID(ctx context.Context, syntheticID str
 		}
 	}
 	return nil, ErrNotFound
-}
-
-func (m *MemoryStore) FindMappingByGatewayUserID(ctx context.Context, gatewayUserID string) (*UserMapping, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if mapping, ok := m.Mappings[gatewayUserID]; ok {
-		return &mapping, nil
-	}
-	return nil, ErrNotFound
-}
-
-func (m *MemoryStore) FindBackendAccountByID(ctx context.Context, backendAccountID string) (*BackendAccount, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	for _, mapping := range m.Mappings {
-		if mapping.BackendAccount.ID == backendAccountID {
-			account := mapping.BackendAccount
-			return &account, nil
-		}
-	}
-	return nil, ErrNotFound
-}
-
-func (m *MemoryStore) ListEnabledServers(ctx context.Context) ([]EmbyServer, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	seen := map[string]bool{}
-	servers := []EmbyServer{}
-	for _, mapping := range m.Mappings {
-		server := mapping.BackendAccount.Server
-		if server.ID == "" {
-			server = EmbyServer{ID: mapping.BackendAccount.ServerID, BaseURL: mapping.BackendAccount.BaseURL, Enabled: mapping.BackendAccount.Enabled, ClientIdentity: mapping.BackendAccount.ClientIdentity}
-		}
-		if !server.Enabled || seen[server.ID] {
-			continue
-		}
-		seen[server.ID] = true
-		servers = append(servers, server)
-	}
-	return servers, nil
-}
-
-func (m *MemoryStore) UpdateBackendToken(ctx context.Context, accountID, token, backendUserID string, updatedAt time.Time) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	updated := false
-	for key, mapping := range m.Mappings {
-		if mapping.BackendAccount.ID != accountID {
-			continue
-		}
-		mapping.BackendAccount.BackendToken = token
-		mapping.BackendAccount.BackendUserID = backendUserID
-		t := updatedAt.UTC()
-		mapping.BackendAccount.TokenUpdatedAt = &t
-		mapping.BackendAccount.LastLoginAt = &t
-		mapping.BackendAccount.LastLoginError = ""
-		m.Mappings[key] = mapping
-		updated = true
-	}
-	if !updated {
-		return ErrNotFound
-	}
-	return nil
-}
-
-func (m *MemoryStore) RecordBackendLoginError(ctx context.Context, accountID, message string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	updated := false
-	for key, mapping := range m.Mappings {
-		if mapping.BackendAccount.ID != accountID {
-			continue
-		}
-		mapping.BackendAccount.LastLoginError = message
-		m.Mappings[key] = mapping
-		updated = true
-	}
-	if !updated {
-		return ErrNotFound
-	}
-	return nil
-}
-
-func (m *MemoryStore) UpdateServerInfo(ctx context.Context, serverRecordID, serverID, serverName, serverVersion string, checkedAt time.Time) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	updated := false
-	for key, mapping := range m.Mappings {
-		server := mapping.BackendAccount.Server
-		if server.ID != serverRecordID && mapping.BackendAccount.ServerID != serverRecordID {
-			continue
-		}
-		server.ID = serverRecordID
-		if strings.TrimSpace(serverID) != "" {
-			server.BackendServerID = serverID
-		}
-		if strings.TrimSpace(serverName) != "" {
-			server.ServerName = serverName
-		}
-		if strings.TrimSpace(serverVersion) != "" {
-			server.ServerVersion = serverVersion
-		}
-		t := checkedAt.UTC()
-		server.VersionCheckedAt = &t
-		mapping.BackendAccount.Server = server
-		m.Mappings[key] = mapping
-		updated = true
-	}
-	if !updated {
-		return ErrNotFound
-	}
-	return nil
 }
 
 func (m *MemoryStore) RecordAudit(ctx context.Context, entry AuditLog) error {

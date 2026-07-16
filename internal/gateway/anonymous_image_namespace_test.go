@@ -29,7 +29,7 @@ func TestRefreshUpstreamServerInfoInvalidatesAnonymousImageNamespace(t *testing.
 		_, _ = w.Write(anonymousGIF())
 	}))
 	defer backend.Close()
-	s := NewServer(Config{}, anonymousImageTestStore(anonymousImageTestServer("one", backend.URL+"/emby", serverID)))
+	s := NewServer(Config{}, anonymousImageTestStore(backend.URL+"/emby", serverID))
 	if err := s.ValidateAnonymousImageNamespace(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestAnonymousImageNamespaceUsesOnlyActiveEndpoint(t *testing.T) {
 		writeTestJSON(w, map[string]any{"Id": serverID})
 	}))
 	defer active.Close()
-	store := anonymousImageTestStore(anonymousImageTestServer("one", active.URL+"/emby", serverID))
+	store := anonymousImageTestStore(active.URL+"/emby", serverID)
 	store.UpstreamEndpoints["inactive"] = UpstreamEndpoint{ID: "inactive", SourceID: "source", Key: "secondary", BaseURL: inactive.URL + "/emby"}
 	s := NewServer(Config{}, store)
 	if err := s.ValidateAnonymousImageNamespace(context.Background()); err != nil {
@@ -100,7 +100,7 @@ func TestAnonymousImageNamespaceClassifiesFailuresAndTTL(t *testing.T) {
 		writeTestJSON(w, map[string]any{"Id": serverID})
 	}))
 	defer backend.Close()
-	s := NewServer(Config{}, anonymousImageTestStore(anonymousImageTestServer("one", backend.URL+"/emby", serverID)))
+	s := NewServer(Config{}, anonymousImageTestStore(backend.URL+"/emby", serverID))
 	now := time.Now().UTC()
 	s.anonymousImageNow = func() time.Time { return now }
 	if err := s.ValidateAnonymousImageNamespace(context.Background()); err != nil {
@@ -125,7 +125,7 @@ func TestAnonymousImageNamespaceRejectsMismatchAndDrift(t *testing.T) {
 		writeTestJSON(w, map[string]any{"Id": serverID})
 	}))
 	defer backend.Close()
-	store := anonymousImageTestStore(anonymousImageTestServer("one", backend.URL+"/emby", serverID))
+	store := anonymousImageTestStore(backend.URL+"/emby", serverID)
 	s := NewServer(Config{}, store)
 	done := make(chan error, 1)
 	go func() { done <- s.ValidateAnonymousImageNamespace(context.Background()) }()
@@ -143,17 +143,10 @@ func TestAnonymousImageNamespaceRejectsMismatchAndDrift(t *testing.T) {
 	}
 }
 
-func anonymousImageTestServer(id, baseURL, backendServerID string) EmbyServer {
-	return EmbyServer{ID: id, BaseURL: baseURL, BackendServerID: backendServerID, Enabled: true, ClientIdentity: BackendClientIdentity{DeviceID: "device"}}
-}
-func anonymousImageTestStore(servers ...EmbyServer) *MemoryStore {
+func anonymousImageTestStore(baseURL, backendServerID string) *MemoryStore {
 	store := NewMemoryStore()
-	if len(servers) == 0 {
-		return store
-	}
-	server := servers[0]
-	identity := server.ClientIdentity.WithDefaults()
-	store.UpstreamSources["source"] = UpstreamSource{ID: "source", Key: "default", ServerID: server.BackendServerID, BackendUsername: "backend", BackendPassword: "password", ClientIdentity: identity}
-	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: "source", Key: "primary", BaseURL: server.BaseURL, Active: true}
+	identity := BackendClientIdentity{DeviceID: "device"}.WithDefaults()
+	store.UpstreamSources["source"] = UpstreamSource{ID: "source", Key: "default", ServerID: backendServerID, BackendUsername: "backend", BackendPassword: "password", ClientIdentity: identity}
+	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: "source", Key: "primary", BaseURL: baseURL, Active: true}
 	return store
 }
