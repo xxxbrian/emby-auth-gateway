@@ -213,7 +213,7 @@ logs case-insensitively.
 Release Docker images are published to GitHub Container Registry:
 
 ```sh
-docker pull ghcr.io/xxxbrian/emby-auth-gateway:0.7.0
+docker pull ghcr.io/xxxbrian/emby-auth-gateway:0.8.0
 docker pull ghcr.io/xxxbrian/emby-auth-gateway:latest
 ```
 

@@ -86,6 +86,27 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Pack script fixture
+        run: |
+          set -euo pipefail
+          chmod +x tools/emby-web-static/pack.sh
+          ROOT="$RUNNER_TEMP/web-fixture"
+          OUT="$RUNNER_TEMP/web-pack"
+          mkdir -p "$ROOT/strings" "$OUT"
+          printf '%s\n' '<!doctype html>' >"$ROOT/index.html"
+          printf '%s\n' '{}' >"$ROOT/manifest.json"
+          printf '%s\n' '{}' >"$ROOT/strings/en-US.json"
+          tools/emby-web-static/pack.sh --version 0.0.0 --date 20260101 --src "$ROOT" --out "$OUT"
+          test -f "$OUT/emby-web-static-0.0.0-20260101.tar.gz"
+          test -s "$OUT/SHA256SUMS"
+          # Symlink must be refused
+          ln -s /etc/hosts "$ROOT/evil-link"
+          if tools/emby-web-static/pack.sh --version 0.0.0 --date 20260102 --src "$ROOT" --out "$OUT-bad"; then
+            echo "pack should reject symlink" >&2
+            exit 1
+          fi
+          echo "ok: pack fixture"
+
   docker:
     name: Docker Build
     runs-on: ubuntu-latest

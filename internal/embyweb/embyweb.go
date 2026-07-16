@@ -79,9 +79,9 @@ var canaryRelativePaths = []string{
 }
 
 const (
-	webPrefix      = "/emby/web"
-	webPrefixSlash = "/emby/web/"
-	requiredBase   = "/emby"
+	webPrefix       = "/emby/web"
+	webPrefixSlash  = "/emby/web/"
+	requiredBase    = "/emby"
 	allowedCORSOrig = "https://app.emby.media"
 
 	cacheRevalidate = "revalidate"

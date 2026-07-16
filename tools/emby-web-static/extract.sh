@@ -105,6 +105,14 @@ PULL_ARGS+=("$REF")
 echo "pulling $REF${PLATFORM:+ (platform $PLATFORM)}"
 docker "${PULL_ARGS[@]}"
 
+# Record the resolved image identity for release provenance (mutable tags).
+IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$REF")"
+IMAGE_DIGEST="$(docker image inspect --format '{{index .RepoDigests 0}}' "$REF" 2>/dev/null || true)"
+if [[ -z "$IMAGE_DIGEST" || "$IMAGE_DIGEST" == "<no value>" ]]; then
+  IMAGE_DIGEST="$IMAGE_ID"
+fi
+echo "resolved image: $IMAGE_DIGEST"
+
 mkdir -p "$OUT_DIR"
 if [[ -n "$(ls -A "$OUT_DIR" 2>/dev/null || true)" ]]; then
   echo "out dir is not empty: $OUT_DIR" >&2
@@ -244,3 +252,5 @@ fi
 COUNT="$(find "$OUT_DIR" -type f | wc -l | tr -d ' ')"
 echo "extracted $COUNT files to $OUT_DIR"
 printf '%s\n' "$VERSION" >"$OUT_DIR/VERSION"
+printf '%s\n' "$REF" >"$OUT_DIR/SOURCE_IMAGE"
+printf '%s\n' "$IMAGE_DIGEST" >"$OUT_DIR/SOURCE_DIGEST"

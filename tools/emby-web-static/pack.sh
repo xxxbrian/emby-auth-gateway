@@ -97,6 +97,18 @@ if [[ -e "$ARCHIVE" ]]; then
   exit 1
 fi
 
+# Defense at the archive boundary: refuse non-regular nodes (symlink/fifo/etc).
+if find "$SRC" \( -type l -o -type p -o -type s -o -type b -o -type c \) | grep -q .; then
+  echo "src contains non-regular nodes (symlink/fifo/socket/device); refusing" >&2
+  find "$SRC" \( -type l -o -type p -o -type s -o -type b -o -type c \) >&2
+  exit 1
+fi
+if find "$SRC" ! -type d ! -type f | grep -q .; then
+  echo "src contains unexpected non-file/non-dir nodes; refusing" >&2
+  find "$SRC" ! -type d ! -type f >&2
+  exit 1
+fi
+
 # Portable tar: store files relative to SRC so extract is a flat web root.
 tar -czf "$ARCHIVE" -C "$SRC" .
 

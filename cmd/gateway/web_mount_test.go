@@ -777,5 +777,3 @@ func syntheticReadyWebHandler() http.Handler {
 		_, _ = w.Write([]byte(body))
 	})
 }
-
-

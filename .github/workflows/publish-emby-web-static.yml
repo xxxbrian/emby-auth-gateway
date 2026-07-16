@@ -101,15 +101,24 @@ jobs:
           PLATFORM: ${{ inputs.platform }}
         run: |
           set -euo pipefail
+          DIGEST=""
+          if [[ -f "$RUNNER_TEMP/web-root/SOURCE_DIGEST" ]]; then
+            DIGEST="$(tr -d '\n' <"$RUNNER_TEMP/web-root/SOURCE_DIGEST")"
+          fi
           NOTES="Emby Web static assets extracted from \`emby/embyserver:${EMBY_VERSION}\`"
           if [[ -n "$PLATFORM" ]]; then
             NOTES="${NOTES} (platform ${PLATFORM})"
           fi
+          if [[ -n "$DIGEST" ]]; then
+            NOTES="${NOTES}"$'\n'"Resolved image: \`${DIGEST}\`"
+          fi
           NOTES="${NOTES}."$'\n\n'"Unpack onto a host path and set \`GATEWAY_WEB_ASSETS_DIR\` to that directory."
-          # Explicitly keep this release off the floating "latest" label.
+          # Pin the auto-created tag to this workflow's checked-out commit, not a
+          # later main tip. Keep this release off the floating "latest" label.
           gh release create "$TAG" \
             --title "$NAME" \
             --notes "$NOTES" \
+            --target "${{ github.sha }}" \
             --latest=false \
             "$RUNNER_TEMP/dist/${NAME}.tar.gz" \
             "$RUNNER_TEMP/dist/SHA256SUMS"
