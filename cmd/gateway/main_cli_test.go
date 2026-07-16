@@ -42,6 +42,7 @@ func TestSelectsDirectExecution(t *testing.T) {
 		{name: "setup_user_missing_flag_value", args: []string{"setup", "user", "--gateway-username"}, want: true},
 		{name: "setup_user_unknown_short_flag", args: []string{"setup", "user", "-x"}, want: true},
 		{name: "setup_upstream_unknown_subcommand", args: []string{"setup", "upstream", "unknown"}, want: true},
+		{name: "setup_upstream_retired_subcommand", args: []string{"setup", "upstream", "import-legacy"}, want: true},
 		{name: "setup_upstream_bare", args: []string{"setup", "upstream"}, want: true},
 		{name: "web_unknown_subcommand", args: []string{"web", "unknown"}, want: true},
 		{name: "web_unknown_flag", args: []string{"web", "init", "--unknown"}, want: true},
@@ -74,6 +75,7 @@ func TestMalformedDirectCLIExitStatus(t *testing.T) {
 		{name: "setup_user_missing_flag_value", args: []string{"setup", "user", "--gateway-username"}},
 		{name: "setup_user_unknown_short_flag", args: []string{"setup", "user", "-x"}},
 		{name: "setup_upstream_unknown_subcommand", args: []string{"setup", "upstream", "unknown"}},
+		{name: "setup_upstream_retired_subcommand", args: []string{"setup", "upstream", "import-legacy"}},
 		{name: "web_unknown_subcommand", args: []string{"web", "unknown"}},
 		{name: "web_unknown_flag", args: []string{"web", "init", "--unknown"}},
 		{name: "web_missing_flag_value", args: []string{"web", "init", "--catalog-id"}},
@@ -87,26 +89,13 @@ func TestMalformedDirectCLIExitStatus(t *testing.T) {
 	}
 }
 
-func TestRetiredRootSetupInvocationDoesNotMutate(t *testing.T) {
+func TestRetiredSetupInvocationDoesNotBootstrapOrMutate(t *testing.T) {
 	dataDir := filepath.Join(t.TempDir(), "data")
-	args := []string{
-		"--dir", dataDir,
-		"setup",
-		"--gateway-username", "legacy-user",
-		"--gateway-password", "test-password",
-		"--synthetic-user-id", "legacy-synthetic-id",
-		"--emby-server-name", "legacy-server",
-		"--emby-url", "https://emby.example.test",
-		"--backend-account-name", "legacy-account",
-		"--backend-username", "backend-user",
-		"--backend-password", "backend-password",
-		"--backend-user-agent", "Legacy/1.0",
-		"--backend-authorization-client", "Legacy",
-		"--backend-authorization-device", "Desktop",
-		"--backend-authorization-version", "1.0",
-	}
+	args := []string{"--dir", dataDir, "setup", "upstream", "import-legacy"}
 	assertGatewayCLIExitCode(t, 1, args...)
-	assertNoLegacySetupWrites(t, dataDir)
+	if _, err := os.Stat(dataDir); !os.IsNotExist(err) {
+		t.Fatalf("retired invocation bootstrapped data dir: %v", err)
+	}
 }
 
 func TestSetupBareShowsHelpWithoutBootstrap(t *testing.T) {
@@ -213,27 +202,5 @@ func assertGatewayUserInDataDir(t *testing.T, dataDir, username string, want boo
 	}
 	if !want && err == nil {
 		t.Fatalf("gateway user %q unexpectedly found in %s", username, dataDir)
-	}
-}
-
-func assertNoLegacySetupWrites(t *testing.T, dataDir string) {
-	t.Helper()
-	app := pocketbase.NewWithConfig(pocketbase.Config{DefaultDataDir: dataDir})
-	if err := app.Bootstrap(); err != nil {
-		t.Fatalf("bootstrap %s: %v", dataDir, err)
-	}
-	defer func() { _ = app.ResetBootstrapState() }()
-
-	for _, collection := range []string{"emby_servers", "backend_accounts", "users", "user_mappings"} {
-		if _, err := app.FindCollectionByNameOrId(collection); err != nil {
-			continue
-		}
-		records, err := app.FindRecordsByFilter(collection, "", "", 0, 0, nil)
-		if err != nil {
-			t.Fatalf("list %s in %s: %v", collection, dataDir, err)
-		}
-		if len(records) != 0 {
-			t.Fatalf("%s has %d records after rejected setup", collection, len(records))
-		}
 	}
 }

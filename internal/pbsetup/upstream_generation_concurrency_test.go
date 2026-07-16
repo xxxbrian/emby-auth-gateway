@@ -1,7 +1,6 @@
 package pbsetup
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"net/http"
@@ -200,99 +199,53 @@ func TestUpstreamGenerationConcurrencySetupUpdate(t *testing.T) {
 	genConcurrentAssertOnlyLoserCleanup(t, upstream, source.GetString("backend_token"))
 }
 
-func TestUpstreamGenerationConcurrencyImportRepair(t *testing.T) {
+func TestUpstreamGenerationConcurrencyEmptyCreate(t *testing.T) {
+	app := newTestApp(t)
 	upstream := genConcurrentNewUpstream(t, false)
-	app, legacyServer, account := laneBLegacy(t, upstream.server.URL)
-	source, _ := laneBSingleton(t, app, legacyServer, account, upstream.server.URL)
-	source.Set("backend_token", "")
-	if err := app.Save(source); err != nil {
-		t.Fatal(err)
-	}
+	opts := upstreamOptions{EmbyBaseURL: upstream.server.URL, BackendUsername: "backend", BackendPassword: "password"}
 	gate := genConcurrentNewGate()
-	previousMarshal := marshalImportSummary
-	marshalImportSummary = func(value any) ([]byte, error) {
-		gate.wait()
-		return previousMarshal(value)
-	}
-	t.Cleanup(func() { marshalImportSummary = previousMarshal })
+	afterUpstreamProbe = gate.wait
+	t.Cleanup(func() { afterUpstreamProbe = nil })
 
-	opts := importLegacyOptions{ServerRecordID: legacyServer.Id, AccountRecordID: account.Id, Apply: true}
-	results := genConcurrentRunPair(func() error {
-		_, err := runUpstreamImportLegacy(context.Background(), app, opts, &bytes.Buffer{})
-		return err
-	})
+	results := genConcurrentRunPair(func() error { return runUpstreamCreate(context.Background(), app, opts) })
 	genConcurrentWait(t, gate)
 	genConcurrentRelease(gate, 2)
 	err1, err2 := <-results, <-results
 	if (err1 == nil) == (err2 == nil) {
-		t.Fatalf("import results = %v, %v; want one winner and one loser", err1, err2)
+		t.Fatalf("empty create results = %v, %v; want one winner and one loser", err1, err2)
 	}
-	source, _ = app.FindFirstRecordByData(upstreamSources, "key", defaultUpstreamKey)
+	if sources, _ := app.CountRecords(upstreamSources); sources != 1 {
+		t.Fatalf("source count=%d, want 1", sources)
+	}
+	if endpoints, _ := app.CountRecords(upstreamEndpoints); endpoints != 1 {
+		t.Fatalf("endpoint count=%d, want 1", endpoints)
+	}
+	source, _ := app.FindFirstRecordByData(upstreamSources, "key", defaultUpstreamKey)
 	genConcurrentAssertWinner(t, app, upstream, source.GetString("backend_token"))
 	genConcurrentAssertOnlyLoserCleanup(t, upstream, source.GetString("backend_token"))
 }
 
 func TestUpstreamGenerationConcurrencyReturnedTokenCollision(t *testing.T) {
-	t.Run("setup", func(t *testing.T) {
-		app := newTestApp(t)
-		upstream := genConcurrentNewUpstream(t, true)
-		opts := genConcurrentSetupState(t, app, upstream.server.URL)
-		gate := genConcurrentNewGate()
-		afterUpstreamProbe = gate.wait
-		t.Cleanup(func() { afterUpstreamProbe = nil })
+	app := newTestApp(t)
+	upstream := genConcurrentNewUpstream(t, true)
+	opts := genConcurrentSetupState(t, app, upstream.server.URL)
+	gate := genConcurrentNewGate()
+	afterUpstreamProbe = gate.wait
+	t.Cleanup(func() { afterUpstreamProbe = nil })
 
-		results := genConcurrentRunPair(func() error { return runUpstreamCreate(context.Background(), app, opts) })
-		genConcurrentWait(t, gate)
-		genConcurrentRelease(gate, 1)
-		winner := <-results
-		if winner != nil {
-			t.Fatalf("first setup operation failed: %v", winner)
-		}
-		genConcurrentRelease(gate, 1)
-		if err := <-results; !isTokenOwnershipError(err) {
-			t.Fatalf("setup loser error = %v, want typed do-not-cleanup ownership error", err)
-		}
-		genConcurrentAssertWinner(t, app, upstream, "collision-token")
-		_, _, logouts := upstream.snapshot()
-		if len(logouts) != 0 {
-			t.Fatalf("collision setup logged out durable winner token: %#v", logouts)
-		}
-	})
-
-	t.Run("import", func(t *testing.T) {
-		upstream := genConcurrentNewUpstream(t, true)
-		app, legacyServer, account := laneBLegacy(t, upstream.server.URL)
-		source, _ := laneBSingleton(t, app, legacyServer, account, upstream.server.URL)
-		source.Set("backend_token", "")
-		if err := app.Save(source); err != nil {
-			t.Fatal(err)
-		}
-		gate := genConcurrentNewGate()
-		previousMarshal := marshalImportSummary
-		marshalImportSummary = func(value any) ([]byte, error) {
-			gate.wait()
-			return previousMarshal(value)
-		}
-		t.Cleanup(func() { marshalImportSummary = previousMarshal })
-
-		opts := importLegacyOptions{ServerRecordID: legacyServer.Id, AccountRecordID: account.Id, Apply: true}
-		results := genConcurrentRunPair(func() error {
-			_, err := runUpstreamImportLegacy(context.Background(), app, opts, &bytes.Buffer{})
-			return err
-		})
-		genConcurrentWait(t, gate)
-		genConcurrentRelease(gate, 1)
-		if err := <-results; err != nil {
-			t.Fatalf("first import operation failed: %v", err)
-		}
-		genConcurrentRelease(gate, 1)
-		if err := <-results; !isTokenOwnershipError(err) {
-			t.Fatalf("import loser error = %v, want typed do-not-cleanup ownership error", err)
-		}
-		genConcurrentAssertWinner(t, app, upstream, "collision-token")
-		_, _, logouts := upstream.snapshot()
-		if len(logouts) != 0 {
-			t.Fatalf("collision import logged out durable winner token: %#v", logouts)
-		}
-	})
+	results := genConcurrentRunPair(func() error { return runUpstreamCreate(context.Background(), app, opts) })
+	genConcurrentWait(t, gate)
+	genConcurrentRelease(gate, 1)
+	if err := <-results; err != nil {
+		t.Fatalf("first create operation failed: %v", err)
+	}
+	genConcurrentRelease(gate, 1)
+	if err := <-results; !isTokenOwnershipError(err) {
+		t.Fatalf("create loser error = %v, want typed ownership error", err)
+	}
+	genConcurrentAssertWinner(t, app, upstream, "collision-token")
+	_, _, logouts := upstream.snapshot()
+	if len(logouts) != 0 {
+		t.Fatalf("collision create logged out durable winner token: %#v", logouts)
+	}
 }

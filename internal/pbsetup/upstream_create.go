@@ -30,8 +30,8 @@ const (
 // afterUpstreamProbe is a test hook for deterministic cancellation/drift tests.
 var afterUpstreamProbe func()
 var afterUpstreamSourceSave func()
-var readProtectedTokenAccounts = func(app core.App) ([]*core.Record, error) {
-	return app.FindRecordsByFilter("backend_accounts", "", "", 0, 0, nil)
+var readCurrentTokenSource = func(app core.App) (*core.Record, error) {
+	return app.FindFirstRecordByData(upstreamSources, "key", defaultUpstreamKey)
 }
 
 type upstreamOptions struct {
@@ -45,18 +45,9 @@ type upstreamOptions struct {
 }
 
 func protectedTokens(app core.App) (map[string]struct{}, error) {
-	accounts, err := readProtectedTokenAccounts(app)
-	if err != nil {
-		return nil, err
-	}
 	set := map[string]struct{}{}
-	for _, account := range accounts {
-		if token := account.GetString("backend_token"); token != "" {
-			set[token] = struct{}{}
-		}
-	}
-	source, err := app.FindFirstRecordByData(upstreamSources, "key", defaultUpstreamKey)
-	if err != nil && !isNotFound(err) {
+	source, err := readCurrentTokenSource(app)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
 	if err == nil {
@@ -75,9 +66,14 @@ const (
 	tokenOwnershipInvocation
 )
 
-type tokenOwnershipError struct{ outcome tokenOwnership }
+type tokenOwnershipError struct {
+	outcome tokenOwnership
+	cause   error
+}
 
 func (e *tokenOwnershipError) Error() string { return "upstream token ownership cannot be established" }
+
+func (e *tokenOwnershipError) Unwrap() error { return e.cause }
 
 func classifyTokenOwnership(app core.App, token string) (tokenOwnership, error) {
 	if token == "" {
@@ -85,10 +81,10 @@ func classifyTokenOwnership(app core.App, token string) (tokenOwnership, error) 
 	}
 	set, err := protectedTokens(app)
 	if err != nil {
-		return tokenOwnershipUnknown, &tokenOwnershipError{tokenOwnershipUnknown}
+		return tokenOwnershipUnknown, &tokenOwnershipError{outcome: tokenOwnershipUnknown, cause: err}
 	}
 	if _, found := set[token]; found {
-		return tokenOwnershipProtected, &tokenOwnershipError{tokenOwnershipProtected}
+		return tokenOwnershipProtected, &tokenOwnershipError{outcome: tokenOwnershipProtected}
 	}
 	return tokenOwnershipInvocation, nil
 }
@@ -119,7 +115,7 @@ func newUpstreamCommand(app core.App) *cobra.Command {
 			return cmd.Help()
 		},
 	}
-	cmd.AddCommand(newUpstreamCreateCommand(app), newUpstreamImportLegacyCommand(app))
+	cmd.AddCommand(newUpstreamCreateCommand(app))
 	return cmd
 }
 
@@ -193,7 +189,7 @@ func loadUpstreamState(app core.App) (upstreamState, error) {
 	if err == nil {
 		state.source = source
 	}
-	if err != nil && !isNotFound(err) {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return state, err
 	}
 	endpoints, err := app.FindRecordsByFilter(upstreamEndpoints, "", "id", 0, 0, nil)
@@ -215,9 +211,7 @@ func loadUpstreamState(app core.App) (upstreamState, error) {
 	return state, nil
 }
 
-func isNotFound(err error) bool {
-	return errors.Is(err, sql.ErrNoRows) || strings.Contains(strings.ToLower(err.Error()), "not found")
-}
+var loadUpstreamStateForCreate = loadUpstreamState
 
 func upstreamFingerprint(state upstreamState) string {
 	type sourceSnapshot struct {
@@ -269,7 +263,7 @@ func runUpstreamCreate(parent context.Context, app core.App, opts upstreamOption
 	if err != nil {
 		return err
 	}
-	state, err := loadUpstreamState(app)
+	state, err := loadUpstreamStateForCreate(app)
 	if err != nil {
 		return err
 	}
@@ -342,7 +336,7 @@ func runUpstreamCreate(parent context.Context, app core.App, opts upstreamOption
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		current, err := loadUpstreamState(txApp)
+		current, err := loadUpstreamStateForCreate(txApp)
 		if err != nil {
 			return err
 		}

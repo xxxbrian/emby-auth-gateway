@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestSetupUserUpsertsWithoutMappingsOrPasswordRehash(t *testing.T) {
+func TestSetupUserUpsertsWithoutPasswordRehash(t *testing.T) {
 	app := newTestApp(t)
 	opts := userOptions{GatewayUsername: "alice", GatewayPassword: "password", SyntheticUserID: "synthetic"}
 	if err := runUser(context.Background(), app, opts); err != nil {
@@ -22,9 +22,5 @@ func TestSetupUserUpsertsWithoutMappingsOrPasswordRehash(t *testing.T) {
 	user, _ = app.FindFirstRecordByData("users", "username", "alice")
 	if user.Id != id || user.GetString("password") != hash || !user.GetBool("enabled") || !user.Verified() {
 		t.Fatalf("user changed unexpectedly: %#v", user)
-	}
-	mappings, err := app.CountRecords("user_mappings")
-	if err != nil || mappings != 0 {
-		t.Fatalf("user setup wrote mappings: %d, %v", mappings, err)
 	}
 }

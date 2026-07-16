@@ -1,8 +1,8 @@
 package pbsetup
 
 import (
-	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -11,69 +11,146 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 )
 
-func TestClassifyTokenOwnershipProtectsAllLegacyAndSingletonTokens(t *testing.T) {
-	app, legacyServer, selected := laneBLegacy(t, "https://legacy.example.test")
-	selected.Set("backend_token", "selected-token")
-	if err := app.Save(selected); err != nil {
-		t.Fatal(err)
-	}
-	other := newBackendAccount(t, app, "other", legacyServer.Id, "other", "password", true, selected.GetDateTime("last_login_at").Time())
-	other.Set("backend_token", "other-token")
-	if err := app.Save(other); err != nil {
-		t.Fatal(err)
-	}
-	source, _ := laneBSingleton(t, app, legacyServer, selected, "https://legacy.example.test")
-	source.Set("backend_token", "singleton-token")
-	if err := app.Save(source); err != nil {
+func TestClassifyTokenOwnershipProtectsCurrentSourceToken(t *testing.T) {
+	app, _, _, closeServer := establishedUpstream(t)
+	defer closeServer()
+	source, err := app.FindFirstRecordByData(upstreamSources, "key", defaultUpstreamKey)
+	if err != nil {
 		t.Fatal(err)
 	}
 	for _, test := range []struct {
 		token string
 		want  tokenOwnership
 		err   bool
-	}{{"singleton-token", tokenOwnershipProtected, true}, {"selected-token", tokenOwnershipProtected, true}, {"other-token", tokenOwnershipProtected, true}, {"", tokenOwnershipUnknown, false}, {"new-token", tokenOwnershipInvocation, false}} {
+	}{{"old-token", tokenOwnershipProtected, true}, {"", tokenOwnershipUnknown, false}, {"new-token", tokenOwnershipInvocation, false}} {
 		got, err := classifyTokenOwnership(app, test.token)
 		if got != test.want || (err != nil) != test.err {
 			t.Fatalf("token %q: got (%v, %v), want (%v, error=%v)", test.token, got, err, test.want, test.err)
 		}
 	}
-	readProtectedTokenAccounts = func(core.App) ([]*core.Record, error) { return nil, errors.New("read failed") }
-	t.Cleanup(func() {
-		readProtectedTokenAccounts = func(app core.App) ([]*core.Record, error) {
-			return app.FindRecordsByFilter("backend_accounts", "", "", 0, 0, nil)
-		}
-	})
-	if got, err := classifyTokenOwnership(app, "new-token"); got != tokenOwnershipUnknown || !isTokenOwnershipError(err) {
-		t.Fatalf("ownership read failure got (%v, %v)", got, err)
+	if source.GetString("backend_token") != "old-token" {
+		t.Fatal("unexpected source fixture token")
 	}
 }
 
-func TestImportDryRunProtectedTokenDoesNotLogoutWriteOrPrint(t *testing.T) {
+func TestCurrentSourceTokenCollisionDoesNotLogout(t *testing.T) {
+	app, _, opts, closeServer := establishedUpstream(t)
+	defer closeServer()
+	logouts := 0
+	upstreamTestLogout = func(string) { logouts++ }
+	t.Cleanup(func() { upstreamTestLogout = nil })
+	opts.BackendUsername = "changed"
+	if err := runUpstreamCreate(context.Background(), app, opts); !isTokenOwnershipError(err) {
+		t.Fatalf("error=%v, want ownership collision", err)
+	}
+	if logouts != 0 {
+		t.Fatalf("current source token was logged out %d times", logouts)
+	}
+}
+
+func TestCurrentSourceOwnershipQueryFailureFailsClosed(t *testing.T) {
 	app := newTestApp(t)
 	logouts := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/System/Info/Public":
-			_, _ = w.Write([]byte(`{"Id":"live-server"}`))
+			_, _ = w.Write([]byte(`{"Id":"server"}`))
 		case "/Users/AuthenticateByName":
-			_, _ = w.Write([]byte(`{"AccessToken":"protected-token","ServerId":"live-server","User":{"Id":"backend-user"}}`))
+			_, _ = w.Write([]byte(`{"AccessToken":"new-token","ServerId":"server","User":{"Id":"user"}}`))
 		case "/Sessions/Logout":
 			logouts++
 		}
 	}))
 	defer server.Close()
-	legacyServer, account := seedLegacyImportRecords(t, app, "selected", server.URL, "selected", "backend", "secret")
-	account.Set("backend_token", "protected-token")
-	if err := app.Save(account); err != nil {
+	lookupErr := errors.New("table not found")
+	readCurrentTokenSource = func(core.App) (*core.Record, error) { return nil, lookupErr }
+	t.Cleanup(func() {
+		readCurrentTokenSource = func(app core.App) (*core.Record, error) {
+			return app.FindFirstRecordByData(upstreamSources, "key", defaultUpstreamKey)
+		}
+	})
+	err := runUpstreamCreate(context.Background(), app, upstreamOptions{EmbyBaseURL: server.URL, BackendUsername: "u", BackendPassword: "p"})
+	if !isTokenOwnershipError(err) || !errors.Is(err, lookupErr) || logouts != 0 {
+		t.Fatalf("error=%v logouts=%d", err, logouts)
+	}
+	if sources, _ := app.CountRecords(upstreamSources); sources != 0 {
+		t.Fatalf("ownership failure wrote %d sources", sources)
+	}
+	if endpoints, _ := app.CountRecords(upstreamEndpoints); endpoints != 0 {
+		t.Fatalf("ownership failure wrote %d endpoints", endpoints)
+	}
+}
+
+func TestPrimaryStateLoaderFailureStopsBeforeProbe(t *testing.T) {
+	app := newTestApp(t)
+	requests := 0
+	logouts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path == "/Sessions/Logout" {
+			logouts++
+		}
+	}))
+	defer server.Close()
+	stateErr := errors.New("table not found")
+	loadUpstreamStateForCreate = func(core.App) (upstreamState, error) { return upstreamState{}, stateErr }
+	t.Cleanup(func() { loadUpstreamStateForCreate = loadUpstreamState })
+
+	err := runUpstreamCreate(context.Background(), app, upstreamOptions{EmbyBaseURL: server.URL, BackendUsername: "u", BackendPassword: "p"})
+	if !errors.Is(err, stateErr) {
+		t.Fatalf("error=%v, want preserved state loader failure", err)
+	}
+	if requests != 0 || logouts != 0 {
+		t.Fatalf("requests=%d logouts=%d, want no upstream side effects", requests, logouts)
+	}
+	if sources, _ := app.CountRecords(upstreamSources); sources != 0 {
+		t.Fatalf("state loader failure wrote %d sources", sources)
+	}
+	if endpoints, _ := app.CountRecords(upstreamEndpoints); endpoints != 0 {
+		t.Fatalf("state loader failure wrote %d endpoints", endpoints)
+	}
+}
+
+func TestPrimaryStateLoaderSQLNoRowsAllowsFreshCreate(t *testing.T) {
+	app := newTestApp(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/System/Info/Public":
+			_, _ = w.Write([]byte(`{"Id":"server"}`))
+		case "/Users/AuthenticateByName":
+			_, _ = w.Write([]byte(`{"AccessToken":"new-token","ServerId":"server","User":{"Id":"user"}}`))
+		}
+	}))
+	defer server.Close()
+	if err := runUpstreamCreate(context.Background(), app, upstreamOptions{EmbyBaseURL: server.URL, BackendUsername: "u", BackendPassword: "p"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, data, err := runUpstreamImportLegacyPrepared(context.Background(), app, importLegacyOptions{ServerRecordID: legacyServer.Id, AccountRecordID: account.Id}, &bytes.Buffer{}); !isTokenOwnershipError(err) || data != nil {
-		t.Fatalf("protected dry-run result data=%q err=%v", data, err)
+	if sources, _ := app.CountRecords(upstreamSources); sources != 1 {
+		t.Fatalf("source count=%d, want 1", sources)
 	}
-	if logouts != 0 {
-		t.Fatalf("protected dry-run logout count=%d", logouts)
+}
+
+func TestCurrentSourceSQLNoRowsAllowsFreshCreate(t *testing.T) {
+	app := newTestApp(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/System/Info/Public":
+			_, _ = w.Write([]byte(`{"Id":"server"}`))
+		case "/Users/AuthenticateByName":
+			_, _ = w.Write([]byte(`{"AccessToken":"new-token","ServerId":"server","User":{"Id":"user"}}`))
+		}
+	}))
+	defer server.Close()
+	readCurrentTokenSource = func(core.App) (*core.Record, error) { return nil, sql.ErrNoRows }
+	t.Cleanup(func() {
+		readCurrentTokenSource = func(app core.App) (*core.Record, error) {
+			return app.FindFirstRecordByData(upstreamSources, "key", defaultUpstreamKey)
+		}
+	})
+	if err := runUpstreamCreate(context.Background(), app, upstreamOptions{EmbyBaseURL: server.URL, BackendUsername: "u", BackendPassword: "p"}); err != nil {
+		t.Fatal(err)
 	}
-	if count, _ := app.CountRecords(upstreamSources); count != 0 {
-		t.Fatalf("protected dry-run wrote %d sources", count)
+	if sources, _ := app.CountRecords(upstreamSources); sources != 1 {
+		t.Fatalf("source count=%d, want 1", sources)
 	}
 }

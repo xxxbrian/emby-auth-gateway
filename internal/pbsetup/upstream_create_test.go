@@ -92,7 +92,7 @@ func establishedUpstream(t *testing.T) (core.App, *httptest.Server, upstreamOpti
 	return app, server, upstreamOptions{EmbyBaseURL: server.URL, BackendUsername: "u", BackendPassword: "p"}, func() { server.Close(); upstreamTestToken = ""; upstreamTestLogout = nil; upstreamTestLogoutMode = "" }
 }
 
-func TestSetupCommandAddsSingletonChildrenWithoutChangingLegacyRunE(t *testing.T) {
+func TestSetupCommandContainsOnlyCurrentSingletonChildren(t *testing.T) {
 	app := newTestApp(t)
 	setup := NewCommand(app)
 	if setup.RunE == nil || setup.Args == nil {
@@ -105,6 +105,11 @@ func TestSetupCommandAddsSingletonChildrenWithoutChangingLegacyRunE(t *testing.T
 	upstream, _, err := setup.Find([]string{"upstream", "create"})
 	if err != nil || upstream.Name() != "create" || upstream.Args == nil {
 		t.Fatalf("missing upstream create cobra.NoArgs command: %v", err)
+	}
+	for _, child := range upstreamGroup.Commands() {
+		if child.Name() == "import-legacy" {
+			t.Fatal("retired upstream command remains registered")
+		}
 	}
 	user, _, err := setup.Find([]string{"user"})
 	if err != nil || user.Args == nil {
