@@ -7,9 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xxxbrian/emby-auth-gateway/internal/gateway"
-	_ "github.com/xxxbrian/emby-auth-gateway/internal/pbmigrations"
-
 	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/core"
 )
@@ -28,10 +25,55 @@ func newProductionGatewayApp(t *testing.T) *pocketbase.PocketBase {
 	if err := app.Bootstrap(); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.RunAppMigrations(); err != nil {
+	return app
+}
+
+func TestProductionBootstrapInitializesAndValidatesSchema(t *testing.T) {
+	app := newProductionGatewayApp(t)
+	if _, err := app.FindCollectionByNameOrId("upstream_endpoints"); err != nil {
+		t.Fatalf("fresh bootstrap did not initialize schema: %v", err)
+	}
+	if err := app.ResetBootstrapState(); err != nil {
+		t.Fatalf("reset fresh app: %v", err)
+	}
+
+	reopened := newGatewayApp()
+	if err := reopened.Bootstrap(); err != nil {
+		t.Fatalf("repeated bootstrap: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.ResetBootstrapState() })
+	if _, err := reopened.FindCollectionByNameOrId("upstream_endpoints"); err != nil {
+		t.Fatalf("repeated bootstrap lost schema: %v", err)
+	}
+}
+
+func TestProductionBootstrapRejectsPartialSchemaWithoutRepair(t *testing.T) {
+	app := newProductionGatewayApp(t)
+	collection, err := app.FindCollectionByNameOrId("upstream_endpoints")
+	if err != nil {
 		t.Fatal(err)
 	}
-	return app
+	if err := app.Delete(collection); err != nil {
+		t.Fatalf("delete fixture collection: %v", err)
+	}
+	if err := app.ResetBootstrapState(); err != nil {
+		t.Fatalf("reset fixture app: %v", err)
+	}
+
+	reopened := newGatewayApp()
+	if err := reopened.Bootstrap(); err == nil {
+		t.Fatal("partial schema bootstrap succeeded")
+	}
+	_ = reopened.ResetBootstrapState()
+
+	checker := pocketbase.New()
+	if err := checker.Bootstrap(); err != nil {
+		t.Fatalf("bootstrap checker: %v", err)
+	}
+	t.Cleanup(func() { _ = checker.ResetBootstrapState() })
+	if _, err := checker.FindCollectionByNameOrId("upstream_endpoints"); err == nil {
+		t.Fatal("partial schema was repaired")
+	}
 }
 
 func TestVersionCommandPrintsBuildMetadata(t *testing.T) {
@@ -75,14 +117,13 @@ func TestCleanupGatewaySessionsKeepsOnlyRecentActiveOrRevokedSessions(t *testing
 	app := newProductionGatewayApp(t)
 
 	userID := createTestUser(t, app)
-	accountID := createTestBackendAccount(t, app)
 	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
-	createGatewaySession(t, app, userID, accountID, "expired-old", now.Add(-8*24*time.Hour), nil)
+	createGatewaySession(t, app, userID, "expired-old", now.Add(-8*24*time.Hour), nil)
 	revokedOld := now.Add(-8 * 24 * time.Hour)
-	createGatewaySession(t, app, userID, accountID, "revoked-old", now.Add(24*time.Hour), &revokedOld)
+	createGatewaySession(t, app, userID, "revoked-old", now.Add(24*time.Hour), &revokedOld)
 	revokedRecent := now.Add(-6 * 24 * time.Hour)
-	createGatewaySession(t, app, userID, accountID, "revoked-recent", now.Add(24*time.Hour), &revokedRecent)
-	createGatewaySession(t, app, userID, accountID, "active", now.Add(24*time.Hour), nil)
+	createGatewaySession(t, app, userID, "revoked-recent", now.Add(24*time.Hour), &revokedRecent)
+	createGatewaySession(t, app, userID, "active", now.Add(24*time.Hour), nil)
 
 	if err := cleanupGatewaySessions(app, now); err != nil {
 		t.Fatalf("cleanup gateway sessions: %v", err)
@@ -99,83 +140,6 @@ func TestCleanupGatewaySessionsKeepsOnlyRecentActiveOrRevokedSessions(t *testing
 	if len(remaining) != 2 || !remaining["revoked-recent"] || !remaining["active"] {
 		t.Fatalf("remaining gateway sessions = %#v, want revoked-recent and active", remaining)
 	}
-}
-
-func TestLegacyBackendIdentityHookIsNotRegistered(t *testing.T) {
-	app := newProductionGatewayApp(t)
-	servers, err := app.FindCollectionByNameOrId("emby_servers")
-	if err != nil {
-		t.Fatalf("find emby_servers: %v", err)
-	}
-	record := core.NewRecord(servers)
-	record.Set("name", "server")
-	record.Set("base_url", "https://emby.example.com")
-	record.Set("enabled", true)
-	if err := app.Save(record); err != nil {
-		t.Fatalf("save server: %v", err)
-	}
-
-	if record.GetString("backend_user_agent") != "" || record.GetString("backend_authorization_device_id") != "" {
-		t.Fatalf("legacy identity hook ran: %#v", record.FieldsData())
-	}
-}
-
-func TestMappingBackendChangeRevokesUserSessions(t *testing.T) {
-	app := newProductionGatewayApp(t)
-	userID := createTestUser(t, app)
-	otherUserID := createTestUserWithName(t, app, "bob", "gateway-bob")
-	accountID := createTestBackendAccount(t, app)
-	newAccountID := createTestBackendAccount(t, app)
-	mapping := createTestMapping(t, app, userID, accountID, true)
-	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
-	createGatewaySession(t, app, userID, accountID, "active-1", now.Add(time.Hour), nil)
-	createGatewaySession(t, app, userID, accountID, "active-2", now.Add(time.Hour), nil)
-	revokedAt := now.Add(-time.Hour)
-	createGatewaySession(t, app, userID, accountID, "already-revoked", now.Add(time.Hour), &revokedAt)
-	createGatewaySession(t, app, otherUserID, accountID, "other-active", now.Add(time.Hour), nil)
-
-	mapping.Set("backend_account", newAccountID)
-	if err := app.Save(mapping); err != nil {
-		t.Fatalf("save mapping: %v", err)
-	}
-
-	assertSessionRevoked(t, app, "active-1", false)
-	assertSessionRevoked(t, app, "active-2", false)
-	assertSessionRevoked(t, app, "already-revoked", true)
-	assertSessionRevoked(t, app, "other-active", false)
-	assertNoAuditEvent(t, app, userID, "sessions_revoked")
-}
-
-func TestMappingDisableRevokesUserSessions(t *testing.T) {
-	app := newProductionGatewayApp(t)
-	userID := createTestUser(t, app)
-	accountID := createTestBackendAccount(t, app)
-	mapping := createTestMapping(t, app, userID, accountID, true)
-	createGatewaySession(t, app, userID, accountID, "active", time.Now().UTC().Add(time.Hour), nil)
-
-	mapping.Set("enabled", false)
-	if err := app.Save(mapping); err != nil {
-		t.Fatalf("save mapping: %v", err)
-	}
-
-	assertSessionRevoked(t, app, "active", false)
-	assertNoAuditEvent(t, app, userID, "sessions_revoked")
-}
-
-func TestMappingUnrelatedUpdateKeepsUserSessions(t *testing.T) {
-	app := newProductionGatewayApp(t)
-	userID := createTestUser(t, app)
-	accountID := createTestBackendAccount(t, app)
-	mapping := createTestMapping(t, app, userID, accountID, true)
-	createGatewaySession(t, app, userID, accountID, "active", time.Now().UTC().Add(time.Hour), nil)
-
-	mapping.Set("enabled", true)
-	if err := app.Save(mapping); err != nil {
-		t.Fatalf("save mapping: %v", err)
-	}
-
-	assertSessionRevoked(t, app, "active", false)
-	assertNoAuditEvent(t, app, userID, "sessions_revoked")
 }
 
 func createTestUser(t *testing.T, app core.App) string {
@@ -218,59 +182,7 @@ func createPlaybackEvent(t *testing.T, app core.App, userID, itemID string, occu
 	}
 }
 
-func createTestBackendAccount(t *testing.T, app core.App) string {
-	t.Helper()
-	servers, err := app.FindCollectionByNameOrId("emby_servers")
-	if err != nil {
-		t.Fatalf("find emby_servers: %v", err)
-	}
-	server := core.NewRecord(servers)
-	server.Set("name", "test")
-	server.Set("base_url", "http://127.0.0.1:8096/emby")
-	identity := gateway.DefaultBackendClientIdentity()
-	server.Set("backend_user_agent", identity.UserAgent)
-	server.Set("backend_authorization_client", identity.Client)
-	server.Set("backend_authorization_device", identity.Device)
-	server.Set("backend_authorization_device_id", gateway.StableBackendDeviceID("test-server"))
-	server.Set("backend_authorization_version", identity.Version)
-	server.Set("enabled", true)
-	if err := app.Save(server); err != nil {
-		t.Fatalf("save server: %v", err)
-	}
-
-	accounts, err := app.FindCollectionByNameOrId("backend_accounts")
-	if err != nil {
-		t.Fatalf("find backend_accounts: %v", err)
-	}
-	account := core.NewRecord(accounts)
-	account.Set("server", server.Id)
-	account.Set("name", "backend")
-	account.Set("backend_username", "shared")
-	account.Set("backend_password", "password")
-	account.Set("enabled", true)
-	if err := app.Save(account); err != nil {
-		t.Fatalf("save account: %v", err)
-	}
-	return account.Id
-}
-
-func createTestMapping(t *testing.T, app core.App, userID, accountID string, enabled bool) *core.Record {
-	t.Helper()
-	mappings, err := app.FindCollectionByNameOrId("user_mappings")
-	if err != nil {
-		t.Fatalf("find user_mappings: %v", err)
-	}
-	record := core.NewRecord(mappings)
-	record.Set("gateway_user", userID)
-	record.Set("backend_account", accountID)
-	record.Set("enabled", enabled)
-	if err := app.Save(record); err != nil {
-		t.Fatalf("save mapping: %v", err)
-	}
-	return record
-}
-
-func createGatewaySession(t *testing.T, app core.App, userID, accountID, tokenHash string, expiresAt time.Time, revokedAt *time.Time) {
+func createGatewaySession(t *testing.T, app core.App, userID, tokenHash string, expiresAt time.Time, revokedAt *time.Time) {
 	t.Helper()
 	sessions, err := app.FindCollectionByNameOrId("gateway_sessions")
 	if err != nil {
@@ -281,7 +193,6 @@ func createGatewaySession(t *testing.T, app core.App, userID, accountID, tokenHa
 	record.Set("gateway_user", userID)
 	record.Set("gateway_username", "alice")
 	record.Set("synthetic_user_id", "gateway-user")
-	record.Set("backend_account", accountID)
 	record.Set("expires_at", expiresAt)
 	if revokedAt != nil {
 		record.Set("revoked_at", *revokedAt)
@@ -289,39 +200,4 @@ func createGatewaySession(t *testing.T, app core.App, userID, accountID, tokenHa
 	if err := app.Save(record); err != nil {
 		t.Fatalf("save gateway session: %v", err)
 	}
-}
-
-func assertSessionRevoked(t *testing.T, app core.App, tokenHash string, wantRevoked bool) {
-	t.Helper()
-	record, err := app.FindFirstRecordByData("gateway_sessions", "gateway_token_hash", tokenHash)
-	if err != nil {
-		t.Fatalf("find session %q: %v", tokenHash, err)
-	}
-	revoked := !record.GetDateTime("revoked_at").IsZero()
-	if revoked != wantRevoked {
-		t.Fatalf("session %q revoked=%v, want %v", tokenHash, revoked, wantRevoked)
-	}
-}
-
-func assertAuditEvent(t *testing.T, app core.App, userID, event string) {
-	t.Helper()
-	if !hasAuditEvent(t, app, userID, event) {
-		t.Fatalf("missing audit event %q for user %s", event, userID)
-	}
-}
-
-func assertNoAuditEvent(t *testing.T, app core.App, userID, event string) {
-	t.Helper()
-	if hasAuditEvent(t, app, userID, event) {
-		t.Fatalf("unexpected audit event %q for user %s", event, userID)
-	}
-}
-
-func hasAuditEvent(t *testing.T, app core.App, userID, event string) bool {
-	t.Helper()
-	records, err := app.FindRecordsByFilter("audit_logs", "gateway_user = {:userID} && event = {:event}", "", 1, 0, map[string]any{"userID": userID, "event": event})
-	if err != nil {
-		t.Fatalf("find audit logs: %v", err)
-	}
-	return len(records) > 0
 }

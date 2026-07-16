@@ -106,10 +106,8 @@ func TestSetupCommandContainsOnlyCurrentSingletonChildren(t *testing.T) {
 	if err != nil || upstream.Name() != "create" || upstream.Args == nil {
 		t.Fatalf("missing upstream create cobra.NoArgs command: %v", err)
 	}
-	for _, child := range upstreamGroup.Commands() {
-		if child.Name() == "import-legacy" {
-			t.Fatal("retired upstream command remains registered")
-		}
+	if children := upstreamGroup.Commands(); len(children) != 1 || children[0].Name() != "create" {
+		t.Fatalf("upstream commands = %#v, want only create", children)
 	}
 	user, _, err := setup.Find([]string{"user"})
 	if err != nil || user.Args == nil {

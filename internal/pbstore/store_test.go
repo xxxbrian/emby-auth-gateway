@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/xxxbrian/emby-auth-gateway/internal/gateway"
-	_ "github.com/xxxbrian/emby-auth-gateway/internal/pbmigrations"
+	"github.com/xxxbrian/emby-auth-gateway/internal/pbschema"
 
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
@@ -28,6 +28,9 @@ func TestRevokeSessionMissingReturnsErrNotFound(t *testing.T) {
 		t.Fatalf("new test app: %v", err)
 	}
 	defer app.Cleanup()
+	if err := pbschema.Ensure(app); err != nil {
+		t.Fatalf("ensure schema: %v", err)
+	}
 
 	if _, err := app.FindCollectionByNameOrId("gateway_sessions"); err != nil {
 		t.Fatalf("find gateway_sessions collection: %v", err)
@@ -914,6 +917,9 @@ func newTestApp(t *testing.T) core.App {
 		t.Fatalf("new test app: %v", err)
 	}
 	t.Cleanup(app.Cleanup)
+	if err := pbschema.Ensure(app); err != nil {
+		t.Fatalf("ensure schema: %v", err)
+	}
 	return app
 }
 

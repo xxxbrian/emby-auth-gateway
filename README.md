@@ -5,7 +5,7 @@ Emby Auth Gateway is a PocketBase-backed reverse proxy for Emby clients. Gateway
 ## Architecture
 
 - `cmd/gateway` embeds PocketBase and registers Emby-compatible gateway routes under the fixed path `/emby`.
-- PocketBase stores gateway users, singleton upstream configuration, sessions, and audit logs in `pb_data`. Legacy collections remain locked migration artifacts and are not used at runtime.
+- PocketBase stores the canonical gateway schema in `pb_data`: users, upstream configuration, sessions, playback state, preferences, policies, and audit data.
 - The gateway exposes Emby-compatible endpoints for clients and proxies authenticated requests to the real Emby server.
 - The real Emby server remains private to the gateway network in the recommended deployment shape.
 
@@ -360,15 +360,19 @@ Anonymous public server info should be available through the gateway under fixed
 curl -i "http://localhost:8090/emby/System/Info/Public"
 ```
 
-PocketBase internal gateway collections should not be anonymously readable:
+PocketBase gateway collections should not be anonymously readable:
 
 ```sh
 curl -i http://localhost:8090/api/collections/users/records
-curl -i http://localhost:8090/api/collections/emby_servers/records
-curl -i http://localhost:8090/api/collections/backend_accounts/records
-curl -i http://localhost:8090/api/collections/user_mappings/records
 curl -i http://localhost:8090/api/collections/gateway_sessions/records
 curl -i http://localhost:8090/api/collections/audit_logs/records
+curl -i http://localhost:8090/api/collections/playback_events/records
+curl -i http://localhost:8090/api/collections/user_item_data/records
+curl -i http://localhost:8090/api/collections/item_child_counts/records
+curl -i http://localhost:8090/api/collections/display_preferences/records
+curl -i http://localhost:8090/api/collections/path_policies/records
+curl -i http://localhost:8090/api/collections/upstream_sources/records
+curl -i http://localhost:8090/api/collections/upstream_endpoints/records
 ```
 
 Login through the gateway and use the returned gateway token:
@@ -434,7 +438,7 @@ available. Hermetic HTTP canary/CORS smoke is the automated stand-in in CI.
 
 ## Security Notes
 
-- Keep PocketBase internal collections locked down. `users`, `emby_servers`, `backend_accounts`, `user_mappings`, `gateway_sessions`, and `audit_logs` should not be anonymously readable or writable. PocketBase superusers bypass collection rules and are the intended administrators.
+- Keep the canonical PocketBase collections locked down. `users`, `gateway_sessions`, `audit_logs`, `playback_events`, `user_item_data`, `item_child_counts`, `display_preferences`, `path_policies`, `upstream_sources`, and `upstream_endpoints` should not be anonymously readable or writable. PocketBase superusers bypass collection rules and are the intended administrators.
 - Gateway users are client identities only. Ordinary `users` records cannot access the PocketBase API and must not be used as an administrator boundary.
 - Gateway tokens are stored only as SHA-256 hashes.
 - Backend Emby passwords and backend Emby session tokens are stored as plaintext fields in PocketBase so administrators can configure and inspect backend records in the Admin UI. PocketBase superuser access or direct database file access is secret access.

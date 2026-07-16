@@ -639,7 +639,7 @@ body="$tmpdir/public-info.json"
 code="$(request GET "$GATEWAY_URL$GATEWAY_BASE_PATH/System/Info/Public" "$body")"
 expect_2xx 'anonymous gateway System/Info/Public' "$code" "$body"
 
-for collection in users emby_servers backend_accounts user_mappings gateway_sessions audit_logs; do
+for collection in users gateway_sessions audit_logs playback_events user_item_data item_child_counts display_preferences path_policies upstream_sources upstream_endpoints; do
   body="$tmpdir/pb-$collection.json"
   code="$(request GET "$PB_URL/api/collections/$collection/records" "$body")"
   expect_not_2xx "anonymous PB $collection records" "$code" "$body"

@@ -2,23 +2,24 @@ package main
 
 import (
 	"context"
-	"log"
+	"errors"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/xxxbrian/emby-auth-gateway/internal/gateway"
+	"github.com/xxxbrian/emby-auth-gateway/internal/pbschema"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pbsetup"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pbstore"
 	"github.com/xxxbrian/emby-auth-gateway/internal/version"
 
-	_ "github.com/xxxbrian/emby-auth-gateway/internal/pbmigrations"
-
 	"github.com/pocketbase/pocketbase"
+	pbcmd "github.com/pocketbase/pocketbase/cmd"
 	"github.com/pocketbase/pocketbase/core"
-	"github.com/pocketbase/pocketbase/plugins/migratecmd"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 func main() {
@@ -28,30 +29,137 @@ func main() {
 }
 
 func runGateway(args []string) int {
-	app := newGatewayApp()
-	app.RootCmd.SetArgs(args)
+	validation := newCLIAppForRun()
+	mode, err := validateCommand(validation, args)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
 
-	// PocketBase's Start/Execute discard cobra command errors (exit 0 on failure).
-	// Commands that execute directly must propagate a nonzero process status so
-	// Compose service_completed_successfully and scripts can trust failure.
-	if selectsDirectExecution(app, args) {
-		if err := app.RootCmd.Execute(); err != nil {
+	app := newCLIAppForRun()
+	app.RootCmd.SetArgs(args)
+	switch mode {
+	case commandServe:
+		if err := app.Execute(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		return 0
+	case commandSuperuser:
+		if err := app.Bootstrap(); err != nil {
+			fmt.Fprintln(os.Stderr, errors.Join(err, terminateAndReset(app)))
+			return 1
+		}
+		err := app.RootCmd.Execute()
+		if cleanupErr := terminateAndReset(app); err != nil || cleanupErr != nil {
+			if cleanupErr != nil {
+				fmt.Fprintln(os.Stderr, cleanupErr)
+			}
+			return 1
+		}
+		return 0
+	default:
+		err := app.RootCmd.Execute()
+		if cleanupErr := terminateAndReset(app); err != nil || cleanupErr != nil {
+			if cleanupErr != nil {
+				fmt.Fprintln(os.Stderr, cleanupErr)
+			}
 			return 1
 		}
 		return 0
 	}
+}
 
-	if err := app.Start(); err != nil {
-		log.Print(err)
-		return 1
+type commandMode uint8
+
+const (
+	commandDirect commandMode = iota
+	commandServe
+	commandSuperuser
+)
+
+var newCLIAppForRun = newCLIApp
+
+func newCLIApp() *pocketbase.PocketBase {
+	app := newGatewayApp()
+	registerSystemCommands(app)
+	app.RootCmd.FParseErrWhitelist.UnknownFlags = false
+	return app
+}
+
+func registerSystemCommands(app *pocketbase.PocketBase) {
+	for _, command := range app.RootCmd.Commands() {
+		if command.Name() == "serve" || command.Name() == "superuser" {
+			panic("PocketBase system command registered twice")
+		}
 	}
-	return 0
+	app.RootCmd.AddCommand(pbcmd.NewServeCommand(app, true), pbcmd.NewSuperuserCommand(app))
+}
+
+// validateCommand resolves syntax against a disposable command tree. It never
+// executes a command or bootstraps an application.
+func validateCommand(app *pocketbase.PocketBase, args []string) (commandMode, error) {
+	root := app.RootCmd
+	root.InitDefaultHelpFlag()
+	root.InitDefaultVersionFlag()
+	command, remaining, err := root.Find(args)
+	if err != nil {
+		return commandDirect, err
+	}
+	if err := command.ParseFlags(remaining); err != nil {
+		if errors.Is(err, pflag.ErrHelp) {
+			return commandDirect, nil
+		}
+		return commandDirect, err
+	}
+	if commandFlagRequested(root, "help") || commandFlagRequested(root, "version") || commandFlagRequested(command, "help") {
+		return commandDirect, nil
+	}
+	if err := command.ValidateRequiredFlags(); err != nil {
+		return commandDirect, err
+	}
+	positionals := command.Flags().Args()
+	if command.Args != nil {
+		if err := command.ValidateArgs(positionals); err != nil {
+			return commandDirect, err
+		}
+	}
+	if command.HasSubCommands() && command.Run == nil && command.RunE == nil {
+		if len(positionals) > 0 || command.Name() == "superuser" {
+			return commandDirect, fmt.Errorf("unknown or incomplete command %q", command.CommandPath())
+		}
+	}
+	if command == root {
+		return commandDirect, nil
+	}
+	for command.HasParent() && command.Parent() != root {
+		command = command.Parent()
+	}
+	switch command.Name() {
+	case "serve":
+		return commandServe, nil
+	case "superuser":
+		return commandSuperuser, nil
+	default:
+		return commandDirect, nil
+	}
+}
+
+func commandFlagRequested(command *cobra.Command, name string) bool {
+	flag := command.Flags().Lookup(name)
+	return flag != nil && flag.Changed
+}
+
+func terminateAndReset(app *pocketbase.PocketBase) error {
+	event := &core.TerminateEvent{App: app}
+	terminateErr := app.OnTerminate().Trigger(event, func(*core.TerminateEvent) error { return nil })
+	resetErr := app.ResetBootstrapState()
+	return errors.Join(terminateErr, resetErr)
 }
 
 func newGatewayApp() *pocketbase.PocketBase {
 	app := pocketbase.New()
 	app.RootCmd.Version = version.Version
-	migratecmd.MustRegister(app, app.RootCmd, migratecmd.Config{})
 	app.RootCmd.AddCommand(pbsetup.NewCommand(app))
 	versionCommand := newVersionCommand()
 	versionCommand.Args = cobra.NoArgs
@@ -66,7 +174,7 @@ func newGatewayApp() *pocketbase.PocketBase {
 		if err := e.Next(); err != nil {
 			return err
 		}
-		return e.App.RunAppMigrations()
+		return pbschema.Ensure(e.App)
 	})
 
 	app.OnServe().BindFunc(func(e *core.ServeEvent) error {
@@ -118,56 +226,6 @@ func newGatewayApp() *pocketbase.PocketBase {
 	})
 
 	return app
-}
-
-// selectsDirectExecution reports whether args identify a direct command subtree.
-// Once Cobra resolves a direct top-level command, later malformed arguments must
-// still execute RootCmd directly so its error reaches the process status.
-func selectsDirectExecution(app *pocketbase.PocketBase, args []string) bool {
-	cmd, _, _ := app.RootCmd.Find(args)
-	if isDirectCommand(cmd, app.RootCmd) {
-		return true
-	}
-
-	// Find normally handles root persistent flags. This fallback only covers the
-	// supported --dir spellings before a top-level command.
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		if arg == "--dir" {
-			i++
-			if i == len(args) {
-				return false
-			}
-			continue
-		}
-		if strings.HasPrefix(arg, "--dir=") {
-			continue
-		}
-		if strings.HasPrefix(arg, "-") {
-			return false
-		}
-		return isDirectCommandName(arg)
-	}
-	return false
-}
-
-func isDirectCommand(cmd, root *cobra.Command) bool {
-	if cmd == nil {
-		return false
-	}
-	for cmd.HasParent() && cmd.Parent() != root {
-		cmd = cmd.Parent()
-	}
-	return isDirectCommandName(cmd.Name())
-}
-
-func isDirectCommandName(name string) bool {
-	switch name {
-	case "setup", "web", "version":
-		return true
-	default:
-		return false
-	}
 }
 
 // configureDirectCommandGroup makes a command group safe for direct execution:

@@ -5,7 +5,7 @@ import (
 
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tests"
-	_ "github.com/xxxbrian/emby-auth-gateway/internal/pbmigrations"
+	"github.com/xxxbrian/emby-auth-gateway/internal/pbschema"
 )
 
 func newTestApp(t *testing.T) core.App {
@@ -18,5 +18,8 @@ func newTestApp(t *testing.T) core.App {
 		t.Fatalf("new test app: %v", err)
 	}
 	t.Cleanup(app.Cleanup)
+	if err := pbschema.Ensure(app); err != nil {
+		t.Fatalf("ensure schema: %v", err)
+	}
 	return app
 }
