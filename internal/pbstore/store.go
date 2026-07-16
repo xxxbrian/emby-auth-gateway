@@ -12,6 +12,7 @@ import (
 
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
+	"github.com/pocketbase/pocketbase/tools/types"
 )
 
 type Store struct {
@@ -86,6 +87,50 @@ func (s *Store) CompareAndSwapUpstreamAuth(ctx context.Context, update gateway.U
 	return classifyUpstreamStoreError(ctx, err)
 }
 
+func (s *Store) UpdateUpstreamServerInfo(ctx context.Context, update gateway.UpstreamServerInfoUpdate) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := gateway.ValidateUpstreamServerInfoUpdate(update); err != nil {
+		return err
+	}
+	err := s.app.RunInTransaction(func(tx core.App) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		checkedAt := update.CheckedAt.UTC().Truncate(time.Millisecond).Format(types.DefaultDateLayout)
+		result, err := tx.DB().NewQuery(`UPDATE upstream_sources
+			SET server_name = CASE WHEN {:serverName} <> '' THEN {:serverName} ELSE server_name END,
+				server_version = CASE WHEN {:serverVersion} <> '' THEN {:serverVersion} ELSE server_version END,
+				version_checked_at = {:checkedAt}
+			WHERE id = {:sourceID} AND key = 'default' AND server_id = {:serverID}`).
+			WithContext(ctx).
+			Bind(dbx.Params{
+				"sourceID": update.SourceID, "serverID": update.ServerID, "serverName": update.ServerName,
+				"serverVersion": update.ServerVersion, "checkedAt": checkedAt,
+			}).Execute()
+		if err != nil {
+			return fmt.Errorf("%w: update upstream server info: %v", gateway.ErrStoreUnavailable, err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("%w: inspect upstream server info update: %v", gateway.ErrStoreUnavailable, err)
+		}
+		if affected == 1 {
+			return ctx.Err()
+		}
+		runtime, loadErr := loadDefaultUpstreamRuntime(ctx, tx)
+		if loadErr != nil {
+			return loadErr
+		}
+		if runtime.Source.ID != update.SourceID {
+			return gateway.ErrUpstreamNotFound
+		}
+		return gateway.ErrUpstreamServerInfoConflict
+	})
+	return classifyUpstreamStoreError(ctx, err)
+}
+
 func classifyUpstreamStoreError(ctx context.Context, err error) error {
 	if err == nil {
 		return nil
@@ -100,7 +145,7 @@ func classifyUpstreamStoreError(ctx context.Context, err error) error {
 }
 
 func isGatewayDomainError(err error) bool {
-	return errors.Is(err, gateway.ErrInvalidCredentials) || errors.Is(err, gateway.ErrNotFound) || errors.Is(err, gateway.ErrDisabled) || errors.Is(err, gateway.ErrUnauthorized) || errors.Is(err, gateway.ErrBadRequest) || errors.Is(err, gateway.ErrUpstreamNotFound) || errors.Is(err, gateway.ErrInvalidUpstreamTopology) || errors.Is(err, gateway.ErrUpstreamAuthConflict) || errors.Is(err, gateway.ErrStoreUnavailable)
+	return errors.Is(err, gateway.ErrInvalidCredentials) || errors.Is(err, gateway.ErrNotFound) || errors.Is(err, gateway.ErrDisabled) || errors.Is(err, gateway.ErrUnauthorized) || errors.Is(err, gateway.ErrBadRequest) || errors.Is(err, gateway.ErrUpstreamNotFound) || errors.Is(err, gateway.ErrInvalidUpstreamTopology) || errors.Is(err, gateway.ErrUpstreamAuthConflict) || errors.Is(err, gateway.ErrUpstreamServerInfoConflict) || errors.Is(err, gateway.ErrStoreUnavailable)
 }
 
 func loadDefaultUpstreamRuntime(ctx context.Context, app core.App) (*gateway.UpstreamRuntime, error) {

@@ -147,6 +147,42 @@ func (m *MemoryStore) CompareAndSwapUpstreamAuth(ctx context.Context, update Ups
 	return nil
 }
 
+func (m *MemoryStore) UpdateUpstreamServerInfo(ctx context.Context, update UpstreamServerInfoUpdate) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := ValidateUpstreamServerInfoUpdate(update); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	source, matched := m.UpstreamSources[update.SourceID]
+	matched = matched && source.ID == update.SourceID && source.Key == "default" && source.ServerID == update.ServerID
+	if !matched {
+		runtime, _, err := loadMemoryDefaultUpstreamRuntime(m.UpstreamSources, m.UpstreamEndpoints)
+		if err != nil {
+			return err
+		}
+		if runtime.Source.ID != update.SourceID {
+			return ErrUpstreamNotFound
+		}
+		return ErrUpstreamServerInfoConflict
+	}
+	if update.ServerName != "" {
+		source.ServerName = update.ServerName
+	}
+	if update.ServerVersion != "" {
+		source.ServerVersion = update.ServerVersion
+	}
+	checkedAt := update.CheckedAt.UTC().Truncate(time.Millisecond)
+	source.VersionCheckedAt = &checkedAt
+	m.UpstreamSources[update.SourceID] = source
+	return nil
+}
+
 func (m *MemoryStore) AuthenticateGatewayUser(ctx context.Context, username, password string) (*GatewayUser, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

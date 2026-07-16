@@ -3,7 +3,9 @@ package pbstore
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -14,6 +16,7 @@ import (
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tests"
+	"github.com/pocketbase/pocketbase/tools/types"
 )
 
 func TestRevokeSessionMissingReturnsErrNotFound(t *testing.T) {
@@ -213,6 +216,166 @@ func TestUpstreamAuthCASConcurrentOneWinner(t *testing.T) {
 	runtime, err := store.LoadDefaultUpstreamRuntime(context.Background())
 	if err != nil || (runtime.Source.AuthGenerationID != "generation-a" && runtime.Source.AuthGenerationID != "generation-b") || runtime.Endpoint.BaseURL != "https://emby.example" || runtime.Source.ServerID != "server" {
 		t.Fatalf("unexpected post-concurrent runtime %#v, %v", runtime, err)
+	}
+}
+
+func TestUpdateUpstreamServerInfo(t *testing.T) {
+	app := newTestApp(t)
+	store := New(app)
+	source := createUpstreamSource(t, app)
+	createUpstreamEndpoint(t, app, source.Id, "primary", "https://emby.example", true)
+	source.Set("server_name", "old name")
+	source.Set("server_version", "old version")
+	source.Set("backend_token", "old-token")
+	if err := app.Save(source); err != nil {
+		t.Fatalf("save fixture: %v", err)
+	}
+	at := time.Date(2026, 7, 16, 12, 0, 0, 123456789, time.FixedZone("offset", 3600))
+	if err := store.UpdateUpstreamServerInfo(context.Background(), gateway.UpstreamServerInfoUpdate{SourceID: source.Id, ServerID: "server", ServerName: "new name", CheckedAt: at}); err != nil {
+		t.Fatalf("update name: %v", err)
+	}
+	runtime, err := store.LoadDefaultUpstreamRuntime(context.Background())
+	wantCheckedAt := at.UTC().Truncate(time.Millisecond)
+	if err != nil || runtime.Source.ServerName != "new name" || runtime.Source.ServerVersion != "old version" || runtime.Source.VersionCheckedAt == nil || !runtime.Source.VersionCheckedAt.Equal(wantCheckedAt) || runtime.Source.BackendToken != "old-token" {
+		t.Fatalf("updated runtime = %#v, %v", runtime, err)
+	}
+	record, err := app.FindRecordById("upstream_sources", source.Id)
+	rawCheckedAt, ok := record.GetRaw("version_checked_at").(types.DateTime)
+	if err != nil || !ok || rawCheckedAt.String() != wantCheckedAt.Format(types.DefaultDateLayout) {
+		t.Fatalf("canonical checked timestamp = %#v, %v", record.GetRaw("version_checked_at"), err)
+	}
+	if err := store.UpdateUpstreamServerInfo(context.Background(), gateway.UpstreamServerInfoUpdate{SourceID: source.Id, ServerID: "server", ServerVersion: "new version", CheckedAt: at.Add(time.Hour)}); err != nil {
+		t.Fatalf("update version: %v", err)
+	}
+	runtime, err = store.LoadDefaultUpstreamRuntime(context.Background())
+	if err != nil || runtime.Source.ServerName != "new name" || runtime.Source.ServerVersion != "new version" {
+		t.Fatalf("empty preserve runtime = %#v, %v", runtime, err)
+	}
+	if err := store.UpdateUpstreamServerInfo(context.Background(), gateway.UpstreamServerInfoUpdate{SourceID: source.Id, ServerID: "server", ServerName: "new name", ServerVersion: "new version", CheckedAt: at.Add(time.Hour)}); err != nil {
+		t.Fatalf("exact no-op update: %v", err)
+	}
+	unicodeName := strings.Repeat("界", 255)
+	unicodeVersion := strings.Repeat("界", 80)
+	if err := store.UpdateUpstreamServerInfo(context.Background(), gateway.UpstreamServerInfoUpdate{SourceID: source.Id, ServerID: "server", ServerName: unicodeName, ServerVersion: unicodeVersion, CheckedAt: at}); err != nil {
+		t.Fatalf("unicode boundary update: %v", err)
+	}
+	if err := store.UpdateUpstreamServerInfo(context.Background(), gateway.UpstreamServerInfoUpdate{SourceID: source.Id, ServerID: "server", ServerName: unicodeName + "界", CheckedAt: at}); !errors.Is(err, gateway.ErrBadRequest) {
+		t.Fatalf("unicode name max+1 error = %v", err)
+	}
+	if err := store.UpdateUpstreamServerInfo(context.Background(), gateway.UpstreamServerInfoUpdate{SourceID: source.Id, ServerID: "server", ServerVersion: unicodeVersion + "界", CheckedAt: at}); !errors.Is(err, gateway.ErrBadRequest) {
+		t.Fatalf("unicode version max+1 error = %v", err)
+	}
+}
+
+func TestUpdateUpstreamServerInfoErrorsAndConcurrentAuth(t *testing.T) {
+	app := newTestApp(t)
+	store := New(app)
+	source := createUpstreamSource(t, app)
+	endpoint := createUpstreamEndpoint(t, app, source.Id, "primary", "https://emby.example", true)
+	backup := createUpstreamEndpoint(t, app, source.Id, "backup", "https://backup.example", false)
+	source.Set("server_name", "old name")
+	source.Set("server_version", "old version")
+	source.Set("last_login_error", "old error")
+	if err := app.Save(source); err != nil {
+		t.Fatalf("save concurrent fixture: %v", err)
+	}
+	before, err := store.LoadDefaultUpstreamRuntime(context.Background())
+	if err != nil {
+		t.Fatalf("load concurrent fixture: %v", err)
+	}
+	endpointSnapshots := map[string]upstreamEndpointSnapshot{}
+	for _, record := range []*core.Record{endpoint, backup} {
+		endpointSnapshots[record.Id] = upstreamEndpointSnapshot{source: record.GetString("source"), key: record.GetString("key"), baseURL: record.GetString("base_url"), active: record.GetBool("active")}
+	}
+	metadataAt := time.Date(2026, 7, 16, 12, 0, 0, 123456789, time.FixedZone("offset", 3600))
+	authenticatedAt := time.Date(2026, 7, 16, 12, 1, 0, 987654321, time.FixedZone("offset", -3600))
+	update := gateway.UpstreamServerInfoUpdate{SourceID: source.Id, ServerID: "server", CheckedAt: time.Now()}
+	for _, invalid := range []gateway.UpstreamServerInfoUpdate{{SourceID: " source", ServerID: "server", CheckedAt: time.Now()}, {SourceID: source.Id, ServerID: " server", CheckedAt: time.Now()}, {SourceID: source.Id, ServerID: "server", ServerName: string(make([]byte, 256)), CheckedAt: time.Now()}, {SourceID: source.Id, ServerID: "server", ServerVersion: string(make([]byte, 81)), CheckedAt: time.Now()}, {SourceID: source.Id, ServerID: "server"}} {
+		if err := store.UpdateUpstreamServerInfo(context.Background(), invalid); !errors.Is(err, gateway.ErrBadRequest) {
+			t.Fatalf("invalid update error = %v", err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := store.UpdateUpstreamServerInfo(ctx, update); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled update error = %v", err)
+	}
+	if err := store.UpdateUpstreamServerInfo(context.Background(), gateway.UpstreamServerInfoUpdate{SourceID: "missing", ServerID: "server", CheckedAt: time.Now()}); !errors.Is(err, gateway.ErrUpstreamNotFound) {
+		t.Fatalf("missing source error = %v", err)
+	}
+	if err := store.UpdateUpstreamServerInfo(context.Background(), gateway.UpstreamServerInfoUpdate{SourceID: source.Id, ServerID: "other", CheckedAt: time.Now()}); !errors.Is(err, gateway.ErrUpstreamServerInfoConflict) {
+		t.Fatalf("namespace mismatch error = %v", err)
+	}
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	go func() {
+		<-start
+		errs <- store.UpdateUpstreamServerInfo(context.Background(), gateway.UpstreamServerInfoUpdate{SourceID: source.Id, ServerID: "server", ServerName: "new", ServerVersion: "1.2", CheckedAt: metadataAt})
+	}()
+	go func() {
+		<-start
+		errs <- store.CompareAndSwapUpstreamAuth(context.Background(), gateway.UpstreamAuthUpdate{SourceID: source.Id, GenerationID: "generation", DeviceID: "new-device", BackendUserID: "user", BackendToken: "token", AuthenticatedAt: authenticatedAt})
+	}()
+	close(start)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent update: %v", err)
+		}
+	}
+	runtime, err := store.LoadDefaultUpstreamRuntime(context.Background())
+	metadataCheckedAt := metadataAt.UTC().Truncate(time.Millisecond)
+	authenticatedUTC := authenticatedAt.UTC()
+	want := before.Source
+	want.ServerName, want.ServerVersion, want.VersionCheckedAt = "new", "1.2", &metadataCheckedAt
+	want.AuthGenerationID, want.ClientIdentity.DeviceID, want.BackendUserID, want.BackendToken = "generation", "new-device", "user", "token"
+	want.TokenUpdatedAt, want.LastLoginAt, want.LastLoginError = &authenticatedUTC, &authenticatedUTC, ""
+	if err != nil || !reflect.DeepEqual(runtime.Source, want) {
+		t.Fatalf("concurrent updates lost data: %#v, %v", runtime, err)
+	}
+	for id, wantEndpoint := range endpointSnapshots {
+		record, err := app.FindRecordById("upstream_endpoints", id)
+		if err != nil {
+			t.Fatalf("find endpoint %s: %v", id, err)
+		}
+		gotEndpoint := upstreamEndpointSnapshot{source: record.GetString("source"), key: record.GetString("key"), baseURL: record.GetString("base_url"), active: record.GetBool("active")}
+		if gotEndpoint != wantEndpoint {
+			t.Fatalf("endpoint %s changed: %#v, %v", id, gotEndpoint, err)
+		}
+	}
+	if err := app.Delete(endpoint); err != nil {
+		t.Fatalf("delete endpoint: %v", err)
+	}
+	if err := store.UpdateUpstreamServerInfo(context.Background(), gateway.UpstreamServerInfoUpdate{SourceID: source.Id, ServerID: "other", CheckedAt: time.Now()}); !errors.Is(err, gateway.ErrInvalidUpstreamTopology) {
+		t.Fatalf("malformed topology error = %v", err)
+	}
+}
+
+type upstreamEndpointSnapshot struct {
+	source  string
+	key     string
+	baseURL string
+	active  bool
+}
+
+func TestUpdateUpstreamServerInfoMissingSchemaIsUnavailable(t *testing.T) {
+	app := newTestApp(t)
+	endpoints, err := app.FindCollectionByNameOrId("upstream_endpoints")
+	if err != nil {
+		t.Fatalf("find endpoint collection: %v", err)
+	}
+	if err := app.Delete(endpoints); err != nil {
+		t.Fatalf("delete endpoint collection: %v", err)
+	}
+	collection, err := app.FindCollectionByNameOrId("upstream_sources")
+	if err != nil {
+		t.Fatalf("find source collection: %v", err)
+	}
+	if err := app.Delete(collection); err != nil {
+		t.Fatalf("delete source collection: %v", err)
+	}
+	err = New(app).UpdateUpstreamServerInfo(context.Background(), gateway.UpstreamServerInfoUpdate{SourceID: "123456789012345", ServerID: "server", CheckedAt: time.Now()})
+	if !errors.Is(err, gateway.ErrStoreUnavailable) {
+		t.Fatalf("missing schema error = %v", err)
 	}
 }
 

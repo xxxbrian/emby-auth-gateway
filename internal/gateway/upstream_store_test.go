@@ -3,6 +3,8 @@ package gateway
 import (
 	"context"
 	"errors"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -196,6 +198,148 @@ func TestMemoryStoreUpstreamCASMatchesPocketBaseBeforeTopologyValidation(t *test
 	}
 	if got := store.UpstreamSources["source"].AuthGenerationID; got != "generation" {
 		t.Fatalf("generation = %q, want generation", got)
+	}
+}
+
+func TestMemoryStoreUpdateUpstreamServerInfo(t *testing.T) {
+	store := NewMemoryStore()
+	source := validMemoryUpstreamSource()
+	source.ServerName = "old name"
+	source.ServerVersion = "old version"
+	source.AuthGenerationID = "old-generation"
+	source.BackendToken = "old-token"
+	store.UpstreamSources[source.ID] = source
+	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: source.ID, Key: "primary", BaseURL: "https://emby.example", Active: true}
+	at := time.Date(2026, 7, 16, 12, 0, 0, 123456789, time.FixedZone("offset", 3600))
+	if err := store.UpdateUpstreamServerInfo(context.Background(), UpstreamServerInfoUpdate{SourceID: source.ID, ServerID: source.ServerID, ServerName: "new name", CheckedAt: at}); err != nil {
+		t.Fatalf("update name: %v", err)
+	}
+	got := store.UpstreamSources[source.ID]
+	wantCheckedAt := at.UTC().Truncate(time.Millisecond)
+	if got.ServerName != "new name" || got.ServerVersion != "old version" || got.VersionCheckedAt == nil || !got.VersionCheckedAt.Equal(wantCheckedAt) || got.VersionCheckedAt.Location() != time.UTC || got.AuthGenerationID != "old-generation" || got.BackendToken != "old-token" {
+		t.Fatalf("unexpected metadata update: %#v", got)
+	}
+	if err := store.UpdateUpstreamServerInfo(context.Background(), UpstreamServerInfoUpdate{SourceID: source.ID, ServerID: source.ServerID, ServerVersion: "new version", CheckedAt: at.Add(time.Hour)}); err != nil {
+		t.Fatalf("update version: %v", err)
+	}
+	got = store.UpstreamSources[source.ID]
+	if got.ServerName != "new name" || got.ServerVersion != "new version" {
+		t.Fatalf("empty metadata values were not preserved independently: %#v", got)
+	}
+	if err := store.UpdateUpstreamServerInfo(context.Background(), UpstreamServerInfoUpdate{SourceID: source.ID, ServerID: source.ServerID, ServerName: "new name", ServerVersion: "new version", CheckedAt: at.Add(time.Hour)}); err != nil {
+		t.Fatalf("exact no-op update: %v", err)
+	}
+}
+
+func TestUpstreamServerInfoUpdateValidationCountsRunes(t *testing.T) {
+	valid := UpstreamServerInfoUpdate{
+		SourceID:      strings.Repeat("界", upstreamSourceIDMaxLength),
+		ServerID:      strings.Repeat("界", upstreamServerIDMaxLength),
+		ServerName:    strings.Repeat("界", upstreamServerNameMaxLength),
+		ServerVersion: strings.Repeat("界", upstreamServerVersionMaxLength),
+		CheckedAt:     time.Now(),
+	}
+	if err := ValidateUpstreamServerInfoUpdate(valid); err != nil {
+		t.Fatalf("unicode boundary update: %v", err)
+	}
+	for _, field := range []func(*UpstreamServerInfoUpdate){
+		func(update *UpstreamServerInfoUpdate) { update.SourceID += "界" },
+		func(update *UpstreamServerInfoUpdate) { update.ServerID += "界" },
+		func(update *UpstreamServerInfoUpdate) { update.ServerName += "界" },
+		func(update *UpstreamServerInfoUpdate) { update.ServerVersion += "界" },
+	} {
+		update := valid
+		field(&update)
+		if err := ValidateUpstreamServerInfoUpdate(update); !errors.Is(err, ErrBadRequest) {
+			t.Fatalf("unicode max+1 validation error = %v", err)
+		}
+	}
+}
+
+func TestMemoryStoreUpdateUpstreamServerInfoErrorsDoNotMutate(t *testing.T) {
+	store := NewMemoryStore()
+	source := validMemoryUpstreamSource()
+	store.UpstreamSources[source.ID] = source
+	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: source.ID, Key: "primary", BaseURL: "https://emby.example", Active: true}
+	before := store.UpstreamSources[source.ID]
+	for _, update := range []UpstreamServerInfoUpdate{
+		{SourceID: " source", ServerID: source.ServerID, CheckedAt: time.Now()},
+		{SourceID: source.ID, ServerID: " server", CheckedAt: time.Now()},
+		{SourceID: source.ID, ServerID: string(make([]byte, 256)), CheckedAt: time.Now()},
+		{SourceID: source.ID, ServerID: source.ServerID, ServerName: string(make([]byte, 256)), CheckedAt: time.Now()},
+		{SourceID: source.ID, ServerID: source.ServerID, ServerVersion: string(make([]byte, 81)), CheckedAt: time.Now()},
+		{SourceID: source.ID, ServerID: source.ServerID},
+	} {
+		if err := store.UpdateUpstreamServerInfo(context.Background(), update); !errors.Is(err, ErrBadRequest) {
+			t.Fatalf("invalid update error = %v", err)
+		}
+		if got := store.UpstreamSources[source.ID]; got != before {
+			t.Fatalf("invalid update mutated source: %#v", got)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := store.UpdateUpstreamServerInfo(ctx, UpstreamServerInfoUpdate{SourceID: source.ID, ServerID: source.ServerID, CheckedAt: time.Now()}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled update error = %v", err)
+	}
+	if got := store.UpstreamSources[source.ID]; got != before {
+		t.Fatalf("canceled update mutated source: %#v", got)
+	}
+	if err := store.UpdateUpstreamServerInfo(context.Background(), UpstreamServerInfoUpdate{SourceID: source.ID, ServerID: "other", CheckedAt: time.Now()}); !errors.Is(err, ErrUpstreamServerInfoConflict) {
+		t.Fatalf("server mismatch error = %v", err)
+	}
+	if err := store.UpdateUpstreamServerInfo(context.Background(), UpstreamServerInfoUpdate{SourceID: "missing", ServerID: source.ServerID, CheckedAt: time.Now()}); !errors.Is(err, ErrUpstreamNotFound) {
+		t.Fatalf("missing source error = %v", err)
+	}
+	store.UpstreamEndpoints = map[string]UpstreamEndpoint{}
+	if err := store.UpdateUpstreamServerInfo(context.Background(), UpstreamServerInfoUpdate{SourceID: source.ID, ServerID: "other", CheckedAt: time.Now()}); !errors.Is(err, ErrInvalidUpstreamTopology) {
+		t.Fatalf("malformed topology error = %v", err)
+	}
+}
+
+func TestMemoryStoreMetadataAndAuthCASPreserveEachOther(t *testing.T) {
+	store := NewMemoryStore()
+	source := validMemoryUpstreamSource()
+	source.ServerName = "old name"
+	source.ServerVersion = "old version"
+	source.LastLoginError = "old error"
+	store.UpstreamSources[source.ID] = source
+	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: source.ID, Key: "primary", BaseURL: "https://emby.example", Active: true}
+	store.UpstreamEndpoints["backup"] = UpstreamEndpoint{ID: "backup", SourceID: source.ID, Key: "backup", BaseURL: "https://backup.example", Active: false}
+	endpointsBefore := make(map[string]UpstreamEndpoint, len(store.UpstreamEndpoints))
+	for id, endpoint := range store.UpstreamEndpoints {
+		endpointsBefore[id] = endpoint
+	}
+	metadataAt := time.Date(2026, 7, 16, 12, 0, 0, 123456789, time.FixedZone("offset", 3600))
+	authenticatedAt := time.Date(2026, 7, 16, 12, 1, 0, 987654321, time.FixedZone("offset", -3600))
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	go func() {
+		<-start
+		errs <- store.UpdateUpstreamServerInfo(context.Background(), UpstreamServerInfoUpdate{SourceID: source.ID, ServerID: source.ServerID, ServerName: "new", ServerVersion: "1.2", CheckedAt: metadataAt})
+	}()
+	go func() {
+		<-start
+		errs <- store.CompareAndSwapUpstreamAuth(context.Background(), UpstreamAuthUpdate{SourceID: source.ID, GenerationID: "generation", DeviceID: "new-device", BackendUserID: "user", BackendToken: "token", AuthenticatedAt: authenticatedAt})
+	}()
+	close(start)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent update: %v", err)
+		}
+	}
+	got := store.UpstreamSources[source.ID]
+	want := source
+	metadataCheckedAt := metadataAt.UTC().Truncate(time.Millisecond)
+	authenticatedUTC := authenticatedAt.UTC()
+	want.ServerName, want.ServerVersion, want.VersionCheckedAt = "new", "1.2", &metadataCheckedAt
+	want.AuthGenerationID, want.ClientIdentity.DeviceID, want.BackendUserID, want.BackendToken = "generation", "new-device", "user", "token"
+	want.TokenUpdatedAt, want.LastLoginAt, want.LastLoginError = &authenticatedUTC, &authenticatedUTC, ""
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("concurrent updates lost data: %#v", got)
+	}
+	if !reflect.DeepEqual(store.UpstreamEndpoints, endpointsBefore) {
+		t.Fatalf("concurrent updates changed endpoints: %#v", store.UpstreamEndpoints)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 type Config struct {
@@ -29,6 +30,7 @@ type Config struct {
 type Store interface {
 	LoadDefaultUpstreamRuntime(ctx context.Context) (*UpstreamRuntime, error)
 	CompareAndSwapUpstreamAuth(ctx context.Context, update UpstreamAuthUpdate) error
+	UpdateUpstreamServerInfo(ctx context.Context, update UpstreamServerInfoUpdate) error
 	AuthenticateGatewayUser(ctx context.Context, username, password string) (*GatewayUser, error)
 	FindGatewayUserByUsername(ctx context.Context, username string) (*GatewayUser, error)
 	ListPublicUsers(ctx context.Context) ([]GatewayUser, error)
@@ -102,7 +104,21 @@ type UpstreamAuthUpdate struct {
 	AuthenticatedAt      time.Time
 }
 
+// UpstreamServerInfoUpdate updates metadata observed from the configured
+// upstream without allowing its server namespace to change.
+type UpstreamServerInfoUpdate struct {
+	SourceID      string
+	ServerID      string
+	ServerName    string
+	ServerVersion string
+	CheckedAt     time.Time
+}
+
 const (
+	upstreamSourceIDMaxLength       = 15
+	upstreamServerIDMaxLength       = 255
+	upstreamServerNameMaxLength     = 255
+	upstreamServerVersionMaxLength  = 80
 	upstreamAuthGenerationMaxLength = 128
 	upstreamDeviceIDMaxLength       = 255
 	upstreamBackendUserIDMaxLength  = 80
@@ -149,6 +165,15 @@ func ValidateUpstreamAuthUpdate(update UpstreamAuthUpdate) error {
 	return nil
 }
 
+func ValidateUpstreamServerInfoUpdate(update UpstreamServerInfoUpdate) error {
+	if !validUpstreamSourceID(update.SourceID) || !validUpstreamServerID(update.ServerID) ||
+		!validOptionalUpstreamServerName(update.ServerName) || !validOptionalUpstreamServerVersion(update.ServerVersion) ||
+		update.CheckedAt.IsZero() {
+		return fmt.Errorf("%w: invalid upstream server info update", ErrBadRequest)
+	}
+	return nil
+}
+
 func validatePersistedUpstreamAuth(source UpstreamSource) error {
 	if !validUpstreamGeneration(source.AuthGenerationID) || !validUpstreamDeviceID(source.ClientIdentity.DeviceID) || !validUpstreamBackendUserID(source.BackendUserID) || !validUpstreamToken(source.BackendToken) || source.TokenUpdatedAt == nil || source.TokenUpdatedAt.IsZero() || source.LastLoginAt == nil || source.LastLoginAt.IsZero() {
 		return invalidUpstreamTopology("incomplete managed authentication")
@@ -158,6 +183,22 @@ func validatePersistedUpstreamAuth(source UpstreamSource) error {
 
 func validUpstreamGeneration(value string) bool {
 	return isTrimmed(value) && len(value) <= upstreamAuthGenerationMaxLength
+}
+
+func validUpstreamSourceID(value string) bool {
+	return isTrimmed(value) && utf8.RuneCountInString(value) <= upstreamSourceIDMaxLength
+}
+
+func validUpstreamServerID(value string) bool {
+	return isTrimmed(value) && utf8.RuneCountInString(value) <= upstreamServerIDMaxLength
+}
+
+func validOptionalUpstreamServerName(value string) bool {
+	return value == "" || (isTrimmed(value) && utf8.RuneCountInString(value) <= upstreamServerNameMaxLength)
+}
+
+func validOptionalUpstreamServerVersion(value string) bool {
+	return value == "" || (isTrimmed(value) && utf8.RuneCountInString(value) <= upstreamServerVersionMaxLength)
 }
 
 func validUpstreamDeviceID(value string) bool {
