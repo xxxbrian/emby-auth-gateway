@@ -95,7 +95,7 @@ Use `--backend-user-agent`, `--backend-authorization-client`, `--backend-authori
 
 ### Upgrade And Rollback
 
-Do not perform a rolling upgrade. Stop the service and back up the complete PocketBase data directory. Before installing the cutover binary, run the transitional pre-cutover binary against that data directory to import the selected legacy records explicitly:
+Do not perform a rolling upgrade. Stop the service and back up the complete PocketBase data directory. Build the transitional pre-cutover binary from source commit `dbd0d4d`, then use it to import the selected legacy records explicitly before the 0.6 `0009` bootstrap:
 
 ```sh
 ./gateway-pre-cutover --dir /path/to/pb_data setup upstream import-legacy \

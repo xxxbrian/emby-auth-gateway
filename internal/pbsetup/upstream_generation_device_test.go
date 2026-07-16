@@ -273,17 +273,7 @@ func genDeviceServer(t *testing.T, handler func(http.ResponseWriter, *http.Reque
 func genDeviceLegacy(t *testing.T, url string) (core.App, *core.Record, *core.Record) {
 	t.Helper()
 	app := newTestApp(t)
-	if err := run(app, options{GatewayUsername: "gateway", GatewayPassword: "password", SyntheticUserID: "user", EmbyServerName: "legacy", EmbyBaseURL: url, BackendAccountName: "legacy", BackendUsername: "legacy-user", BackendPassword: "legacy-password"}); err != nil {
-		t.Fatal(err)
-	}
-	server, err := app.FindFirstRecordByData("emby_servers", "name", "legacy")
-	if err != nil {
-		t.Fatal(err)
-	}
-	account, err := app.FindFirstRecordByData("backend_accounts", "name", "legacy")
-	if err != nil {
-		t.Fatal(err)
-	}
+	server, account := seedLegacyImportRecords(t, app, "legacy", url, "legacy", "legacy-user", "legacy-password")
 	return app, server, account
 }
 

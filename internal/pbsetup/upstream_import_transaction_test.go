@@ -261,11 +261,7 @@ func laneBAssertRepairImmutable(t *testing.T, before laneBImmutableRepairState, 
 func laneBLegacy(t *testing.T, url string) (core.App, *core.Record, *core.Record) {
 	t.Helper()
 	app := newTestApp(t)
-	if err := run(app, options{GatewayUsername: "gateway", GatewayPassword: "password", SyntheticUserID: "synthetic", EmbyServerName: "selected", EmbyBaseURL: url, BackendAccountName: "selected", BackendUsername: "backend", BackendPassword: "legacy-password"}); err != nil {
-		t.Fatal(err)
-	}
-	server, _ := app.FindFirstRecordByData("emby_servers", "name", "selected")
-	account, _ := app.FindFirstRecordByData("backend_accounts", "name", "selected")
+	server, account := seedLegacyImportRecords(t, app, "selected", url, "selected", "backend", "legacy-password")
 	server.Set("server_id", "live-server")
 	account.Set("backend_token", "legacy-account-token")
 	if err := app.Save(server); err != nil {

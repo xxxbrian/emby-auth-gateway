@@ -62,11 +62,7 @@ func TestImportDryRunProtectedTokenDoesNotLogoutWriteOrPrint(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	if err := run(app, options{GatewayUsername: "gateway", GatewayPassword: "password", SyntheticUserID: "synthetic", EmbyServerName: "selected", EmbyBaseURL: server.URL, BackendAccountName: "selected", BackendUsername: "backend", BackendPassword: "secret"}); err != nil {
-		t.Fatal(err)
-	}
-	legacyServer, _ := app.FindFirstRecordByData("emby_servers", "name", "selected")
-	account, _ := app.FindFirstRecordByData("backend_accounts", "name", "selected")
+	legacyServer, account := seedLegacyImportRecords(t, app, "selected", server.URL, "selected", "backend", "secret")
 	account.Set("backend_token", "protected-token")
 	if err := app.Save(account); err != nil {
 		t.Fatal(err)

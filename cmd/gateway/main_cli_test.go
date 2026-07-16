@@ -87,23 +87,39 @@ func TestMalformedDirectCLIExitStatus(t *testing.T) {
 	}
 }
 
-func TestSetupUnknownLegacyInputDoesNotMutate(t *testing.T) {
-	for _, malformed := range []string{"unknown", "--unknown"} {
-		t.Run(malformed, func(t *testing.T) {
-			dataDir := filepath.Join(t.TempDir(), "data")
-			args := []string{
-				"--dir", dataDir,
-				"setup", malformed,
-				"--gateway-username", "legacy-user",
-				"--gateway-password", "test-password",
-				"--synthetic-user-id", "legacy-synthetic-id",
-				"--emby-url", "https://emby.example.test",
-				"--backend-username", "backend-user",
-				"--backend-password", "backend-password",
-			}
-			assertGatewayCLIExitCode(t, 1, args...)
-			assertNoLegacySetupWrites(t, dataDir)
-		})
+func TestRetiredRootSetupInvocationDoesNotMutate(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	args := []string{
+		"--dir", dataDir,
+		"setup",
+		"--gateway-username", "legacy-user",
+		"--gateway-password", "test-password",
+		"--synthetic-user-id", "legacy-synthetic-id",
+		"--emby-server-name", "legacy-server",
+		"--emby-url", "https://emby.example.test",
+		"--backend-account-name", "legacy-account",
+		"--backend-username", "backend-user",
+		"--backend-password", "backend-password",
+		"--backend-user-agent", "Legacy/1.0",
+		"--backend-authorization-client", "Legacy",
+		"--backend-authorization-device", "Desktop",
+		"--backend-authorization-version", "1.0",
+	}
+	assertGatewayCLIExitCode(t, 1, args...)
+	assertNoLegacySetupWrites(t, dataDir)
+}
+
+func TestSetupBareShowsHelpWithoutBootstrap(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	output, err := gatewayCLIOutput(t, "--dir", dataDir, "setup")
+	if err != nil {
+		t.Fatalf("bare setup: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "Configure gateway upstreams and users") {
+		t.Fatalf("setup help missing from output:\n%s", output)
+	}
+	if _, err := os.Stat(dataDir); !os.IsNotExist(err) {
+		t.Fatalf("bare setup bootstrapped data dir: %v", err)
 	}
 }
 

@@ -223,16 +223,14 @@ func laneCSeedImportAppWithLogout(t *testing.T, logout func(http.ResponseWriter,
 			logout(w, r)
 		}
 	}))
-	if err := run(app, options{GatewayUsername: "gateway-username-secret", GatewayPassword: "gateway-password-secret", SyntheticUserID: "synthetic", EmbyServerName: "selected", EmbyBaseURL: upstream.URL, BackendAccountName: "selected", BackendUsername: "backend-username-secret", BackendPassword: "backend-password-secret"}); err != nil {
-		upstream.Close()
-		t.Fatalf("seed legacy setup: %v", err)
-	}
-	legacyServer, err := app.FindFirstRecordByData("emby_servers", "name", "selected")
+	legacyServer, account := seedLegacyImportRecords(t, app, "selected", upstream.URL, "selected", "backend-username-secret", "backend-password-secret")
+	user, err := app.FindFirstRecordByData("users", "username", "gateway")
 	if err != nil {
 		t.Fatal(err)
 	}
-	account, err := app.FindFirstRecordByData("backend_accounts", "name", "selected")
-	if err != nil {
+	user.Set("username", "gateway-username-secret")
+	user.SetEmail(internalEmail("gateway-username-secret"))
+	if err := app.Save(user); err != nil {
 		t.Fatal(err)
 	}
 	legacyServer.Set("backend_authorization_device_id", "raw-device-id-secret")
@@ -246,10 +244,6 @@ func laneCSeedImportAppWithLogout(t *testing.T, logout func(http.ResponseWriter,
 	account.Set("backend_token", "legacy-token-secret")
 	account.Set("backend_user_id", "backend-user-id-secret")
 	if err := app.Save(account); err != nil {
-		t.Fatal(err)
-	}
-	user, err := app.FindFirstRecordByData("users", "username", "gateway-username-secret")
-	if err != nil {
 		t.Fatal(err)
 	}
 	laneCSaveRecord(t, app, "gateway_sessions", map[string]any{"gateway_token_hash": "session-hash", "gateway_user": user.Id, "gateway_username": "gateway-username-secret", "synthetic_user_id": "synthetic", "backend_account": account.Id, "client": "client", "device": "device", "device_id": "device-id", "version": "1", "remote_ip": "127.0.0.1", "expires_at": time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)})

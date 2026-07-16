@@ -27,12 +27,7 @@ func TestImportLegacyDryRunCreateApplyAndNoop(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	legacy := options{GatewayUsername: "gateway", GatewayPassword: "password", SyntheticUserID: "synthetic", EmbyServerName: "selected", EmbyBaseURL: server.URL, BackendAccountName: "selected", BackendUsername: "backend", BackendPassword: "secret"}
-	if err := run(app, legacy); err != nil {
-		t.Fatal(err)
-	}
-	legacyServer, _ := app.FindFirstRecordByData("emby_servers", "name", "selected")
-	account, _ := app.FindFirstRecordByData("backend_accounts", "name", "selected")
+	legacyServer, account := seedLegacyImportRecords(t, app, "selected", server.URL, "selected", "backend", "secret")
 	opts := importLegacyOptions{ServerRecordID: legacyServer.Id, AccountRecordID: account.Id}
 	summary, err := runUpstreamImportLegacy(context.Background(), app, opts, &bytes.Buffer{})
 	if err != nil || summary.Action != "create" || summary.Mode != "dry-run" || summary.ValidationToken != "logged_out" {
@@ -65,9 +60,7 @@ func TestImportLegacyRejectsAccessExpansion(t *testing.T) {
 	app := newTestApp(t)
 	server := newUpstreamResponder(t)
 	defer server.Close()
-	if err := run(app, options{GatewayUsername: "gateway", GatewayPassword: "password", SyntheticUserID: "synthetic", EmbyServerName: "selected", EmbyBaseURL: server.URL, BackendAccountName: "selected", BackendUsername: "backend", BackendPassword: "secret"}); err != nil {
-		t.Fatal(err)
-	}
+	serverRecord, account := seedLegacyImportRecords(t, app, "selected", server.URL, "selected", "backend", "secret")
 	userCollection, _ := app.FindCollectionByNameOrId("users")
 	user := core.NewRecord(userCollection)
 	user.Set("username", "unmapped")
@@ -78,8 +71,6 @@ func TestImportLegacyRejectsAccessExpansion(t *testing.T) {
 	if err := app.Save(user); err != nil {
 		t.Fatal(err)
 	}
-	serverRecord, _ := app.FindFirstRecordByData("emby_servers", "name", "selected")
-	account, _ := app.FindFirstRecordByData("backend_accounts", "name", "selected")
 	if _, err := runUpstreamImportLegacy(context.Background(), app, importLegacyOptions{ServerRecordID: serverRecord.Id, AccountRecordID: account.Id}, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), user.Id) {
 		t.Fatal("unmapped enabled user was accepted or not identified")
 	}
@@ -157,11 +148,7 @@ func TestImportFingerprintMarshalFailurePropagates(t *testing.T) {
 	t.Cleanup(func() { marshalImportSnapshot = json.Marshal })
 	server := newUpstreamResponder(t)
 	defer server.Close()
-	if err := run(app, options{GatewayUsername: "gateway", GatewayPassword: "password", SyntheticUserID: "synthetic", EmbyServerName: "selected", EmbyBaseURL: server.URL, BackendAccountName: "selected", BackendUsername: "backend", BackendPassword: "secret"}); err != nil {
-		t.Fatal(err)
-	}
-	legacyServer, _ := app.FindFirstRecordByData("emby_servers", "name", "selected")
-	account, _ := app.FindFirstRecordByData("backend_accounts", "name", "selected")
+	legacyServer, account := seedLegacyImportRecords(t, app, "selected", server.URL, "selected", "backend", "secret")
 	if _, err := loadImportPlan(app, importLegacyOptions{ServerRecordID: legacyServer.Id, AccountRecordID: account.Id}); err == nil {
 		t.Fatal("snapshot marshal failure was ignored")
 	}
@@ -181,11 +168,7 @@ func TestImportLegacySummaryMarshalFailureOccursBeforeApply(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	if err := run(app, options{GatewayUsername: "gateway", GatewayPassword: "password", SyntheticUserID: "synthetic", EmbyServerName: "selected", EmbyBaseURL: server.URL, BackendAccountName: "selected", BackendUsername: "backend", BackendPassword: "secret"}); err != nil {
-		t.Fatal(err)
-	}
-	legacyServer, _ := app.FindFirstRecordByData("emby_servers", "name", "selected")
-	account, _ := app.FindFirstRecordByData("backend_accounts", "name", "selected")
+	legacyServer, account := seedLegacyImportRecords(t, app, "selected", server.URL, "selected", "backend", "secret")
 	marshalImportSummary = func(any) ([]byte, error) { return nil, errors.New("summary marshal failed") }
 	t.Cleanup(func() { marshalImportSummary = json.Marshal })
 	if _, err := runUpstreamImportLegacy(context.Background(), app, importLegacyOptions{ServerRecordID: legacyServer.Id, AccountRecordID: account.Id, Apply: true}, &bytes.Buffer{}); err == nil {

@@ -223,17 +223,7 @@ func TestLaneALoadImportPlanGuards(t *testing.T) {
 func laneAImportFixture(t *testing.T) (core.App, importPlan) {
 	t.Helper()
 	app := newTestApp(t)
-	if err := run(app, options{GatewayUsername: "lanea", GatewayPassword: "gateway-password", SyntheticUserID: "lanea-user", EmbyServerName: "lanea-server", EmbyBaseURL: "https://legacy.example.test/emby", BackendAccountName: "lanea-account", BackendUsername: "legacy-user", BackendPassword: "legacy-password"}); err != nil {
-		t.Fatal(err)
-	}
-	server, err := app.FindFirstRecordByData("emby_servers", "name", "lanea-server")
-	if err != nil {
-		t.Fatal(err)
-	}
-	account, err := app.FindFirstRecordByData("backend_accounts", "name", "lanea-account")
-	if err != nil {
-		t.Fatal(err)
-	}
+	server, account := seedLegacyImportRecords(t, app, "lanea-server", "https://legacy.example.test/emby", "lanea-account", "legacy-user", "legacy-password")
 	plan, err := loadImportPlan(app, importLegacyOptions{ServerRecordID: server.Id, AccountRecordID: account.Id})
 	if err != nil {
 		t.Fatal(err)

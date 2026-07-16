@@ -16,6 +16,11 @@ type userOptions struct {
 	SyntheticUserID string
 }
 
+func internalEmail(username string) string {
+	replacer := strings.NewReplacer("@", "_at_", " ", "_", "/", "_", "\\", "_")
+	return strings.ToLower(replacer.Replace(username)) + "@gateway.local"
+}
+
 func newUserCommand(app core.App) *cobra.Command {
 	var opts userOptions
 	cmd := &cobra.Command{
