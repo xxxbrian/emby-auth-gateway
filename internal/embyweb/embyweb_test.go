@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func writeReadyTree(t *testing.T, root string, extra map[string]string) {
@@ -299,6 +301,193 @@ func TestServeReadyBasics(t *testing.T) {
 		s.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/emby/web/../secret", nil))
 		if rr.Code == http.StatusOK {
 			t.Fatal("traversal must not serve")
+		}
+	})
+
+	t.Run("head_canary_content_type", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		s.ServeHTTP(rr, httptest.NewRequest(http.MethodHead, "/emby/web/manifest.json", nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("code=%d", rr.Code)
+		}
+		if ct := rr.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+			t.Fatalf("content-type=%q", ct)
+		}
+		if rr.Body.Len() != 0 {
+			t.Fatalf("HEAD must not write body, got %d bytes", rr.Body.Len())
+		}
+	})
+
+	t.Run("inject_cache_headers", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/emby/web/modules/emby-apiclient/connectionmanager.js", nil)
+		req.Host = "media.xvv.net"
+		s.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("code=%d", rr.Code)
+		}
+		if got := rr.Header().Get("Cache-Control"); got != "no-cache" {
+			t.Fatalf("cache-control=%q", got)
+		}
+		if got := rr.Header().Get("Vary"); !strings.Contains(got, "Host") {
+			t.Fatalf("vary=%q want Host", got)
+		}
+		if ct := rr.Header().Get("Content-Type"); !strings.Contains(ct, "javascript") {
+			t.Fatalf("content-type=%q", ct)
+		}
+	})
+}
+
+func TestServeRejectsFIFO(t *testing.T) {
+	root := t.TempDir()
+	writeReadyTree(t, root, nil)
+	fifoPath := filepath.Join(root, "modules", "fifo.js")
+	if err := syscall.Mkfifo(fifoPath, 0o644); err != nil {
+		t.Skipf("mkfifo not available: %v", err)
+	}
+
+	s, err := New(Config{GatewayBasePath: "/emby", AssetsRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Status().State != StateReady {
+		t.Fatalf("state=%s err=%v", s.Status().State, s.Status().Err)
+	}
+
+	type result struct {
+		code int
+		err  string
+	}
+	done := make(chan result, 1)
+	go func() {
+		rr := httptest.NewRecorder()
+		s.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/emby/web/modules/fifo.js", nil))
+		done <- result{code: rr.Code}
+	}()
+
+	select {
+	case res := <-done:
+		if res.code != http.StatusNotFound {
+			t.Fatalf("FIFO GET code=%d want 404", res.code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("GET on FIFO hung (timeout); open must not block on non-regular nodes")
+	}
+}
+
+func TestTraversalMatrix(t *testing.T) {
+	root := t.TempDir()
+	writeReadyTree(t, root, nil)
+	s, err := New(Config{GatewayBasePath: "/emby", AssetsRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	paths := []string{
+		"/emby/web/../secret",
+		"/emby/web/..%2fsecret",
+		"/emby/web/%2e%2e/secret",
+		"/emby/web/modules/%2e%2e/%2e%2e/secret",
+		"/emby/web/modules/..%2f..%2fsecret",
+		"/emby/web/foo/../../etc/passwd",
+		"/emby/web/%2fetc/passwd",
+		"/emby/web/..",
+		"/emby/web/./../../secret",
+	}
+	for _, p := range paths {
+		t.Run(p, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, p, nil)
+			// Preserve raw path for encoded forms when possible.
+			if req.URL.RawPath == "" && strings.Contains(p, "%") {
+				req.URL.RawPath = p
+			}
+			s.ServeHTTP(rr, req)
+			if rr.Code == http.StatusOK {
+				t.Fatalf("traversal path must not be 200: code=%d body=%q", rr.Code, rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestInjectHostMatrix(t *testing.T) {
+	root := t.TempDir()
+	injectRel := "modules/emby-apiclient/connectionmanager.js"
+	orig := `u="https://mb3admin.com/api"`
+	writeReadyTree(t, root, map[string]string{injectRel: orig})
+
+	s, err := New(Config{
+		GatewayBasePath: "/emby",
+		AssetsRoot:      root,
+		PublicBaseURL:   "https://fallback.example/emby",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	urlPath := "/emby/web/" + injectRel
+
+	t.Run("request_host_wins", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, urlPath, nil)
+		req.Host = "req.example:8443"
+		s.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("code=%d", rr.Code)
+		}
+		body := rr.Body.String()
+		if !strings.Contains(body, "req.example:8443") || strings.Contains(body, "mb3admin.com") || strings.Contains(body, "fallback.example") {
+			t.Fatalf("body=%q", body)
+		}
+	})
+
+	t.Run("empty_host_uses_public_fallback", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, urlPath, nil)
+		req.Host = ""
+		s.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("code=%d", rr.Code)
+		}
+		body := rr.Body.String()
+		if !strings.Contains(body, "fallback.example") || strings.Contains(body, "mb3admin.com") {
+			t.Fatalf("body=%q", body)
+		}
+	})
+
+	t.Run("invalid_host_no_inject", func(t *testing.T) {
+		// Server with no usable fallback so invalid Host cannot rewrite.
+		s2, err := New(Config{
+			GatewayBasePath: "/emby",
+			AssetsRoot:      root,
+			PublicBaseURL:   "",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, urlPath, nil)
+		req.Host = "user@evil.example"
+		s2.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("code=%d", rr.Code)
+		}
+		body := rr.Body.String()
+		if !strings.Contains(body, "mb3admin.com") {
+			t.Fatalf("invalid host must leave placeholder, body=%q", body)
+		}
+		if strings.Contains(body, "evil.example") {
+			t.Fatalf("must not inject invalid host, body=%q", body)
+		}
+	})
+
+	t.Run("disk_unchanged", func(t *testing.T) {
+		onDisk, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(injectRel)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(onDisk) != orig {
+			t.Fatalf("disk mutated: %q", onDisk)
 		}
 	})
 }
