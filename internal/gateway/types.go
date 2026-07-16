@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/xxxbrian/emby-auth-gateway/internal/pathpolicy"
 )
 
 type Config struct {
@@ -230,25 +231,8 @@ type AuditLog struct {
 	CreatedAt         time.Time
 }
 
-type PathPolicy struct {
-	ID       string
-	Method   string
-	Path     string
-	Action   string
-	Reason   string
-	Priority int
-	Enabled  bool
-}
-
-func (p PathPolicy) Deny() bool {
-	return strings.EqualFold(p.Action, "deny")
-}
-
-type PathPolicyDecision struct {
-	Allowed  bool
-	Action   string
-	PolicyID string
-}
+type PathPolicy = pathpolicy.Policy
+type PathPolicyDecision = pathpolicy.Decision
 
 type PlaybackEvent struct {
 	ID               string
@@ -329,42 +313,11 @@ type DisplayPreference struct {
 }
 
 func DecidePathPolicy(policies []PathPolicy, method, path string) PathPolicyDecision {
-	policy, ok := FirstMatchingPathPolicy(policies, method, path)
-	if !ok {
-		return PathPolicyDecision{Allowed: true, Action: "allow"}
-	}
-	if policy.Deny() {
-		return PathPolicyDecision{Allowed: false, Action: "deny", PolicyID: policy.ID}
-	}
-	return PathPolicyDecision{Allowed: true, Action: "allow", PolicyID: policy.ID}
+	return pathpolicy.Decide(policies, method, path)
 }
 
 func FirstMatchingPathPolicy(policies []PathPolicy, method, path string) (PathPolicy, bool) {
-	matched := make([]PathPolicy, 0, len(policies))
-	for _, policy := range policies {
-		if policy.Enabled && methodMatches(policy.Method, method) && pathMatches(policy.Path, path) {
-			matched = append(matched, policy)
-		}
-	}
-	if len(matched) == 0 {
-		return PathPolicy{}, false
-	}
-	sort.SliceStable(matched, func(i, j int) bool {
-		if matched[i].Action != matched[j].Action {
-			return strings.EqualFold(matched[i].Action, "deny")
-		}
-		if matched[i].Priority != matched[j].Priority {
-			return matched[i].Priority > matched[j].Priority
-		}
-		if matched[i].Method != matched[j].Method {
-			return matched[i].Method < matched[j].Method
-		}
-		if matched[i].Path != matched[j].Path {
-			return matched[i].Path < matched[j].Path
-		}
-		return matched[i].ID < matched[j].ID
-	})
-	return matched[0], true
+	return pathpolicy.FirstMatch(policies, method, path)
 }
 
 type GatewayUser struct {

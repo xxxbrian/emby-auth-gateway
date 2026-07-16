@@ -68,6 +68,11 @@ func NewServer(cfg Config, store Store) *Server {
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set(gatewayVersionHeader, version.Version)
+	if !validRequestPath(r) {
+		w.Header().Set("Cache-Control", "no-store")
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
 	rel, ok := s.relativePath(r.URL.Path)
 	if !ok {
 		http.NotFound(w, r)
@@ -680,11 +685,56 @@ func (s *Server) pathPolicyAllows(w http.ResponseWriter, r *http.Request, rel st
 		return false
 	}
 	if !decision.Allowed {
-		s.audit(r.Context(), s.auditForRequest(r, rel, "path_denied", "path policy denied request", http.StatusForbidden))
+		message := "path policy denied request"
+		if decision.PolicyID != "" || decision.Reason != "" {
+			message = fmt.Sprintf("path policy denied request: policy=%s reason=%s", decision.PolicyID, decision.Reason)
+		}
+		s.audit(r.Context(), s.auditForRequest(r, rel, "path_denied", message, http.StatusForbidden))
+		w.Header().Set("Cache-Control", "no-store")
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return false
 	}
 	return true
+}
+
+func validRequestPath(r *http.Request) bool {
+	raw := r.URL.EscapedPath()
+	if raw == "" {
+		raw = r.URL.Path
+	}
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == '\\' || raw[i] == 0 {
+			return false
+		}
+		if raw[i] == '%' {
+			if i+2 >= len(raw) || !pathHex(raw[i+1]) || !pathHex(raw[i+2]) {
+				return false
+			}
+			v := strings.ToLower(raw[i+1 : i+3])
+			if v == "2f" || v == "5c" || v == "00" {
+				return false
+			}
+			i += 2
+		}
+	}
+	decoded, err := url.PathUnescape(raw)
+	if err != nil || strings.ContainsAny(decoded, "\\\x00") {
+		return false
+	}
+	segments := strings.Split(decoded, "/")
+	for i, segment := range segments {
+		if segment == "." || segment == ".." {
+			return false
+		}
+		if segment == "" && i != 0 && i != len(segments)-1 {
+			return false
+		}
+	}
+	return true
+}
+
+func pathHex(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
 }
 
 func (s *Server) auditForRequest(r *http.Request, rel, event, message string, status int) AuditLog {

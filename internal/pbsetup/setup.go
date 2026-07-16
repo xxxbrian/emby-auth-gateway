@@ -15,6 +15,6 @@ func NewCommand(app core.App) *cobra.Command {
 		},
 	}
 	cmd.FParseErrWhitelist.UnknownFlags = false
-	cmd.AddCommand(newUpstreamCommand(app), newUserCommand(app))
+	cmd.AddCommand(newUpstreamCommand(app), newUserCommand(app), newPoliciesCommand(app))
 	return cmd
 }

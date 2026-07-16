@@ -10,6 +10,7 @@ import (
 
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/types"
+	"github.com/xxxbrian/emby-auth-gateway/internal/pathpolicy"
 )
 
 // ErrUnsupportedSchema identifies a database that is neither pristine nor the
@@ -82,11 +83,34 @@ func Ensure(app core.App) error {
 					return err
 				}
 			}
+			if err := installDefaultPolicies(tx); err != nil {
+				return err
+			}
 			return validate(tx)
 		default:
 			return errors.New("concurrent schema initialization left a partial schema")
 		}
 	})
+}
+
+func installDefaultPolicies(app core.App) error {
+	collection, err := collectionByExactName(app, "path_policies")
+	if err != nil {
+		return err
+	}
+	for _, policy := range pathpolicy.Defaults() {
+		record := core.NewRecord(collection)
+		record.Set("method", policy.Method)
+		record.Set("path", policy.Path)
+		record.Set("action", policy.Action)
+		record.Set("reason", policy.Reason)
+		record.Set("priority", policy.Priority)
+		record.Set("enabled", policy.Enabled)
+		if err := app.Save(record); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type schemaState uint8

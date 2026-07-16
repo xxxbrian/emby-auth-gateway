@@ -117,8 +117,9 @@ func TestResourceRouteClassifierCanonicalMediaScope(t *testing.T) {
 
 func TestServeHTTPRejectsUnsafeCookieResourceRoutesWithoutUpstream(t *testing.T) {
 	for _, tt := range []struct {
-		name  string
-		setup func(*http.Request)
+		name       string
+		setup      func(*http.Request)
+		wantStatus int
 	}{
 		{
 			name: "websocket upgrade",
@@ -130,11 +131,13 @@ func TestServeHTTPRejectsUnsafeCookieResourceRoutesWithoutUpstream(t *testing.T)
 		},
 		{
 			name: "image traversal widening",
+			// API path validation rejects traversal before authentication.
 			setup: func(req *http.Request) {
 				// Set Path directly so URL construction cannot clean the dot segment.
 				req.URL.Path = "/emby/Items/foo/Images/.."
 				req.URL.RawPath = "/emby/Items/foo/Images/%2E%2E"
 			},
+			wantStatus: http.StatusBadRequest,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -150,7 +153,11 @@ func TestServeHTTPRejectsUnsafeCookieResourceRoutesWithoutUpstream(t *testing.T)
 			req.AddCookie(&http.Cookie{Name: resourceCookieName, Value: "gateway-token"})
 			writer := httptest.NewRecorder()
 			server.ServeHTTP(writer, req)
-			if writer.Code != http.StatusUnauthorized || transport.hits != 0 {
+			wantStatus := tt.wantStatus
+			if wantStatus == 0 {
+				wantStatus = http.StatusUnauthorized
+			}
+			if writer.Code != wantStatus || transport.hits != 0 {
 				t.Fatalf("status/upstream hits = %d/%d", writer.Code, transport.hits)
 			}
 		})

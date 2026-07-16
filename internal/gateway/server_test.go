@@ -17,6 +17,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/xxxbrian/emby-auth-gateway/internal/pathpolicy"
 )
 
 var testHTTPClient = &http.Client{Timeout: 5 * time.Second}
@@ -1414,6 +1416,74 @@ func TestPathPolicyDenyAndDefaultAllow(t *testing.T) {
 	_ = usersResp.Body.Close()
 	if usersResp.StatusCode != http.StatusForbidden {
 		t.Fatalf("special handler denied status = %d, want 403", usersResp.StatusCode)
+	}
+}
+
+func TestDefaultPathPoliciesDenyTrailingSlashBeforeBackend(t *testing.T) {
+	var hits int
+	backend := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { hits++ }))
+	defer backend.Close()
+	store := NewMemoryStore()
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.PathPolicies = pathpolicy.Defaults()
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+	for _, tc := range []struct{ method, path string }{{http.MethodPost, "/Users/x/Password/"}, {http.MethodPost, "/System/Shutdown/"}, {http.MethodDelete, "/Items/x/"}, {http.MethodPost, "/Plugins/x/Configuration"}, {http.MethodGet, "/System/Logs/x/Lines"}} {
+		t.Run(tc.method+tc.path, func(t *testing.T) {
+			resp := do(t, mustRequest(t, tc.method, gw.URL+"/emby"+tc.path, nil))
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusForbidden || resp.Header.Get("Cache-Control") != "no-store" {
+				t.Fatalf("status/cache = %d/%q", resp.StatusCode, resp.Header.Get("Cache-Control"))
+			}
+		})
+	}
+	if hits != 0 {
+		t.Fatalf("denied defaults reached backend %d times", hits)
+	}
+	if len(store.AuditLogs) != 5 {
+		t.Fatalf("audits = %#v", store.AuditLogs)
+	}
+	for _, audit := range store.AuditLogs {
+		if audit.Event != "path_denied" || !strings.Contains(audit.Message, "reason=") {
+			t.Fatalf("audit = %#v", audit)
+		}
+	}
+}
+
+func TestServeHTTPRejectsUnsafeRawPathsBeforePolicyOrBackend(t *testing.T) {
+	var hits int
+	backend := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { hits++ }))
+	defer backend.Close()
+	store := NewMemoryStore()
+	configureTestUpstream(store, backend.URL+"/emby")
+	server := NewServer(Config{GatewayBasePath: "/emby"}, store)
+	for _, tc := range []struct {
+		name, path, raw string
+		want            int
+	}{
+		{"encoded slash", "/emby/Items/a/b", "/emby/Items/a%2fb", http.StatusBadRequest},
+		{"encoded backslash", "/emby/Items/a\\b", "/emby/Items/a%5cb", http.StatusBadRequest},
+		{"encoded nul", "/emby/Items/a\x00b", "/emby/Items/a%00b", http.StatusBadRequest},
+		{"encoded dot", "/emby/Items/..", "/emby/Items/%2e%2e", http.StatusBadRequest},
+		{"repeated separator", "/emby/Items//x", "/emby/Items//x", http.StatusBadRequest},
+		{"ordinary encoding", "/emby/Items/a", "/emby/Items/%61", http.StatusUnauthorized},
+		{"double encoding", "/emby/Items/%2f", "/emby/Items/%252f", http.StatusUnauthorized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/placeholder", nil)
+			req.URL.Path, req.URL.RawPath = tc.path, tc.raw
+			w := httptest.NewRecorder()
+			server.ServeHTTP(w, req)
+			if w.Code != tc.want {
+				t.Fatalf("status = %d, want %d", w.Code, tc.want)
+			}
+			if tc.want == http.StatusBadRequest && w.Header().Get("Cache-Control") != "no-store" {
+				t.Fatalf("cache = %q", w.Header().Get("Cache-Control"))
+			}
+		})
+	}
+	if hits != 0 {
+		t.Fatalf("unsafe paths reached backend %d times", hits)
 	}
 }
 

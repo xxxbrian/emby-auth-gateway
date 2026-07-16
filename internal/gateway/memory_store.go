@@ -5,6 +5,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/xxxbrian/emby-auth-gateway/internal/pathpolicy"
 )
 
 type MemoryStore struct {
@@ -498,12 +500,5 @@ func methodMatches(policyMethod, requestMethod string) bool {
 }
 
 func pathMatches(policyPath, requestPath string) bool {
-	policyPath = strings.TrimSpace(policyPath)
-	if policyPath == "" || policyPath == "*" {
-		return true
-	}
-	if strings.HasSuffix(policyPath, "*") {
-		return strings.HasPrefix(strings.ToLower(requestPath), strings.ToLower(strings.TrimSuffix(policyPath, "*")))
-	}
-	return equalPath(policyPath, requestPath)
+	return pathpolicy.MatchPath(policyPath, requestPath)
 }

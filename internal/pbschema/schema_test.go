@@ -13,6 +13,7 @@ import (
 
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tests"
+	"github.com/xxxbrian/emby-auth-gateway/internal/pathpolicy"
 )
 
 func TestEnsureFreshThenExisting(t *testing.T) {
@@ -47,6 +48,32 @@ func TestEnsureFreshThenExisting(t *testing.T) {
 		c, err := app.FindCollectionByNameOrId(name)
 		if err != nil || c.Id != id {
 			t.Fatalf("collection %s id changed", name)
+		}
+	}
+}
+
+func TestEnsureFreshSeedsExactDefaultPolicies(t *testing.T) {
+	app := testApp(t)
+	if err := Ensure(app); err != nil {
+		t.Fatal(err)
+	}
+	records, err := app.FindRecordsByFilter("path_policies", "", "", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != len(pathpolicy.Defaults()) {
+		t.Fatalf("records = %d, defaults = %d", len(records), len(pathpolicy.Defaults()))
+	}
+	want := map[string]pathpolicy.Policy{}
+	for _, p := range pathpolicy.Defaults() {
+		m, path := pathpolicy.NormalizedIdentity(p.Method, p.Path)
+		want[m+"\x00"+path] = p
+	}
+	for _, r := range records {
+		m, path := pathpolicy.NormalizedIdentity(r.GetString("method"), r.GetString("path"))
+		p, ok := want[m+"\x00"+path]
+		if !ok || r.GetString("action") != p.Action || r.GetString("reason") != p.Reason || r.GetInt("priority") != p.Priority || r.GetBool("enabled") != p.Enabled {
+			t.Fatalf("unexpected policy record %#v", r.PublicExport())
 		}
 	}
 }
