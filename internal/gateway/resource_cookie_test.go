@@ -140,9 +140,10 @@ func TestServeHTTPRejectsUnsafeCookieResourceRoutesWithoutUpstream(t *testing.T)
 		t.Run(tt.name, func(t *testing.T) {
 			transport := &countingRoundTripper{}
 			store := NewMemoryStore()
+			configureTestUpstream(store, "http://backend.test/emby")
 			// An active session ensures a classifier regression reaches proxying
 			// instead of being masked by activeSession's unauthorized response.
-			store.Sessions[HashToken("gateway-token")] = testSession("http://backend.test/emby")
+			store.Sessions[HashToken("gateway-token")] = testSession()
 			server := NewServer(Config{GatewayBasePath: "/emby", HTTPClient: &http.Client{Transport: transport}}, store)
 			req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/placeholder", nil)
 			tt.setup(req)
@@ -178,7 +179,8 @@ func TestResourceCookieAuthenticatesImageWithoutForwardingCookie(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 	req, err := http.NewRequest(http.MethodGet, gw.URL+"/emby/Items/item/Images/Primary", nil)
@@ -221,7 +223,8 @@ func TestResourceCookieAuthenticatesNativeMediaRange(t *testing.T) {
 	}))
 	defer backend.Close()
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
@@ -316,7 +319,8 @@ func TestResourceCachePolicyAppliesToEveryCredentialSource(t *testing.T) {
 	}))
 	defer backend.Close()
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
@@ -349,7 +353,11 @@ func TestResourceCachePolicyAppliesToEveryCredentialSource(t *testing.T) {
 		req := mustRequest(t, http.MethodGet, gw.URL+"/emby"+path, nil)
 		resp := do(t, req)
 		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusUnauthorized || resp.Header.Get("Cache-Control") != "private, no-store" {
+		wantStatus, wantCache := http.StatusUnauthorized, "private, no-store"
+		if path == "/Items/item/Images/Primary" {
+			wantStatus, wantCache = http.StatusServiceUnavailable, "no-store"
+		}
+		if resp.StatusCode != wantStatus || resp.Header.Get("Cache-Control") != wantCache {
 			t.Fatalf("unauthenticated %s status/cache = %d/%q", path, resp.StatusCode, resp.Header.Get("Cache-Control"))
 		}
 	}
@@ -384,7 +392,8 @@ func TestCookieOnlyManifestAndChildrenDoNotExposeTokens(t *testing.T) {
 	defer backend.Close()
 	backendURL = backend.URL
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 	manifestReq, _ := http.NewRequest(http.MethodGet, gw.URL+"/emby/Videos/item/master.m3u8", nil)

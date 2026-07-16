@@ -24,8 +24,9 @@ func TestPlaybackGuardScopesAndAllowsDirectPlayedItems(t *testing.T) {
 	}))
 	defer backend.Close()
 	store := NewMemoryStore()
-	store.Sessions[HashToken(tokenOne)] = testSession(backend.URL + "/emby")
-	second := testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken(tokenOne)] = testSession()
+	second := testSession()
 	second.GatewayTokenHash = HashToken(tokenTwo)
 	store.Sessions[HashToken(tokenTwo)] = second
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
@@ -51,6 +52,22 @@ func TestPlaybackGuardScopesAndAllowsDirectPlayedItems(t *testing.T) {
 	}
 }
 
+func TestSuppressedPlaybackReportDoesNotRequireUpstream(t *testing.T) {
+	const token = "gateway-token"
+	store := NewMemoryStore()
+	session := testSession()
+	store.Sessions[HashToken(token)] = session
+	server := NewServer(Config{GatewayBasePath: "/emby"}, store)
+	server.playbackGuards.deny(playbackGuardKey{GatewayTokenHash: session.GatewayTokenHash, ItemID: "item-1"})
+	recorder := httptest.NewRecorder()
+	req := mustRequest(t, http.MethodPost, "http://gateway/emby/Sessions/Playing/Stopped?api_key="+token, strings.NewReader(`{"ItemId":"item-1","Played":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	server.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusNoContent || len(store.PlaybackEvents) != 0 {
+		t.Fatalf("status/events = %d/%d", recorder.Code, len(store.PlaybackEvents))
+	}
+}
+
 func TestPlaybackInfoSuccessClearsGuard(t *testing.T) {
 	const token = "gateway-token"
 	var deny atomic.Bool
@@ -66,7 +83,8 @@ func TestPlaybackInfoSuccessClearsGuard(t *testing.T) {
 	}))
 	defer backend.Close()
 	store := NewMemoryStore()
-	store.Sessions[HashToken(token)] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken(token)] = testSession()
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 	mustPlaybackInfoStatus(t, gw.URL, token, "item-1", http.StatusForbidden)
@@ -96,7 +114,8 @@ func TestOldPlaybackInfoSuccessCannotClearNewDenial(t *testing.T) {
 	}))
 	defer backend.Close()
 	store := NewMemoryStore()
-	session := testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	session := testSession()
 	store.Sessions[HashToken(token)] = session
 	server := NewServer(Config{GatewayBasePath: "/emby"}, store)
 	server.playbackGuards.deny(playbackGuardKey{GatewayTokenHash: session.GatewayTokenHash, ItemID: "item-1"})
@@ -156,7 +175,8 @@ func TestPlaybackConcurrencyAuditCooldown(t *testing.T) {
 	}))
 	defer backend.Close()
 	store := NewMemoryStore()
-	store.Sessions[HashToken(token)] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken(token)] = testSession()
 	server := NewServer(Config{GatewayBasePath: "/emby"}, store)
 	server.playbackGuards.now = func() time.Time { return now }
 	gw := httptest.NewServer(server)

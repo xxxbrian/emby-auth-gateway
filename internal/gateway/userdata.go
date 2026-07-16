@@ -325,7 +325,7 @@ func (s *Server) writeNextUpItems(w http.ResponseWriter, r *http.Request, sessio
 		}
 		episodes := extractItems(episodeValue)
 		if len(episodes) > 0 {
-			_ = s.store.SaveItemChildCount(r.Context(), ItemChildCount{BackendAccountID: session.BackendAccountID, ItemID: seriesID, ChildCount: len(episodes)})
+			_ = s.store.SaveItemChildCount(r.Context(), ItemChildCount{ItemID: seriesID, ChildCount: len(episodes)})
 		}
 		sort.SliceStable(episodes, func(i, j int) bool {
 			return episodeOrderLess(episodes[i], episodes[j])
@@ -570,10 +570,14 @@ func lowerSet(values []string) map[string]bool {
 }
 
 func (s *Server) fetchBackendJSON(ctx context.Context, r *http.Request, rel, rawQuery string, session *Session, gatewayToken string) (any, int, upstreamRequestSnapshot, error) {
-	if err := s.ensureBackendSession(ctx, session); err != nil {
+	runtime, err := s.upstreamAuth.Ensure(ctx)
+	if err != nil {
 		return nil, 0, upstreamRequestSnapshot{}, err
 	}
-	upstream := upstreamRequestSnapshotFromLegacySession(session)
+	upstream, err := upstreamRequestSnapshotFromRuntime(runtime)
+	if err != nil {
+		return nil, 0, upstreamRequestSnapshot{}, err
+	}
 	u, err := s.proxyURL(upstream, session, rel, rawQuery, gatewayToken)
 	if err != nil {
 		return nil, 0, upstreamRequestSnapshot{}, err
@@ -591,9 +595,8 @@ func (s *Server) fetchBackendJSON(ctx context.Context, r *http.Request, rel, raw
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusUnauthorized {
-		failedToken := upstream.token
-		if err := s.refreshBackendSession(ctx, session, failedToken); err == nil {
-			upstream = upstreamRequestSnapshotFromLegacySession(session)
+		if refreshed, confirmed, refreshErr := s.refreshAfterUnauthorized(ctx, upstream); confirmed && refreshErr == nil {
+			upstream = refreshed
 			s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh", "backend token refreshed after unauthorized response", http.StatusOK)
 			_ = resp.Body.Close()
 			u, err = s.proxyURL(upstream, session, rel, rawQuery, gatewayToken)

@@ -16,7 +16,7 @@ import (
 	"github.com/xxxbrian/emby-auth-gateway/internal/gateway"
 )
 
-const importSummaryVersion = 1
+const importSummaryVersion = 2
 
 var (
 	marshalImportSnapshot    = json.Marshal
@@ -481,27 +481,28 @@ func logoutImport(ctx context.Context, p importPlan, result upstreamProbeResult,
 }
 
 type importSummary struct {
-	SchemaVersion              int                       `json:"schema_version"`
-	Mode                       string                    `json:"mode"`
-	Action                     string                    `json:"action"`
-	ServerRecordID             string                    `json:"server_record_id"`
-	AccountRecordID            string                    `json:"account_record_id"`
-	EndpointURL                string                    `json:"endpoint_url"`
-	LiveServerID               string                    `json:"live_server_id"`
-	EndpointKey                string                    `json:"endpoint_key"`
-	DeviceIDSource             string                    `json:"device_id_source"`
-	DeviceIDDisposition        string                    `json:"device_id_disposition"`
-	DeviceIDFingerprint        string                    `json:"device_id_sha256"`
-	IdentityDefaultsApplied    []string                  `json:"identity_defaults_applied"`
-	SingletonState             string                    `json:"singleton_state"`
-	EnabledUsers               int                       `json:"enabled_user_count"`
-	EligibleUsers              int                       `json:"selected_account_eligible_user_count"`
-	EnabledMappings            int                       `json:"enabled_mapping_count"`
-	SelectedMappings           int                       `json:"selected_mapping_count"`
-	UnrevokedSessions          int                       `json:"unrevoked_session_count"`
-	SelectedAccountChildCounts int                       `json:"selected_account_child_count"`
-	Collections                []importCollectionSummary `json:"collections"`
-	ValidationToken            string                    `json:"validation_token_disposition"`
+	SchemaVersion           int                       `json:"schema_version"`
+	Mode                    string                    `json:"mode"`
+	Action                  string                    `json:"action"`
+	ServerRecordID          string                    `json:"server_record_id"`
+	AccountRecordID         string                    `json:"account_record_id"`
+	EndpointURL             string                    `json:"endpoint_url"`
+	LiveServerID            string                    `json:"live_server_id"`
+	EndpointKey             string                    `json:"endpoint_key"`
+	DeviceIDSource          string                    `json:"device_id_source"`
+	DeviceIDDisposition     string                    `json:"device_id_disposition"`
+	DeviceIDFingerprint     string                    `json:"device_id_sha256"`
+	IdentityDefaultsApplied []string                  `json:"identity_defaults_applied"`
+	SingletonState          string                    `json:"singleton_state"`
+	EnabledUsers            int                       `json:"enabled_user_count"`
+	EligibleUsers           int                       `json:"selected_account_eligible_user_count"`
+	EnabledMappings         int                       `json:"enabled_mapping_count"`
+	SelectedMappings        int                       `json:"selected_mapping_count"`
+	UnrevokedSessions       int                       `json:"unrevoked_session_count"`
+	ItemChildCountRows      int                       `json:"item_child_count_row_count"`
+	ItemChildCountScope     string                    `json:"item_child_count_scope"`
+	Collections             []importCollectionSummary `json:"collections"`
+	ValidationToken         string                    `json:"validation_token_disposition"`
 }
 
 type importCollectionSummary struct {
@@ -515,7 +516,7 @@ func makeImportSummary(app core.App, p importPlan, probe upstreamProbeResult, ac
 	if apply {
 		mode = "apply"
 	}
-	collections, sessions, childCounts, err := importCollectionSummaries(app, p.account.Id)
+	collections, sessions, childCounts, childCountScope, err := importCollectionSummaries(app, p.account.Id)
 	if err != nil {
 		return importSummary{}, err
 	}
@@ -532,17 +533,26 @@ func makeImportSummary(app core.App, p importPlan, probe upstreamProbeResult, ac
 	if apply && action != "noop" {
 		deviceDisposition = "generated"
 	}
-	return importSummary{SchemaVersion: importSummaryVersion, Mode: mode, Action: action, ServerRecordID: p.server.Id, AccountRecordID: p.account.Id, EndpointURL: p.url, LiveServerID: probe.serverID, EndpointKey: primaryEndpointKey, DeviceIDSource: p.deviceSource, DeviceIDDisposition: deviceDisposition, DeviceIDFingerprint: fingerprint, IdentityDefaultsApplied: defaults, SingletonState: stateName(p.state), EnabledUsers: p.enabledUsers, EligibleUsers: p.eligibleUsers, EnabledMappings: p.enabledMappings, SelectedMappings: p.selectedMappings, UnrevokedSessions: sessions, SelectedAccountChildCounts: childCounts, Collections: collections, ValidationToken: disposition}, nil
+	return importSummary{SchemaVersion: importSummaryVersion, Mode: mode, Action: action, ServerRecordID: p.server.Id, AccountRecordID: p.account.Id, EndpointURL: p.url, LiveServerID: probe.serverID, EndpointKey: primaryEndpointKey, DeviceIDSource: p.deviceSource, DeviceIDDisposition: deviceDisposition, DeviceIDFingerprint: fingerprint, IdentityDefaultsApplied: defaults, SingletonState: stateName(p.state), EnabledUsers: p.enabledUsers, EligibleUsers: p.eligibleUsers, EnabledMappings: p.enabledMappings, SelectedMappings: p.selectedMappings, UnrevokedSessions: sessions, ItemChildCountRows: childCounts, ItemChildCountScope: childCountScope, Collections: collections, ValidationToken: disposition}, nil
 }
 
-func importCollectionSummaries(app core.App, accountID string) ([]importCollectionSummary, int, int, error) {
+func importCollectionSummaries(app core.App, accountID string) ([]importCollectionSummary, int, int, string, error) {
 	names := []string{"users", "emby_servers", "backend_accounts", "user_mappings", "gateway_sessions", "user_item_data", "playback_events", "display_preferences", "audit_logs", "item_child_counts", "path_policies"}
+	counts, err := app.FindCollectionByNameOrId("item_child_counts")
+	if err != nil {
+		return nil, 0, 0, "", fmt.Errorf("load item_child_counts schema: %w", err)
+	}
+	legacyChildCounts := counts.Fields.GetByName("backend_account_id") != nil
+	childCountScope := "all_items"
+	if legacyChildCounts {
+		childCountScope = "selected_account"
+	}
 	result := make([]importCollectionSummary, 0, len(names))
 	unrevoked, childCounts := 0, 0
 	for _, name := range names {
 		records, err := readImportSummaryRecords(app, name)
 		if err != nil {
-			return nil, 0, 0, fmt.Errorf("read preservation collection %s: %w", name, err)
+			return nil, 0, 0, "", fmt.Errorf("read preservation collection %s: %w", name, err)
 		}
 		parts := make([]string, 0, len(records))
 		for _, r := range records {
@@ -550,14 +560,16 @@ func importCollectionSummaries(app core.App, accountID string) ([]importCollecti
 			if name == "gateway_sessions" && r.GetDateTime("revoked_at").IsZero() {
 				unrevoked++
 			}
-			if name == "item_child_counts" && r.GetString("backend_account_id") == accountID {
-				childCounts++
+			if name == "item_child_counts" {
+				if !legacyChildCounts || r.GetString("backend_account_id") == accountID {
+					childCounts++
+				}
 			}
 		}
 		sort.Strings(parts)
 		result = append(result, importCollectionSummary{Name: name, Count: len(records), Fingerprint: fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(parts, "\x01"))))})
 	}
-	return result, unrevoked, childCounts, nil
+	return result, unrevoked, childCounts, childCountScope, nil
 }
 func stateName(s upstreamState) string {
 	if s.source == nil {

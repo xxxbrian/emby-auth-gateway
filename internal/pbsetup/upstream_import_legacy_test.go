@@ -93,8 +93,61 @@ func TestImportLegacySummaryReadFailureFailsClosed(t *testing.T) {
 			return app.FindRecordsByFilter(collection, "", "id", 0, 0, nil)
 		}
 	})
-	if _, _, _, err := importCollectionSummaries(app, "account"); err == nil {
+	if _, _, _, _, err := importCollectionSummaries(app, "account"); err == nil {
 		t.Fatal("summary read failure was ignored")
+	}
+}
+
+func TestImportCollectionSummariesFinalChildCountScope(t *testing.T) {
+	app := newTestApp(t)
+	counts, err := app.FindCollectionByNameOrId("item_child_counts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, itemID := range []string{"one", "two"} {
+		record := core.NewRecord(counts)
+		record.Set("item_id", itemID)
+		record.Set("child_count", 1)
+		if err := app.Save(record); err != nil {
+			t.Fatalf("save final child count: %v", err)
+		}
+	}
+
+	_, _, childCounts, scope, err := importCollectionSummaries(app, "selected")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if childCounts != 2 || scope != "all_items" {
+		t.Fatalf("final child-count summary = %d/%q, want 2/all_items", childCounts, scope)
+	}
+}
+
+func TestImportCollectionSummariesLegacyChildCountScope(t *testing.T) {
+	app := newTestApp(t)
+	counts, err := app.FindCollectionByNameOrId("item_child_counts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts.Fields.Add(&core.TextField{Name: "backend_account_id", Max: 80})
+	if err := app.Save(counts); err != nil {
+		t.Fatalf("add legacy child-count field: %v", err)
+	}
+	for _, accountID := range []string{"selected", "other"} {
+		record := core.NewRecord(counts)
+		record.Set("backend_account_id", accountID)
+		record.Set("item_id", accountID+"-item")
+		record.Set("child_count", 1)
+		if err := app.Save(record); err != nil {
+			t.Fatalf("save legacy child count: %v", err)
+		}
+	}
+
+	_, _, childCounts, scope, err := importCollectionSummaries(app, "selected")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if childCounts != 1 || scope != "selected_account" {
+		t.Fatalf("legacy child-count summary = %d/%q, want 1/selected_account", childCounts, scope)
 	}
 }
 

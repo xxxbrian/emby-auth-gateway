@@ -286,14 +286,6 @@ func (m *MemoryStore) UpdateBackendToken(ctx context.Context, accountID, token, 
 		m.Mappings[key] = mapping
 		updated = true
 	}
-	for _, session := range m.Sessions {
-		if session.BackendAccountID == accountID {
-			session.BackendToken = token
-			session.BackendUserID = backendUserID
-			session.BackendAccount.BackendToken = token
-			session.BackendAccount.BackendUserID = backendUserID
-		}
-	}
 	if !updated {
 		return ErrNotFound
 	}
@@ -433,12 +425,12 @@ func (m *MemoryStore) ListPlaybackAggregates(ctx context.Context, gatewayUserID 
 	return aggregates, nil
 }
 
-func (m *MemoryStore) ListItemChildCounts(ctx context.Context, backendAccountID string, itemIDs []string) (map[string]ItemChildCount, error) {
+func (m *MemoryStore) ListItemChildCounts(ctx context.Context, itemIDs []string) (map[string]ItemChildCount, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	counts := map[string]ItemChildCount{}
 	for _, itemID := range itemIDs {
-		if count, ok := m.ItemChildCounts[itemChildCountKey(backendAccountID, itemID)]; ok {
+		if count, ok := m.ItemChildCounts[itemChildCountKey(itemID)]; ok {
 			counts[itemID] = count
 		}
 	}
@@ -446,6 +438,9 @@ func (m *MemoryStore) ListItemChildCounts(ctx context.Context, backendAccountID 
 }
 
 func (m *MemoryStore) SaveItemChildCount(ctx context.Context, count ItemChildCount) error {
+	if count.ItemID == "" || count.ChildCount <= 0 {
+		return nil
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.ItemChildCounts == nil {
@@ -454,7 +449,7 @@ func (m *MemoryStore) SaveItemChildCount(ctx context.Context, count ItemChildCou
 	if count.UpdatedAt.IsZero() {
 		count.UpdatedAt = time.Now().UTC()
 	}
-	m.ItemChildCounts[itemChildCountKey(count.BackendAccountID, count.ItemID)] = count
+	m.ItemChildCounts[itemChildCountKey(count.ItemID)] = count
 	return nil
 }
 
@@ -566,17 +561,6 @@ func (m *MemoryStore) SaveSession(ctx context.Context, session *Session) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	copySession := *session
-	for _, mapping := range m.Mappings {
-		if mapping.BackendAccount.ID == copySession.BackendAccountID {
-			copySession.BackendAccount = mapping.BackendAccount
-			copySession.BackendBaseURL = mapping.BackendAccount.BaseURL
-			copySession.BackendUserID = mapping.BackendAccount.BackendUserID
-			copySession.BackendUsername = mapping.BackendAccount.Username
-			copySession.BackendToken = mapping.BackendAccount.BackendToken
-			copySession.BackendIdentity = mapping.BackendAccount.ClientIdentity.WithDefaults()
-			copySession.BackendServerID = mapping.BackendAccount.Server.BackendServerID
-		}
-	}
 	m.Sessions[session.GatewayTokenHash] = &copySession
 	return nil
 }
@@ -589,17 +573,6 @@ func (m *MemoryStore) FindSessionByTokenHash(ctx context.Context, tokenHash stri
 		return nil, ErrNotFound
 	}
 	copySession := *session
-	for _, mapping := range m.Mappings {
-		if mapping.BackendAccount.ID == copySession.BackendAccountID {
-			copySession.BackendAccount = mapping.BackendAccount
-			copySession.BackendBaseURL = mapping.BackendAccount.BaseURL
-			copySession.BackendUserID = mapping.BackendAccount.BackendUserID
-			copySession.BackendUsername = mapping.BackendAccount.Username
-			copySession.BackendToken = mapping.BackendAccount.BackendToken
-			copySession.BackendIdentity = mapping.BackendAccount.ClientIdentity.WithDefaults()
-			copySession.BackendServerID = mapping.BackendAccount.Server.BackendServerID
-		}
-	}
 	return &copySession, nil
 }
 
@@ -625,8 +598,8 @@ func playbackStateKey(gatewayUserID, itemID string) string {
 	return gatewayUserID + "\x00" + itemID
 }
 
-func itemChildCountKey(backendAccountID, itemID string) string {
-	return backendAccountID + "\x00" + itemID
+func itemChildCountKey(itemID string) string {
+	return itemID
 }
 
 func displayPreferenceKey(gatewayUserID, preferenceID, client string) string {

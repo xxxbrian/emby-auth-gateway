@@ -67,7 +67,7 @@ func TestCurrentUserRejectsExpiredAndRevokedSessions(t *testing.T) {
 	for _, state := range []string{"expired", "revoked"} {
 		t.Run(state, func(t *testing.T) {
 			store := NewMemoryStore()
-			session := testSession("http://backend.invalid/emby")
+			session := testSession()
 			if state == "expired" {
 				session.ExpiresAt = time.Now().UTC().Add(-time.Minute)
 			} else {
@@ -87,12 +87,12 @@ func TestCurrentUserRejectsExpiredAndRevokedSessions(t *testing.T) {
 
 func TestCurrentUserRejectsStoredGenericCredentialConflict(t *testing.T) {
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession("http://backend.invalid/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	otherToken, otherHash, err := NewOpaqueToken()
 	if err != nil {
 		t.Fatal(err)
 	}
-	store.Sessions[otherHash] = testSession("http://backend.invalid/emby")
+	store.Sessions[otherHash] = testSession()
 	server := NewServer(Config{GatewayBasePath: "/emby"}, store)
 	writer := httptest.NewRecorder()
 	server.ServeHTTP(writer, httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Users/gateway-user?api_key=gateway-token&token="+otherToken, nil))

@@ -104,7 +104,7 @@ func TestMissingContentTypeJSONUsesGatewayLocalUserData(t *testing.T) {
 	body := " \t" + `{"Id":"item-1","UserData":{"Played":true,"PlaybackPositionTicks":9999}}`
 	resp := missingContentTypeResponse(req, strings.NewReader(body), int64(len(body)))
 	session := &Session{GatewayUserID: "u1", SyntheticUserID: "gateway-user"}
-	server.writeProxyResponseWithSnapshot(writer, req, "/Items/item-1", resp, session, upstreamRequestSnapshotFromLegacySession(session), "", "")
+	server.writeProxyResponseWithSnapshot(writer, req, "/Items/item-1", resp, session, testUpstreamSnapshot("http://backend.invalid/emby"), "", "")
 	var item map[string]any
 	if writer.Code != http.StatusOK || json.Unmarshal(writer.Body.Bytes(), &item) != nil {
 		t.Fatal("missing content type json was not returned")

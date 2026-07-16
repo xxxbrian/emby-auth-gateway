@@ -13,18 +13,13 @@ import (
 )
 
 type Config struct {
-	PublicBaseURL                 string
-	GatewayBasePath               string
-	GatewayServerID               string
-	HTTPClient                    *http.Client
-	MinResumePct                  float64
-	MaxResumePct                  float64
-	MinResumeDurationSeconds      float64
-	AnonymousImageServerRecordID  string
-	AnonymousImageBackendServerID string
-	// AnonymousImageConfigured preserves explicit empty environment values so
-	// startup validation can reject a malformed paired configuration.
-	AnonymousImageConfigured bool
+	PublicBaseURL            string
+	GatewayBasePath          string
+	GatewayServerID          string
+	HTTPClient               *http.Client
+	MinResumePct             float64
+	MaxResumePct             float64
+	MinResumeDurationSeconds float64
 }
 
 type Store interface {
@@ -47,7 +42,7 @@ type Store interface {
 	FindPlaybackState(ctx context.Context, gatewayUserID, itemID string) (*PlaybackState, error)
 	ListPlaybackStatesByItemIDs(ctx context.Context, gatewayUserID string, itemIDs []string) (map[string]*PlaybackState, error)
 	ListPlaybackAggregates(ctx context.Context, gatewayUserID string, seriesIDs, seasonIDs []string) (PlaybackAggregates, error)
-	ListItemChildCounts(ctx context.Context, backendAccountID string, itemIDs []string) (map[string]ItemChildCount, error)
+	ListItemChildCounts(ctx context.Context, itemIDs []string) (map[string]ItemChildCount, error)
 	SaveItemChildCount(ctx context.Context, count ItemChildCount) error
 	ListPlaybackStates(ctx context.Context, gatewayUserID string, filter PlaybackStateFilter) ([]PlaybackState, error)
 	SavePlaybackState(ctx context.Context, state PlaybackState) error
@@ -324,10 +319,9 @@ type PlaybackAggregates struct {
 }
 
 type ItemChildCount struct {
-	BackendAccountID string
-	ItemID           string
-	ChildCount       int
-	UpdatedAt        time.Time
+	ItemID     string
+	ChildCount int
+	UpdatedAt  time.Time
 }
 
 type DisplayPreference struct {
@@ -474,23 +468,14 @@ type Session struct {
 	GatewayUserID    string
 	GatewayUsername  string
 	SyntheticUserID  string
-	BackendAccountID string
-	BackendAccount   BackendAccount
-	// The backend fields below are resolved from backend_accounts/emby_servers at runtime.
-	BackendServerID string
-	BackendBaseURL  string
-	BackendUserID   string
-	BackendUsername string
-	BackendToken    string
-	BackendIdentity BackendClientIdentity
-	Client          string
-	Device          string
-	DeviceID        string
-	Version         string
-	RemoteIP        string
-	CreatedAt       time.Time
-	ExpiresAt       time.Time
-	RevokedAt       *time.Time
+	Client           string
+	Device           string
+	DeviceID         string
+	Version          string
+	RemoteIP         string
+	CreatedAt        time.Time
+	ExpiresAt        time.Time
+	RevokedAt        *time.Time
 }
 
 func (s *Session) Active(now time.Time) bool {

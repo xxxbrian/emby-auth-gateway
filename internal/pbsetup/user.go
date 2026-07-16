@@ -20,7 +20,7 @@ func newUserCommand(app core.App) *cobra.Command {
 	var opts userOptions
 	cmd := &cobra.Command{
 		Use:   "user",
-		Short: "Create or update a preparatory gateway user for singleton upstream cutover",
+		Short: "Create or update a gateway user",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			operationCtx, cancel := context.WithTimeout(cmd.Context(), 30*time.Second)
@@ -34,7 +34,7 @@ func newUserCommand(app core.App) *cobra.Command {
 			if err := runUser(operationCtx, app, opts); err != nil {
 				return err
 			}
-			fmt.Printf("configured preparatory gateway user %q; it will be used after singleton runtime cutover\n", opts.GatewayUsername)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "configured gateway user %q\n", opts.GatewayUsername)
 			return nil
 		},
 	}

@@ -127,7 +127,7 @@ func newUpstreamCreateCommand(app core.App) *cobra.Command {
 	var opts upstreamOptions
 	cmd := &cobra.Command{
 		Use:   "create",
-		Short: "Create or update preparatory singleton upstream configuration",
+		Short: "Create or update singleton upstream configuration",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			operationCtx, cancel := context.WithTimeout(cmd.Context(), 30*time.Second)
@@ -141,7 +141,7 @@ func newUpstreamCreateCommand(app core.App) *cobra.Command {
 			if err := runUpstreamCreate(operationCtx, app, opts); err != nil {
 				return err
 			}
-			fmt.Printf("configured preparatory singleton upstream; it will be used after runtime cutover\n")
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "configured singleton upstream")
 			return nil
 		},
 	}

@@ -257,7 +257,7 @@ func laneCSeedImportAppWithLogout(t *testing.T, logout func(http.ResponseWriter,
 	laneCSaveRecord(t, app, "playback_events", map[string]any{"gateway_user": user.Id, "synthetic_user_id": "synthetic", "item_id": "item", "item_name": "Item", "event": "progress", "playback_position_ticks": 100, "played": true, "played_percentage": 50, "remote_ip": "127.0.0.1", "occurred_at": time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)})
 	laneCSaveRecord(t, app, "display_preferences", map[string]any{"gateway_user": user.Id, "synthetic_user_id": "synthetic", "preference_id": "pref", "client": "client", "payload_json": `{"secret":"payload-secret"}`})
 	laneCSaveRecord(t, app, "audit_logs", map[string]any{"gateway_user": user.Id, "synthetic_user_id": "synthetic", "event": "event", "message": "audit message", "method": "GET", "path": "/Items", "status": 200, "remote_ip": "127.0.0.1"})
-	laneCSaveRecord(t, app, "item_child_counts", map[string]any{"backend_account_id": account.Id, "item_id": "parent", "child_count": 2})
+	laneCSaveRecord(t, app, "item_child_counts", map[string]any{"item_id": "parent", "child_count": 2})
 	laneCSaveRecord(t, app, "path_policies", map[string]any{"method": "GET", "path": "/Items/*", "action": "allow", "priority": 7, "reason": "test", "enabled": true})
 	return app, legacyServer, account, upstream.Close, func() int { logoutMu.Lock(); defer logoutMu.Unlock(); return logouts }
 }
@@ -333,7 +333,7 @@ func laneCAssertSummary(t *testing.T, summary importSummary, server, account *co
 	if got, want := strings.Join(summary.IdentityDefaultsApplied, ","), "user_agent,client,device,version"; got != want {
 		t.Fatalf("identity defaults = %q, want %q", got, want)
 	}
-	if summary.SingletonState != map[string]string{"create": "empty", "noop": "present"}[action] || summary.EnabledUsers != 1 || summary.EligibleUsers != 1 || summary.EnabledMappings != 1 || summary.SelectedMappings != 1 || summary.UnrevokedSessions != 1 || summary.SelectedAccountChildCounts != 1 {
+	if summary.SingletonState != map[string]string{"create": "empty", "noop": "present"}[action] || summary.EnabledUsers != 1 || summary.EligibleUsers != 1 || summary.EnabledMappings != 1 || summary.SelectedMappings != 1 || summary.UnrevokedSessions != 1 || summary.ItemChildCountRows != 1 || summary.ItemChildCountScope != "all_items" {
 		t.Fatalf("summary singleton/access fields = %#v", summary)
 	}
 	if len(summary.Collections) != len(expected) {

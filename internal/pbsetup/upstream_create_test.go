@@ -1,6 +1,7 @@
 package pbsetup
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -12,6 +13,34 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/hook"
 )
+
+func TestSingletonSetupCommandSuccessOutput(t *testing.T) {
+	app := newTestApp(t)
+	backend := newUpstreamResponder(t)
+	defer backend.Close()
+
+	upstream := NewCommand(app)
+	var upstreamOutput bytes.Buffer
+	upstream.SetOut(&upstreamOutput)
+	upstream.SetArgs([]string{"upstream", "create", "--emby-url", backend.URL, "--backend-username", "backend", "--backend-password", "password"})
+	if err := upstream.Execute(); err != nil {
+		t.Fatalf("upstream create: %v", err)
+	}
+	if got := upstreamOutput.String(); got != "configured singleton upstream\n" {
+		t.Fatalf("upstream output = %q", got)
+	}
+
+	user := NewCommand(app)
+	var userOutput bytes.Buffer
+	user.SetOut(&userOutput)
+	user.SetArgs([]string{"user", "--gateway-username", "alice", "--gateway-password", "password", "--synthetic-user-id", "gateway-alice"})
+	if err := user.Execute(); err != nil {
+		t.Fatalf("setup user: %v", err)
+	}
+	if got := userOutput.String(); got != "configured gateway user \"alice\"\n" {
+		t.Fatalf("user output = %q", got)
+	}
+}
 
 var (
 	upstreamTestToken      string

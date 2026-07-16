@@ -44,6 +44,7 @@ func TestGatewayCollectionsAreLockedAndStoreAuthStillWorks(t *testing.T) {
 	}, nil)
 	assertFields(t, app, "backend_accounts", []string{"backend_password", "backend_user_id", "backend_token", "token_updated_at"}, []string{"backend_password_encrypted"})
 	assertFields(t, app, "gateway_sessions", nil, []string{
+		"backend_account",
 		"backend_token",
 		"backend_server_id",
 		"backend_base_url",

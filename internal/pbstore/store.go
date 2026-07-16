@@ -505,9 +505,9 @@ func (s *Store) ListPlaybackAggregates(ctx context.Context, gatewayUserID string
 	return aggregates, nil
 }
 
-func (s *Store) ListItemChildCounts(ctx context.Context, backendAccountID string, itemIDs []string) (map[string]gateway.ItemChildCount, error) {
+func (s *Store) ListItemChildCounts(ctx context.Context, itemIDs []string) (map[string]gateway.ItemChildCount, error) {
 	counts := map[string]gateway.ItemChildCount{}
-	if backendAccountID == "" || len(itemIDs) == 0 {
+	if len(itemIDs) == 0 {
 		return counts, nil
 	}
 	for start := 0; start < len(itemIDs); start += playbackStateItemIDBatchLimit {
@@ -515,7 +515,7 @@ func (s *Store) ListItemChildCounts(ctx context.Context, backendAccountID string
 		if end > len(itemIDs) {
 			end = len(itemIDs)
 		}
-		batch, err := s.listItemChildCountBatch(ctx, backendAccountID, itemIDs[start:end])
+		batch, err := s.listItemChildCountBatch(ctx, itemIDs[start:end])
 		if err != nil {
 			return nil, err
 		}
@@ -526,9 +526,9 @@ func (s *Store) ListItemChildCounts(ctx context.Context, backendAccountID string
 	return counts, nil
 }
 
-func (s *Store) listItemChildCountBatch(ctx context.Context, backendAccountID string, itemIDs []string) (map[string]gateway.ItemChildCount, error) {
+func (s *Store) listItemChildCountBatch(ctx context.Context, itemIDs []string) (map[string]gateway.ItemChildCount, error) {
 	filterParts := make([]string, 0, len(itemIDs))
-	params := dbx.Params{"backendAccountID": backendAccountID}
+	params := dbx.Params{}
 	for i, itemID := range itemIDs {
 		if itemID == "" {
 			continue
@@ -542,7 +542,7 @@ func (s *Store) listItemChildCountBatch(ctx context.Context, backendAccountID st
 	}
 	records, err := s.app.FindRecordsByFilter(
 		"item_child_counts",
-		"backend_account_id = {:backendAccountID} && ("+strings.Join(filterParts, " || ")+")",
+		strings.Join(filterParts, " || "),
 		"",
 		0,
 		0,
@@ -560,16 +560,16 @@ func (s *Store) listItemChildCountBatch(ctx context.Context, backendAccountID st
 }
 
 func (s *Store) SaveItemChildCount(ctx context.Context, count gateway.ItemChildCount) error {
-	if count.BackendAccountID == "" || count.ItemID == "" || count.ChildCount <= 0 {
+	if count.ItemID == "" || count.ChildCount <= 0 {
 		return nil
 	}
 	records, err := s.app.FindRecordsByFilter(
 		"item_child_counts",
-		"backend_account_id = {:backendAccountID} && item_id = {:itemID}",
+		"item_id = {:itemID}",
 		"",
 		1,
 		0,
-		dbx.Params{"backendAccountID": count.BackendAccountID, "itemID": count.ItemID},
+		dbx.Params{"itemID": count.ItemID},
 	)
 	if err != nil {
 		return err
@@ -583,7 +583,6 @@ func (s *Store) SaveItemChildCount(ctx context.Context, count gateway.ItemChildC
 			return err
 		}
 		record = core.NewRecord(collection)
-		record.Set("backend_account_id", count.BackendAccountID)
 		record.Set("item_id", count.ItemID)
 	}
 	record.Set("child_count", count.ChildCount)
@@ -789,7 +788,6 @@ func (s *Store) SaveSession(ctx context.Context, session *gateway.Session) error
 	record.Set("gateway_user", session.GatewayUserID)
 	record.Set("gateway_username", session.GatewayUsername)
 	record.Set("synthetic_user_id", session.SyntheticUserID)
-	record.Set("backend_account", session.BackendAccountID)
 	record.Set("client", session.Client)
 	record.Set("device", session.Device)
 	record.Set("device_id", session.DeviceID)
@@ -827,23 +825,11 @@ func (s *Store) FindSessionByTokenHash(ctx context.Context, tokenHash string) (*
 		t := record.GetDateTime("revoked_at").Time()
 		revokedAt = &t
 	}
-	account, err := s.backendAccountByID(record.GetString("backend_account"))
-	if err != nil {
-		return nil, err
-	}
 	return &gateway.Session{
 		GatewayTokenHash: record.GetString("gateway_token_hash"),
 		GatewayUserID:    record.GetString("gateway_user"),
 		GatewayUsername:  record.GetString("gateway_username"),
 		SyntheticUserID:  record.GetString("synthetic_user_id"),
-		BackendAccountID: record.GetString("backend_account"),
-		BackendAccount:   *account,
-		BackendServerID:  account.Server.BackendServerID,
-		BackendBaseURL:   account.BaseURL,
-		BackendUserID:    account.BackendUserID,
-		BackendUsername:  account.Username,
-		BackendToken:     account.BackendToken,
-		BackendIdentity:  account.ClientIdentity.WithDefaults(),
 		Client:           record.GetString("client"),
 		Device:           record.GetString("device"),
 		DeviceID:         record.GetString("device_id"),
@@ -1034,10 +1020,9 @@ func displayPreferenceFromRecord(record *core.Record) *gateway.DisplayPreference
 
 func itemChildCountFromRecord(record *core.Record) gateway.ItemChildCount {
 	return gateway.ItemChildCount{
-		BackendAccountID: record.GetString("backend_account_id"),
-		ItemID:           record.GetString("item_id"),
-		ChildCount:       record.GetInt("child_count"),
-		UpdatedAt:        record.GetDateTime("updated").Time(),
+		ItemID:     record.GetString("item_id"),
+		ChildCount: record.GetInt("child_count"),
+		UpdatedAt:  record.GetDateTime("updated").Time(),
 	}
 }
 

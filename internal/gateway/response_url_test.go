@@ -7,7 +7,7 @@ import (
 )
 
 func TestRewriteMediaReference(t *testing.T) {
-	session := testSession("https://backend.example.com:443/emby/")
+	session := testSession()
 	const gateway = "gateway-token"
 	public := "https://media.example.com/emby"
 	cases := []struct {
@@ -28,30 +28,26 @@ func TestRewriteMediaReference(t *testing.T) {
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := rewriteMediaReference(tt.in, session, upstreamRequestSnapshotFromLegacySession(session), gateway, public, "gateway-server", false); got != tt.want {
+			if got := rewriteMediaReference(tt.in, session, testResponseUpstreamSnapshot("https://backend.example.com:443/emby/"), gateway, public, "gateway-server", false); got != tt.want {
 				t.Fatalf("rewriteMediaReference() = %q, want %q", got, tt.want)
 			}
 		})
 	}
 
-	absolute := rewriteMediaReference("https://backend.example.com/emby/Videos/a/stream?api_key=backend-token", session, upstreamRequestSnapshotFromLegacySession(session), gateway, public, "gateway-server", true)
+	absolute := rewriteMediaReference("https://backend.example.com/emby/Videos/a/stream?api_key=backend-token", session, testResponseUpstreamSnapshot("https://backend.example.com:443/emby/"), gateway, public, "gateway-server", true)
 	if absolute != "https://media.example.com/emby/Videos/a/stream?api_key=gateway-token" {
 		t.Fatalf("absolute = %q", absolute)
 	}
-	rewritten := rewriteJSONValueWithSnapshot(map[string]any{"DirectStreamUrl": "https://outside.example.com/file?api_key=backend-token"}, session, upstreamRequestSnapshotFromLegacySession(session), gateway, public, "gateway-server").(map[string]any)
+	rewritten := rewriteJSONValueWithSnapshot(map[string]any{"DirectStreamUrl": "https://outside.example.com/file?api_key=backend-token"}, session, testResponseUpstreamSnapshot("https://backend.example.com:443/emby/"), gateway, public, "gateway-server").(map[string]any)
 	if got := rewritten["DirectStreamUrl"]; got != "" {
 		t.Fatalf("external media field = %q", got)
 	}
 }
 
-func TestResponseURLRewritesUseCapturedSnapshotAfterSessionMutation(t *testing.T) {
-	session := testSession("https://backend.example.com/emby")
-	upstream := upstreamRequestSnapshotFromLegacySession(session)
-	session.BackendBaseURL = "https://mutated.example.com/other"
-	session.BackendServerID = "mutated-server"
-	session.BackendUserID = "mutated-user"
-	session.BackendToken = "mutated-token"
-	session.BackendIdentity = backendIdentityForTest("mutated-device")
+func TestResponseURLRewritesUseCapturedSnapshotAfterRuntimeChange(t *testing.T) {
+	session := testSession()
+	upstream := testResponseUpstreamSnapshot("https://backend.example.com/emby")
+	changedRuntime := testResponseUpstreamSnapshot("https://mutated.example.com/other")
 
 	const gatewayToken = "gateway-token"
 	const publicBase = "https://gateway.example.com/emby"
@@ -69,15 +65,15 @@ func TestResponseURLRewritesUseCapturedSnapshotAfterSessionMutation(t *testing.T
 	if got := rewriteStringWithSnapshot("backend-token backend-user backend-server", session, upstream, gatewayToken, publicBase, "gateway-server"); got != "gateway-token gateway-user gateway-server" {
 		t.Fatalf("scalar rewrite = %q", got)
 	}
-	if strings.Contains(strings.Join([]string{rewriteMediaReference(input, session, upstream, gatewayToken, publicBase, "gateway-server", false), rewriteM3U8Reference(input, "/Videos/a/master.m3u8", session, upstream, gatewayToken, publicBase, "gateway-server"), rewriteResponseLocation(input, "/Items/a", session, upstream, gatewayToken, publicBase, "gateway-server")}, " "), "mutated-") {
-		t.Fatal("response rewrite used mutated session values")
+	if strings.Contains(strings.Join([]string{rewriteMediaReference(input, session, upstream, gatewayToken, publicBase, "gateway-server", false), rewriteM3U8Reference(input, "/Videos/a/master.m3u8", session, upstream, gatewayToken, publicBase, "gateway-server"), rewriteResponseLocation(input, "/Items/a", session, upstream, gatewayToken, publicBase, "gateway-server")}, " "), changedRuntime.baseURL) {
+		t.Fatal("response rewrite used a later runtime")
 	}
 }
 
 func TestRewriteM3U8MediaReferences(t *testing.T) {
-	session := testSession("https://backend.example.com/emby")
+	session := testSession()
 	input := "seg.ts?api_key=backend-token\r\n/Videos/a/root.ts?api_key=backend-token\r\n/emby/Videos/a/base.ts?api_key=backend-token\r\n#EXT-X-KEY:METHOD=AES-128,URI=\"keys/key?api_key=backend-token\"\r\n"
-	got := string(rewriteM3U8MediaReferences([]byte(input), "/Videos/a/master.m3u8", session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server"))
+	got := string(rewriteM3U8MediaReferences([]byte(input), "/Videos/a/master.m3u8", session, testResponseUpstreamSnapshot("https://backend.example.com/emby"), "gateway-token", "https://media.example.com/emby", "gateway-server"))
 	want := "https://media.example.com/emby/Videos/a/seg.ts?api_key=gateway-token\r\nhttps://media.example.com/emby/Videos/a/root.ts?api_key=gateway-token\r\nhttps://media.example.com/emby/Videos/a/base.ts?api_key=gateway-token\r\n#EXT-X-KEY:METHOD=AES-128,URI=\"https://media.example.com/emby/Videos/a/keys/key?api_key=gateway-token\"\r\n"
 	if got != want {
 		t.Fatalf("playlist = %q, want %q", got, want)
@@ -85,7 +81,7 @@ func TestRewriteM3U8MediaReferences(t *testing.T) {
 }
 
 func TestRewriteResponseLocation(t *testing.T) {
-	session := testSession("https://backend.example.com/emby")
+	session := testSession()
 	public := "https://media.example.com/emby"
 	cases := []struct{ in, want string }{
 		{"https://backend.example.com/emby/Items/a?api_key=backend-token", "https://media.example.com/emby/Items/a"},
@@ -96,19 +92,19 @@ func TestRewriteResponseLocation(t *testing.T) {
 		{"https://cdn.example.com/emby/Items/a?api_key=backend-token", ""},
 	}
 	for _, tt := range cases {
-		if got := rewriteResponseLocation(tt.in, "/Items/a", session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", public, "gateway-server"); got != tt.want {
+		if got := rewriteResponseLocation(tt.in, "/Items/a", session, testResponseUpstreamSnapshot("https://backend.example.com/emby"), "gateway-token", public, "gateway-server"); got != tt.want {
 			t.Fatalf("location %q = %q, want %q", tt.in, got, tt.want)
 		}
 	}
 }
 
 func TestCopyResponseHeadersRewritesLocations(t *testing.T) {
-	session := testSession("https://backend.example.com/emby")
+	session := testSession()
 	dst := make(http.Header)
 	copyResponseHeadersWithSnapshot(dst, http.Header{
 		"Location":         []string{"https://backend.example.com/emby/Items/a?api_key=backend-token"},
 		"Content-Location": []string{"/emby/Items/b?api_key=backend-token"},
-	}, "/Items/a", session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server")
+	}, "/Items/a", session, testResponseUpstreamSnapshot("https://backend.example.com/emby"), "gateway-token", "https://media.example.com/emby", "gateway-server")
 	if got := dst.Get("Location"); got != "https://media.example.com/emby/Items/a" {
 		t.Fatalf("Location = %q", got)
 	}
@@ -118,8 +114,8 @@ func TestCopyResponseHeadersRewritesLocations(t *testing.T) {
 }
 
 func TestForeignAliasMediaURLComposesOnceWithGatewayBase(t *testing.T) {
-	session := testSession("https://backend.example.com/emby")
-	value := rewriteJSONValueWithSnapshot(map[string]any{"DirectStreamUrl": "https://cdn.example.com/emby/videos/item/stream?api_key=backend-token"}, session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server").(map[string]any)
+	session := testSession()
+	value := rewriteJSONValueWithSnapshot(map[string]any{"DirectStreamUrl": "https://cdn.example.com/emby/videos/item/stream?api_key=backend-token"}, session, testResponseUpstreamSnapshot("https://backend.example.com/emby"), "gateway-token", "https://media.example.com/emby", "gateway-server").(map[string]any)
 	media := value["DirectStreamUrl"].(string)
 	composed := "/emby" + media
 	if media != "/videos/item/stream?api_key=gateway-token" || composed != "/emby/videos/item/stream?api_key=gateway-token" || strings.Contains(composed, "/emby/https://") {
@@ -135,8 +131,8 @@ func TestSameOriginMediaBaseVariants(t *testing.T) {
 		{"https://backend.example.com/emby", "https://backend.example.com/embyfoo/Videos/a/stream", "https://backend.example.com/embyfoo/Videos/a/stream"},
 	}
 	for _, tt := range cases {
-		session := testSession(tt.base)
-		if got := rewriteMediaReference(tt.in, session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server", false); got != tt.want {
+		session := testSession()
+		if got := rewriteMediaReference(tt.in, session, testResponseUpstreamSnapshot(tt.base), "gateway-token", "https://media.example.com/emby", "gateway-server", false); got != tt.want {
 			t.Fatalf("base=%q input=%q got=%q want=%q", tt.base, tt.in, got, tt.want)
 		}
 	}
@@ -144,20 +140,20 @@ func TestSameOriginMediaBaseVariants(t *testing.T) {
 
 func TestSameOriginVariantsHaveOneGatewayBaseInHLSAndLocations(t *testing.T) {
 	for _, backendBase := range []string{"https://backend.example.com", "https://backend.example.com/emby", "https://backend.example.com/mediabrowser"} {
-		session := testSession(backendBase)
+		session := testSession()
 		input := "https://backend.example.com/emby/Videos/a/stream?api_key=backend-token"
 		want := "https://media.example.com/emby/Videos/a/stream?api_key=gateway-token"
-		if got := rewriteM3U8Reference(input, "/Videos/a/master.m3u8", session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server"); got != want {
+		if got := rewriteM3U8Reference(input, "/Videos/a/master.m3u8", session, testResponseUpstreamSnapshot(backendBase), "gateway-token", "https://media.example.com/emby", "gateway-server"); got != want {
 			t.Fatalf("hls base=%q got=%q", backendBase, got)
 		}
-		if got := rewriteResponseLocation(input, "/Items/a", session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server"); got != want {
+		if got := rewriteResponseLocation(input, "/Items/a", session, testResponseUpstreamSnapshot(backendBase), "gateway-token", "https://media.example.com/emby", "gateway-server"); got != want {
 			t.Fatalf("location base=%q got=%q", backendBase, got)
 		}
 	}
 }
 
 func TestSpecializedReferencesNeverLeakBackendToken(t *testing.T) {
-	session := testSession("https://backend.example.com/emby")
+	session := testSession()
 	inputs := []string{
 		"https://outside.example.com/Videos/a?signature=backend-token",
 		"https://outside.example.com/backend-token/Videos/a",
@@ -166,11 +162,12 @@ func TestSpecializedReferencesNeverLeakBackendToken(t *testing.T) {
 		"https://outside.example.com/Videos/a\r\nbackend-token",
 	}
 	for _, input := range inputs {
-		jsonValue := rewriteMediaReference(input, session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server", false)
-		hlsValue := rewriteM3U8Reference(input, "/Videos/a/master.m3u8", session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server")
-		location := rewriteResponseLocation(input, "/Items/a", session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server")
+		upstream := testResponseUpstreamSnapshot("https://backend.example.com/emby")
+		jsonValue := rewriteMediaReference(input, session, upstream, "gateway-token", "https://media.example.com/emby", "gateway-server", false)
+		hlsValue := rewriteM3U8Reference(input, "/Videos/a/master.m3u8", session, upstream, "gateway-token", "https://media.example.com/emby", "gateway-server")
+		location := rewriteResponseLocation(input, "/Items/a", session, upstream, "gateway-token", "https://media.example.com/emby", "gateway-server")
 		for _, output := range []string{jsonValue, hlsValue, location} {
-			if strings.Contains(output, session.BackendToken) {
+			if strings.Contains(output, upstream.token) {
 				t.Fatalf("backend token leaked for %q in %q", input, output)
 			}
 		}
@@ -178,17 +175,18 @@ func TestSpecializedReferencesNeverLeakBackendToken(t *testing.T) {
 }
 
 func TestOwnedReferencesRewriteIdentityQueryValues(t *testing.T) {
-	session := testSession("https://backend.example.com/emby")
+	session := testSession()
 	input := "https://backend.example.com/emby/Videos/a/stream?UserId=backend-user&ServerId=backend-server&api_key=backend-token"
 	wantRelative := "/Videos/a/stream?UserId=gateway-user&ServerId=gateway-server&api_key=gateway-token"
-	if got := rewriteMediaReference(input, session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server", false); got != wantRelative {
+	upstream := testResponseUpstreamSnapshot("https://backend.example.com/emby")
+	if got := rewriteMediaReference(input, session, upstream, "gateway-token", "https://media.example.com/emby", "gateway-server", false); got != wantRelative {
 		t.Fatalf("json owned = %q", got)
 	}
 	wantAbsolute := "https://media.example.com/emby" + wantRelative
-	if got := rewriteM3U8Reference(input, "/Videos/a/master.m3u8", session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server"); got != wantAbsolute {
+	if got := rewriteM3U8Reference(input, "/Videos/a/master.m3u8", session, upstream, "gateway-token", "https://media.example.com/emby", "gateway-server"); got != wantAbsolute {
 		t.Fatalf("hls owned = %q", got)
 	}
-	if got := rewriteResponseLocation(input, "/Items/a", session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server"); got != wantAbsolute {
+	if got := rewriteResponseLocation(input, "/Items/a", session, upstream, "gateway-token", "https://media.example.com/emby", "gateway-server"); got != wantAbsolute {
 		t.Fatalf("location owned = %q", got)
 	}
 }
@@ -200,24 +198,25 @@ func TestConfiguredOriginResolverForNonMediaHLSAndLocations(t *testing.T) {
 		{"https://backend.example.com/mediabrowser", "https://backend.example.com/mediabrowser/Items/a"},
 	}
 	for _, tt := range cases {
-		session := testSession(tt.base)
+		session := testSession()
 		want := "https://media.example.com/emby/Items/a"
-		if got := rewriteM3U8Reference(tt.input, "/Videos/a/master.m3u8", session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server"); got != want+"?api_key=gateway-token" {
+		if got := rewriteM3U8Reference(tt.input, "/Videos/a/master.m3u8", session, testResponseUpstreamSnapshot(tt.base), "gateway-token", "https://media.example.com/emby", "gateway-server"); got != want+"?api_key=gateway-token" {
 			t.Fatalf("hls base=%q got=%q", tt.base, got)
 		}
-		if got := rewriteResponseLocation(tt.input, "/Items/a", session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server"); got != want {
+		if got := rewriteResponseLocation(tt.input, "/Items/a", session, testResponseUpstreamSnapshot(tt.base), "gateway-token", "https://media.example.com/emby", "gateway-server"); got != want {
 			t.Fatalf("location base=%q got=%q", tt.base, got)
 		}
 	}
 	noMatch := "https://backend.example.com/embyfoo/Items/a"
-	session := testSession("https://backend.example.com/emby")
-	if got := rewriteResponseLocation(noMatch, "/Items/a", session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server"); got != noMatch {
+	session := testSession()
+	if got := rewriteResponseLocation(noMatch, "/Items/a", session, testResponseUpstreamSnapshot("https://backend.example.com/emby"), "gateway-token", "https://media.example.com/emby", "gateway-server"); got != noMatch {
 		t.Fatalf("prefix confusion location = %q", got)
 	}
 }
 
 func TestSpecializedReferenceDecodedTokenAndNetworkPathSafety(t *testing.T) {
-	session := testSession("https://backend.example.com/emby")
+	session := testSession()
+	upstream := testResponseUpstreamSnapshot("https://backend.example.com/emby")
 	unsafe := []string{
 		"https://user:backend-token@outside.example/a",
 		"mailto:backend-token@example.com",
@@ -229,9 +228,9 @@ func TestSpecializedReferenceDecodedTokenAndNetworkPathSafety(t *testing.T) {
 	}
 	for _, input := range unsafe {
 		for _, output := range []string{
-			rewriteMediaReference(input, session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server", false),
-			rewriteM3U8Reference(input, "/Videos/a/master.m3u8", session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server"),
-			rewriteResponseLocation(input, "/Items/a", session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server"),
+			rewriteMediaReference(input, session, upstream, "gateway-token", "https://media.example.com/emby", "gateway-server", false),
+			rewriteM3U8Reference(input, "/Videos/a/master.m3u8", session, upstream, "gateway-token", "https://media.example.com/emby", "gateway-server"),
+			rewriteResponseLocation(input, "/Items/a", session, upstream, "gateway-token", "https://media.example.com/emby", "gateway-server"),
 		} {
 			if output != "" {
 				t.Fatalf("unsafe %q produced %q", input, output)
@@ -239,49 +238,49 @@ func TestSpecializedReferenceDecodedTokenAndNetworkPathSafety(t *testing.T) {
 		}
 	}
 	for _, input := range []string{"https://outside.example/a", "//outside.example/a"} {
-		if got := rewriteMediaReference(input, session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server", false); got != input {
+		if got := rewriteMediaReference(input, session, upstream, "gateway-token", "https://media.example.com/emby", "gateway-server", false); got != input {
 			t.Fatalf("harmless JSON external %q became %q", input, got)
 		}
-		if got := rewriteM3U8Reference(input, "/Videos/a/master.m3u8", session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server"); got != input {
+		if got := rewriteM3U8Reference(input, "/Videos/a/master.m3u8", session, upstream, "gateway-token", "https://media.example.com/emby", "gateway-server"); got != input {
 			t.Fatalf("harmless HLS external %q became %q", input, got)
 		}
-		if got := rewriteResponseLocation(input, "/Items/a", session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server"); got != input {
+		if got := rewriteResponseLocation(input, "/Items/a", session, upstream, "gateway-token", "https://media.example.com/emby", "gateway-server"); got != input {
 			t.Fatalf("harmless location external %q became %q", input, got)
 		}
 	}
 }
 
 func TestRewriteOwnedQueryDoesNotMatchEmptySources(t *testing.T) {
-	session := testSession("https://backend.example.com/emby")
-	session.BackendToken = ""
-	session.BackendUserID = ""
-	session.BackendServerID = ""
-	if got, ok := rewriteOwnedQuery("foo=&UserId=&ServerId=", session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "gateway-server"); !ok || got != "foo=&UserId=&ServerId=" {
+	session := testSession()
+	emptyUpstream := upstreamRequestSnapshot{}
+	if got, ok := rewriteOwnedQuery("foo=&UserId=&ServerId=", session, emptyUpstream, "gateway-token", "gateway-server"); !ok || got != "foo=&UserId=&ServerId=" {
 		t.Fatalf("empty sources rewrote query to %q", got)
 	}
 }
 
 func TestOwnedResourceQueriesAreCanonicalizedWithoutReorderingSignedSegments(t *testing.T) {
-	session := testSession("https://backend.example.com/emby")
+	session := testSession()
+	upstream := testResponseUpstreamSnapshot("https://backend.example.com/emby")
 	input := "/Videos/a/stream?sig=a%2Bb&api_key=stale&X-Emby-Token=&x=1&access_token=conflict&token=backend-token#part"
 	want := "/Videos/a/stream?sig=a%2Bb&x=1&token=gateway-token&api_key=gateway-token#part"
-	if got := rewriteMediaReference(input, session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server", false); got != want {
+	if got := rewriteMediaReference(input, session, upstream, "gateway-token", "https://media.example.com/emby", "gateway-server", false); got != want {
 		t.Fatalf("canonical resource query = %q, want %q", got, want)
 	}
-	if got := rewriteMediaReference("/Videos/a/stream?sig=a%2Bb&api_key=stale", session, upstreamRequestSnapshotFromLegacySession(session), "", "https://media.example.com/emby", "gateway-server", false); got != "/Videos/a/stream?sig=a%2Bb" {
+	if got := rewriteMediaReference("/Videos/a/stream?sig=a%2Bb&api_key=stale", session, upstream, "", "https://media.example.com/emby", "gateway-server", false); got != "/Videos/a/stream?sig=a%2Bb" {
 		t.Fatalf("cookie resource query = %q", got)
 	}
-	if got := rewriteMediaReference("/Videos/a/stream?API_KEY=keep&sig=a%2Bb", session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server", false); got != "/Videos/a/stream?API_KEY=keep&sig=a%2Bb&api_key=gateway-token" {
+	if got := rewriteMediaReference("/Videos/a/stream?API_KEY=keep&sig=a%2Bb", session, upstream, "gateway-token", "https://media.example.com/emby", "gateway-server", false); got != "/Videos/a/stream?API_KEY=keep&sig=a%2Bb&api_key=gateway-token" {
 		t.Fatalf("mixed-case key was not preserved: %q", got)
 	}
 }
 
 func TestMalformedOwnedResourceQueriesFailClosed(t *testing.T) {
-	session := testSession("https://backend.example.com/emby")
+	session := testSession()
+	upstream := testResponseUpstreamSnapshot("https://backend.example.com/emby")
 	for _, output := range []string{
-		rewriteMediaReference("/Videos/a/stream?x=%zz", session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server", false),
-		rewriteM3U8Reference("https://backend.example.com/emby/Videos/a/stream?x=%zz", "/Videos/a/master.m3u8", session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server"),
-		rewriteResponseLocation("https://backend.example.com/emby/Videos/a/stream?x=%zz", "/Videos/a/master.m3u8", session, upstreamRequestSnapshotFromLegacySession(session), "gateway-token", "https://media.example.com/emby", "gateway-server"),
+		rewriteMediaReference("/Videos/a/stream?x=%zz", session, upstream, "gateway-token", "https://media.example.com/emby", "gateway-server", false),
+		rewriteM3U8Reference("https://backend.example.com/emby/Videos/a/stream?x=%zz", "/Videos/a/master.m3u8", session, upstream, "gateway-token", "https://media.example.com/emby", "gateway-server"),
+		rewriteResponseLocation("https://backend.example.com/emby/Videos/a/stream?x=%zz", "/Videos/a/master.m3u8", session, upstream, "gateway-token", "https://media.example.com/emby", "gateway-server"),
 	} {
 		if output != "" {
 			t.Fatalf("malformed owned reference = %q, want empty", output)
@@ -290,32 +289,38 @@ func TestMalformedOwnedResourceQueriesFailClosed(t *testing.T) {
 }
 
 func TestMalformedPercentEscapeFailsClosedBeforeTokenDecoding(t *testing.T) {
-	session := testSession("https://backend.example.com/emby")
+	session := testSession()
+	upstream := testResponseUpstreamSnapshot("https://backend.example.com/emby")
 	const input = "https://outside.example/a?bad=%zz&x=%62ackend-token"
 	const gatewayToken = "gateway-token"
 	for _, output := range []string{
-		rewriteMediaReference(input, session, upstreamRequestSnapshotFromLegacySession(session), gatewayToken, "https://media.example.com/emby", "gateway-server", false),
-		rewriteM3U8Reference(input, "/Videos/a/master.m3u8", session, upstreamRequestSnapshotFromLegacySession(session), gatewayToken, "https://media.example.com/emby", "gateway-server"),
-		rewriteResponseLocation(input, "/Items/a", session, upstreamRequestSnapshotFromLegacySession(session), gatewayToken, "https://media.example.com/emby", "gateway-server"),
+		rewriteMediaReference(input, session, upstream, gatewayToken, "https://media.example.com/emby", "gateway-server", false),
+		rewriteM3U8Reference(input, "/Videos/a/master.m3u8", session, upstream, gatewayToken, "https://media.example.com/emby", "gateway-server"),
+		rewriteResponseLocation(input, "/Items/a", session, upstream, gatewayToken, "https://media.example.com/emby", "gateway-server"),
 	} {
-		if output != "" || strings.Contains(output, session.BackendToken) || strings.Contains(output, gatewayToken) {
+		if output != "" || strings.Contains(output, upstream.token) || strings.Contains(output, gatewayToken) {
 			t.Fatalf("unsafe reference output = %q", output)
 		}
 	}
-	playlist := string(rewriteM3U8MediaReferences([]byte(`#EXT-X-KEY:METHOD=AES-128,URI="`+input+`"`), "/Videos/a/master.m3u8", session, upstreamRequestSnapshotFromLegacySession(session), gatewayToken, "https://media.example.com/emby", "gateway-server"))
-	if strings.Contains(playlist, session.BackendToken) || strings.Contains(playlist, gatewayToken) || playlist != `#EXT-X-KEY:METHOD=AES-128,URI=""` {
+	playlist := string(rewriteM3U8MediaReferences([]byte(`#EXT-X-KEY:METHOD=AES-128,URI="`+input+`"`), "/Videos/a/master.m3u8", session, upstream, gatewayToken, "https://media.example.com/emby", "gateway-server"))
+	if strings.Contains(playlist, upstream.token) || strings.Contains(playlist, gatewayToken) || playlist != `#EXT-X-KEY:METHOD=AES-128,URI=""` {
 		t.Fatalf("unsafe HLS URI attribute = %q", playlist)
 	}
 }
 
 func TestCookieResponseRewriteDoesNotExposeGatewayToken(t *testing.T) {
-	session := testSession("https://backend.example.com/emby")
-	manifest := string(rewriteM3U8MediaReferences([]byte("https://backend.example.com/emby/Videos/a/seg.ts?api_key=backend-token\n#EXT-X-KEY:URI=\"https://backend.example.com/emby/Videos/a/key?api_key=backend-token\""), "/Videos/a/master.m3u8", session, upstreamRequestSnapshotFromLegacySession(session), "", "https://media.example.com/emby", "gateway-server"))
-	if strings.Contains(manifest, session.BackendToken) || strings.Contains(manifest, "gateway-token") || strings.Contains(manifest, "api_key=") {
+	session := testSession()
+	upstream := testResponseUpstreamSnapshot("https://backend.example.com/emby")
+	manifest := string(rewriteM3U8MediaReferences([]byte("https://backend.example.com/emby/Videos/a/seg.ts?api_key=backend-token\n#EXT-X-KEY:URI=\"https://backend.example.com/emby/Videos/a/key?api_key=backend-token\""), "/Videos/a/master.m3u8", session, upstream, "", "https://media.example.com/emby", "gateway-server"))
+	if strings.Contains(manifest, upstream.token) || strings.Contains(manifest, "gateway-token") || strings.Contains(manifest, "api_key=") {
 		t.Fatalf("cookie manifest = %q", manifest)
 	}
-	location := rewriteResponseLocation("https://backend.example.com/emby/Videos/a/seg.ts?api_key=backend-token", "/Videos/a/master.m3u8", session, upstreamRequestSnapshotFromLegacySession(session), "", "https://media.example.com/emby", "gateway-server")
-	if strings.Contains(location, session.BackendToken) || strings.Contains(location, "gateway-token") || strings.Contains(location, "api_key=") {
+	location := rewriteResponseLocation("https://backend.example.com/emby/Videos/a/seg.ts?api_key=backend-token", "/Videos/a/master.m3u8", session, upstream, "", "https://media.example.com/emby", "gateway-server")
+	if strings.Contains(location, upstream.token) || strings.Contains(location, "gateway-token") || strings.Contains(location, "api_key=") {
 		t.Fatalf("cookie location = %q", location)
 	}
+}
+
+func testResponseUpstreamSnapshot(baseURL string) upstreamRequestSnapshot {
+	return upstreamRequestSnapshot{baseURL: baseURL, serverID: "backend-server", userID: "backend-user", token: "backend-token", identity: backendIdentityForTest("backend-device")}
 }

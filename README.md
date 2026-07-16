@@ -1,11 +1,11 @@
 # Emby Auth Gateway
 
-Emby Auth Gateway is a PocketBase-backed reverse proxy for Emby clients. Clients sign in with gateway credentials, while the gateway signs in to a controlled real Emby backend account, stores the backend session, and rewrites backend user ids, tokens, server ids, and URLs before returning responses to clients.
+Emby Auth Gateway is a PocketBase-backed reverse proxy for Emby clients. Gateway users sign in with gateway credentials while the process uses one configured singleton upstream, shared backend credential, and one active endpoint.
 
 ## Architecture
 
 - `cmd/gateway` embeds PocketBase and registers Emby-compatible gateway routes under the fixed path `/emby`.
-- PocketBase stores gateway users, backend Emby servers, backend accounts, gateway-to-backend mappings, sessions, and audit logs in `pb_data`.
+- PocketBase stores gateway users, singleton upstream configuration, sessions, and audit logs in `pb_data`. Legacy collections remain locked migration artifacts and are not used at runtime.
 - The gateway exposes Emby-compatible endpoints for clients and proxies authenticated requests to the real Emby server.
 - The real Emby server remains private to the gateway network in the recommended deployment shape.
 
@@ -20,8 +20,6 @@ Gateway environment variables:
 | `GATEWAY_PUBLIC_URL` | No, but set it in production | Request host/proxy headers | Externally reachable gateway Emby base URL, including the fixed `/emby` path, for example `https://media.example.com/emby`. Without it, URL rewriting follows the inbound request host, which can produce unusable `127.0.0.1` URLs behind some proxies. |
 | `GATEWAY_SERVER_ID` | No | `emby-auth-gateway` | Synthetic server id returned to clients instead of the backend Emby server id. |
 | `GATEWAY_WEB_ASSETS_DIR` | No | unset (Web disabled) | Absolute or relative path to the Web assets root. Blank/unset disables Web: `/emby/web` returns 404 and never falls through to the authenticated API. |
-| `GATEWAY_ANONYMOUS_IMAGE_SERVER_RECORD_ID` | No, paired | unset | PocketBase `emby_servers` record ID for the canonical anonymous item-image ingress. Must be set with `GATEWAY_ANONYMOUS_IMAGE_BACKEND_SERVER_ID`. |
-| `GATEWAY_ANONYMOUS_IMAGE_BACKEND_SERVER_ID` | No, paired | unset | Immutable upstream Emby `ServerId` expected for every enabled `emby_servers` record. The gateway probes each enabled ingress tokenlessly and rejects mismatched namespaces at startup. |
 
 PocketBase runtime flags you will commonly use:
 
@@ -31,7 +29,7 @@ PocketBase runtime flags you will commonly use:
 | `--dir` | PocketBase data directory. The default is `pb_data` under the working directory. |
 | `--encryptionEnv` | Optional PocketBase app settings encryption environment variable. This is separate from gateway backend account storage. |
 
-Backend client identity defaults written by `setup` into `emby_servers` records:
+Backend client identity defaults stored with the singleton upstream:
 
 | Field | Default |
 | --- | --- |
@@ -41,19 +39,9 @@ Backend client identity defaults written by `setup` into `emby_servers` records:
 | `backend_authorization_device_id` | Generated once by `setup` and saved as a UUID |
 | `backend_authorization_version` | `6.1.3` |
 
-Anonymous image ingress never selects an arbitrary/default server or tries all servers for a request. Every enabled `emby_servers` record must share the configured upstream `ServerId`; multiple HK/CF-style ingress records are allowed when they expose that same namespace. With the paired opt-in enabled, only canonical `GET`/`HEAD /emby/Items/{id}/Images/{type}` routes, with an optional decimal image index, are anonymous. `/Users/.../Images/...`, media, metadata, and mutations remain authenticated. Explicit credentials or the resource cookie always use the authenticated path. Anonymous responses currently use `Cache-Control: no-store`; public caching is deferred.
+Anonymous item-image origin always derives from the configured singleton upstream's active endpoint. The gateway probes only that endpoint tokenlessly, using its persisted client identity, and requires its live `ServerId` to match the singleton source. Only canonical `GET`/`HEAD /emby/Items/{id}/Images/{type}` routes, with an optional decimal image index, are anonymous. `/Users/.../Images/...`, media, metadata, and mutations remain authenticated. Explicit credentials or the resource cookie always use the authenticated path. Anonymous responses currently use `Cache-Control: no-store`; public caching is deferred.
 
-Fresh `emby_servers` records may have an empty cached `BackendServerID`: startup probes each enabled ingress tokenlessly and accepts matching live IDs without a manual pre-refresh step. If those probes are temporarily unavailable, authenticated service still starts while anonymous item images return `503 no-store`; the normal server-info refresh and namespace revalidation recover automatically once the ingress is reachable.
-
-To opt into Phase 2B namespace validation under Compose, set both nonempty values and add the dedicated overlay:
-
-```sh
-GATEWAY_ANONYMOUS_IMAGE_SERVER_RECORD_ID="<emby_servers-record-id>" \
-GATEWAY_ANONYMOUS_IMAGE_BACKEND_SERVER_ID="<upstream-Emby-ServerId>" \
-docker compose -f docker-compose.yml -f docker-compose.anonymous-images.yml up --build
-```
-
-The base Compose file deliberately omits both variables. The overlay fails configuration when either value is absent or blank. The overlay enables only the item-image opt-in described above.
+Anonymous image validation is best-effort at startup and during metadata refresh. A missing, malformed, mismatched, or temporarily unavailable singleton endpoint does not block authenticated service; anonymous item images return `503 no-store` until a successful validation publishes the active origin.
 
 ## Local Compose
 
@@ -87,55 +75,36 @@ docker compose run --rm gateway superuser create admin@example.com 'replace-with
 
 The PocketBase Admin UI is available at `http://localhost:8090/_/` when the gateway is running.
 
-## Gateway Account Setup
+## Gateway Setup
 
-Use `setup` to create or update the Emby server record, controlled backend account, gateway user, and mapping in one command.
-
-Local binary example:
+For a fresh installation, create the singleton upstream, then create gateway users. The identity flags are optional and default to the values above.
 
 ```sh
-./bin/gateway setup \
-  --gateway-username alice \
-  --gateway-password 'gateway-client-password' \
-  --synthetic-user-id gateway-alice-001 \
-  --emby-server-name local-emby \
+./bin/gateway setup upstream create \
   --emby-url http://localhost:8096/emby \
-  --backend-account-name alice-backend \
   --backend-username real-emby-user \
-  --backend-password 'real-emby-password'
+  --backend-password 'replace-with-a-strong-password'
+
+./bin/gateway setup user \
+  --gateway-username alice \
+  --gateway-password 'replace-with-a-strong-password' \
+  --synthetic-user-id gateway-alice-001
 ```
 
-The backend client identity flags are optional because they default to the SenPlayer values above. Override them when a backend node requires different headers:
+Use `--backend-user-agent`, `--backend-authorization-client`, `--backend-authorization-device`, and `--backend-authorization-version` on `setup upstream create` only when the backend requires a different client identity. The setup command generates and persists the upstream device ID.
+
+### Upgrade And Rollback
+
+Do not perform a rolling upgrade. Stop the service and back up the complete PocketBase data directory. Before installing the cutover binary, run the transitional pre-cutover binary against that data directory to import the selected legacy records explicitly:
 
 ```sh
-./bin/gateway setup \
-  --gateway-username alice \
-  --gateway-password 'gateway-client-password' \
-  --synthetic-user-id gateway-alice-001 \
-  --emby-url https://media.example.com \
-  --backend-username real-emby-user \
-  --backend-password 'real-emby-password' \
-  --backend-user-agent 'SenPlayer/6.1.3' \
-  --backend-authorization-client SenPlayer \
-  --backend-authorization-device Mac \
-  --backend-authorization-version 6.1.3
+./gateway-pre-cutover --dir /path/to/pb_data setup upstream import-legacy \
+  --server-record-id '<legacy-server-record-id>' \
+  --account-record-id '<legacy-account-record-id>' \
+  --apply
 ```
 
-`setup` generates `backend_authorization_device_id` once per `emby_servers` record and preserves it on later updates. Administrators can still view or edit the saved value in the PocketBase Admin UI.
-
-Docker Compose example:
-
-```sh
-docker compose run --rm gateway setup \
-  --gateway-username alice \
-  --gateway-password 'gateway-client-password' \
-  --synthetic-user-id gateway-alice-001 \
-  --emby-server-name compose-emby \
-  --emby-url http://emby:8096/emby \
-  --backend-account-name alice-backend \
-  --backend-username real-emby-user \
-  --backend-password 'real-emby-password'
-```
+Install and start the new binary only after that command succeeds. Cutover revokes existing sessions and rebuilds runtime caches; gateway users must sign in again. To roll back, stop the new service, restore the data-directory backup, and start the old binary. Do not mix old and new binaries against the same data directory.
 
 ## Start Commands
 
@@ -485,8 +454,8 @@ available. Hermetic HTTP canary/CORS smoke is the automated stand-in in CI.
 
 ## Troubleshooting
 
-- Login returns `401`: verify the gateway username and password created by `setup`, confirm the `users` record is enabled, and confirm `user_mappings`, `backend_accounts`, and `emby_servers` records exist and are enabled.
-- Login returns `502 backend authentication failed`: verify `--emby-url`, backend username, backend password, and network reachability from the gateway to Emby. In Compose, the backend URL should be `http://emby:8096/emby`.
+- Login returns `401`: verify the gateway username/password created with `setup user` and that the `users` record is enabled.
+- Login returns `502 backend authentication failed`: verify the singleton active endpoint, its shared backend credentials, and network reachability. In Compose, the endpoint URL is commonly `http://emby:8096/emby`.
 - Proxied requests return `401`: the gateway token may be missing, expired, revoked, or sent under an unsupported header/query name. Supported inputs include `X-Emby-Token`, `X-MediaBrowser-Token`, Emby authorization headers, `api_key`, `access_token`, and `token`.
 - URLs in Emby responses point at the backend: set `GATEWAY_PUBLIC_URL` to the public gateway base URL including `/emby`.
 - The smoke script fails on PB side-door checks with `2xx`: lock down the PocketBase collection API rules before treating the deployment as safe.

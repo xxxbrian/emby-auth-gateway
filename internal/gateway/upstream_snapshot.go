@@ -1,7 +1,7 @@
 package gateway
 
-// upstreamRequestSnapshot is an immutable projection of the legacy session
-// fields consumed by one upstream request attempt.
+// upstreamRequestSnapshot is an immutable projection of one authoritative
+// singleton upstream runtime, consumed by one request attempt.
 type upstreamRequestSnapshot struct {
 	baseURL  string
 	serverID string
@@ -10,13 +10,15 @@ type upstreamRequestSnapshot struct {
 	identity BackendClientIdentity
 }
 
-func upstreamRequestSnapshotFromLegacySession(session *Session) upstreamRequestSnapshot {
-	if session == nil {
-		return upstreamRequestSnapshot{}
+func upstreamRequestSnapshotFromRuntime(runtime *UpstreamRuntime) (upstreamRequestSnapshot, error) {
+	if runtime == nil {
+		return upstreamRequestSnapshot{}, invalidUpstreamTopology("missing runtime")
 	}
-	return upstreamRequestSnapshot{
-		baseURL: session.BackendBaseURL, serverID: session.BackendServerID,
-		userID: session.BackendUserID, token: session.BackendToken,
-		identity: session.BackendIdentity,
+	if err := ValidateUpstreamRuntime(*runtime); err != nil {
+		return upstreamRequestSnapshot{}, err
 	}
+	if err := validatePersistedUpstreamAuth(runtime.Source); err != nil {
+		return upstreamRequestSnapshot{}, err
+	}
+	return upstreamRequestSnapshot{baseURL: runtime.Endpoint.BaseURL, serverID: runtime.Source.ServerID, userID: runtime.Source.BackendUserID, token: runtime.Source.BackendToken, identity: runtime.Source.ClientIdentity}, nil
 }

@@ -97,8 +97,10 @@ func TestInitialProxyDoFailureUsesStructuredHandler(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			store := NewMemoryStore()
-			store.Sessions[HashToken("gateway-token")] = testSession("http://backend.test/emby")
+			backend := httptest.NewServer(http.NotFoundHandler())
+			defer backend.Close()
+			store := testStore(backend.URL + "/emby")
+			store.Sessions[HashToken("gateway-token")] = testSession()
 			client := &http.Client{Transport: proxyFailureRoundTripper{err: tt.err}}
 			server := NewServer(Config{GatewayBasePath: "/emby", HTTPClient: client}, store)
 			req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items?api_key=gateway-token", nil).WithContext(tt.ctx)
@@ -137,10 +139,11 @@ func TestRefreshedProxyRetryFailureUsesStructuredHandler(t *testing.T) {
 		{name: "canceled", err: context.Canceled, canceled: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			store := NewMemoryStore()
-			session := testSession("http://backend.test/emby")
+			backend := httptest.NewServer(http.NotFoundHandler())
+			defer backend.Close()
+			store := testStore(backend.URL + "/emby")
+			session := testSession()
 			store.Sessions[HashToken("gateway-token")] = session
-			store.Mappings["u1"] = UserMapping{GatewayUserID: "u1", BackendAccountID: "b1", Enabled: true, BackendAccount: BackendAccount{ID: "b1", BaseURL: session.BackendBaseURL, Username: "shared", Password: "backend-pass", BackendToken: "backend-token", BackendUserID: "backend-user", Enabled: true}}
 			client := &http.Client{Transport: &retryFailureRoundTripper{retryErr: tt.err}}
 			server := NewServer(Config{GatewayBasePath: "/emby", HTTPClient: client}, store)
 			req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items?api_key=gateway-token", nil)

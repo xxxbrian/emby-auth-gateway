@@ -3,77 +3,93 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 )
 
-func (s *Server) RefreshBackendServerInfo(ctx context.Context) error {
-	servers, err := s.store.ListEnabledServers(ctx)
-	if err != nil {
-		return err
-	}
-	var firstErr error
-	for _, server := range servers {
-		if err := s.refreshOneBackendServerInfo(ctx, server); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	// Namespace validation is read-only and must not make ordinary authenticated
-	// server-info refresh unavailable when an anonymous ingress is transiently down.
-	_ = s.ValidateAnonymousImageNamespace(ctx)
-	return firstErr
+const publicInfoProbeTimeout = 10 * time.Second
+const publicInfoProbeBodyLimit = 1 << 20
+
+type publicInfoMetadata struct {
+	ServerID string
+	Name     string
+	Version  string
 }
 
-func (s *Server) refreshOneBackendServerInfo(ctx context.Context, server EmbyServer) error {
-	u, err := backendURL(server.BaseURL, "/System/Info/Public")
-	if err != nil {
-		return err
+// probeUpstreamPublic uses only the persisted client identity; it deliberately
+// never carries managed-auth credentials, a user identity, or cookies.
+func (s *Server) probeUpstreamPublic(ctx context.Context, runtime *UpstreamRuntime) (publicInfoMetadata, error) {
+	if runtime == nil {
+		return publicInfoMetadata{}, errors.New("public upstream probe unavailable")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return err
+	if err := ValidateUpstreamRuntime(*runtime); err != nil {
+		return publicInfoMetadata{}, errors.New("public upstream probe unavailable")
 	}
-	identity := server.ClientIdentity.WithDefaults()
+	u, err := backendURL(runtime.Endpoint.BaseURL, "/System/Info/Public")
+	if err != nil {
+		return publicInfoMetadata{}, errors.New("public upstream probe unavailable")
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, publicInfoProbeTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, u, nil)
+	if err != nil {
+		return publicInfoMetadata{}, errors.New("public upstream probe unavailable")
+	}
+	identity := runtime.Source.ClientIdentity
 	req.Header.Set("User-Agent", identity.UserAgent)
 	req.Header.Set("X-Emby-Authorization", backendAuthHeader(identity, "", "").String())
-	resp, err := s.client.Do(req)
+	client := *s.client
+	client.Jar = nil
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return publicInfoMetadata{}, errors.New("public upstream probe unavailable")
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return publicInfoMetadata{}, errors.New("public upstream probe unavailable")
 	}
-	var raw map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		return err
+	var body struct {
+		ID         string `json:"Id"`
+		ServerName string `json:"ServerName"`
+		Version    string `json:"Version"`
 	}
-	serverID, _ := raw["Id"].(string)
-	if serverID == "" {
-		serverID, _ = raw["ServerId"].(string)
+	payload, err := io.ReadAll(io.LimitReader(resp.Body, publicInfoProbeBodyLimit+1))
+	if err != nil || len(payload) > publicInfoProbeBodyLimit || json.Unmarshal(payload, &body) != nil || strings.TrimSpace(body.ID) == "" || body.ID != strings.TrimSpace(body.ID) {
+		return publicInfoMetadata{}, errors.New("public upstream probe unavailable")
 	}
-	serverName, _ := raw["ServerName"].(string)
-	version, _ := raw["Version"].(string)
-	if strings.TrimSpace(version) == "" {
-		return nil
+	if body.ID != runtime.Source.ServerID {
+		return publicInfoMetadata{}, ErrUpstreamServerInfoConflict
 	}
-	return s.store.UpdateServerInfo(ctx, server.ID, serverID, serverName, version, time.Now().UTC())
+	return publicInfoMetadata{ServerID: body.ID, Name: strings.TrimSpace(body.ServerName), Version: strings.TrimSpace(body.Version)}, nil
 }
 
-func highestServerVersion(servers []EmbyServer) string {
-	best := ""
-	for _, server := range servers {
-		version := strings.TrimSpace(server.ServerVersion)
-		if version == "" {
-			continue
-		}
-		if best == "" || compareVersions(version, best) > 0 {
-			best = version
-		}
+// RefreshUpstreamServerInfo refreshes only the configured singleton metadata.
+// A probe error leaves authentication and ordinary proxy service untouched.
+func (s *Server) RefreshUpstreamServerInfo(ctx context.Context) error {
+	var refreshErr error
+	runtime, err := s.store.LoadDefaultUpstreamRuntime(ctx)
+	if err != nil {
+		refreshErr = err
+	} else if metadata, err := s.probeUpstreamPublic(ctx, runtime); err != nil {
+		refreshErr = err
+	} else if err := s.store.UpdateUpstreamServerInfo(ctx, UpstreamServerInfoUpdate{
+		SourceID: runtime.Source.ID, ServerID: runtime.Source.ServerID, ServerName: metadata.Name, ServerVersion: metadata.Version, CheckedAt: time.Now().UTC(),
+	}); err != nil {
+		refreshErr = err
 	}
-	return best
+	validationErr := s.ValidateAnonymousImageNamespace(ctx)
+	if refreshErr != nil && validationErr != nil {
+		return errors.Join(refreshErr, validationErr)
+	}
+	if refreshErr != nil {
+		return refreshErr
+	}
+	return validationErr
 }
 
 func compareVersions(a, b string) int {
@@ -98,17 +114,14 @@ func compareVersions(a, b string) int {
 			return -1
 		}
 	}
-	aRelease := isPlainNumericVersion(a)
-	bRelease := isPlainNumericVersion(b)
-	if aRelease && !bRelease {
+	if isPlainNumericVersion(a) && !isPlainNumericVersion(b) {
 		return 1
 	}
-	if !aRelease && bRelease {
+	if !isPlainNumericVersion(a) && isPlainNumericVersion(b) {
 		return -1
 	}
 	return strings.Compare(a, b)
 }
-
 func isPlainNumericVersion(version string) bool {
 	version = strings.TrimSpace(version)
 	if version == "" {
@@ -121,7 +134,6 @@ func isPlainNumericVersion(version string) bool {
 	}
 	return true
 }
-
 func versionParts(version string) []int {
 	version = numericVersionCore(version)
 	parts := []int{}
@@ -143,7 +155,6 @@ func versionParts(version string) []int {
 	}
 	return parts
 }
-
 func numericVersionCore(version string) string {
 	version = strings.TrimSpace(version)
 	for i, r := range version {
@@ -153,7 +164,6 @@ func numericVersionCore(version string) string {
 	}
 	return version
 }
-
 func atoiZero(value string) int {
 	parsed, err := strconv.Atoi(value)
 	if err != nil {

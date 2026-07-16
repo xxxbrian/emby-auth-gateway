@@ -21,26 +21,22 @@ import (
 	"time"
 
 	"github.com/xxxbrian/emby-auth-gateway/internal/version"
-
-	"golang.org/x/sync/singleflight"
 )
 
 const gatewayVersionHeader = "X-Emby-Auth-Gateway-Version"
 
 type Server struct {
-	cfg                   Config
-	store                 Store
-	client                *http.Client
-	proxyClient           *http.Client
-	logins                *loginFailureLimiter
-	backendAuth           singleflight.Group
-	backendAuthFailuresMu sync.Mutex
-	backendAuthFailures   map[string]backendLoginFailure
-	playbackGuards        *playbackGuardTracker
-	mediaDeadlineWarning  atomic.Bool
-	anonymousImages       anonymousImageNamespaceState
-	anonymousImageNow     func() time.Time
-	anonymousImageSlots   chan struct{}
+	cfg                  Config
+	store                Store
+	client               *http.Client
+	proxyClient          *http.Client
+	logins               *loginFailureLimiter
+	upstreamAuth         *upstreamAuthenticator
+	playbackGuards       *playbackGuardTracker
+	mediaDeadlineWarning atomic.Bool
+	anonymousImages      anonymousImageNamespaceState
+	anonymousImageNow    func() time.Time
+	anonymousImageSlots  chan struct{}
 }
 
 func NewServer(cfg Config, store Store) *Server {
@@ -67,7 +63,7 @@ func NewServer(cfg Config, store Store) *Server {
 		client = &http.Client{Timeout: backendAuthTimeout}
 	}
 	proxyClient := newProxyClient(cfg.HTTPClient)
-	return &Server{cfg: cfg, store: store, client: client, proxyClient: proxyClient, logins: newLoginFailureLimiter(), backendAuthFailures: map[string]backendLoginFailure{}, playbackGuards: newPlaybackGuardTracker(), anonymousImageNow: time.Now, anonymousImageSlots: make(chan struct{}, anonymousImageValidationConcurrency)}
+	return &Server{cfg: cfg, store: store, client: client, proxyClient: proxyClient, upstreamAuth: newUpstreamAuthenticator(store, client), logins: newLoginFailureLimiter(), playbackGuards: newPlaybackGuardTracker(), anonymousImageNow: time.Now, anonymousImageSlots: make(chan struct{}, anonymousImageValidationConcurrency)}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -91,7 +87,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !s.pathPolicyAllows(w, r, rel) {
 		return
 	}
-	if isAnonymousItemImageRoute(r, rel) && !hasAuthControlOccurrence(r) && !hasReservedResourceCookie(r) && s.anonymousImageConfigEnabled() {
+	if isAnonymousItemImageRoute(r, rel) && !hasAuthControlOccurrence(r) && !hasReservedResourceCookie(r) {
 		s.handleAnonymousItemImage(w, r, rel)
 		return
 	}
@@ -150,14 +146,6 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mapping, err := s.store.FindMappingByGatewayUserID(ctx, user.ID)
-	if err != nil || mapping == nil || !mapping.Enabled || !mapping.BackendAccount.Enabled {
-		s.logins.recordFailure(key, time.Now())
-		s.audit(ctx, AuditLog{GatewayUserID: user.ID, SyntheticUserID: user.SyntheticUserID, Event: "mapping_unavailable", Message: "mapping unavailable", RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusUnauthorized})
-		http.Error(w, "failed to authenticate", http.StatusUnauthorized)
-		return
-	}
-
 	clientAuth := firstAuthHeader(r)
 
 	s.logins.clear(key)
@@ -173,14 +161,6 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 		GatewayUserID:    user.ID,
 		GatewayUsername:  user.Username,
 		SyntheticUserID:  user.SyntheticUserID,
-		BackendAccountID: mapping.BackendAccount.ID,
-		BackendAccount:   mapping.BackendAccount,
-		BackendServerID:  mapping.BackendAccount.Server.BackendServerID,
-		BackendBaseURL:   mapping.BackendAccount.BaseURL,
-		BackendUserID:    mapping.BackendAccount.BackendUserID,
-		BackendUsername:  mapping.BackendAccount.Username,
-		BackendToken:     mapping.BackendAccount.BackendToken,
-		BackendIdentity:  mapping.BackendAccount.ClientIdentity.WithDefaults(),
 		Client:           clientAuth.Client,
 		Device:           clientAuth.Device,
 		DeviceID:         clientAuth.DeviceID,
@@ -225,77 +205,6 @@ func parseAuthenticateBody(w http.ResponseWriter, r *http.Request) (authenticate
 		return form, nil
 	}
 	return form, json.Unmarshal(body, &form)
-}
-
-func (s *Server) authenticateBackend(ctx context.Context, account BackendAccount) (*backendAuthResult, error) {
-	u, err := backendURL(account.BaseURL, "/Users/AuthenticateByName")
-	if err != nil {
-		return nil, err
-	}
-	body, err := json.Marshal(map[string]string{
-		"Username": account.Username,
-		"Pw":       account.Password,
-	})
-	if err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	identity := account.ClientIdentity.WithDefaults()
-	req.Header.Set("User-Agent", identity.UserAgent)
-	req.Header.Set("X-Emby-Authorization", backendAuthHeader(identity, "", "").String())
-
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("backend status %d: %s", resp.StatusCode, string(data))
-	}
-
-	var raw map[string]any
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return nil, err
-	}
-	result := &backendAuthResult{Raw: raw}
-	if v, _ := raw["AccessToken"].(string); v != "" {
-		result.AccessToken = v
-	}
-	if v, _ := raw["ServerId"].(string); v != "" {
-		result.ServerID = v
-	}
-	if v, _ := raw["ServerName"].(string); v != "" {
-		result.ServerName = v
-	}
-	if v, _ := raw["Version"].(string); v != "" {
-		result.ServerVersion = v
-	}
-	if user, _ := raw["User"].(map[string]any); user != nil {
-		result.UserID, _ = user["Id"].(string)
-		result.Username, _ = user["Name"].(string)
-	}
-	if result.AccessToken == "" || result.UserID == "" {
-		return nil, errors.New("backend auth response missing token or user id")
-	}
-	return result, nil
-}
-
-type backendAuthResult struct {
-	AccessToken   string
-	ServerID      string
-	ServerName    string
-	ServerVersion string
-	UserID        string
-	Username      string
-	Raw           map[string]any
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, rel string) {
@@ -349,22 +258,19 @@ func (s *Server) handlePublicSystemInfo(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) publicSystemInfoVersion(ctx context.Context) string {
-	servers, err := s.store.ListEnabledServers(ctx)
+	runtime, err := s.store.LoadDefaultUpstreamRuntime(ctx)
 	if err != nil {
 		return defaultBackendServerVersion
 	}
-	if highest := highestServerVersion(servers); highest != "" {
-		return highest
+	if version := strings.TrimSpace(runtime.Source.ServerVersion); version != "" {
+		return version
 	}
-	if err := s.RefreshBackendServerInfo(ctx); err != nil {
+	if err := s.RefreshUpstreamServerInfo(ctx); err != nil {
 		return defaultBackendServerVersion
 	}
-	servers, err = s.store.ListEnabledServers(ctx)
-	if err != nil {
-		return defaultBackendServerVersion
-	}
-	if highest := highestServerVersion(servers); highest != "" {
-		return highest
+	runtime, err = s.store.LoadDefaultUpstreamRuntime(ctx)
+	if err == nil && strings.TrimSpace(runtime.Source.ServerVersion) != "" {
+		return strings.TrimSpace(runtime.Source.ServerVersion)
 	}
 	return defaultBackendServerVersion
 }
@@ -443,12 +349,20 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 	if s.handlePersonalDataRequest(w, r, rel, session, gatewayToken) {
 		return
 	}
-	if err := s.ensureBackendSession(r.Context(), session); err != nil {
+	runtime, err := s.upstreamAuth.Ensure(r.Context())
+	if err != nil {
+		if r.Context().Err() != nil || errors.Is(err, context.Canceled) {
+			panic(http.ErrAbortHandler)
+		}
 		s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "backend_auth_failure", Message: "backend authentication failed", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
 		http.Error(w, "backend authentication failed", http.StatusBadGateway)
 		return
 	}
-	upstream := upstreamRequestSnapshotFromLegacySession(session)
+	upstream, err := upstreamRequestSnapshotFromRuntime(runtime)
+	if err != nil {
+		http.Error(w, "backend authentication failed", http.StatusBadGateway)
+		return
+	}
 	if isUpgradeRequest(r) {
 		upstream = s.prepareBackendUpgrade(r.Context(), r, rel, session, upstream)
 	}
@@ -496,9 +410,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 		return
 	}
 	if resp.StatusCode == http.StatusUnauthorized && replayable {
-		failedToken := upstream.token
-		if err := s.refreshBackendSession(r.Context(), session, failedToken); err == nil {
-			upstream = upstreamRequestSnapshotFromLegacySession(session)
+		if refreshed, confirmed, refreshErr := s.refreshAfterUnauthorized(r.Context(), upstream); confirmed && refreshErr == nil {
+			upstream = refreshed
 			s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh", "backend token refreshed after unauthorized response", http.StatusOK)
 			_ = resp.Body.Close()
 			retryURL, retryErr := s.proxyURL(upstream, session, rel, r.URL.RawQuery, gatewayToken)
@@ -534,8 +447,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 				s.writeConcurrentPlaybackDenied(w, r, rel, session, guardKey)
 				return
 			}
-		} else if !errors.Is(err, ErrUnauthorized) {
-			s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh_failure", err.Error(), http.StatusUnauthorized)
+		} else if confirmed && !errors.Is(refreshErr, ErrUnauthorized) {
+			s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh_failure", refreshErr.Error(), http.StatusUnauthorized)
 		}
 	}
 	if isPlaybackInfo && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
@@ -696,18 +609,54 @@ func (s *Server) handleUpgradeProxy(w http.ResponseWriter, r *http.Request, prox
 // prepareBackendUpgrade is best-effort: a failed validity probe must not block
 // a usable websocket handshake.
 func (s *Server) prepareBackendUpgrade(ctx context.Context, r *http.Request, rel string, session *Session, upstream upstreamRequestSnapshot) upstreamRequestSnapshot {
-	failedToken := upstream.token
-	stale, err := s.backendTokenIsUnauthorized(ctx, session, failedToken)
-	if err != nil || !stale {
-		return upstream
-	}
-	if err := s.refreshBackendSessionKnownUnauthorized(ctx, session, failedToken); err == nil {
+	if refreshed, confirmed, err := s.refreshAfterUnauthorized(ctx, upstream); confirmed && err == nil {
 		s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh", "backend token refreshed before upgrade", http.StatusOK)
-		return upstreamRequestSnapshotFromLegacySession(session)
-	} else if !errors.Is(err, ErrUnauthorized) {
+		return refreshed
+	} else if confirmed && !errors.Is(err, ErrUnauthorized) {
 		s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh_failure", "backend token refresh failed before upgrade", http.StatusUnauthorized)
 	}
 	return upstream
+}
+
+// refreshAfterUnauthorized confirms that a route-specific 401 reflects shared
+// source credentials before rotating them. Probe failures deliberately leave
+// the original response in place, since they do not establish global expiry.
+func (s *Server) refreshAfterUnauthorized(ctx context.Context, upstream upstreamRequestSnapshot) (upstreamRequestSnapshot, bool, error) {
+	unauthorized, err := s.upstreamSnapshotUnauthorized(ctx, upstream)
+	if err != nil || !unauthorized {
+		return upstream, false, err
+	}
+	runtime, err := s.upstreamAuth.Refresh(ctx, upstream.token)
+	if err != nil {
+		return upstream, true, err
+	}
+	refreshed, err := upstreamRequestSnapshotFromRuntime(runtime)
+	if err != nil {
+		return upstream, true, err
+	}
+	return refreshed, true, nil
+}
+
+// upstreamSnapshotUnauthorized probes the exact failed source credentials
+// without cookies or redirects. Only a literal 401 confirms global expiry.
+func (s *Server) upstreamSnapshotUnauthorized(ctx context.Context, upstream upstreamRequestSnapshot) (bool, error) {
+	u, err := backendURL(upstream.baseURL, "/System/Info")
+	if err != nil {
+		return false, err
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, upstreamAuthTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, u, nil)
+	if err != nil {
+		return false, err
+	}
+	s.rewriteRequestHeaders(req.Header, upstream)
+	resp, err := s.upstreamAuth.client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusUnauthorized, nil
 }
 
 func (s *Server) activeSession(w http.ResponseWriter, r *http.Request, token string) (*Session, bool) {
@@ -1519,7 +1468,7 @@ func (s *Server) rewriteProxyJSONValueForRequestWithSnapshot(ctx context.Context
 func (s *Server) applyChildCountsToAggregates(ctx context.Context, r *http.Request, session *Session, gatewayToken string, items []map[string]any, aggregates *PlaybackAggregates) {
 	seriesIDs, seasonIDs := aggregateItemIDs(items)
 	ids := append(seriesIDs, seasonIDs...)
-	counts, err := s.store.ListItemChildCounts(ctx, session.BackendAccountID, ids)
+	counts, err := s.store.ListItemChildCounts(ctx, ids)
 	if err != nil {
 		counts = map[string]ItemChildCount{}
 	}
@@ -1539,7 +1488,7 @@ func (s *Server) applyChildCountsToAggregates(ctx context.Context, r *http.Reque
 			continue
 		}
 		applyAggregateTotal(aggregates, id, count)
-		_ = s.store.SaveItemChildCount(ctx, ItemChildCount{BackendAccountID: session.BackendAccountID, ItemID: id, ChildCount: count})
+		_ = s.store.SaveItemChildCount(ctx, ItemChildCount{ItemID: id, ChildCount: count})
 	}
 }
 

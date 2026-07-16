@@ -7,10 +7,6 @@ services:
     environment:
       GATEWAY_PUBLIC_URL: "${GATEWAY_PUBLIC_URL:-http://localhost:${GATEWAY_PORT:-8090}/emby}"
       GATEWAY_SERVER_ID: "${GATEWAY_SERVER_ID:-emby-auth-gateway-dev}"
-      # Optional Phase 2B validation pair. Intentionally omitted by default so
-      # both variables remain absent and anonymous-image validation is disabled.
-      # Set both in .env: GATEWAY_ANONYMOUS_IMAGE_SERVER_RECORD_ID and
-      # GATEWAY_ANONYMOUS_IMAGE_BACKEND_SERVER_ID. This does not enable routes.
       # Opt-in Web serving. Blank (default) keeps API-only mode.
       # Emby-compatible routes are always under fixed /emby. Enable only with
       # the stable volume path:

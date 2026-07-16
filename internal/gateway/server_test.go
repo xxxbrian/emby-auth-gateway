@@ -196,9 +196,6 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 
 	var backendURL string
 	const backendDeviceID = "11111111-2222-4333-8444-555555555555"
-	var sawControlledBackendLogin bool
-	var sawBackendAuthUserAgent bool
-	var sawBackendAuthIdentity bool
 	var sawProxyUserAgent bool
 	var sawProxyIdentity bool
 	var sawBackendTokenInRequest bool
@@ -207,31 +204,6 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/emby/Users/AuthenticateByName":
-			if r.UserAgent() == "SenPlayer/6.1.3" {
-				sawBackendAuthUserAgent = true
-			}
-			auth := ParseEmbyAuthHeader(r.Header.Get("X-Emby-Authorization"))
-			if auth.Client == "SenPlayer" && auth.Device == "Mac" && auth.DeviceID == backendDeviceID && auth.Version == "6.1.3" {
-				sawBackendAuthIdentity = true
-			}
-			var body map[string]string
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				t.Fatalf("decode backend auth body: %v", err)
-			}
-			if body["Username"] == "shared" && body["Pw"] == "backend-pass" {
-				sawControlledBackendLogin = true
-			}
-			writeTestJSON(w, map[string]any{
-				"AccessToken": backendToken,
-				"ServerId":    backendServerID,
-				"User": map[string]any{
-					"Id":       backendUserID,
-					"Name":     "shared",
-					"ServerId": backendServerID,
-				},
-			})
-
 		case r.Method == http.MethodGet && r.URL.Path == "/emby/System/Info":
 			if r.UserAgent() == "SenPlayer/6.1.3" {
 				sawProxyUserAgent = true
@@ -303,21 +275,11 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 		GatewayUser: GatewayUser{ID: "u1", Username: "alice", SyntheticUserID: syntheticUserID, Enabled: true},
 		Password:    "alice-pass",
 	}
-	store.Mappings["u1"] = UserMapping{
-		ID:               "m1",
-		GatewayUserID:    "u1",
-		BackendAccountID: "b1",
-		Enabled:          true,
-		BackendAccount: BackendAccount{
-			ID:             "b1",
-			ServerID:       "s1",
-			BaseURL:        backend.URL + "/emby",
-			Username:       "shared",
-			Password:       "backend-pass",
-			Enabled:        true,
-			ClientIdentity: backendIdentityForTest(backendDeviceID),
-		},
-	}
+	configureTestUpstream(store, backend.URL+"/emby")
+	source := store.UpstreamSources["source"]
+	source.ServerID, source.BackendUserID, source.BackendToken = backendServerID, backendUserID, backendToken
+	source.ClientIdentity = backendIdentityForTest(backendDeviceID)
+	store.UpstreamSources["source"] = source
 
 	gw := httptest.NewServer(NewServer(Config{
 		PublicBaseURL:   "https://media.example.com",
@@ -342,9 +304,6 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 	gatewayToken, _ := login["AccessToken"].(string)
 	if gatewayToken == "" || gatewayToken == backendToken {
 		t.Fatalf("expected gateway token, got %q", gatewayToken)
-	}
-	if sawControlledBackendLogin || sawBackendAuthUserAgent || sawBackendAuthIdentity {
-		t.Fatal("gateway login unexpectedly authenticated to backend")
 	}
 	if strings.Contains(mustJSON(t, login), backendToken) || strings.Contains(mustJSON(t, login), backendUserID) {
 		t.Fatalf("login leaked backend token or user id: %s", mustJSON(t, login))
@@ -376,15 +335,6 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 	systemJSON := mustJSON(t, system)
 	if !sawBackendTokenInRequest {
 		t.Fatal("backend did not receive mapped token")
-	}
-	if !sawControlledBackendLogin {
-		t.Fatal("lazy backend authentication did not use controlled backend account credentials")
-	}
-	if !sawBackendAuthUserAgent {
-		t.Fatal("backend authentication did not receive configured user agent")
-	}
-	if !sawBackendAuthIdentity {
-		t.Fatal("backend authentication did not receive configured authorization identity")
 	}
 	if !sawProxyUserAgent || !sawProxyIdentity {
 		t.Fatal("backend proxy request did not receive configured identity")
@@ -513,19 +463,10 @@ func TestGatewayWebSocketUpgradeProxy(t *testing.T) {
 		GatewayUser: GatewayUser{ID: "u1", Username: "alice", SyntheticUserID: syntheticUserID, Enabled: true},
 		Password:    "alice-pass",
 	}
-	store.Mappings["u1"] = UserMapping{
-		ID:               "m1",
-		GatewayUserID:    "u1",
-		BackendAccountID: "b1",
-		Enabled:          true,
-		BackendAccount: BackendAccount{
-			ID:       "b1",
-			BaseURL:  backend.URL + "/emby",
-			Username: "shared",
-			Password: "backend-pass",
-			Enabled:  true,
-		},
-	}
+	configureTestUpstream(store, backend.URL+"/emby")
+	source := store.UpstreamSources["source"]
+	source.ServerID, source.BackendUserID, source.BackendToken = "backend-server-id", backendUserID, backendToken
+	store.UpstreamSources["source"] = source
 
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
@@ -594,7 +535,7 @@ func TestEmbyWebSocketRejectsBadCredentialsWithoutDial(t *testing.T) {
 		{
 			name: "expired token",
 			setup: func(store *MemoryStore, req *http.Request) {
-				session := testSession("http://backend.invalid/emby")
+				session := testSession()
 				session.ExpiresAt = time.Now().UTC().Add(-time.Minute)
 				store.Sessions[HashToken("gateway-token")] = session
 				req.URL.RawQuery = "api_key=gateway-token"
@@ -620,22 +561,30 @@ func TestEmbyWebSocketRejectsBadCredentialsWithoutDial(t *testing.T) {
 }
 
 func TestEmbyWebSocketPreflightRefreshesStaleBackendToken(t *testing.T) {
+	var mu sync.Mutex
 	var probes, logins, handshakes int
+	handshakeDone := make(chan struct{})
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/emby/System/Info":
+			mu.Lock()
 			probes++
+			mu.Unlock()
 			if r.Header.Get("X-Emby-Token") != "old-backend-token" {
 				t.Fatalf("probe token = %q", r.Header.Get("X-Emby-Token"))
 			}
 			w.WriteHeader(http.StatusUnauthorized)
 		case "/emby/Users/AuthenticateByName":
+			mu.Lock()
 			logins++
-			writeTestJSON(w, map[string]any{"AccessToken": "new-backend-token", "User": map[string]any{"Id": "backend-user", "Name": "shared"}})
+			mu.Unlock()
+			writeTestJSON(w, map[string]any{"AccessToken": "new-backend-token", "ServerId": "backend-server", "User": map[string]any{"Id": "backend-user", "Name": "shared"}})
 		case "/emby/Sessions/Logout":
 			w.WriteHeader(http.StatusOK)
 		case "/emby/embywebsocket":
+			mu.Lock()
 			handshakes++
+			mu.Unlock()
 			if r.Header.Get("X-Emby-Token") != "new-backend-token" || r.URL.Query().Get("api_key") != "new-backend-token" {
 				t.Fatalf("handshake token/query = %q/%q", r.Header.Get("X-Emby-Token"), r.URL.RawQuery)
 			}
@@ -647,20 +596,17 @@ func TestEmbyWebSocketPreflightRefreshesStaleBackendToken(t *testing.T) {
 			defer conn.Close()
 			_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
 			_ = rw.Flush()
+			close(handshakeDone)
 		default:
 			t.Fatalf("unexpected backend path %q", r.URL.Path)
 		}
 	}))
 	defer backend.Close()
 	store := testStore(backend.URL + "/emby")
-	mapping := store.Mappings["u1"]
-	mapping.BackendAccount.BackendToken = "old-backend-token"
-	mapping.BackendAccount.BackendUserID = "backend-user"
-	store.Mappings["u1"] = mapping
-	session := testSession(backend.URL + "/emby")
-	session.BackendToken = "old-backend-token"
-	session.BackendUserID = "backend-user"
-	session.BackendAccount = mapping.BackendAccount
+	source := store.UpstreamSources["source"]
+	source.BackendToken = "old-backend-token"
+	store.UpstreamSources["source"] = source
+	session := testSession()
 	store.Sessions[HashToken("gateway-token")] = session
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
@@ -672,38 +618,52 @@ func TestEmbyWebSocketPreflightRefreshesStaleBackendToken(t *testing.T) {
 	defer conn.Close()
 	_, _ = conn.Write([]byte("GET /emby/embywebsocket?api_key=gateway-token&deviceId=device HTTP/1.1\r\nHost: " + gwURL.Host + "\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: key\r\nSec-WebSocket-Version: 13\r\n\r\n"))
 	status, err := bufio.NewReader(conn).ReadString('\n')
-	if err != nil || !strings.Contains(status, "101") || probes != 1 || logins != 1 || handshakes != 1 || session.BackendToken != "new-backend-token" {
-		t.Fatalf("status/probe/login/handshake/token = %q/%d/%d/%d/%q err=%v", status, probes, logins, handshakes, session.BackendToken, err)
+	<-handshakeDone
+	mu.Lock()
+	gotProbes, gotLogins, gotHandshakes := probes, logins, handshakes
+	mu.Unlock()
+	if err != nil || !strings.Contains(status, "101") || gotProbes != 1 || gotLogins != 1 || gotHandshakes != 1 || store.UpstreamSources["source"].BackendToken != "new-backend-token" {
+		t.Fatalf("status/probe/login/handshake/token = %q/%d/%d/%d/%q err=%v", status, gotProbes, gotLogins, gotHandshakes, store.UpstreamSources["source"].BackendToken, err)
 	}
 }
 
 func TestEmbyWebSocketRetriesOneHandshakeUnauthorized(t *testing.T) {
+	var mu sync.Mutex
 	var probes, logins, handshakes int
+	handshakeDone := make(chan struct{})
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/emby/System/Info":
+			mu.Lock()
 			probes++
-			if probes == 1 {
+			currentProbe := probes
+			mu.Unlock()
+			if currentProbe == 1 {
 				w.WriteHeader(http.StatusOK) // Upgrade preflight.
 			} else {
 				w.WriteHeader(http.StatusUnauthorized) // Refresh confirmation.
 			}
 		case "/emby/Users/AuthenticateByName":
+			mu.Lock()
 			logins++
-			writeTestJSON(w, map[string]any{"AccessToken": "new-backend-token", "User": map[string]any{"Id": "backend-user"}})
+			mu.Unlock()
+			writeTestJSON(w, map[string]any{"AccessToken": "new-backend-token", "ServerId": "backend-server", "User": map[string]any{"Id": "backend-user"}})
 		case "/emby/Sessions/Logout":
 			w.WriteHeader(http.StatusOK)
 		case "/emby/embywebsocket":
+			mu.Lock()
 			handshakes++
-			if handshakes == 1 {
+			currentHandshake := handshakes
+			mu.Unlock()
+			if currentHandshake == 1 {
 				if r.Header.Get("X-Emby-Token") != "old-backend-token" {
 					t.Fatalf("first handshake token = %q", r.Header.Get("X-Emby-Token"))
 				}
 				w.WriteHeader(http.StatusUnauthorized)
 				return
 			}
-			if handshakes != 2 || r.Header.Get("X-Emby-Token") != "new-backend-token" || r.URL.Query().Get("api_key") != "new-backend-token" || r.URL.Query().Get("deviceId") != "device" || r.Header.Get("Cookie") != "other=keep" || !headerHasToken(r.Header, "Connection", "upgrade") || r.Header.Get("Upgrade") != "websocket" || r.Header.Get("Sec-WebSocket-Key") != "key" || r.Header.Get("Sec-WebSocket-Version") != "13" {
-				t.Fatalf("retry handshake = headers=%#v query=%q count=%d", r.Header, r.URL.RawQuery, handshakes)
+			if currentHandshake != 2 || r.Header.Get("X-Emby-Token") != "new-backend-token" || r.URL.Query().Get("api_key") != "new-backend-token" || r.URL.Query().Get("deviceId") != "device" || r.Header.Get("Cookie") != "other=keep" || !headerHasToken(r.Header, "Connection", "upgrade") || r.Header.Get("Upgrade") != "websocket" || r.Header.Get("Sec-WebSocket-Key") != "key" || r.Header.Get("Sec-WebSocket-Version") != "13" {
+				t.Fatalf("retry handshake = headers=%#v query=%q count=%d", r.Header, r.URL.RawQuery, currentHandshake)
 			}
 			hj := w.(http.Hijacker)
 			conn, rw, err := hj.Hijack()
@@ -713,18 +673,17 @@ func TestEmbyWebSocketRetriesOneHandshakeUnauthorized(t *testing.T) {
 			defer conn.Close()
 			_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
 			_ = rw.Flush()
+			close(handshakeDone)
 		default:
 			t.Fatalf("unexpected backend path %q", r.URL.Path)
 		}
 	}))
 	defer backend.Close()
 	store := testStore(backend.URL + "/emby")
-	mapping := store.Mappings["u1"]
-	mapping.BackendAccount.BackendToken = "old-backend-token"
-	mapping.BackendAccount.BackendUserID = "backend-user"
-	store.Mappings["u1"] = mapping
-	session := testSession(backend.URL + "/emby")
-	session.BackendToken, session.BackendUserID, session.BackendAccount = "old-backend-token", "backend-user", mapping.BackendAccount
+	source := store.UpstreamSources["source"]
+	source.BackendToken = "old-backend-token"
+	store.UpstreamSources["source"] = source
+	session := testSession()
 	store.Sessions[HashToken("gateway-token")] = session
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
@@ -736,8 +695,12 @@ func TestEmbyWebSocketRetriesOneHandshakeUnauthorized(t *testing.T) {
 	defer conn.Close()
 	_, _ = conn.Write([]byte("GET /emby/embywebsocket?api_key=gateway-token&deviceId=device HTTP/1.1\r\nHost: " + gwURL.Host + "\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nCookie: " + resourceCookieName + "=gateway-token; other=keep\r\nSec-WebSocket-Key: key\r\nSec-WebSocket-Version: 13\r\n\r\n"))
 	status, err := bufio.NewReader(conn).ReadString('\n')
-	if err != nil || !strings.Contains(status, "101") || probes != 2 || logins != 1 || handshakes != 2 {
-		t.Fatalf("status/probes/logins/handshakes = %q/%d/%d/%d err=%v", status, probes, logins, handshakes, err)
+	<-handshakeDone
+	mu.Lock()
+	gotProbes, gotLogins, gotHandshakes := probes, logins, handshakes
+	mu.Unlock()
+	if err != nil || !strings.Contains(status, "101") || gotProbes != 2 || gotLogins != 1 || gotHandshakes != 2 {
+		t.Fatalf("status/probes/logins/handshakes = %q/%d/%d/%d err=%v", status, gotProbes, gotLogins, gotHandshakes, err)
 	}
 }
 
@@ -780,14 +743,9 @@ func TestProxyRefreshesBackendTokenOnUnauthorized(t *testing.T) {
 
 	store := testStore(backend.URL + "/emby")
 	store.Users["u1"] = MemoryUser{GatewayUser: GatewayUser{ID: "u1", Username: "alice", SyntheticUserID: syntheticUserID, Enabled: true}, Password: "alice-pass"}
-	mapping := store.Mappings["u1"]
-	mapping.BackendAccount.Server.ServerVersion = "4.9.5.0"
-	mapping.BackendAccount.Server.ServerName = "Probed Emby"
-	mapping.BackendAccount.BackendToken = "backend-token-1"
-	mapping.BackendAccount.BackendUserID = "backend-user"
-	oldTokenTime := time.Now().UTC().Add(-backendTokenRefreshMinInterval - time.Second)
-	mapping.BackendAccount.TokenUpdatedAt = &oldTokenTime
-	store.Mappings["u1"] = mapping
+	source := store.UpstreamSources["source"]
+	source.BackendToken, source.BackendUserID = "backend-token-1", "backend-user"
+	store.UpstreamSources["source"] = source
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby", GatewayServerID: "gateway-server"}, store))
 	defer gw.Close()
 
@@ -813,11 +771,8 @@ func TestProxyRefreshesBackendTokenOnUnauthorized(t *testing.T) {
 	if !hasAuditEvent(store, "backend_token_refresh") {
 		t.Fatalf("missing backend token refresh audit log: %#v", store.AuditLogs)
 	}
-	if store.Mappings["u1"].BackendAccount.BackendToken != "backend-token-2" {
-		t.Fatalf("backend token was not refreshed in store: %#v", store.Mappings["u1"].BackendAccount)
-	}
-	if store.Mappings["u1"].BackendAccount.Server.ServerVersion != "4.9.5.0" || store.Mappings["u1"].BackendAccount.Server.ServerName != "Probed Emby" {
-		t.Fatalf("lazy login cleared probed server info: %#v", store.Mappings["u1"].BackendAccount.Server)
+	if store.UpstreamSources["source"].BackendToken != "backend-token-2" {
+		t.Fatalf("upstream source token was not refreshed: %#v", store.UpstreamSources["source"])
 	}
 }
 
@@ -867,8 +822,8 @@ func TestProxyDoesNotRefreshWhenUnauthorizedTokenStillWorks(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("proxy status = %d, want 401: %s", resp.StatusCode, string(body))
 	}
-	if authCount != 1 || playbackCount != 1 {
-		t.Fatalf("auth/playback counts = %d/%d, want 1/1", authCount, playbackCount)
+	if authCount != 0 || playbackCount != 1 {
+		t.Fatalf("auth/playback counts = %d/%d, want 0/1", authCount, playbackCount)
 	}
 }
 
@@ -960,12 +915,9 @@ func TestProxyDoesNotRetryWhenRefreshReturnsSameToken(t *testing.T) {
 	decodeJSON(t, loginResp.Body, &login)
 	_ = loginResp.Body.Close()
 	gatewayToken, _ := login["AccessToken"].(string)
-	oldTokenTime := time.Now().UTC().Add(-backendTokenRefreshMinInterval - time.Second)
-	mapping := store.Mappings["u1"]
-	mapping.BackendAccount.BackendToken = "backend-token"
-	mapping.BackendAccount.BackendUserID = "backend-user"
-	mapping.BackendAccount.TokenUpdatedAt = &oldTokenTime
-	store.Mappings["u1"] = mapping
+	source := store.UpstreamSources["source"]
+	source.BackendToken, source.BackendUserID = "backend-token", "backend-user"
+	store.UpstreamSources["source"] = source
 
 	req := mustRequest(t, http.MethodGet, gw.URL+"/emby/Items/item-1/PlaybackInfo", nil)
 	req.Header.Set("X-Emby-Token", gatewayToken)
@@ -977,42 +929,6 @@ func TestProxyDoesNotRetryWhenRefreshReturnsSameToken(t *testing.T) {
 	}
 	if refreshCount != 1 || playbackCount != 1 {
 		t.Fatalf("refresh/playback counts = %d/%d, want 1/1", refreshCount, playbackCount)
-	}
-}
-
-func TestBackendLoginFailureBackoff(t *testing.T) {
-	var authCount int
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost && r.URL.Path == "/emby/Users/AuthenticateByName" {
-			authCount++
-			http.Error(w, "backend auth failed", http.StatusUnauthorized)
-			return
-		}
-		t.Fatalf("unexpected backend request %s %s", r.Method, r.URL.String())
-	}))
-	defer backend.Close()
-
-	store := testStore(backend.URL + "/emby")
-	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby", GatewayServerID: "gateway-server"}, store))
-	defer gw.Close()
-
-	loginResp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice","Pw":"alice-pass"}`))
-	var login map[string]any
-	decodeJSON(t, loginResp.Body, &login)
-	_ = loginResp.Body.Close()
-	token, _ := login["AccessToken"].(string)
-
-	for i := 0; i < 2; i++ {
-		req := mustRequest(t, http.MethodGet, gw.URL+"/emby/System/Info", nil)
-		req.Header.Set("X-Emby-Token", token)
-		resp := do(t, req)
-		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusBadGateway {
-			t.Fatalf("request %d status = %d, want 502", i+1, resp.StatusCode)
-		}
-	}
-	if authCount != 1 {
-		t.Fatalf("backend auth count = %d, want 1 due to cooldown", authCount)
 	}
 }
 
@@ -1083,12 +999,9 @@ func TestProxyRetryRewritesBodyWithRefreshedToken(t *testing.T) {
 	decodeJSON(t, loginResp.Body, &login)
 	_ = loginResp.Body.Close()
 	gatewayToken, _ := login["AccessToken"].(string)
-	oldTokenTime := time.Now().UTC().Add(-backendTokenRefreshMinInterval - time.Second)
-	mapping := store.Mappings["u1"]
-	mapping.BackendAccount.BackendToken = "backend-token-1"
-	mapping.BackendAccount.BackendUserID = backendUserID
-	mapping.BackendAccount.TokenUpdatedAt = &oldTokenTime
-	store.Mappings["u1"] = mapping
+	source := store.UpstreamSources["source"]
+	source.BackendToken, source.BackendUserID = "backend-token-1", backendUserID
+	store.UpstreamSources["source"] = source
 
 	body := `{"Token":"` + gatewayToken + `","UserId":"` + syntheticUserID + `"}`
 	req := mustRequest(t, http.MethodPost, gw.URL+"/emby/Users/"+syntheticUserID+"/Items", strings.NewReader(body))
@@ -1108,75 +1021,12 @@ func TestProxyRetryRewritesBodyWithRefreshedToken(t *testing.T) {
 	}
 }
 
-func TestRefreshBackendSessionReusesRotatedToken(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Fatalf("refresh should not call backend when token already rotated: %s %s", r.Method, r.URL.String())
-	}))
-	defer backend.Close()
-
-	store := testStore(backend.URL + "/emby")
-	mapping := store.Mappings["u1"]
-	mapping.BackendAccount.BackendToken = "new-token"
-	mapping.BackendAccount.BackendUserID = "backend-user"
-	store.Mappings["u1"] = mapping
-	session := testSession(backend.URL + "/emby")
-	session.BackendToken = "old-token"
-	session.BackendUserID = "backend-user"
-	session.BackendAccount = mapping.BackendAccount
-
-	server := NewServer(Config{GatewayBasePath: "/emby"}, store)
-	if err := server.refreshBackendSession(context.Background(), session, "old-token"); err != nil {
-		t.Fatalf("refresh backend session: %v", err)
-	}
-	if session.BackendToken != "new-token" {
-		t.Fatalf("session token = %q, want rotated token", session.BackendToken)
-	}
-}
-
-func TestBackendLoginIgnoresCallerCancellation(t *testing.T) {
-	backend := testAuthBackend(t)
-	defer backend.Close()
-	store := testStore(backend.URL + "/emby")
-	session := testSession(backend.URL + "/emby")
-	session.BackendToken = ""
-	session.BackendUserID = ""
-	session.BackendAccount = store.Mappings["u1"].BackendAccount
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	server := NewServer(Config{GatewayBasePath: "/emby"}, store)
-	if err := server.ensureBackendSession(ctx, session); err != nil {
-		t.Fatalf("ensure backend session with canceled caller context: %v", err)
-	}
-	if session.BackendToken == "" || store.Mappings["u1"].BackendAccount.BackendToken == "" {
-		t.Fatalf("backend token was not stored after canceled caller context")
-	}
-}
-
-func TestDisabledBackendAccountDoesNotLogin(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Fatalf("disabled backend account should not call backend: %s %s", r.Method, r.URL.String())
-	}))
-	defer backend.Close()
-	store := testStore(backend.URL + "/emby")
-	mapping := store.Mappings["u1"]
-	mapping.BackendAccount.Enabled = false
-	store.Mappings["u1"] = mapping
-	session := testSession(backend.URL + "/emby")
-	session.BackendToken = ""
-	session.BackendUserID = ""
-	session.BackendAccount = mapping.BackendAccount
-
-	server := NewServer(Config{GatewayBasePath: "/emby"}, store)
-	if err := server.ensureBackendSession(context.Background(), session); !errors.Is(err, ErrDisabled) {
-		t.Fatalf("ensure backend session error = %v, want ErrDisabled", err)
-	}
-}
-
 func TestAnonymousPublicInfoAndPing(t *testing.T) {
 	store := NewMemoryStore()
-	store.Mappings["m1"] = UserMapping{BackendAccount: BackendAccount{ID: "b1", ServerID: "s1", Enabled: true, Server: EmbyServer{ID: "s1", Enabled: true, ServerVersion: "4.9.1"}}}
-	store.Mappings["m2"] = UserMapping{BackendAccount: BackendAccount{ID: "b2", ServerID: "s2", Enabled: true, Server: EmbyServer{ID: "s2", Enabled: true, ServerVersion: "4.10.0"}}}
+	configureTestUpstream(store, "http://127.0.0.1:1")
+	source := store.UpstreamSources["source"]
+	source.ServerVersion = "4.10.0"
+	store.UpstreamSources["source"] = source
 	gw := httptest.NewServer(NewServer(Config{
 		PublicBaseURL:   "https://media.example.com",
 		GatewayBasePath: "/emby",
@@ -1216,11 +1066,11 @@ func TestPublicSystemInfoProbesBackendWhenVersionMissing(t *testing.T) {
 		if r.Method != http.MethodGet || r.URL.Path != "/emby/System/Info/Public" {
 			t.Fatalf("unexpected backend request %s %s", r.Method, r.URL.String())
 		}
-		writeTestJSON(w, map[string]any{"Id": "real-server", "ServerName": "Real Emby", "Version": "4.9.5.0"})
+		writeTestJSON(w, map[string]any{"Id": "backend-server", "ServerName": "Real Emby", "Version": "4.9.5.0"})
 	}))
 	defer backend.Close()
 	store := NewMemoryStore()
-	store.Mappings["m1"] = UserMapping{BackendAccount: BackendAccount{ID: "b1", ServerID: "s1", BaseURL: backend.URL + "/emby", Enabled: true, Server: EmbyServer{ID: "s1", BaseURL: backend.URL + "/emby", Enabled: true}}}
+	configureTestUpstream(store, backend.URL+"/emby")
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby", GatewayServerID: "gateway-server"}, store))
 	defer gw.Close()
 
@@ -1242,11 +1092,11 @@ func TestPublicSystemInfoFallsBackWithoutBackendVersion(t *testing.T) {
 		if r.Method != http.MethodGet || r.URL.Path != "/emby/System/Info/Public" {
 			t.Fatalf("unexpected backend request %s %s", r.Method, r.URL.String())
 		}
-		writeTestJSON(w, map[string]any{"Id": "real-server", "ServerName": "Real Emby"})
+		writeTestJSON(w, map[string]any{"Id": "backend-server", "ServerName": "Real Emby"})
 	}))
 	defer backend.Close()
 	store := NewMemoryStore()
-	store.Mappings["m1"] = UserMapping{BackendAccount: BackendAccount{ID: "b1", ServerID: "s1", BaseURL: backend.URL + "/emby", Enabled: true, Server: EmbyServer{ID: "s1", BaseURL: backend.URL + "/emby", Enabled: true}}}
+	configureTestUpstream(store, backend.URL+"/emby")
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby", GatewayServerID: "gateway-server"}, store))
 	defer gw.Close()
 
@@ -1323,30 +1173,34 @@ func TestAuthenticateByNameAcceptsJSONPasswordField(t *testing.T) {
 	}
 }
 
-func TestLoginFailureRateLimitAndMappingStatus(t *testing.T) {
-	store := testStore("http://127.0.0.1/emby")
-	store.Mappings["u1"] = UserMapping{Enabled: false}
-	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
-	defer gw.Close()
+func TestLoginIgnoresLegacyMappingStatus(t *testing.T) {
+	for _, name := range []string{"missing", "disabled", "corrupt"} {
+		t.Run(name, func(t *testing.T) {
+			store := testStore("http://127.0.0.1/emby")
+			switch name {
+			case "missing":
+				store.Mappings = map[string]UserMapping{}
+			case "disabled":
+				store.Mappings["u1"] = UserMapping{Enabled: false}
+			case "corrupt":
+				store.Mappings["u1"] = UserMapping{ID: "legacy", GatewayUserID: "u1", Enabled: true, BackendAccount: BackendAccount{Enabled: false}}
+			}
+			gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+			defer gw.Close()
 
-	validBody := `{"Username":"alice","Pw":"alice-pass"}`
-	resp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", validBody))
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("disabled mapping status = %d, want 401", resp.StatusCode)
-	}
-
-	for i := 0; i < loginFailureLimit-1; i++ {
-		resp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice","Pw":"bad"}`))
-		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusUnauthorized {
-			t.Fatalf("bad login %d status = %d, want 401", i, resp.StatusCode)
-		}
-	}
-	resp = do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", validBody))
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("rate limited login status = %d, want 401", resp.StatusCode)
+			resp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice","Pw":"alice-pass"}`))
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("login status = %d, want 200", resp.StatusCode)
+			}
+			var result map[string]any
+			decodeJSON(t, resp.Body, &result)
+			token, _ := result["AccessToken"].(string)
+			session := store.Sessions[HashToken(token)]
+			if token == "" || session == nil || session.GatewayUserID != "u1" {
+				t.Fatalf("expected gateway-only session, got %#v", session)
+			}
+		})
 	}
 }
 
@@ -1449,19 +1303,19 @@ func TestAuditLogsForAuthAndLogout(t *testing.T) {
 }
 
 func TestAuditLogsForAuthDependencyFailures(t *testing.T) {
-	t.Run("mapping unavailable", func(t *testing.T) {
+	t.Run("missing mapping does not affect gateway login", func(t *testing.T) {
 		store := testStore("http://127.0.0.1/emby")
-		store.Mappings["u1"] = UserMapping{Enabled: false}
+		store.Mappings = map[string]UserMapping{}
 		gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 		defer gw.Close()
 
 		resp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice","Pw":"alice-pass"}`))
 		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusUnauthorized {
-			t.Fatalf("login status = %d, want 401", resp.StatusCode)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("login status = %d, want 200", resp.StatusCode)
 		}
-		if !hasAuditEvent(store, "mapping_unavailable") {
-			t.Fatalf("missing mapping_unavailable audit in %#v", store.AuditLogs)
+		if hasAuditEvent(store, "mapping_unavailable") {
+			t.Fatalf("unexpected mapping audit in %#v", store.AuditLogs)
 		}
 	})
 
@@ -1471,6 +1325,10 @@ func TestAuditLogsForAuthDependencyFailures(t *testing.T) {
 		}))
 		defer backend.Close()
 		store := testStore(backend.URL + "/emby")
+		source := store.UpstreamSources["source"]
+		source.AuthGenerationID, source.BackendToken, source.BackendUserID = "", "", ""
+		source.TokenUpdatedAt, source.LastLoginAt = nil, nil
+		store.UpstreamSources["source"] = source
 		gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 		defer gw.Close()
 
@@ -1562,7 +1420,8 @@ func TestPathPolicyDenyAndDefaultAllow(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	store.PathPolicies = []PathPolicy{{Method: http.MethodGet, Path: "/Items/Secret", Action: "deny", Enabled: true}}
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
@@ -1704,7 +1563,7 @@ func TestPlaybackEventsAndStateAreRecordedWithoutForwarding(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken(gatewayToken)] = testSession(backend.URL + "/emby")
+	store.Sessions[HashToken(gatewayToken)] = testSession()
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
@@ -1746,7 +1605,7 @@ func TestPlaybackEventsAndStateAreRecordedWithoutForwarding(t *testing.T) {
 
 func TestPlaybackReportsSucceedWhenBackendUnavailable(t *testing.T) {
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession("http://127.0.0.1:1/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
@@ -1771,7 +1630,7 @@ func TestPlaybackPingAndCapabilitiesAreLocalOnly(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
@@ -1798,7 +1657,8 @@ func TestRemoteControlPlaybackRequestStillForwards(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
@@ -1862,14 +1722,15 @@ func TestUserDataVirtualizationIsGatewayUserScoped(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("token-u1")] = testSession(backend.URL + "/emby")
-	u2Session := *testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("token-u1")] = testSession()
+	u2Session := *testSession()
 	u2Session.GatewayTokenHash = HashToken("token-u2")
 	u2Session.GatewayUserID = "u2"
 	u2Session.GatewayUsername = "bob"
 	u2Session.SyntheticUserID = "gateway-user-2"
 	store.Sessions[u2Session.GatewayTokenHash] = &u2Session
-	u3Session := *testSession(backend.URL + "/emby")
+	u3Session := *testSession()
 	u3Session.GatewayTokenHash = HashToken("token-u3")
 	u3Session.GatewayUserID = "u3"
 	u3Session.GatewayUsername = "charlie"
@@ -1920,7 +1781,8 @@ func TestCompressedJSONUserDataIsVirtualized(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "episode-1", IsFavorite: true})
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
@@ -1959,8 +1821,9 @@ func TestProxyUserDataOverlayUsesBatchLookup(t *testing.T) {
 	defer backend.Close()
 
 	base := NewMemoryStore()
+	configureTestUpstream(base, backend.URL+"/emby")
 	store := &countingPlaybackStore{MemoryStore: base}
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "episode-1", PlaybackPositionTicks: 1200})
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "episode-2", IsFavorite: true})
 	gateway := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
@@ -1990,7 +1853,7 @@ func TestProxyUserDataOverlayUsesBatchLookup(t *testing.T) {
 func TestProxyUserDataOverlaySelectsOnlyDirectBaseItems(t *testing.T) {
 	base := NewMemoryStore()
 	store := &countingPlaybackStore{MemoryStore: base}
-	session := testSession("http://backend.invalid/emby")
+	session := testSession()
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", ItemID: "movie-1", IsFavorite: true})
 	server := NewServer(Config{GatewayBasePath: "/emby"}, store)
 
@@ -2004,7 +1867,7 @@ func TestProxyUserDataOverlaySelectsOnlyDirectBaseItems(t *testing.T) {
 	}
 	metadataBefore := mustJSON(t, metadata)
 	root := map[string]any{"Id": "movie-1", "Name": "Movie", "Type": "Movie", "UserData": map[string]any{}, "Metadata": metadata}
-	rewritten := server.rewriteProxyJSONValueForRequestWithSnapshot(context.Background(), nil, root, session, upstreamRequestSnapshotFromLegacySession(session), "token", "http://gateway/emby").(map[string]any)
+	rewritten := server.rewriteProxyJSONValueForRequestWithSnapshot(context.Background(), nil, root, session, testUpstreamSnapshot("http://backend.invalid/emby"), "token", "http://gateway/emby").(map[string]any)
 	if got := strings.Join(store.batchItemIDs, ","); got != "movie-1" {
 		t.Fatalf("batched item ids = %q, want movie-1", got)
 	}
@@ -2069,7 +1932,8 @@ func TestPlaybackInfoBareSignedDirectStreamURLRoundTrip(t *testing.T) {
 	defer backend.Close()
 	backendURL = backend.URL
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
@@ -2096,14 +1960,14 @@ func TestPlaybackInfoBareSignedDirectStreamURLRoundTrip(t *testing.T) {
 
 func TestProxyUserDataOverlaySelectsItemAndItemsWrappers(t *testing.T) {
 	store := &countingPlaybackStore{MemoryStore: NewMemoryStore()}
-	session := testSession("http://backend.invalid/emby")
+	session := testSession()
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", ItemID: "item-1", IsFavorite: true})
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", ItemID: "item-2", IsFavorite: true})
 	value := map[string]any{
 		"Item":  map[string]any{"Id": "item-1", "Type": "Movie", "UserData": map[string]any{}, "People": []any{map[string]any{"Id": "person-1", "Type": "Person", "UserData": map[string]any{"Played": true}}}},
 		"Items": []any{map[string]any{"Id": "item-2", "Type": "Episode", "UserData": map[string]any{}, "MediaSources": []any{map[string]any{"Id": "source-1", "Type": "Video", "UserData": map[string]any{"Played": true}}}}},
 	}
-	rewritten := NewServer(Config{}, store).rewriteProxyJSONValueForRequestWithSnapshot(context.Background(), nil, value, session, upstreamRequestSnapshotFromLegacySession(session), "token", "http://gateway/emby").(map[string]any)
+	rewritten := NewServer(Config{}, store).rewriteProxyJSONValueForRequestWithSnapshot(context.Background(), nil, value, session, testUpstreamSnapshot("http://backend.invalid/emby"), "token", "http://gateway/emby").(map[string]any)
 	if got := strings.Join(store.batchItemIDs, ","); got != "item-1,item-2" {
 		t.Fatalf("batched item ids = %q, want item-1,item-2", got)
 	}
@@ -2117,15 +1981,15 @@ func TestProxyUserDataOverlaySelectsItemAndItemsWrappers(t *testing.T) {
 
 func TestProxyUserDataOverlaySelectsMediaRootArraysButNotSessions(t *testing.T) {
 	store := &countingPlaybackStore{MemoryStore: NewMemoryStore()}
-	session := testSession("http://backend.invalid/emby")
+	session := testSession()
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", ItemID: "movie-1", IsFavorite: true})
 	server := NewServer(Config{}, store)
-	media := server.rewriteProxyJSONValueForRequestWithSnapshot(context.Background(), nil, []any{map[string]any{"Id": "movie-1", "Type": "Movie", "UserData": map[string]any{}}}, session, upstreamRequestSnapshotFromLegacySession(session), "token", "http://gateway/emby").([]any)
+	media := server.rewriteProxyJSONValueForRequestWithSnapshot(context.Background(), nil, []any{map[string]any{"Id": "movie-1", "Type": "Movie", "UserData": map[string]any{}}}, session, testUpstreamSnapshot("http://backend.invalid/emby"), "token", "http://gateway/emby").([]any)
 	if media[0].(map[string]any)["UserData"].(map[string]any)["IsFavorite"] != true {
 		t.Fatalf("media root array was not overlaid: %#v", media)
 	}
 	sessions := []any{map[string]any{"Id": "session-1", "Name": "Session", "Type": "Session"}}
-	rewritten := server.rewriteProxyJSONValueForRequestWithSnapshot(context.Background(), nil, sessions, session, upstreamRequestSnapshotFromLegacySession(session), "token", "http://gateway/emby").([]any)
+	rewritten := server.rewriteProxyJSONValueForRequestWithSnapshot(context.Background(), nil, sessions, session, testUpstreamSnapshot("http://backend.invalid/emby"), "token", "http://gateway/emby").([]any)
 	if _, ok := rewritten[0].(map[string]any)["UserData"]; ok {
 		t.Fatalf("session root array was modified: %#v", rewritten)
 	}
@@ -2170,7 +2034,8 @@ func TestProxyUserDataOverlayIgnoresOrphanedState(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	orphanedAt := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "episode-1", PlaybackPositionTicks: 1234, PlayedPercentage: floatPtr(12), OrphanedAt: &orphanedAt})
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
@@ -2201,8 +2066,9 @@ func TestResumeUsesGatewayStateAndResolvesExistingItems(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("token-u1")] = testSession(backend.URL + "/emby")
-	u2 := *testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("token-u1")] = testSession()
+	u2 := *testSession()
 	u2.GatewayTokenHash = HashToken("token-u2")
 	u2.GatewayUserID = "u2"
 	u2.SyntheticUserID = "gateway-user-2"
@@ -2251,7 +2117,8 @@ func TestResumeMediaTypeFilterDoesNotOrphanFilteredItems(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "video-1", PlaybackPositionTicks: 1200})
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "audio-1", PlaybackPositionTicks: 2200})
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
@@ -2283,7 +2150,8 @@ func TestResumeRepairsPreviouslyOrphanedState(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	orphanedAt := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "episode-1", PlaybackPositionTicks: 1200, OrphanedAt: &orphanedAt})
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
@@ -2315,7 +2183,8 @@ func TestResumeResolutionIgnoresCollectionFiltersForOrphanDecision(t *testing.T)
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "movie-1", PlaybackPositionTicks: 1200})
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
@@ -2353,7 +2222,8 @@ func TestResumeDoesNotOrphanItemsBeyondResolutionBatchLimit(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
 	for i := 0; i < personalIDBatchLimit+1; i++ {
 		_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "item-" + strconv.Itoa(i), PlaybackPositionTicks: 1000, UpdatedAt: now.Add(-time.Duration(i) * time.Minute)})
@@ -2382,7 +2252,8 @@ func TestSeriesAndSeasonUserDataAreAggregatedFromGatewayState(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	lastPlayed := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "ep-1", SeriesID: "show-1", SeasonID: "season-1", Played: true, LastPlayedDate: &lastPlayed})
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "ep-2", SeriesID: "show-1", SeasonID: "season-1", Played: false})
@@ -2420,7 +2291,8 @@ func TestPersonalStateWritesAreTerminatedAtGateway(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
@@ -2472,7 +2344,8 @@ func TestPersonalFiltersTranslateToBackendIDSets(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "fav-1", IsFavorite: true})
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "plain-1"})
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "resume-1", PlaybackPositionTicks: 1000})
@@ -2525,7 +2398,8 @@ func TestPersonalFiltersApplyToNonUserItemLists(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "ep-played", Played: true})
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
@@ -2557,7 +2431,8 @@ func TestPositivePersonalFilterResolvesAllIDsWithoutCap(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	for i := 0; i < personalIDBatchLimit+1; i++ {
 		_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "fav-" + strconv.Itoa(i), ItemType: "Movie", IsFavorite: true})
 	}
@@ -2583,7 +2458,7 @@ func TestAggregatePersonalFilterEndpointIsRejected(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "fav-1", ItemType: "Movie", IsFavorite: true})
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
@@ -2610,7 +2485,8 @@ func TestPositivePersonalFilterKeepsBackendOnlyFilters(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "fav-foo", ItemType: "Movie", IsFavorite: true})
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "fav-bar", ItemType: "Movie", IsFavorite: true})
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
@@ -2633,7 +2509,8 @@ func TestPositivePersonalFilterBackendFailureReturnsBadGateway(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "fav-1", IsFavorite: true})
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
@@ -2657,7 +2534,8 @@ func TestClearlyNonItemPersonalFilterPathIsPassedThrough(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
@@ -2675,7 +2553,7 @@ func TestUnknownPersonalFilterPathIsRejected(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
@@ -2716,7 +2594,8 @@ func TestNegativePersonalFilterBackfillsFromUpstreamPages(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	for i := 0; i < 5; i++ {
 		_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "item-" + strconv.Itoa(i), ItemType: "Movie", Played: true})
 	}
@@ -2757,7 +2636,8 @@ func TestNegativePersonalFilterWithoutLimitDoesNotTruncateAtFirstPage(t *testing
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
@@ -2777,7 +2657,8 @@ func TestNegativePersonalFilterDoesNotUndercountTotalWithBackendOnlyFilters(t *t
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "played-outside-search", ItemType: "Movie", Played: true})
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
@@ -2805,7 +2686,8 @@ func TestLatestBackfillsWhenInitialItemsArePlayed(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	for i := 0; i < 10; i++ {
 		_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "latest-" + strconv.Itoa(i), Played: true})
 	}
@@ -2834,7 +2716,8 @@ func TestLatestLargeLimitIsCappedInsteadOfReturningEmpty(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
@@ -2856,7 +2739,7 @@ func TestPlaybackReportsCanUseFormBodyAndQueryParameters(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
@@ -2907,7 +2790,8 @@ func TestJSONOverlayRunsWhenContentTypeIsMissing(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
@@ -2933,7 +2817,8 @@ func TestAggregateWithoutTrustedChildCountDoesNotReportComplete(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "ep-1", SeriesID: "show-1", Played: true})
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
@@ -2977,7 +2862,8 @@ func TestNextUpUsesGatewaySeriesState(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	lastPlayed := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
 	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "ep-1", SeriesID: "show-1", ParentIndexNumber: 1, IndexNumber: 1, Played: true, LastPlayedDate: &lastPlayed})
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
@@ -3006,9 +2892,12 @@ func TestDisplayPreferencesAndSessionsAreUserScoped(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	session := testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	source := store.UpstreamSources["source"]
+	source.ClientIdentity = backendIdentityForTest("device-1")
+	store.UpstreamSources["source"] = source
+	session := testSession()
 	session.DeviceID = "client-device"
-	session.BackendIdentity = backendIdentityForTest("device-1")
 	store.Sessions[HashToken("gateway-token")] = session
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
@@ -3116,7 +3005,7 @@ func TestLogoutReturnsErrorWhenRevokeFails(t *testing.T) {
 	defer backend.Close()
 
 	store := &failingRevokeStore{MemoryStore: NewMemoryStore()}
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
@@ -3137,7 +3026,8 @@ func TestOversizedJSONDoesNotPassTruncatedBody(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
@@ -3158,7 +3048,8 @@ func TestOversizedJSONDoesNotPassTruncatedBody(t *testing.T) {
 
 func TestProxyBackendUnavailableIsAudited(t *testing.T) {
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession("http://127.0.0.1:1/emby")
+	configureTestUpstream(store, "http://127.0.0.1:1/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
@@ -3182,7 +3073,8 @@ func TestOctetStreamM3U8IsRewritten(t *testing.T) {
 	backendURL = backend.URL
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	gw := httptest.NewServer(NewServer(Config{PublicBaseURL: "https://media.example.com", GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
@@ -3202,14 +3094,17 @@ func TestOctetStreamM3U8IsRewritten(t *testing.T) {
 }
 
 func TestOversizedM3U8DoesNotPassTruncatedBody(t *testing.T) {
+	var backendHits int
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendHits++
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 		_, _ = w.Write([]byte("#EXTM3U\nbackend-token\n" + strings.Repeat("x", proxyM3U8Limit)))
 	}))
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken("gateway-token")] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
@@ -3221,6 +3116,12 @@ func TestOversizedM3U8DoesNotPassTruncatedBody(t *testing.T) {
 	}
 	if strings.Contains(string(body), "backend-token") || strings.Contains(string(body), strings.Repeat("x", 128)) {
 		t.Fatalf("oversized m3u8 body included backend/truncated content")
+	}
+	if backendHits != 1 {
+		t.Fatalf("backend hits = %d, want 1", backendHits)
+	}
+	if !hasAuditEvent(store, "proxy_read_failed") {
+		t.Fatalf("missing proxy_read_failed audit in %#v", store.AuditLogs)
 	}
 }
 
@@ -3270,9 +3171,8 @@ func TestCredentialQueryXEmbyTokenProxiesBackendTokenOnly(t *testing.T) {
 		t.Fatalf("NewOpaqueToken: %v", err)
 	}
 	store := testStore(backend.URL + "/emby")
-	session := testSession(backend.URL + "/emby")
+	session := testSession()
 	session.GatewayTokenHash = HashToken(selected)
-	session.BackendToken = backendToken
 	store.Sessions[session.GatewayTokenHash] = session
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
@@ -3428,7 +3328,7 @@ func TestCredentialQueryNormalizationAndGuards(t *testing.T) {
 			wantFinds:       1,
 			wantExists:      1,
 			prepare: func(store *countingSessionStore) {
-				session := testSession("http://backend/emby")
+				session := testSession()
 				session.GatewayTokenHash = HashToken(otherActive)
 				store.Sessions[session.GatewayTokenHash] = session
 			},
@@ -3442,7 +3342,7 @@ func TestCredentialQueryNormalizationAndGuards(t *testing.T) {
 			wantFinds:       1,
 			wantExists:      1,
 			prepare: func(store *countingSessionStore) {
-				session := testSession("http://backend/emby")
+				session := testSession()
 				session.GatewayTokenHash = HashToken(otherRevoked)
 				now := time.Now().UTC()
 				session.RevokedAt = &now
@@ -3458,7 +3358,7 @@ func TestCredentialQueryNormalizationAndGuards(t *testing.T) {
 			wantFinds:       1,
 			wantExists:      1,
 			prepare: func(store *countingSessionStore) {
-				session := testSession("http://backend/emby")
+				session := testSession()
 				session.GatewayTokenHash = HashToken(otherExpired)
 				session.ExpiresAt = time.Now().UTC().Add(-time.Hour)
 				store.Sessions[session.GatewayTokenHash] = session
@@ -3536,9 +3436,8 @@ func TestCredentialQueryNormalizationAndGuards(t *testing.T) {
 
 			base := testStore(backend.URL + "/emby")
 			store := &countingSessionStore{MemoryStore: base}
-			session := testSession(backend.URL + "/emby")
+			session := testSession()
 			session.GatewayTokenHash = HashToken(selected)
-			session.BackendToken = "backend-token"
 			store.Sessions[session.GatewayTokenHash] = session
 			if tc.prepare != nil {
 				tc.prepare(store)
@@ -3596,9 +3495,8 @@ func TestCredentialQueryStoreErrorReturns503WithoutUpstream(t *testing.T) {
 
 	base := testStore(backend.URL + "/emby")
 	store := &storeErrorOnMissingSession{MemoryStore: base}
-	session := testSession(backend.URL + "/emby")
+	session := testSession()
 	session.GatewayTokenHash = HashToken(selected)
-	session.BackendToken = "backend-token"
 	store.Sessions[session.GatewayTokenHash] = session
 
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
@@ -3626,7 +3524,7 @@ func TestCredentialQueryLogoutRevokesSelectedToken(t *testing.T) {
 		t.Fatalf("NewOpaqueToken: %v", err)
 	}
 	store := testStore("http://backend/emby")
-	session := testSession("http://backend/emby")
+	session := testSession()
 	session.GatewayTokenHash = HashToken(selected)
 	store.Sessions[session.GatewayTokenHash] = session
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
@@ -3697,10 +3595,10 @@ func TestCredentialQueryLogoutSelectedOnlyIgnoresLowerPriorityToken(t *testing.T
 	}
 
 	store := &countingSessionStore{MemoryStore: testStore("http://backend/emby")}
-	selectedSession := testSession("http://backend/emby")
+	selectedSession := testSession()
 	selectedSession.GatewayTokenHash = HashToken(selected)
 	store.Sessions[selectedSession.GatewayTokenHash] = selectedSession
-	otherSession := testSession("http://backend/emby")
+	otherSession := testSession()
 	otherSession.GatewayTokenHash = HashToken(other)
 	store.Sessions[otherSession.GatewayTokenHash] = otherSession
 
@@ -3779,9 +3677,8 @@ func TestCredentialQueryWebSocketGuardAndAPIKey(t *testing.T) {
 		defer backend.Close()
 
 		store := testStore(backend.URL + "/emby")
-		session := testSession(backend.URL + "/emby")
+		session := testSession()
 		session.GatewayTokenHash = HashToken(selected)
-		session.BackendToken = "backend-token"
 		store.Sessions[session.GatewayTokenHash] = session
 		gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 		defer gw.Close()
@@ -3822,10 +3719,10 @@ func TestCredentialQueryWebSocketGuardAndAPIKey(t *testing.T) {
 		defer backend.Close()
 
 		store := testStore(backend.URL + "/emby")
-		session := testSession(backend.URL + "/emby")
+		session := testSession()
 		session.GatewayTokenHash = HashToken(selected)
 		store.Sessions[session.GatewayTokenHash] = session
-		conflictSession := testSession(backend.URL + "/emby")
+		conflictSession := testSession()
 		conflictSession.GatewayTokenHash = HashToken(conflict)
 		store.Sessions[conflictSession.GatewayTokenHash] = conflictSession
 		gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
@@ -3902,6 +3799,56 @@ func (c *countingSessionStore) existsHashesLocked() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]string(nil), c.existsHashes...)
+}
+
+func TestProxyDoesNotUseLegacyStoreMethods(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/emby/Items/item-1" {
+			t.Fatalf("unexpected backend path %q", r.URL.Path)
+		}
+		writeTestJSON(w, map[string]any{"Id": "item-1", "Type": "Movie"})
+	}))
+	defer backend.Close()
+
+	base := testStore(backend.URL + "/emby")
+	store := &panicLegacyStore{MemoryStore: base}
+	store.Sessions[HashToken("gateway-token")] = testSession()
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Items/item-1?api_key=gateway-token", nil))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("proxy status = %d, want 200", resp.StatusCode)
+	}
+}
+
+type panicLegacyStore struct {
+	*MemoryStore
+}
+
+func (*panicLegacyStore) FindMappingByGatewayUserID(context.Context, string) (*UserMapping, error) {
+	panic("legacy mapping store method called")
+}
+
+func (*panicLegacyStore) FindBackendAccountByID(context.Context, string) (*BackendAccount, error) {
+	panic("legacy backend account store method called")
+}
+
+func (*panicLegacyStore) ListEnabledServers(context.Context) ([]EmbyServer, error) {
+	panic("legacy server store method called")
+}
+
+func (*panicLegacyStore) UpdateBackendToken(context.Context, string, string, string, time.Time) error {
+	panic("legacy backend token store method called")
+}
+
+func (*panicLegacyStore) RecordBackendLoginError(context.Context, string, string) error {
+	panic("legacy backend login store method called")
+}
+
+func (*panicLegacyStore) UpdateServerInfo(context.Context, string, string, string, string, time.Time) error {
+	panic("legacy server info store method called")
 }
 
 type countingOpsStore struct {
@@ -4032,21 +3979,18 @@ func testStore(backendBaseURL string) *MemoryStore {
 		GatewayUser: GatewayUser{ID: "u1", Username: "alice", SyntheticUserID: "gateway-user", Enabled: true},
 		Password:    "alice-pass",
 	}
-	store.Mappings["u1"] = UserMapping{
-		ID:               "m1",
-		GatewayUserID:    "u1",
-		BackendAccountID: "b1",
-		Enabled:          true,
-		BackendAccount: BackendAccount{
-			ID:       "b1",
-			ServerID: "s1",
-			BaseURL:  backendBaseURL,
-			Username: "shared",
-			Password: "backend-pass",
-			Enabled:  true,
-		},
-	}
+	configureTestUpstream(store, backendBaseURL)
 	return store
+}
+
+func configureTestUpstream(store *MemoryStore, backendBaseURL string) {
+	now := time.Now().UTC()
+	store.UpstreamSources["source"] = UpstreamSource{
+		ID: "source", Key: "default", ServerID: "backend-server", BackendUsername: "shared", BackendPassword: "backend-pass",
+		BackendUserID: "backend-user", BackendToken: "backend-token", AuthGenerationID: "generation", TokenUpdatedAt: &now, LastLoginAt: &now,
+		ClientIdentity: backendIdentityForTest("backend-device"),
+	}
+	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: "source", Key: "default", BaseURL: backendBaseURL, Active: true}
 }
 
 func backendIdentityForTest(deviceID string) BackendClientIdentity {
@@ -4055,21 +3999,19 @@ func backendIdentityForTest(deviceID string) BackendClientIdentity {
 	return identity
 }
 
-func testSession(backendBaseURL string) *Session {
+func testSession() *Session {
 	return &Session{
 		GatewayTokenHash: HashToken("gateway-token"),
 		GatewayUserID:    "u1",
 		GatewayUsername:  "alice",
 		SyntheticUserID:  "gateway-user",
-		BackendAccountID: "b1",
-		BackendServerID:  "backend-server",
-		BackendBaseURL:   backendBaseURL,
-		BackendUserID:    "backend-user",
-		BackendUsername:  "shared",
-		BackendToken:     "backend-token",
 		CreatedAt:        time.Now().UTC(),
 		ExpiresAt:        time.Now().UTC().Add(time.Hour),
 	}
+}
+
+func testUpstreamSnapshot(baseURL string) upstreamRequestSnapshot {
+	return upstreamRequestSnapshot{baseURL: baseURL, serverID: "backend-server", userID: "backend-user", token: "backend-token", identity: backendIdentityForTest("backend-device")}
 }
 
 func testAuthBackend(t *testing.T) *httptest.Server {

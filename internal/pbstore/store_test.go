@@ -679,34 +679,47 @@ func TestPlaybackStateBatchLookupChunksLargeIDLists(t *testing.T) {
 	}
 }
 
-func TestItemChildCountsAreScopedByBackendAccount(t *testing.T) {
+func TestItemChildCountsAreSingletonByItemID(t *testing.T) {
 	app := newTestApp(t)
 	store := New(app)
 	ctx := context.Background()
 
-	if err := store.SaveItemChildCount(ctx, gateway.ItemChildCount{BackendAccountID: "account-1", ItemID: "show-1", ChildCount: 12}); err != nil {
-		t.Fatalf("save child count: %v", err)
+	if err := store.SaveItemChildCount(ctx, gateway.ItemChildCount{ItemID: "show-1", ChildCount: 12}); err != nil {
+		t.Fatalf("save initial child count: %v", err)
 	}
-	if err := store.SaveItemChildCount(ctx, gateway.ItemChildCount{BackendAccountID: "account-2", ItemID: "show-1", ChildCount: 99}); err != nil {
-		t.Fatalf("save second child count: %v", err)
+	if err := store.SaveItemChildCount(ctx, gateway.ItemChildCount{ItemID: "show-1", ChildCount: 99}); err != nil {
+		t.Fatalf("save replacement child count: %v", err)
 	}
-	if err := store.SaveItemChildCount(ctx, gateway.ItemChildCount{BackendAccountID: "account-1", ItemID: "show-1", ChildCount: 13}); err != nil {
+	if err := store.SaveItemChildCount(ctx, gateway.ItemChildCount{ItemID: "movie-1", ChildCount: 4}); err != nil {
+		t.Fatalf("save second item child count: %v", err)
+	}
+	if err := store.SaveItemChildCount(ctx, gateway.ItemChildCount{ItemID: "show-1", ChildCount: 13}); err != nil {
 		t.Fatalf("update child count: %v", err)
 	}
 
-	counts, err := store.ListItemChildCounts(ctx, "account-1", []string{"show-1", "missing"})
+	itemIDs := make([]string, playbackStateItemIDBatchLimit+1)
+	for i := range itemIDs {
+		itemIDs[i] = "missing-" + strconv.Itoa(i)
+	}
+	itemIDs[0] = "show-1"
+	itemIDs[len(itemIDs)-1] = "movie-1"
+	counts, err := store.ListItemChildCounts(ctx, itemIDs)
 	if err != nil {
 		t.Fatalf("list child counts: %v", err)
 	}
-	if len(counts) != 1 || counts["show-1"].ChildCount != 13 {
-		t.Fatalf("unexpected account-1 counts: %#v", counts)
+	if len(counts) != 2 || counts["show-1"].ChildCount != 13 || counts["movie-1"].ChildCount != 4 {
+		t.Fatalf("unexpected singleton counts: %#v", counts)
 	}
-	counts, err = store.ListItemChildCounts(ctx, "account-2", []string{"show-1"})
+	records, err := app.FindRecordsByFilter("item_child_counts", "item_id = 'show-1'", "", 0, 0, nil)
 	if err != nil {
-		t.Fatalf("list account-2 child counts: %v", err)
+		t.Fatalf("query show child counts: %v", err)
 	}
-	if counts["show-1"].ChildCount != 99 {
-		t.Fatalf("unexpected account-2 counts: %#v", counts)
+	if len(records) != 1 || records[0].GetInt("child_count") != 13 {
+		t.Fatalf("show child count records = %#v, want one current record", records)
+	}
+	collection, err := app.FindCollectionByNameOrId("item_child_counts")
+	if err != nil || collection.Fields.GetByName("backend_account_id") != nil {
+		t.Fatalf("item_child_counts retained account scope, collection=%#v err=%v", collection, err)
 	}
 }
 
@@ -794,10 +807,9 @@ func TestAuditAndPlaybackEventAreWritable(t *testing.T) {
 	}
 }
 
-func TestBackendAccountAndSessionUsePlainCredentialsAndClientIdentity(t *testing.T) {
+func TestBackendAccountUsesPlainCredentialsAndClientIdentity(t *testing.T) {
 	app := newTestApp(t)
 	store := New(app)
-	userID := createGatewayUser(t, app, "alice", "gateway-user")
 	accountID := createBackendAccount(t, app)
 
 	account, err := store.FindBackendAccountByID(context.Background(), accountID)
@@ -814,13 +826,23 @@ func TestBackendAccountAndSessionUsePlainCredentialsAndClientIdentity(t *testing
 	if err := store.UpdateBackendToken(context.Background(), accountID, "backend-token", "backend-user", now); err != nil {
 		t.Fatalf("update backend token: %v", err)
 	}
+}
 
+func TestSessionPersistsGatewayOnlyFieldsAndRevokes(t *testing.T) {
+	app := newTestApp(t)
+	store := New(app)
+	userID := createGatewayUser(t, app, "alice", "gateway-user")
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
 	session := &gateway.Session{
 		GatewayTokenHash: "hash",
 		GatewayUserID:    userID,
 		GatewayUsername:  "alice",
 		SyntheticUserID:  "gateway-user",
-		BackendAccountID: accountID,
+		Client:           "Emby Web",
+		Device:           "Desktop",
+		DeviceID:         "device-1",
+		Version:          "4.8.0",
+		RemoteIP:         "192.0.2.1",
 		ExpiresAt:        now.Add(time.Hour),
 	}
 	if err := store.SaveSession(context.Background(), session); err != nil {
@@ -834,16 +856,28 @@ func TestBackendAccountAndSessionUsePlainCredentialsAndClientIdentity(t *testing
 	if err != nil {
 		t.Fatalf("find gateway_sessions collection: %v", err)
 	}
-	if collection.Fields.GetByName("backend_token") != nil || saved.GetString("backend_token") != "" {
-		t.Fatalf("gateway_sessions should not store backend_token, field=%#v value=%q", collection.Fields.GetByName("backend_token"), saved.GetString("backend_token"))
+	for _, field := range []string{
+		"backend_account", "backend_token", "backend_server_id", "backend_base_url", "backend_user_id", "backend_username",
+		"backend_user_agent", "backend_authorization_client", "backend_authorization_device", "backend_authorization_device_id", "backend_authorization_version", "backend_token_encrypted",
+	} {
+		if collection.Fields.GetByName(field) != nil || saved.GetRaw(field) != nil {
+			t.Fatalf("gateway_sessions retained upstream field %q: schema=%#v raw=%#v", field, collection.Fields.GetByName(field), saved.GetRaw(field))
+		}
 	}
 
 	found, err := store.FindSessionByTokenHash(context.Background(), "hash")
 	if err != nil {
 		t.Fatalf("find session: %v", err)
 	}
-	if found.BackendToken != "backend-token" || found.BackendIdentity.UserAgent != "Custom/1.0" || found.BackendIdentity.Client != "Custom" || found.BackendIdentity.Device != "Desktop" || found.BackendIdentity.DeviceID != "device-1" || found.BackendIdentity.Version != "1.0" {
-		t.Fatalf("unexpected found session: %#v", found)
+	if found.GatewayUserID != userID || found.GatewayUsername != "alice" || found.SyntheticUserID != "gateway-user" || found.Client != "Emby Web" || found.Device != "Desktop" || found.DeviceID != "device-1" || found.Version != "4.8.0" || found.RemoteIP != "192.0.2.1" || !found.ExpiresAt.Equal(session.ExpiresAt) {
+		t.Fatalf("unexpected hydrated gateway session: %#v", found)
+	}
+	if err := store.RevokeSession(context.Background(), "hash"); err != nil {
+		t.Fatalf("revoke session: %v", err)
+	}
+	revoked, err := store.FindSessionByTokenHash(context.Background(), "hash")
+	if err != nil || revoked.RevokedAt == nil || !revoked.RevokedAt.After(now) {
+		t.Fatalf("revoked session = %#v, %v", revoked, err)
 	}
 }
 
@@ -894,7 +928,6 @@ func TestSessionTokenExistsExistingMissingAndOperationalError(t *testing.T) {
 	app := newTestApp(t)
 	store := New(app)
 	userID := createGatewayUser(t, app, "alice", "gateway-user")
-	accountID := createBackendAccount(t, app)
 
 	const tokenHash = "exists-hash-value"
 	if err := store.SaveSession(context.Background(), &gateway.Session{
@@ -902,7 +935,6 @@ func TestSessionTokenExistsExistingMissingAndOperationalError(t *testing.T) {
 		GatewayUserID:    userID,
 		GatewayUsername:  "alice",
 		SyntheticUserID:  "gateway-user",
-		BackendAccountID: accountID,
 		ExpiresAt:        time.Now().UTC().Add(time.Hour),
 	}); err != nil {
 		t.Fatalf("save session: %v", err)

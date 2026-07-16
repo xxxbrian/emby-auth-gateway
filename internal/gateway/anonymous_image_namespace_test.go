@@ -5,350 +5,155 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"strings"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-func TestAnonymousImageNamespaceValidation(t *testing.T) {
-	const expected = "namespace-1"
+func TestRefreshUpstreamServerInfoInvalidatesAnonymousImageNamespace(t *testing.T) {
+	const serverID = "server-1"
+	mode := "valid"
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/emby/System/Info/Public" {
-			t.Fatalf("probe path = %q", r.URL.Path)
+		if r.URL.Path == "/emby/System/Info/Public" {
+			switch mode {
+			case "mismatch":
+				writeTestJSON(w, map[string]any{"Id": "other-server"})
+			case "unavailable":
+				w.WriteHeader(http.StatusServiceUnavailable)
+			default:
+				writeTestJSON(w, map[string]any{"Id": serverID, "Version": "4.9"})
+			}
+			return
 		}
-		writeTestJSON(w, map[string]any{"Id": expected})
+		w.Header().Set("Content-Type", "image/gif")
+		_, _ = w.Write(anonymousGIF())
 	}))
 	defer backend.Close()
-
-	for _, tc := range []struct {
-		name    string
-		cfg     Config
-		servers []EmbyServer
-		wantErr AnonymousImageNamespaceErrorKind
-		wantOK  bool
-	}{
-		{"disabled", Config{}, nil, 0, false},
-		{"only record", Config{AnonymousImageServerRecordID: "one"}, nil, AnonymousImageNamespaceStaticError, false},
-		{"only expected", Config{AnonymousImageBackendServerID: expected}, nil, AnonymousImageNamespaceStaticError, false},
-		{"whitespace", Config{AnonymousImageConfigured: true, AnonymousImageServerRecordID: " ", AnonymousImageBackendServerID: expected}, nil, AnonymousImageNamespaceStaticError, false},
-		{"missing selected", Config{AnonymousImageServerRecordID: "missing", AnonymousImageBackendServerID: expected}, []EmbyServer{anonymousImageTestServer("one", backend.URL+"/emby", expected)}, AnonymousImageNamespaceStaticError, false},
-		{"invalid base", Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: expected}, []EmbyServer{anonymousImageTestServer("one", "ftp://backend", expected)}, AnonymousImageNamespaceStaticError, false},
-		{"query base", Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: expected}, []EmbyServer{anonymousImageTestServer("one", backend.URL+"/emby?api_key=value", expected)}, AnonymousImageNamespaceStaticError, false},
-		{"force query base", Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: expected}, []EmbyServer{anonymousImageTestServer("one", backend.URL+"/emby?", expected)}, AnonymousImageNamespaceStaticError, false},
-		{"fragment base", Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: expected}, []EmbyServer{anonymousImageTestServer("one", backend.URL+"/emby#fragment", expected)}, AnonymousImageNamespaceStaticError, false},
-		{"empty stored id bootstraps from live", Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: expected}, []EmbyServer{anonymousImageTestServer("one", backend.URL+"/emby", "")}, 0, true},
-		{"whitespace stored id bootstraps from live", Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: expected}, []EmbyServer{anonymousImageTestServer("one", backend.URL+"/emby", " \t ")}, 0, true},
-		{"whitespace wrapped stored id mismatches", Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: expected}, []EmbyServer{anonymousImageTestServer("one", backend.URL+"/emby", " namespace-1 ")}, AnonymousImageNamespaceMismatchError, false},
-		{"stored mismatch", Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: expected}, []EmbyServer{anonymousImageTestServer("one", backend.URL+"/emby", "other")}, AnonymousImageNamespaceMismatchError, false},
-		{"one server", Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: expected}, []EmbyServer{anonymousImageTestServer("one", backend.URL+"/emby", expected)}, 0, true},
-		{"duplicate ingress", Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: expected}, []EmbyServer{anonymousImageTestServer("one", backend.URL+"/emby", expected), anonymousImageTestServer("two", backend.URL+"/emby", expected)}, 0, true},
-		{"duplicate fresh ingresses", Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: expected}, []EmbyServer{anonymousImageTestServer("one", backend.URL+"/emby", ""), anonymousImageTestServer("two", backend.URL+"/emby", "")}, 0, true},
-		{"two namespaces", Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: expected}, []EmbyServer{anonymousImageTestServer("one", backend.URL+"/emby", expected), anonymousImageTestServer("two", backend.URL+"/emby", "other")}, AnonymousImageNamespaceMismatchError, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			store := anonymousImageTestStore(tc.servers...)
-			server := NewServer(tc.cfg, store)
-			err := server.ValidateAnonymousImageNamespace(context.Background())
-			if tc.wantErr == 0 {
-				if err != nil {
-					t.Fatal(err)
-				}
-			} else {
-				var namespaceErr *AnonymousImageNamespaceError
-				if !errors.As(err, &namespaceErr) || namespaceErr.Kind != tc.wantErr {
-					t.Fatalf("error = %#v, want kind %d", err, tc.wantErr)
-				}
+	s := NewServer(Config{}, anonymousImageTestStore(anonymousImageTestServer("one", backend.URL+"/emby", serverID)))
+	if err := s.ValidateAnonymousImageNamespace(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	gw := httptest.NewServer(s)
+	defer gw.Close()
+	requestImage := func() *http.Response {
+		return do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Items/item/Images/Primary", nil))
+	}
+	for _, failedMode := range []string{"mismatch", "unavailable"} {
+		t.Run(failedMode, func(t *testing.T) {
+			mode = failedMode
+			if err := s.RefreshUpstreamServerInfo(context.Background()); err == nil {
+				t.Fatal("periodic refresh unexpectedly succeeded")
 			}
-			_, ok := server.ValidatedAnonymousImageOrigin(context.Background())
-			if ok != tc.wantOK {
-				t.Fatalf("origin available = %v, want %v", ok, tc.wantOK)
+			resp := requestImage()
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Cache-Control") != "no-store" {
+				t.Fatalf("stale origin remained available: %d/%q", resp.StatusCode, resp.Header.Get("Cache-Control"))
+			}
+			mode = "valid"
+			if err := s.RefreshUpstreamServerInfo(context.Background()); err != nil {
+				t.Fatalf("recovery refresh: %v", err)
+			}
+			resp = requestImage()
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("recovered image status = %d", resp.StatusCode)
 			}
 		})
 	}
 }
 
-func TestAnonymousImageNamespaceProbeIdentityAndTransientState(t *testing.T) {
-	const expected = "namespace-1"
-	var sawAuth, sawCookie, sawToken bool
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sawAuth = r.Header.Get("X-Emby-Authorization") != ""
-		sawCookie = r.Header.Get("Cookie") != ""
-		sawToken = r.Header.Get("X-Emby-Token") != ""
-		if r.UserAgent() != "Custom/1" {
-			t.Fatalf("User-Agent = %q", r.UserAgent())
+func TestAnonymousImageNamespaceUsesOnlyActiveEndpoint(t *testing.T) {
+	const serverID = "server-1"
+	var inactiveCalls atomic.Int32
+	inactive := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { inactiveCalls.Add(1) }))
+	defer inactive.Close()
+	active := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/emby/System/Info/Public" {
+			t.Fatalf("path = %s", r.URL.Path)
 		}
-		writeTestJSON(w, map[string]any{"Id": expected})
+		if r.Header.Get("Cookie") != "" || r.Header.Get("X-Emby-Token") != "" || r.Header.Get("X-Emby-Authorization") == "" {
+			t.Fatal("probe forwarded credentials")
+		}
+		writeTestJSON(w, map[string]any{"Id": serverID})
 	}))
-	defer backend.Close()
-	configured := anonymousImageTestServer("one", backend.URL+"/emby", expected)
-	configured.ClientIdentity = BackendClientIdentity{UserAgent: "Custom/1", Client: "Client", Device: "Device", DeviceID: "device", Version: "1"}
-	server := NewServer(Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: expected}, anonymousImageTestStore(configured))
-	if err := server.ValidateAnonymousImageNamespace(context.Background()); err != nil {
+	defer active.Close()
+	store := anonymousImageTestStore(anonymousImageTestServer("one", active.URL+"/emby", serverID))
+	store.UpstreamEndpoints["inactive"] = UpstreamEndpoint{ID: "inactive", SourceID: "source", Key: "secondary", BaseURL: inactive.URL + "/emby"}
+	s := NewServer(Config{}, store)
+	if err := s.ValidateAnonymousImageNamespace(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if !sawAuth || sawCookie || sawToken {
-		t.Fatalf("probe auth/cookie/token = %v/%v/%v", sawAuth, sawCookie, sawToken)
-	}
-
-	unreachable := anonymousImageTestServer("one", "http://127.0.0.1:1", expected)
-	transient := NewServer(Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: expected}, anonymousImageTestStore(unreachable))
-	err := transient.ValidateAnonymousImageNamespace(context.Background())
-	if !IsAnonymousImageNamespaceTransient(err) {
-		t.Fatalf("transient error = %#v", err)
-	}
-	if _, ok := transient.ValidatedAnonymousImageOrigin(context.Background()); ok || transient.AnonymousImageNamespaceDiagnostic() == "" {
-		t.Fatalf("transient namespace state is available: %q", transient.AnonymousImageNamespaceDiagnostic())
+	origin, ok := s.ValidatedAnonymousImageOrigin(context.Background())
+	if !ok || origin.BaseURL != active.URL+"/emby" || inactiveCalls.Load() != 0 {
+		t.Fatalf("origin=%#v active=%v inactive=%d", origin, ok, inactiveCalls.Load())
 	}
 }
 
-func TestAnonymousImageNamespaceFreshRecordTransientRecoveryServesHTTP(t *testing.T) {
-	const expected = "namespace-1"
-	transient := true
-	var imageCalls int
+func TestAnonymousImageNamespaceClassifiesFailuresAndTTL(t *testing.T) {
+	const serverID = "server-1"
+	status := http.StatusOK
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/emby/System/Info/Public" {
-			if transient {
-				w.WriteHeader(http.StatusServiceUnavailable)
-				return
-			}
-			writeTestJSON(w, map[string]any{"Id": expected, "Version": "1.0.0"})
+		if status != http.StatusOK {
+			w.WriteHeader(status)
 			return
 		}
-		imageCalls++
-		w.Header().Set("Content-Type", "image/gif")
-		_, _ = w.Write(anonymousGIF())
+		writeTestJSON(w, map[string]any{"Id": serverID})
 	}))
 	defer backend.Close()
-	store := anonymousImageTestStore(anonymousImageTestServer("one", backend.URL+"/emby", ""))
-	server := NewServer(Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: expected}, store)
-	if !IsAnonymousImageNamespaceTransient(server.ValidateAnonymousImageNamespace(context.Background())) {
-		t.Fatal("fresh transient probe was not transient")
-	}
-	gw := httptest.NewServer(server)
-	defer gw.Close()
-	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Items/item/Images/Primary", nil))
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Cache-Control") != "no-store" || imageCalls != 0 {
-		t.Fatalf("transient HTTP = %d/%q/%d", resp.StatusCode, resp.Header.Get("Cache-Control"), imageCalls)
-	}
-	server.anonymousImages.mu.RLock()
-	beforeGeneration := server.anonymousImages.snapshot.generation
-	server.anonymousImages.mu.RUnlock()
-	transient = false
-	if err := server.RefreshBackendServerInfo(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	persisted := store.Mappings["mapping-one"].BackendAccount.Server.BackendServerID
-	server.anonymousImages.mu.RLock()
-	afterGeneration := server.anonymousImages.snapshot.generation
-	server.anonymousImages.mu.RUnlock()
-	if persisted != expected || afterGeneration <= beforeGeneration || server.AnonymousImageNamespaceFingerprintChanged(context.Background()) {
-		t.Fatalf("refresh persistence/generation/fingerprint = %q/%d/%d/%v", persisted, beforeGeneration, afterGeneration, server.AnonymousImageNamespaceFingerprintChanged(context.Background()))
-	}
-	resp = do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Items/item/Images/Primary", nil))
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || imageCalls != 1 {
-		t.Fatalf("recovered HTTP = %d/%d", resp.StatusCode, imageCalls)
-	}
-}
-
-func TestAnonymousImageNamespaceMissingLiveIDIsStatic(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { writeTestJSON(w, map[string]any{"ServerName": "Emby"}) }))
-	defer backend.Close()
-	server := NewServer(Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: "namespace-1"}, anonymousImageTestStore(anonymousImageTestServer("one", backend.URL+"/emby", "")))
-	err := server.ValidateAnonymousImageNamespace(context.Background())
-	var namespaceErr *AnonymousImageNamespaceError
-	if !errors.As(err, &namespaceErr) || namespaceErr.Kind != AnonymousImageNamespaceStaticError {
-		t.Fatalf("missing Id error = %#v", err)
-	}
-}
-
-func TestAnonymousImageNamespaceRejectsLiveServerIDMismatch(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeTestJSON(w, map[string]any{"Id": "live-other"})
-	}))
-	defer backend.Close()
-	server := NewServer(Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: "namespace-1"}, anonymousImageTestStore(anonymousImageTestServer("one", backend.URL+"/emby", "")))
-	err := server.ValidateAnonymousImageNamespace(context.Background())
-	var namespaceErr *AnonymousImageNamespaceError
-	if !errors.As(err, &namespaceErr) || namespaceErr.Kind != AnonymousImageNamespaceMismatchError {
-		t.Fatalf("live mismatch error = %#v", err)
-	}
-}
-
-func TestAnonymousImageNamespaceFingerprintInvalidatesAndRevalidates(t *testing.T) {
-	const expected = "namespace-1"
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { writeTestJSON(w, map[string]any{"Id": expected}) }))
-	defer backend.Close()
-	store := anonymousImageTestStore(anonymousImageTestServer("one", backend.URL+"/emby", expected))
-	server := NewServer(Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: expected}, store)
-	if err := server.ValidateAnonymousImageNamespace(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if server.AnonymousImageNamespaceFingerprintChanged(context.Background()) {
-		t.Fatal("fresh fingerprint reported changed")
-	}
-	mapping := store.Mappings["mapping-one"]
-	mapping.BackendAccount.Server.BaseURL = backend.URL + "/other"
-	store.Mappings["mapping-one"] = mapping
-	if _, ok := server.ValidatedAnonymousImageOrigin(context.Background()); ok || !server.AnonymousImageNamespaceFingerprintChanged(context.Background()) {
-		t.Fatal("base URL mutation did not invalidate origin")
-	}
-	mapping.BackendAccount.Server.BaseURL = backend.URL + "/emby"
-	mapping.BackendAccount.Server.ClientIdentity.UserAgent = "Changed/1"
-	store.Mappings["mapping-one"] = mapping
-	if _, ok := server.ValidatedAnonymousImageOrigin(context.Background()); ok {
-		t.Fatal("identity mutation did not invalidate origin")
-	}
-	if err := server.ValidateAnonymousImageNamespace(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := server.ValidatedAnonymousImageOrigin(context.Background()); !ok {
-		t.Fatal("revalidation did not restore origin")
-	}
-	mapping.BackendAccount.Server.BackendServerID = "changed"
-	store.Mappings["mapping-one"] = mapping
-	if _, ok := server.ValidatedAnonymousImageOrigin(context.Background()); ok {
-		t.Fatal("server ID mutation did not invalidate origin")
-	}
-}
-
-func TestAnonymousImageNamespaceFingerprintIsDeterministic(t *testing.T) {
-	first := anonymousImageTestServer("one", "https://one.example/emby", "namespace")
-	second := anonymousImageTestServer("two", "https://two.example/emby", "namespace")
-	if anonymousImageNamespaceFingerprint([]EmbyServer{first, second}) != anonymousImageNamespaceFingerprint([]EmbyServer{second, first}) {
-		t.Fatal("fingerprint depends on enabled-server order")
-	}
-}
-
-func TestAnonymousImageNamespaceOldReaderCannotInvalidateNewGeneration(t *testing.T) {
-	server := NewServer(Config{}, NewMemoryStore())
-	server.setAnonymousImageNamespaceSnapshot(anonymousImageNamespaceSnapshot{fingerprint: "same", available: true, diagnostic: "available"})
-	server.anonymousImages.mu.RLock()
-	old := server.anonymousImages.snapshot
-	server.anonymousImages.mu.RUnlock()
-	server.setAnonymousImageNamespaceSnapshot(anonymousImageNamespaceSnapshot{fingerprint: "same", available: true, diagnostic: "available"})
-	server.invalidateAnonymousImageNamespace(old.generation, old.fingerprint, "configuration changed")
-	server.anonymousImages.mu.RLock()
-	current := server.anonymousImages.snapshot
-	server.anonymousImages.mu.RUnlock()
-	if !current.available || current.generation == old.generation || current.diagnostic != "available" {
-		t.Fatalf("new snapshot was invalidated by stale reader: %#v", current)
-	}
-}
-
-func TestAnonymousImageNamespaceFreshnessAndRecovery(t *testing.T) {
-	const expected = "namespace-1"
-	var transient bool
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if transient {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
-		writeTestJSON(w, map[string]any{"Id": expected})
-	}))
-	defer backend.Close()
-	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
-	server := NewServer(Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: expected}, anonymousImageTestStore(anonymousImageTestServer("one", backend.URL+"/emby", expected)))
-	server.anonymousImageNow = func() time.Time { return now }
-	if err := server.ValidateAnonymousImageNamespace(context.Background()); err != nil {
+	s := NewServer(Config{}, anonymousImageTestStore(anonymousImageTestServer("one", backend.URL+"/emby", serverID)))
+	now := time.Now().UTC()
+	s.anonymousImageNow = func() time.Time { return now }
+	if err := s.ValidateAnonymousImageNamespace(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	now = now.Add(anonymousImageNamespaceMaxAge + time.Second)
-	if _, ok := server.ValidatedAnonymousImageOrigin(context.Background()); ok || server.AnonymousImageNamespaceDiagnostic() != "validation expired" {
-		t.Fatalf("stale origin state = %q", server.AnonymousImageNamespaceDiagnostic())
+	if _, ok := s.ValidatedAnonymousImageOrigin(context.Background()); ok {
+		t.Fatal("stale namespace served")
 	}
-	transient = true
-	if !IsAnonymousImageNamespaceTransient(server.ValidateAnonymousImageNamespace(context.Background())) {
-		t.Fatal("transient refresh was not classified transient")
-	}
-	transient = false
-	if err := server.ValidateAnonymousImageNamespace(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := server.ValidatedAnonymousImageOrigin(context.Background()); !ok {
-		t.Fatal("successful revalidation did not restore stale origin")
+	status = http.StatusServiceUnavailable
+	if !IsAnonymousImageNamespaceTransient(s.ValidateAnonymousImageNamespace(context.Background())) {
+		t.Fatal("5xx not transient")
 	}
 }
 
-func TestAnonymousImageNamespaceDuplicateIngressesProbeDistinctOrigins(t *testing.T) {
-	const expected = "namespace-1"
-	var mu sync.Mutex
-	probed := map[string]bool{}
-	newBackend := func() *httptest.Server {
-		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if auth := r.Header.Get("X-Emby-Authorization"); auth == "" || strings.Contains(auth, "UserId=") || strings.Contains(auth, "Token=") || r.Header.Get("Cookie") != "" || r.Header.Get("X-Emby-Token") != "" {
-				t.Fatalf("probe credentials = %q cookie=%q token=%q", auth, r.Header.Get("Cookie"), r.Header.Get("X-Emby-Token"))
-			}
-			mu.Lock()
-			probed[r.Host] = true
-			mu.Unlock()
-			writeTestJSON(w, map[string]any{"Id": expected})
-		}))
-	}
-	first, second := newBackend(), newBackend()
-	defer first.Close()
-	defer second.Close()
-	server := NewServer(Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: expected}, anonymousImageTestStore(anonymousImageTestServer("one", first.URL+"/emby", expected), anonymousImageTestServer("two", second.URL+"/emby", expected)))
-	if err := server.ValidateAnonymousImageNamespace(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	mu.Lock()
-	count := len(probed)
-	mu.Unlock()
-	if count != 2 {
-		t.Fatalf("probed origins = %d, want 2", count)
-	}
-}
-
-func TestAnonymousImageNamespaceValidationIsSerialized(t *testing.T) {
-	const expected = "namespace-1"
-	started := make(chan struct{})
-	release := make(chan struct{})
-	var mu sync.Mutex
-	calls := 0
+func TestAnonymousImageNamespaceRejectsMismatchAndDrift(t *testing.T) {
+	const serverID = "server-1"
+	started, release := make(chan struct{}), make(chan struct{})
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		calls++
-		call := calls
-		mu.Unlock()
-		if call == 1 {
-			close(started)
-			<-release
-		}
-		writeTestJSON(w, map[string]any{"Id": expected})
+		close(started)
+		<-release
+		writeTestJSON(w, map[string]any{"Id": serverID})
 	}))
 	defer backend.Close()
-	server := NewServer(Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: expected}, anonymousImageTestStore(anonymousImageTestServer("one", backend.URL+"/emby", expected)))
-	done := make(chan error, 2)
-	go func() { done <- server.ValidateAnonymousImageNamespace(context.Background()) }()
+	store := anonymousImageTestStore(anonymousImageTestServer("one", backend.URL+"/emby", serverID))
+	s := NewServer(Config{}, store)
+	done := make(chan error, 1)
+	go func() { done <- s.ValidateAnonymousImageNamespace(context.Background()) }()
 	<-started
-	go func() { done <- server.ValidateAnonymousImageNamespace(context.Background()) }()
-	time.Sleep(20 * time.Millisecond)
-	mu.Lock()
-	gotCalls := calls
-	mu.Unlock()
-	if gotCalls != 1 {
-		t.Fatalf("concurrent probe calls = %d, want 1 before release", gotCalls)
-	}
+	store.mu.Lock()
+	source := store.UpstreamSources["source"]
+	source.ClientIdentity.DeviceID = "changed"
+	store.UpstreamSources["source"] = source
+	store.mu.Unlock()
 	close(release)
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-	if err := <-done; err != nil {
-		t.Fatal(err)
+	err := <-done
+	var namespaceErr *AnonymousImageNamespaceError
+	if !errors.As(err, &namespaceErr) || namespaceErr.Kind != AnonymousImageNamespaceTransientError {
+		t.Fatalf("drift error=%v", err)
 	}
 }
 
 func anonymousImageTestServer(id, baseURL, backendServerID string) EmbyServer {
 	return EmbyServer{ID: id, BaseURL: baseURL, BackendServerID: backendServerID, Enabled: true, ClientIdentity: BackendClientIdentity{DeviceID: "device"}}
 }
-
 func anonymousImageTestStore(servers ...EmbyServer) *MemoryStore {
 	store := NewMemoryStore()
-	for _, server := range servers {
-		store.Mappings["mapping-"+server.ID] = UserMapping{ID: "mapping-" + server.ID, Enabled: true, BackendAccount: BackendAccount{ID: "account-" + server.ID, Enabled: true, Server: server}}
+	if len(servers) == 0 {
+		return store
 	}
+	server := servers[0]
+	identity := server.ClientIdentity.WithDefaults()
+	store.UpstreamSources["source"] = UpstreamSource{ID: "source", Key: "default", ServerID: server.BackendServerID, BackendUsername: "backend", BackendPassword: "password", ClientIdentity: identity}
+	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: "source", Key: "primary", BaseURL: server.BaseURL, Active: true}
 	return store
 }

@@ -2,8 +2,7 @@ package main
 
 import (
 	"bytes"
-	"context"
-	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -11,9 +10,29 @@ import (
 	"github.com/xxxbrian/emby-auth-gateway/internal/gateway"
 	_ "github.com/xxxbrian/emby-auth-gateway/internal/pbmigrations"
 
+	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/core"
-	"github.com/pocketbase/pocketbase/tests"
 )
+
+func newProductionGatewayApp(t *testing.T) *pocketbase.PocketBase {
+	t.Helper()
+	previous, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(previous) })
+	app := newGatewayApp()
+	if err := app.Bootstrap(); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.RunAppMigrations(); err != nil {
+		t.Fatal(err)
+	}
+	return app
+}
 
 func TestVersionCommandPrintsBuildMetadata(t *testing.T) {
 	cmd := newVersionCommand()
@@ -31,96 +50,8 @@ func TestVersionCommandPrintsBuildMetadata(t *testing.T) {
 	}
 }
 
-func TestAnonymousImageConfigFromEnvRequiresPair(t *testing.T) {
-	for _, tc := range []struct {
-		name                      string
-		recordID, backendID       string
-		hasRecordID, hasBackendID bool
-		wantErr                   bool
-	}{
-		{"compose absent disabled", "", "", false, false, false},
-		{"explicit blank pair", "", "", true, true, true},
-		{"record only", "record", "", true, false, true},
-		{"record plus blank backend", "record", "", true, true, true},
-		{"backend only", "", "server", false, true, true},
-		{"valid", " record ", " server ", true, true, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			config, err := anonymousImageConfigFromValues(tc.recordID, tc.hasRecordID, tc.backendID, tc.hasBackendID)
-			if (err != nil) != tc.wantErr {
-				t.Fatalf("error = %v, wantErr %v", err, tc.wantErr)
-			}
-			if !tc.wantErr && tc.hasRecordID && (!config.configured || config.serverRecordID != "record" || config.backendServerID != "server") {
-				t.Fatalf("config = %#v", config)
-			}
-		})
-	}
-}
-
-type anonymousImageStartupValidatorStub struct{ err error }
-
-func (s anonymousImageStartupValidatorStub) ValidateAnonymousImageNamespace(context.Context) error {
-	return s.err
-}
-
-func TestValidateAnonymousImageStartup(t *testing.T) {
-	staticErr := &gateway.AnonymousImageNamespaceError{Kind: gateway.AnonymousImageNamespaceStaticError, Err: errors.New("static")}
-	mismatchErr := &gateway.AnonymousImageNamespaceError{Kind: gateway.AnonymousImageNamespaceMismatchError, Err: errors.New("mismatch")}
-	transientErr := &gateway.AnonymousImageNamespaceError{Kind: gateway.AnonymousImageNamespaceTransientError, Err: errors.New("transient")}
-	for _, tc := range []struct {
-		name          string
-		err           error
-		wantTransient bool
-		wantError     bool
-	}{
-		{"available", nil, false, false},
-		{"transient mounts authenticated gateway", transientErr, true, false},
-		{"static prevents mount", staticErr, false, true},
-		{"mismatch prevents mount", mismatchErr, false, true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			transient, err := validateAnonymousImageStartup(anonymousImageStartupValidatorStub{err: tc.err})
-			if transient != tc.wantTransient || (err != nil) != tc.wantError {
-				t.Fatalf("transient/error = %v/%v", transient, err)
-			}
-		})
-	}
-}
-
-func TestStartAnonymousImageNamespaceMountsOnlyWhenAllowed(t *testing.T) {
-	staticErr := &gateway.AnonymousImageNamespaceError{Kind: gateway.AnonymousImageNamespaceStaticError, Err: errors.New("static")}
-	mismatchErr := &gateway.AnonymousImageNamespaceError{Kind: gateway.AnonymousImageNamespaceMismatchError, Err: errors.New("mismatch")}
-	transientErr := &gateway.AnonymousImageNamespaceError{Kind: gateway.AnonymousImageNamespaceTransientError, Err: errors.New("transient")}
-	for _, tc := range []struct {
-		name          string
-		err           error
-		wantMount     int
-		wantTransient bool
-	}{
-		{"success", nil, 1, false},
-		{"transient", transientErr, 1, true},
-		{"static", staticErr, 0, false},
-		{"mismatch", mismatchErr, 0, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			mounts := 0
-			transient, err := startAnonymousImageNamespace(anonymousImageStartupValidatorStub{err: tc.err}, func() { mounts++ })
-			if mounts != tc.wantMount || transient != tc.wantTransient || ((err != nil) != (tc.wantMount == 0)) {
-				t.Fatalf("mounts/transient/error = %d/%v/%v", mounts, transient, err)
-			}
-		})
-	}
-}
-
 func TestCleanupPlaybackEventsKeepsOnlyRecentEvents(t *testing.T) {
-	app, err := tests.NewTestAppWithConfig(core.BaseAppConfig{
-		DataDir:       t.TempDir(),
-		EncryptionEnv: "test",
-	})
-	if err != nil {
-		t.Fatalf("new test app: %v", err)
-	}
-	defer app.Cleanup()
+	app := newProductionGatewayApp(t)
 
 	userID := createTestUser(t, app)
 	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
@@ -141,14 +72,7 @@ func TestCleanupPlaybackEventsKeepsOnlyRecentEvents(t *testing.T) {
 }
 
 func TestCleanupGatewaySessionsKeepsOnlyRecentActiveOrRevokedSessions(t *testing.T) {
-	app, err := tests.NewTestAppWithConfig(core.BaseAppConfig{
-		DataDir:       t.TempDir(),
-		EncryptionEnv: "test",
-	})
-	if err != nil {
-		t.Fatalf("new test app: %v", err)
-	}
-	defer app.Cleanup()
+	app := newProductionGatewayApp(t)
 
 	userID := createTestUser(t, app)
 	accountID := createTestBackendAccount(t, app)
@@ -177,17 +101,8 @@ func TestCleanupGatewaySessionsKeepsOnlyRecentActiveOrRevokedSessions(t *testing
 	}
 }
 
-func TestBackendIdentityDefaultsArePersistedOnServerCreate(t *testing.T) {
-	app, err := tests.NewTestAppWithConfig(core.BaseAppConfig{
-		DataDir:       t.TempDir(),
-		EncryptionEnv: "test",
-	})
-	if err != nil {
-		t.Fatalf("new test app: %v", err)
-	}
-	defer app.Cleanup()
-	registerBackendIdentityDefaults(app)
-
+func TestLegacyBackendIdentityHookIsNotRegistered(t *testing.T) {
+	app := newProductionGatewayApp(t)
 	servers, err := app.FindCollectionByNameOrId("emby_servers")
 	if err != nil {
 		t.Fatalf("find emby_servers: %v", err)
@@ -200,26 +115,13 @@ func TestBackendIdentityDefaultsArePersistedOnServerCreate(t *testing.T) {
 		t.Fatalf("save server: %v", err)
 	}
 
-	defaults := gateway.DefaultBackendClientIdentity()
-	if record.GetString("backend_user_agent") != defaults.UserAgent || record.GetString("backend_authorization_client") != defaults.Client || record.GetString("backend_authorization_device") != defaults.Device || record.GetString("backend_authorization_version") != defaults.Version {
-		t.Fatalf("backend identity defaults not persisted: %#v", record.FieldsData())
-	}
-	if record.GetString("backend_authorization_device_id") != gateway.StableBackendDeviceID(record.Id) {
-		t.Fatalf("backend device id = %q, want stable id from record id", record.GetString("backend_authorization_device_id"))
+	if record.GetString("backend_user_agent") != "" || record.GetString("backend_authorization_device_id") != "" {
+		t.Fatalf("legacy identity hook ran: %#v", record.FieldsData())
 	}
 }
 
 func TestMappingBackendChangeRevokesUserSessions(t *testing.T) {
-	app, err := tests.NewTestAppWithConfig(core.BaseAppConfig{
-		DataDir:       t.TempDir(),
-		EncryptionEnv: "test",
-	})
-	if err != nil {
-		t.Fatalf("new test app: %v", err)
-	}
-	defer app.Cleanup()
-	registerMappingSessionRevocation(app)
-
+	app := newProductionGatewayApp(t)
 	userID := createTestUser(t, app)
 	otherUserID := createTestUserWithName(t, app, "bob", "gateway-bob")
 	accountID := createTestBackendAccount(t, app)
@@ -237,24 +139,15 @@ func TestMappingBackendChangeRevokesUserSessions(t *testing.T) {
 		t.Fatalf("save mapping: %v", err)
 	}
 
-	assertSessionRevoked(t, app, "active-1", true)
-	assertSessionRevoked(t, app, "active-2", true)
+	assertSessionRevoked(t, app, "active-1", false)
+	assertSessionRevoked(t, app, "active-2", false)
 	assertSessionRevoked(t, app, "already-revoked", true)
 	assertSessionRevoked(t, app, "other-active", false)
-	assertAuditEvent(t, app, userID, "sessions_revoked")
+	assertNoAuditEvent(t, app, userID, "sessions_revoked")
 }
 
 func TestMappingDisableRevokesUserSessions(t *testing.T) {
-	app, err := tests.NewTestAppWithConfig(core.BaseAppConfig{
-		DataDir:       t.TempDir(),
-		EncryptionEnv: "test",
-	})
-	if err != nil {
-		t.Fatalf("new test app: %v", err)
-	}
-	defer app.Cleanup()
-	registerMappingSessionRevocation(app)
-
+	app := newProductionGatewayApp(t)
 	userID := createTestUser(t, app)
 	accountID := createTestBackendAccount(t, app)
 	mapping := createTestMapping(t, app, userID, accountID, true)
@@ -265,21 +158,12 @@ func TestMappingDisableRevokesUserSessions(t *testing.T) {
 		t.Fatalf("save mapping: %v", err)
 	}
 
-	assertSessionRevoked(t, app, "active", true)
-	assertAuditEvent(t, app, userID, "sessions_revoked")
+	assertSessionRevoked(t, app, "active", false)
+	assertNoAuditEvent(t, app, userID, "sessions_revoked")
 }
 
 func TestMappingUnrelatedUpdateKeepsUserSessions(t *testing.T) {
-	app, err := tests.NewTestAppWithConfig(core.BaseAppConfig{
-		DataDir:       t.TempDir(),
-		EncryptionEnv: "test",
-	})
-	if err != nil {
-		t.Fatalf("new test app: %v", err)
-	}
-	defer app.Cleanup()
-	registerMappingSessionRevocation(app)
-
+	app := newProductionGatewayApp(t)
 	userID := createTestUser(t, app)
 	accountID := createTestBackendAccount(t, app)
 	mapping := createTestMapping(t, app, userID, accountID, true)

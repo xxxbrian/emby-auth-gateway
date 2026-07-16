@@ -27,7 +27,8 @@ func TestConcurrentPlaybackDenialNormalizesAndSuppressesReports(t *testing.T) {
 	defer backend.Close()
 
 	store := NewMemoryStore()
-	store.Sessions[HashToken(token)] = testSession(backend.URL + "/emby")
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken(token)] = testSession()
 	server := NewServer(Config{GatewayBasePath: "/emby"}, store)
 	gw := httptest.NewServer(server)
 	defer gw.Close()
@@ -214,7 +215,8 @@ func TestPlaybackInfoReadErrorReachesProxyResponseWithoutGuard(t *testing.T) {
 		}
 	})
 	store := NewMemoryStore()
-	store.Sessions[HashToken(token)] = testSession("http://backend/emby")
+	configureTestUpstream(store, "http://backend/emby")
+	store.Sessions[HashToken(token)] = testSession()
 	server := NewServer(Config{GatewayBasePath: "/emby", HTTPClient: &http.Client{Transport: transport}}, store)
 	recorder := httptest.NewRecorder()
 	server.ServeHTTP(recorder, mustRequest(t, http.MethodGet, "http://gateway/emby/Items/item-1/PlaybackInfo?api_key="+token, nil))
@@ -286,7 +288,7 @@ func TestPlaybackInfoRefreshRetryConcurrentDenial(t *testing.T) {
 			http.Error(w, "stale", http.StatusUnauthorized)
 		case "/emby/Users/AuthenticateByName":
 			logins.Add(1)
-			writeTestJSON(w, map[string]any{"AccessToken": "new-token", "User": map[string]any{"Id": "backend-user"}})
+			writeTestJSON(w, map[string]any{"AccessToken": "new-token", "ServerId": "backend-server", "User": map[string]any{"Id": "backend-user"}})
 		case "/emby/Sessions/Logout":
 			w.WriteHeader(http.StatusNoContent)
 		default:
@@ -295,13 +297,10 @@ func TestPlaybackInfoRefreshRetryConcurrentDenial(t *testing.T) {
 	}))
 	defer backend.Close()
 	store := testStore(backend.URL + "/emby")
-	mapping := store.Mappings["u1"]
-	mapping.BackendAccount.BackendToken, mapping.BackendAccount.BackendUserID = "old-token", "backend-user"
-	old := time.Now().Add(-backendTokenRefreshMinInterval - time.Second)
-	mapping.BackendAccount.TokenUpdatedAt = &old
-	store.Mappings["u1"] = mapping
-	session := testSession(backend.URL + "/emby")
-	session.BackendToken = "old-token"
+	source := store.UpstreamSources["source"]
+	source.BackendToken = "old-token"
+	store.UpstreamSources["source"] = source
+	session := testSession()
 	store.Sessions[HashToken(token)] = session
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()

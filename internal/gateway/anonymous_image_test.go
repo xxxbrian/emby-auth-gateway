@@ -117,7 +117,7 @@ func TestAnonymousItemImagePrecedenceAndAvailability(t *testing.T) {
 		t.Fatalf("credentialed requests reached anonymous upstream: %d", calls)
 	}
 
-	unavailable := NewServer(Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: namespace}, anonymousImageTestStore(anonymousImageTestServer("one", backend.URL+"/emby", namespace)))
+	unavailable := NewServer(Config{}, anonymousImageTestStore(anonymousImageTestServer("one", backend.URL+"/emby", namespace)))
 	unavailableGW := httptest.NewServer(unavailable)
 	defer unavailableGW.Close()
 	resp := do(t, mustRequest(t, http.MethodGet, unavailableGW.URL+"/emby/Items/item/Images/Primary", nil))
@@ -130,8 +130,8 @@ func TestAnonymousItemImagePrecedenceAndAvailability(t *testing.T) {
 	defer absent.Close()
 	resp = do(t, mustRequest(t, http.MethodGet, absent.URL+"/emby/Items/item/Images/Primary", nil))
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("absent config status = %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("absent singleton status/cache = %d/%q", resp.StatusCode, resp.Header.Get("Cache-Control"))
 	}
 }
 
@@ -401,7 +401,7 @@ func TestAnonymousItemImageUsesOnlySelectedIngress(t *testing.T) {
 	defer selected.Close()
 	defer other.Close()
 	store := anonymousImageTestStore(anonymousImageTestServer("one", selected.URL+"/emby", namespace), anonymousImageTestServer("two", other.URL+"/emby", namespace))
-	server := NewServer(Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: namespace}, store)
+	server := NewServer(Config{}, store)
 	if err := server.ValidateAnonymousImageNamespace(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -437,22 +437,26 @@ func TestAnonymousItemImageHTTPNamespaceMutationAndRecovery(t *testing.T) {
 	}))
 	defer backend.Close()
 	store := anonymousImageTestStore(anonymousImageTestServer("one", backend.URL+"/emby", namespace))
-	server := NewServer(Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: namespace}, store)
+	server := NewServer(Config{}, store)
 	if err := server.ValidateAnonymousImageNamespace(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	gw := httptest.NewServer(server)
 	defer gw.Close()
-	mapping := store.Mappings["mapping-one"]
-	mapping.BackendAccount.Server.BaseURL = backend.URL + "/changed"
-	store.Mappings["mapping-one"] = mapping
+	store.mu.Lock()
+	endpoint := store.UpstreamEndpoints["endpoint"]
+	endpoint.BaseURL = backend.URL + "/changed"
+	store.UpstreamEndpoints["endpoint"] = endpoint
+	store.mu.Unlock()
 	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Items/item/Images/Primary", nil))
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Cache-Control") != "no-store" || imageCalls != 0 {
 		t.Fatalf("mutated status/calls = %d/%d", resp.StatusCode, imageCalls)
 	}
-	mapping.BackendAccount.Server.BaseURL = backend.URL + "/emby"
-	store.Mappings["mapping-one"] = mapping
+	store.mu.Lock()
+	endpoint.BaseURL = backend.URL + "/emby"
+	store.UpstreamEndpoints["endpoint"] = endpoint
+	store.mu.Unlock()
 	if err := server.ValidateAnonymousImageNamespace(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -503,7 +507,7 @@ func TestAnonymousFullImageValidationAcceptsStdlibGIFAndMinimalWebP(t *testing.T
 func anonymousImageGateway(t *testing.T, baseURL, namespace string) *Server {
 	t.Helper()
 	store := anonymousImageTestStore(anonymousImageTestServer("one", baseURL, namespace))
-	server := NewServer(Config{AnonymousImageServerRecordID: "one", AnonymousImageBackendServerID: namespace}, store)
+	server := NewServer(Config{}, store)
 	if err := server.ValidateAnonymousImageNamespace(context.Background()); err != nil {
 		t.Fatal(err)
 	}

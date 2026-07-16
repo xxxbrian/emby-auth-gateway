@@ -1,6 +1,0 @@
-services:
-  gateway:
-    environment:
-      # This opt-in overlay requires both non-empty namespace settings.
-      GATEWAY_ANONYMOUS_IMAGE_SERVER_RECORD_ID: "${GATEWAY_ANONYMOUS_IMAGE_SERVER_RECORD_ID:?set the canonical emby_servers record ID}"
-      GATEWAY_ANONYMOUS_IMAGE_BACKEND_SERVER_ID: "${GATEWAY_ANONYMOUS_IMAGE_BACKEND_SERVER_ID:?set the expected upstream Emby ServerId}"

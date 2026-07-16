@@ -680,6 +680,6 @@ func learnChildCountsFromItems(ctx context.Context, store Store, session *Sessio
 		if itemID == "" || count <= 0 {
 			continue
 		}
-		_ = store.SaveItemChildCount(ctx, ItemChildCount{BackendAccountID: session.BackendAccountID, ItemID: itemID, ChildCount: count})
+		_ = store.SaveItemChildCount(ctx, ItemChildCount{ItemID: itemID, ChildCount: count})
 	}
 }

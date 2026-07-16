@@ -26,16 +26,16 @@ func (t *upgradeRetryTransport) RoundTrip(req *http.Request) (*http.Response, er
 	if err != nil || resp == nil || resp.StatusCode != http.StatusUnauthorized {
 		return resp, err
 	}
-	failedToken := t.upstream.token
 	// Refresh must not inherit ReverseProxy's internal trace context. The retry
 	// itself keeps req.Context so its cancellation/tracing remains intact.
-	if refreshErr := t.server.refreshBackendSession(t.original.Context(), t.session, failedToken); refreshErr != nil {
-		if !errors.Is(refreshErr, ErrUnauthorized) {
+	refreshed, confirmed, refreshErr := t.server.refreshAfterUnauthorized(t.original.Context(), t.upstream)
+	if refreshErr != nil || !confirmed {
+		if confirmed && !errors.Is(refreshErr, ErrUnauthorized) {
 			t.server.auditBackendTokenRefresh(t.original, t.rel, t.session, "backend_token_refresh_failure", "backend token refresh failed after upgrade unauthorized response", http.StatusUnauthorized)
 		}
 		return resp, nil
 	}
-	t.upstream = upstreamRequestSnapshotFromLegacySession(t.session)
+	t.upstream = refreshed
 	t.server.auditBackendTokenRefresh(t.original, t.rel, t.session, "backend_token_refresh", "backend token refreshed after upgrade unauthorized response", http.StatusOK)
 	_ = resp.Body.Close()
 	retryURL, err := t.server.proxyURL(t.upstream, t.session, t.rel, t.original.URL.RawQuery, t.gatewayToken)
