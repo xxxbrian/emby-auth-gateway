@@ -108,6 +108,92 @@ func TestNewStates(t *testing.T) {
 			t.Fatalf("state=%s err=%v", s.Status().State, s.Status().Err)
 		}
 	})
+
+	t.Run("corrupt_symlink_root", func(t *testing.T) {
+		real := t.TempDir()
+		writeReadyTree(t, real, nil)
+		link := filepath.Join(t.TempDir(), "root-link")
+		if err := os.Symlink(real, link); err != nil {
+			t.Fatal(err)
+		}
+		s, err := New(Config{GatewayBasePath: "/emby", AssetsRoot: link})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.Status().State != StateCorrupt {
+			t.Fatalf("state=%s err=%v", s.Status().State, s.Status().Err)
+		}
+	})
+}
+
+func TestServeRejectsSymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	writeReadyTree(t, root, nil)
+
+	// Outside secret that must never be served via intermediate or final symlink.
+	outside := t.TempDir()
+	secretPath := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(secretPath, []byte("TOPSECRET"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Intermediate component: modules -> outside dir. Request modules/secret.txt
+	// would escape if open followed intermediate symlinks.
+	modulesPath := filepath.Join(root, "modules")
+	if err := os.RemoveAll(modulesPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, modulesPath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Final-component symlink under a real directory.
+	if err := os.MkdirAll(filepath.Join(root, "strings"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	finalLink := filepath.Join(root, "strings", "leak.json")
+	if err := os.Symlink(secretPath, finalLink); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := New(Config{GatewayBasePath: "/emby", AssetsRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Status().State != StateReady {
+		// Canaries still present; intermediate modules symlink must not break Ready.
+		t.Fatalf("state=%s err=%v", s.Status().State, s.Status().Err)
+	}
+
+	t.Run("intermediate_symlink_escape", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		s.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/emby/web/modules/secret.txt", nil))
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("code=%d body=%q", rr.Code, rr.Body.String())
+		}
+		if strings.Contains(rr.Body.String(), "TOPSECRET") {
+			t.Fatal("leaked outside content via intermediate symlink")
+		}
+	})
+
+	t.Run("final_component_symlink", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		s.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/emby/web/strings/leak.json", nil))
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("code=%d body=%q", rr.Code, rr.Body.String())
+		}
+		if strings.Contains(rr.Body.String(), "TOPSECRET") {
+			t.Fatal("leaked outside content via final-component symlink")
+		}
+	})
+
+	t.Run("regular_canary_still_served", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		s.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/emby/web/manifest.json", nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("code=%d", rr.Code)
+		}
+	})
 }
 
 func TestServeReadyBasics(t *testing.T) {

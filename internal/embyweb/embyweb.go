@@ -65,8 +65,9 @@ type Status struct {
 // Server is a read-only Emby Web asset handler backed by a directory on disk.
 type Server struct {
 	status       Status
-	root         string // absolute assets root when Ready
-	fallbackHost string // host[:port] from PublicBaseURL, may be empty
+	root         string       // absolute assets root when Ready
+	dir          *anchoredDir // root-anchored FD; all serve opens are openat+O_NOFOLLOW
+	fallbackHost string       // host[:port] from PublicBaseURL, may be empty
 }
 
 // canaryRelativePaths are the app.emby.media manual-server validation paths,
@@ -152,7 +153,22 @@ func New(cfg Config) (*Server, error) {
 		}, nil
 	}
 
-	if err := checkCanaries(abs); err != nil {
+	// Anchor the root with O_DIRECTORY|O_NOFOLLOW so serve-time openat walks
+	// cannot follow intermediate or final symlinks out of the tree.
+	dir, err := openAnchoredDir(abs)
+	if err != nil {
+		return &Server{
+			status: Status{
+				State: StateCorrupt,
+				Root:  abs,
+				Err:   fmt.Errorf("anchor assets root: %w", err),
+			},
+			fallbackHost: fallbackHost,
+		}, nil
+	}
+
+	if err := checkCanaries(dir); err != nil {
+		_ = dir.Close()
 		return &Server{
 			status:       Status{State: StateMissing, Root: abs, Err: err},
 			fallbackHost: fallbackHost,
@@ -162,14 +178,14 @@ func New(cfg Config) (*Server, error) {
 	return &Server{
 		status:       Status{State: StateReady, Root: abs},
 		root:         abs,
+		dir:          dir,
 		fallbackHost: fallbackHost,
 	}, nil
 }
 
-func checkCanaries(root string) error {
+func checkCanaries(dir *anchoredDir) error {
 	for _, rel := range canaryRelativePaths {
-		full := filepath.Join(root, filepath.FromSlash(rel))
-		st, err := os.Lstat(full)
+		st, err := dir.Lstat(rel)
 		if err != nil {
 			if os.IsNotExist(err) {
 				return fmt.Errorf("missing canary %q", rel)

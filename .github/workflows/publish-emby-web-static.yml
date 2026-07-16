@@ -7,11 +7,6 @@ on:
         description: Emby Server (mbServer) version tag, e.g. 4.9.5.0
         required: true
         type: string
-      image:
-        description: Container image repository
-        required: false
-        default: emby/embyserver
-        type: string
       platform:
         description: Optional docker platform (e.g. linux/amd64). Empty = default.
         required: false
@@ -74,12 +69,12 @@ jobs:
       - name: Extract dashboard-ui
         env:
           EMBY_VERSION: ${{ inputs.emby_version }}
-          IMAGE: ${{ inputs.image }}
           PLATFORM: ${{ inputs.platform }}
         run: |
           set -euo pipefail
           chmod +x tools/emby-web-static/extract.sh tools/emby-web-static/pack.sh
-          ARGS=(--version "$EMBY_VERSION" --out "$RUNNER_TEMP/web-root" --image "$IMAGE")
+          # Publication is pinned to the official Emby image only.
+          ARGS=(--version "$EMBY_VERSION" --out "$RUNNER_TEMP/web-root" --image emby/embyserver)
           if [[ -n "$PLATFORM" ]]; then
             ARGS+=(--platform "$PLATFORM")
           fi
@@ -103,18 +98,18 @@ jobs:
           TAG: ${{ steps.meta.outputs.tag }}
           NAME: ${{ steps.meta.outputs.name }}
           EMBY_VERSION: ${{ inputs.emby_version }}
-          IMAGE: ${{ inputs.image }}
           PLATFORM: ${{ inputs.platform }}
         run: |
           set -euo pipefail
-          NOTES="Emby Web static assets extracted from \`${IMAGE}:${EMBY_VERSION}\`"
+          NOTES="Emby Web static assets extracted from \`emby/embyserver:${EMBY_VERSION}\`"
           if [[ -n "$PLATFORM" ]]; then
             NOTES="${NOTES} (platform ${PLATFORM})"
           fi
           NOTES="${NOTES}."$'\n\n'"Unpack onto a host path and set \`GATEWAY_WEB_ASSETS_DIR\` to that directory."
-          # Explicitly do not pass --latest.
+          # Explicitly keep this release off the floating "latest" label.
           gh release create "$TAG" \
             --title "$NAME" \
             --notes "$NOTES" \
+            --latest=false \
             "$RUNNER_TEMP/dist/${NAME}.tar.gz" \
             "$RUNNER_TEMP/dist/SHA256SUMS"

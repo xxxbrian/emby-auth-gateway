@@ -195,9 +195,16 @@ if [[ "$need_runtime" -eq 1 ]]; then
   RUN_CID=""
 fi
 
-if find "$OUT_DIR" -type l | grep -q .; then
-  echo "extract contains symlinks; refusing" >&2
-  find "$OUT_DIR" -type l >&2
+# Refuse any non-directory, non-regular node (symlinks, FIFOs, devices, sockets).
+if find "$OUT_DIR" \( -type l -o -type p -o -type s -o -type b -o -type c \) | grep -q .; then
+  echo "extract contains non-regular nodes (symlink/fifo/socket/device); refusing" >&2
+  find "$OUT_DIR" \( -type l -o -type p -o -type s -o -type b -o -type c \) >&2
+  exit 1
+fi
+# Also refuse anything that is neither a directory nor a regular file.
+if find "$OUT_DIR" ! -type d ! -type f | grep -q .; then
+  echo "extract contains unexpected non-file/non-dir nodes; refusing" >&2
+  find "$OUT_DIR" ! -type d ! -type f >&2
   exit 1
 fi
 

@@ -10,7 +10,6 @@ import (
 	"net/url"
 	"os"
 	"path"
-	"path/filepath"
 	"strings"
 	"time"
 )
@@ -173,15 +172,9 @@ func (s *Server) serveReady(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveDiskAsset(w http.ResponseWriter, r *http.Request, assetPath string, canary bool) {
-	full, err := s.resolveAssetPath(assetPath)
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-
 	// Host injection is serve-time only: on-disk bytes are never modified.
 	if needsHostInject(assetPath) {
-		data, err := readRegularFileLimited(full, maxInjectFileBytes)
+		data, err := s.readAssetLimited(assetPath, maxInjectFileBytes)
 		if err != nil {
 			http.NotFound(w, r)
 			return
@@ -204,7 +197,7 @@ func (s *Server) serveDiskAsset(w http.ResponseWriter, r *http.Request, assetPat
 		return
 	}
 
-	f, err := openRegularFileNoFollow(full)
+	f, err := s.openAssetFile(assetPath)
 	if err != nil {
 		http.NotFound(w, r)
 		return
@@ -236,22 +229,30 @@ func (s *Server) serveDiskAsset(w http.ResponseWriter, r *http.Request, assetPat
 	http.ServeContent(w, r, path.Base(assetPath), st.ModTime(), f)
 }
 
-// resolveAssetPath joins a validated relative asset path under the ready root.
-func (s *Server) resolveAssetPath(assetPath string) (string, error) {
-	if s == nil || s.root == "" || !validAssetPath(assetPath) {
-		return "", os.ErrNotExist
+// openAssetFile opens a validated relative asset via the root-anchored directory
+// FD with O_NOFOLLOW on every path component. Lexical join alone is not used.
+func (s *Server) openAssetFile(assetPath string) (*os.File, error) {
+	if s == nil || s.dir == nil || !validAssetPath(assetPath) {
+		return nil, os.ErrNotExist
 	}
-	full := filepath.Join(s.root, filepath.FromSlash(assetPath))
-	// filepath.Join cleaned the path; require it still lives under root.
-	rel, err := filepath.Rel(s.root, full)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-		return "", os.ErrNotExist
+	f, err := s.dir.Open(assetPath)
+	if err != nil {
+		return nil, err
 	}
-	return full, nil
+	st, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if !st.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, os.ErrNotExist
+	}
+	return f, nil
 }
 
-func readRegularFileLimited(path string, limit int64) ([]byte, error) {
-	f, err := openRegularFileNoFollow(path)
+func (s *Server) readAssetLimited(assetPath string, limit int64) ([]byte, error) {
+	f, err := s.openAssetFile(assetPath)
 	if err != nil {
 		return nil, err
 	}
