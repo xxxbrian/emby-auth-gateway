@@ -2874,6 +2874,61 @@ func TestAggregateWithoutTrustedChildCountDoesNotReportComplete(t *testing.T) {
 	}
 }
 
+func TestFetchItemChildCountDoesNotPoisonCacheFromPartialItems(t *testing.T) {
+	// Backend returns a partial Items page without TotalRecordCount — must not
+	// treat len(Items) as ChildCount or report series complete.
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("ParentId") == "show-1" {
+			writeTestJSON(w, map[string]any{"Items": []any{
+				map[string]any{"Id": "ep-1", "Type": "Episode"},
+				map[string]any{"Id": "ep-2", "Type": "Episode"},
+			}})
+			return
+		}
+		writeTestJSON(w, map[string]any{"Items": []any{map[string]any{
+			"Id": "show-1", "Name": "Show", "Type": "Series",
+			"UserData": map[string]any{"Played": true, "UnplayedItemCount": float64(0)},
+		}}})
+	}))
+	defer backend.Close()
+
+	store := &countingChildCountStore{MemoryStore: NewMemoryStore()}
+	configureTestUpstream(store.MemoryStore, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
+	_ = store.SavePlaybackState(context.Background(), PlaybackState{
+		GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "ep-1", SeriesID: "show-1", Played: true,
+	})
+	_ = store.SavePlaybackState(context.Background(), PlaybackState{
+		GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "ep-2", SeriesID: "show-1", Played: true,
+	})
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Users/gateway-user/Items?api_key=gateway-token", nil))
+	defer resp.Body.Close()
+	var body map[string]any
+	decodeJSON(t, resp.Body, &body)
+	userData := body["Items"].([]any)[0].(map[string]any)["UserData"].(map[string]any)
+	if userData["Played"] == true {
+		t.Fatalf("partial Items without TotalRecordCount must not report complete: %#v", userData)
+	}
+	if _, ok := userData["UnplayedItemCount"]; ok {
+		t.Fatalf("untrusted UnplayedItemCount should be omitted: %#v", userData)
+	}
+
+	counts, err := store.ListItemChildCounts(context.Background(), []string{"show-1"})
+	if err != nil {
+		t.Fatalf("list child counts: %v", err)
+	}
+	if _, ok := counts["show-1"]; ok {
+		t.Fatalf("must not SaveItemChildCount from partial page: %#v", counts["show-1"])
+	}
+	if store.batchCalls != 0 && store.batchItems > 0 {
+		// applyChildCountsToAggregates only saves when count > 0
+		t.Fatalf("unexpected child count save: batchCalls=%d batchItems=%d", store.batchCalls, store.batchItems)
+	}
+}
+
 func itemIDsFromResponse(items []any) []string {
 	ids := make([]string, 0, len(items))
 	for _, item := range items {
@@ -3905,6 +3960,7 @@ type countingPlaybackStore struct {
 	singleLookups int
 	batchLookups  int
 	batchItemIDs  []string
+	listCalls     int
 }
 
 func (c *countingPlaybackStore) FindPlaybackState(ctx context.Context, gatewayUserID, itemID string) (*PlaybackState, error) {
@@ -3916,6 +3972,59 @@ func (c *countingPlaybackStore) ListPlaybackStatesByItemIDs(ctx context.Context,
 	c.batchLookups++
 	c.batchItemIDs = append([]string(nil), itemIDs...)
 	return c.MemoryStore.ListPlaybackStatesByItemIDs(ctx, gatewayUserID, itemIDs)
+}
+
+func (c *countingPlaybackStore) ListPlaybackStates(ctx context.Context, gatewayUserID string, filter PlaybackStateFilter) ([]PlaybackState, error) {
+	c.listCalls++
+	return c.MemoryStore.ListPlaybackStates(ctx, gatewayUserID, filter)
+}
+
+func TestPersonalFilterIDsUsesSingleListPlaybackStates(t *testing.T) {
+	store := &countingPlaybackStore{MemoryStore: NewMemoryStore()}
+	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", ItemID: "both", Played: true, IsFavorite: true})
+	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", ItemID: "played-only", Played: true})
+	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", ItemID: "fav-only", IsFavorite: true})
+
+	s := NewServer(Config{}, store)
+	q := url.Values{}
+	q.Set("Filters", "IsPlayed,IsFavorite")
+	positive, hasPositive, exclude, err := s.personalFilterIDs(context.Background(), "u1", q)
+	if err != nil {
+		t.Fatalf("personalFilterIDs: %v", err)
+	}
+	if store.listCalls != 1 {
+		t.Fatalf("ListPlaybackStates calls = %d, want 1 (not one per filter)", store.listCalls)
+	}
+	if !hasPositive {
+		t.Fatal("expected hasPositive")
+	}
+	if len(exclude) != 0 {
+		t.Fatalf("exclude = %#v, want empty", exclude)
+	}
+	if len(positive) != 1 || positive[0] != "both" {
+		t.Fatalf("positive = %#v, want [both]", positive)
+	}
+	if q.Get("Filters") != "" {
+		t.Fatalf("Filters should be cleared after personal consumption, got %q", q.Get("Filters"))
+	}
+
+	// No personal filters → no store call.
+	store.listCalls = 0
+	q2 := url.Values{}
+	q2.Set("Filters", "IsFolder")
+	_, hasPos, _, err := s.personalFilterIDs(context.Background(), "u1", q2)
+	if err != nil {
+		t.Fatalf("personalFilterIDs passthrough: %v", err)
+	}
+	if hasPos {
+		t.Fatal("non-personal Filters should not set hasPositive")
+	}
+	if store.listCalls != 0 {
+		t.Fatalf("ListPlaybackStates calls = %d, want 0 when no personal filters", store.listCalls)
+	}
+	if q2.Get("Filters") != "IsFolder" {
+		t.Fatalf("remaining Filters = %q, want IsFolder", q2.Get("Filters"))
+	}
 }
 
 func hasAuditEvent(store *MemoryStore, event string) bool {

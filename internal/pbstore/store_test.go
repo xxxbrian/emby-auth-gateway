@@ -826,6 +826,58 @@ func TestItemChildCountsAreSingletonByItemID(t *testing.T) {
 	}
 }
 
+func TestSaveItemChildCountsBatchUpserts(t *testing.T) {
+	app := newTestApp(t)
+	store := New(app)
+	ctx := context.Background()
+
+	if err := store.SaveItemChildCounts(ctx, []gateway.ItemChildCount{
+		{ItemID: "show-1", ChildCount: 12},
+		{ItemID: "show-2", ChildCount: 8},
+		{ItemID: "movie-1", ChildCount: 4},
+		{ItemID: "", ChildCount: 1},
+		{ItemID: "bad", ChildCount: 0},
+		{ItemID: "show-1", ChildCount: 15},
+	}); err != nil {
+		t.Fatalf("batch save: %v", err)
+	}
+
+	counts, err := store.ListItemChildCounts(ctx, []string{"show-1", "show-2", "movie-1", "bad"})
+	if err != nil {
+		t.Fatalf("list after batch save: %v", err)
+	}
+	if len(counts) != 3 || counts["show-1"].ChildCount != 15 || counts["show-2"].ChildCount != 8 || counts["movie-1"].ChildCount != 4 {
+		t.Fatalf("unexpected counts after batch save: %#v", counts)
+	}
+
+	if err := store.SaveItemChildCounts(ctx, []gateway.ItemChildCount{
+		{ItemID: "show-1", ChildCount: 20},
+		{ItemID: "show-3", ChildCount: 7},
+	}); err != nil {
+		t.Fatalf("batch update: %v", err)
+	}
+
+	counts, err = store.ListItemChildCounts(ctx, []string{"show-1", "show-2", "movie-1", "show-3"})
+	if err != nil {
+		t.Fatalf("list after batch update: %v", err)
+	}
+	if len(counts) != 4 ||
+		counts["show-1"].ChildCount != 20 ||
+		counts["show-2"].ChildCount != 8 ||
+		counts["movie-1"].ChildCount != 4 ||
+		counts["show-3"].ChildCount != 7 {
+		t.Fatalf("unexpected counts after batch update: %#v", counts)
+	}
+
+	records, err := app.FindRecordsByFilter("item_child_counts", "item_id = 'show-1'", "", 0, 0, nil)
+	if err != nil {
+		t.Fatalf("query show-1 records: %v", err)
+	}
+	if len(records) != 1 || records[0].GetInt("child_count") != 20 {
+		t.Fatalf("show-1 records = %#v, want one current record", records)
+	}
+}
+
 func TestPathPolicyDefaultAllowAndDeny(t *testing.T) {
 	app := newTestApp(t)
 	store := New(app)

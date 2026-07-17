@@ -13,11 +13,13 @@ import (
 
 type faultInjectPlaybackStore struct {
 	*MemoryStore
-	findErr   error
-	saveErr   error
-	eventErr  error
-	findCalls int
-	saveCalls int
+	findErr        error
+	saveErr        error
+	eventErr       error
+	resolutionErr  error
+	findCalls      int
+	saveCalls      int
+	resolutionCalls int
 }
 
 func (f *faultInjectPlaybackStore) FindPlaybackState(ctx context.Context, gatewayUserID, itemID string) (*PlaybackState, error) {
@@ -41,6 +43,14 @@ func (f *faultInjectPlaybackStore) RecordPlaybackEvent(ctx context.Context, even
 		return f.eventErr
 	}
 	return f.MemoryStore.RecordPlaybackEvent(ctx, event)
+}
+
+func (f *faultInjectPlaybackStore) SavePlaybackResolution(ctx context.Context, state PlaybackState) error {
+	f.resolutionCalls++
+	if f.resolutionErr != nil {
+		return f.resolutionErr
+	}
+	return f.MemoryStore.SavePlaybackResolution(ctx, state)
 }
 
 func TestPersonalStateWriteDoesNotBlankOnFindStoreOutage(t *testing.T) {
@@ -334,5 +344,64 @@ func TestPersonalFilterFindStoreOutageReturns500(t *testing.T) {
 	}
 	if strings.Contains(string(body), "backend unavailable") {
 		t.Fatalf("store outage should not report backend unavailable: %s", body)
+	}
+}
+
+func TestSavePlaybackResolutionFailureFailsClosedOnResume(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeTestJSON(w, map[string]any{"Items": []any{
+			map[string]any{"Id": "item-1", "Name": "Movie", "Type": "Movie", "UserData": map[string]any{}},
+		}, "TotalRecordCount": 1})
+	}))
+	defer backend.Close()
+
+	store := &faultInjectPlaybackStore{MemoryStore: NewMemoryStore(), resolutionErr: errors.New("resolution write failed")}
+	configureTestUpstream(store.MemoryStore, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
+	_ = store.MemoryStore.SavePlaybackState(context.Background(), PlaybackState{
+		GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "item-1", PlaybackPositionTicks: 1200,
+	})
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Users/gateway-user/Items/Resume?api_key=gateway-token", nil))
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("resume status = %d body=%s, want 500 (fail closed, not partial success)", resp.StatusCode, body)
+	}
+	if store.resolutionCalls == 0 {
+		t.Fatal("expected SavePlaybackResolution to be attempted")
+	}
+}
+
+func TestSavePlaybackResolutionFailureFailsClosedOnPersonalFavorite(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeTestJSON(w, map[string]any{"Items": []any{
+			map[string]any{"Id": "fav-1", "Name": "Favorite", "Type": "Movie", "UserData": map[string]any{}},
+		}, "TotalRecordCount": 1})
+	}))
+	defer backend.Close()
+
+	store := &faultInjectPlaybackStore{MemoryStore: NewMemoryStore(), resolutionErr: errors.New("resolution write failed")}
+	configureTestUpstream(store.MemoryStore, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
+	_ = store.MemoryStore.SavePlaybackState(context.Background(), PlaybackState{
+		GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "fav-1", IsFavorite: true, ItemType: "Movie",
+	})
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Users/gateway-user/Items?api_key=gateway-token&Filters=IsFavorite", nil))
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("personal favorite status = %d body=%s, want 500 (fail closed, not partial success)", resp.StatusCode, body)
+	}
+	if store.resolutionCalls == 0 {
+		t.Fatal("expected SavePlaybackResolution to be attempted")
+	}
+	if strings.Contains(string(body), "backend unavailable") {
+		t.Fatalf("store resolution failure should not report backend unavailable: %s", body)
 	}
 }

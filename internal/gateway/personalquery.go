@@ -339,14 +339,18 @@ func (s *Server) resolvePersonalItemsByID(ctx context.Context, r *http.Request, 
 			}
 			if !ok {
 				_ = reconcileResolvedItem(state, nil, false, now)
-				_ = s.store.SavePlaybackResolution(ctx, *state)
+				if err := s.store.SavePlaybackResolution(ctx, *state); err != nil {
+					return nil, fmt.Errorf("%w: save playback resolution: %w", ErrStoreUnavailable, err)
+				}
 				continue
 			}
 			if !itemMatchesResolutionQuery(item, pq.raw) || !pq.matchesResolvedPath(item) {
 				continue
 			}
 			outcome := reconcileResolvedItem(state, item, true, now)
-			_ = s.store.SavePlaybackResolution(ctx, *state)
+			if err := s.store.SavePlaybackResolution(ctx, *state); err != nil {
+				return nil, fmt.Errorf("%w: save playback resolution: %w", ErrStoreUnavailable, err)
+			}
 			if outcome != resolutionKeep {
 				continue
 			}
@@ -677,12 +681,26 @@ func learnChildCountsFromItems(ctx context.Context, store Store, session *Sessio
 	if session == nil {
 		return
 	}
+	// Dedupe by ItemID; last non-zero explicit count wins.
+	byID := map[string]int{}
+	order := make([]string, 0, len(items))
 	for _, item := range items {
 		itemID, _ := stringField(item, "Id")
 		count := itemChildCount(item)
 		if itemID == "" || count <= 0 {
 			continue
 		}
-		_ = store.SaveItemChildCount(ctx, ItemChildCount{ItemID: itemID, ChildCount: count})
+		if _, seen := byID[itemID]; !seen {
+			order = append(order, itemID)
+		}
+		byID[itemID] = count
 	}
+	if len(byID) == 0 {
+		return
+	}
+	counts := make([]ItemChildCount, 0, len(order))
+	for _, itemID := range order {
+		counts = append(counts, ItemChildCount{ItemID: itemID, ChildCount: byID[itemID]})
+	}
+	_ = store.SaveItemChildCounts(ctx, counts)
 }

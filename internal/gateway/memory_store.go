@@ -2,11 +2,8 @@ package gateway
 
 import (
 	"context"
-	"strings"
 	"sync"
 	"time"
-
-	"github.com/xxxbrian/emby-auth-gateway/internal/pathpolicy"
 )
 
 type MemoryStore struct {
@@ -326,18 +323,25 @@ func (m *MemoryStore) ListItemChildCounts(ctx context.Context, itemIDs []string)
 }
 
 func (m *MemoryStore) SaveItemChildCount(ctx context.Context, count ItemChildCount) error {
-	if count.ItemID == "" || count.ChildCount <= 0 {
-		return nil
-	}
+	return m.SaveItemChildCounts(ctx, []ItemChildCount{count})
+}
+
+func (m *MemoryStore) SaveItemChildCounts(ctx context.Context, counts []ItemChildCount) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.ItemChildCounts == nil {
 		m.ItemChildCounts = map[string]ItemChildCount{}
 	}
-	if count.UpdatedAt.IsZero() {
-		count.UpdatedAt = time.Now().UTC()
+	now := time.Now().UTC()
+	for _, count := range counts {
+		if count.ItemID == "" || count.ChildCount <= 0 {
+			continue
+		}
+		if count.UpdatedAt.IsZero() {
+			count.UpdatedAt = now
+		}
+		m.ItemChildCounts[itemChildCountKey(count.ItemID)] = count
 	}
-	m.ItemChildCounts[itemChildCountKey(count.ItemID)] = count
 	return nil
 }
 
@@ -532,13 +536,4 @@ func itemChildCountKey(itemID string) string {
 
 func displayPreferenceKey(gatewayUserID, preferenceID, client string) string {
 	return gatewayUserID + "\x00" + preferenceID + "\x00" + client
-}
-
-func methodMatches(policyMethod, requestMethod string) bool {
-	policyMethod = strings.TrimSpace(policyMethod)
-	return policyMethod == "" || policyMethod == "*" || strings.EqualFold(policyMethod, requestMethod)
-}
-
-func pathMatches(policyPath, requestPath string) bool {
-	return pathpolicy.MatchPath(policyPath, requestPath)
 }

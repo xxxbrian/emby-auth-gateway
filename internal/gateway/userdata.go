@@ -338,8 +338,9 @@ func (s *Server) writeNextUpItems(w http.ResponseWriter, r *http.Request, sessio
 			continue
 		}
 		episodes := extractItems(episodeValue)
-		if len(episodes) > 0 {
-			_ = s.store.SaveItemChildCount(r.Context(), ItemChildCount{ItemID: seriesID, ChildCount: len(episodes)})
+		// Only cache when Emby reports a trusted total; len(episodes) may be a partial page.
+		if total, ok := totalRecordCount(episodeValue); ok && total > 0 {
+			_ = s.store.SaveItemChildCount(r.Context(), ItemChildCount{ItemID: seriesID, ChildCount: total})
 		}
 		sort.SliceStable(episodes, func(i, j int) bool {
 			return episodeOrderLess(episodes[i], episodes[j])
@@ -365,6 +366,67 @@ func (s *Server) writeNextUpItems(w http.ResponseWriter, r *http.Request, sessio
 func (s *Server) personalFilterIDs(ctx context.Context, gatewayUserID string, q url.Values) ([]string, bool, []string, error) {
 	filters := splitFilterValues(q["Filters"])
 	remaining := make([]string, 0, len(filters))
+	type personalFilterOp struct {
+		positive bool
+		filter   PlaybackStateFilter
+	}
+	ops := make([]personalFilterOp, 0, 6)
+	for _, filter := range filters {
+		switch strings.ToLower(filter) {
+		case "isplayed":
+			v := true
+			ops = append(ops, personalFilterOp{positive: true, filter: PlaybackStateFilter{Played: &v}})
+		case "isfavorite":
+			v := true
+			ops = append(ops, personalFilterOp{positive: true, filter: PlaybackStateFilter{Favorite: &v}})
+		case "isresumable":
+			v := true
+			ops = append(ops, personalFilterOp{positive: true, filter: PlaybackStateFilter{Resumable: &v}})
+		case "isunplayed":
+			v := true
+			ops = append(ops, personalFilterOp{positive: false, filter: PlaybackStateFilter{Played: &v}})
+		default:
+			remaining = append(remaining, filter)
+		}
+	}
+	for _, name := range []string{"IsPlayed", "IsFavorite", "IsResumable"} {
+		raw := q.Get(name)
+		if raw == "" {
+			continue
+		}
+		value, err := strconv.ParseBool(raw)
+		if err != nil {
+			q.Del(name)
+			continue
+		}
+		var filter PlaybackStateFilter
+		switch name {
+		case "IsPlayed":
+			v := true
+			filter = PlaybackStateFilter{Played: &v}
+		case "IsFavorite":
+			v := true
+			filter = PlaybackStateFilter{Favorite: &v}
+		case "IsResumable":
+			v := true
+			filter = PlaybackStateFilter{Resumable: &v}
+		}
+		ops = append(ops, personalFilterOp{positive: value, filter: filter})
+		q.Del(name)
+	}
+	q.Del("Filters")
+	if len(remaining) > 0 {
+		q.Set("Filters", strings.Join(remaining, ","))
+	}
+	if len(ops) == 0 {
+		return nil, false, nil, nil
+	}
+
+	allStates, err := s.store.ListPlaybackStates(ctx, gatewayUserID, PlaybackStateFilter{})
+	if err != nil {
+		return nil, false, nil, err
+	}
+
 	var positive map[string]bool
 	hasPositive := false
 	exclude := map[string]bool{}
@@ -381,87 +443,47 @@ func (s *Server) personalFilterIDs(ctx context.Context, gatewayUserID string, q 
 			}
 		}
 	}
-	for _, filter := range filters {
-		switch strings.ToLower(filter) {
-		case "isplayed":
-			v := true
-			states, err := s.store.ListPlaybackStates(ctx, gatewayUserID, PlaybackStateFilter{Played: &v})
-			if err != nil {
-				return nil, false, nil, err
-			}
-			intersectPositive(states)
-		case "isfavorite":
-			v := true
-			states, err := s.store.ListPlaybackStates(ctx, gatewayUserID, PlaybackStateFilter{Favorite: &v})
-			if err != nil {
-				return nil, false, nil, err
-			}
-			intersectPositive(states)
-		case "isresumable":
-			v := true
-			states, err := s.store.ListPlaybackStates(ctx, gatewayUserID, PlaybackStateFilter{Resumable: &v})
-			if err != nil {
-				return nil, false, nil, err
-			}
-			intersectPositive(states)
-		case "isunplayed":
-			v := true
-			states, err := s.store.ListPlaybackStates(ctx, gatewayUserID, PlaybackStateFilter{Played: &v})
-			if err != nil {
-				return nil, false, nil, err
-			}
-			for _, state := range states {
+	for _, op := range ops {
+		matched := statesMatchingFilter(allStates, op.filter)
+		if op.positive {
+			intersectPositive(matched)
+		} else {
+			for _, state := range matched {
 				exclude[state.ItemID] = true
 			}
-		default:
-			remaining = append(remaining, filter)
 		}
-	}
-	if err := applyBoolPersonalFilter(ctx, s.store, gatewayUserID, q, "IsPlayed", func(value bool) PlaybackStateFilter {
-		return PlaybackStateFilter{Played: &value}
-	}, intersectPositive, exclude); err != nil {
-		return nil, false, nil, err
-	}
-	if err := applyBoolPersonalFilter(ctx, s.store, gatewayUserID, q, "IsFavorite", func(value bool) PlaybackStateFilter {
-		return PlaybackStateFilter{Favorite: &value}
-	}, intersectPositive, exclude); err != nil {
-		return nil, false, nil, err
-	}
-	if err := applyBoolPersonalFilter(ctx, s.store, gatewayUserID, q, "IsResumable", func(value bool) PlaybackStateFilter {
-		return PlaybackStateFilter{Resumable: &value}
-	}, intersectPositive, exclude); err != nil {
-		return nil, false, nil, err
-	}
-	q.Del("Filters")
-	if len(remaining) > 0 {
-		q.Set("Filters", strings.Join(remaining, ","))
 	}
 	return sortedSetKeys(positive), hasPositive, sortedSetKeys(exclude), nil
 }
 
-func applyBoolPersonalFilter(ctx context.Context, store Store, gatewayUserID string, q url.Values, name string, filterFor func(bool) PlaybackStateFilter, intersectPositive func([]PlaybackState), exclude map[string]bool) error {
-	raw := q.Get(name)
-	if raw == "" {
-		return nil
-	}
-	value, err := strconv.ParseBool(raw)
-	if err != nil {
-		q.Del(name)
-		return nil
-	}
-	states, err := store.ListPlaybackStates(ctx, gatewayUserID, filterFor(true))
-	if err != nil {
-		return err
-	}
-	if value {
-		intersectPositive(states)
-	} else {
-		for _, state := range states {
-			exclude[state.ItemID] = true
+// statesMatchingFilter applies the same field checks as MemoryStore.ListPlaybackStates.
+func statesMatchingFilter(states []PlaybackState, filter PlaybackStateFilter) []PlaybackState {
+	out := make([]PlaybackState, 0, len(states))
+	for _, state := range states {
+		if !filter.IncludeOrphaned && state.OrphanedAt != nil {
+			continue
 		}
+		if filter.Played != nil && state.Played != *filter.Played {
+			continue
+		}
+		if filter.Favorite != nil && state.IsFavorite != *filter.Favorite {
+			continue
+		}
+		if filter.Resumable != nil {
+			resumable := state.PlaybackPositionTicks > 0 && !state.Played
+			if resumable != *filter.Resumable {
+				continue
+			}
+		}
+		if filter.SeriesID != "" && state.SeriesID != filter.SeriesID {
+			continue
+		}
+		if filter.SeasonID != "" && state.SeasonID != filter.SeasonID {
+			continue
+		}
+		out = append(out, state)
 	}
-	q.Del(name)
-	return nil
+	return out
 }
 
 func (s *Server) resolveItemsByID(ctx context.Context, r *http.Request, session *Session, gatewayToken string, ids []string) ([]any, error) {
@@ -498,14 +520,18 @@ func (s *Server) resolveItemsByID(ctx context.Context, r *http.Request, session 
 			}
 			if !ok {
 				_ = reconcileResolvedItem(state, nil, false, now)
-				_ = s.store.SavePlaybackResolution(ctx, *state)
+				if err := s.store.SavePlaybackResolution(ctx, *state); err != nil {
+					return nil, fmt.Errorf("%w: save playback resolution: %w", ErrStoreUnavailable, err)
+				}
 				continue
 			}
 			if !itemMatchesResolutionQuery(item, requestQuery) {
 				continue
 			}
 			outcome := reconcileResolvedItem(state, item, true, now)
-			_ = s.store.SavePlaybackResolution(ctx, *state)
+			if err := s.store.SavePlaybackResolution(ctx, *state); err != nil {
+				return nil, fmt.Errorf("%w: save playback resolution: %w", ErrStoreUnavailable, err)
+			}
 			if outcome != resolutionKeep {
 				continue
 			}
@@ -1103,13 +1129,6 @@ func cloneQuery(q url.Values) url.Values {
 		copy[k] = append([]string(nil), vals...)
 	}
 	return copy
-}
-
-func limitStrings(values []string, limit int) []string {
-	if len(values) <= limit {
-		return values
-	}
-	return values[:limit]
 }
 
 func floatPtr(v float64) *float64 {

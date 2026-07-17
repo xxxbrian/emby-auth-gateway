@@ -39,6 +39,9 @@ type Store interface {
 	ListPlaybackAggregates(ctx context.Context, gatewayUserID string, seriesIDs, seasonIDs []string) (PlaybackAggregates, error)
 	ListItemChildCounts(ctx context.Context, itemIDs []string) (map[string]ItemChildCount, error)
 	SaveItemChildCount(ctx context.Context, count ItemChildCount) error
+	// SaveItemChildCounts upserts many child-count rows. Invalid entries (empty id or count<=0) are skipped.
+	// Implementations should minimize store round-trips (batch load existing, then save).
+	SaveItemChildCounts(ctx context.Context, counts []ItemChildCount) error
 	ListPlaybackStates(ctx context.Context, gatewayUserID string, filter PlaybackStateFilter) ([]PlaybackState, error)
 	SavePlaybackState(ctx context.Context, state PlaybackState) error
 	// SavePlaybackResolution persists metadata/orphan/last-seen fields for an item

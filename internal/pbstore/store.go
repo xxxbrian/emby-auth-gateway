@@ -482,33 +482,97 @@ func (s *Store) listItemChildCountBatch(ctx context.Context, itemIDs []string) (
 }
 
 func (s *Store) SaveItemChildCount(ctx context.Context, count gateway.ItemChildCount) error {
-	if count.ItemID == "" || count.ChildCount <= 0 {
+	return s.SaveItemChildCounts(ctx, []gateway.ItemChildCount{count})
+}
+
+func (s *Store) SaveItemChildCounts(ctx context.Context, counts []gateway.ItemChildCount) error {
+	// Dedupe by ItemID (last wins) while filtering invalid entries.
+	deduped := make([]gateway.ItemChildCount, 0, len(counts))
+	indexByItemID := map[string]int{}
+	for _, count := range counts {
+		if count.ItemID == "" || count.ChildCount <= 0 {
+			continue
+		}
+		if idx, ok := indexByItemID[count.ItemID]; ok {
+			deduped[idx] = count
+			continue
+		}
+		indexByItemID[count.ItemID] = len(deduped)
+		deduped = append(deduped, count)
+	}
+	if len(deduped) == 0 {
 		return nil
 	}
-	records, err := s.app.FindRecordsByFilter(
-		"item_child_counts",
-		"item_id = {:itemID}",
-		"",
-		1,
-		0,
-		dbx.Params{"itemID": count.ItemID},
-	)
+
+	itemIDs := make([]string, len(deduped))
+	for i, count := range deduped {
+		itemIDs[i] = count.ItemID
+	}
+	existing, err := s.findItemChildCountRecords(ctx, itemIDs)
 	if err != nil {
 		return err
 	}
-	var record *core.Record
-	if len(records) > 0 {
-		record = records[0]
-	} else {
-		collection, err := s.app.FindCollectionByNameOrId("item_child_counts")
-		if err != nil {
+
+	var collection *core.Collection
+	for _, count := range deduped {
+		record := existing[count.ItemID]
+		if record == nil {
+			if collection == nil {
+				collection, err = s.app.FindCollectionByNameOrId("item_child_counts")
+				if err != nil {
+					return err
+				}
+			}
+			record = core.NewRecord(collection)
+			record.Set("item_id", count.ItemID)
+		}
+		record.Set("child_count", count.ChildCount)
+		if err := s.app.Save(record); err != nil {
 			return err
 		}
-		record = core.NewRecord(collection)
-		record.Set("item_id", count.ItemID)
 	}
-	record.Set("child_count", count.ChildCount)
-	return s.app.Save(record)
+	return nil
+}
+
+func (s *Store) findItemChildCountRecords(ctx context.Context, itemIDs []string) (map[string]*core.Record, error) {
+	recordsByItemID := map[string]*core.Record{}
+	if len(itemIDs) == 0 {
+		return recordsByItemID, nil
+	}
+	for start := 0; start < len(itemIDs); start += playbackStateItemIDBatchLimit {
+		end := start + playbackStateItemIDBatchLimit
+		if end > len(itemIDs) {
+			end = len(itemIDs)
+		}
+		filterParts := make([]string, 0, end-start)
+		params := dbx.Params{}
+		for i, itemID := range itemIDs[start:end] {
+			if itemID == "" {
+				continue
+			}
+			name := fmt.Sprintf("itemID%d", i)
+			filterParts = append(filterParts, "item_id = {:"+name+"}")
+			params[name] = itemID
+		}
+		if len(filterParts) == 0 {
+			continue
+		}
+		records, err := s.app.FindRecordsByFilter(
+			"item_child_counts",
+			strings.Join(filterParts, " || "),
+			"",
+			0,
+			0,
+			params,
+		)
+		if err != nil {
+			return nil, err
+		}
+		for _, record := range records {
+			recordsByItemID[record.GetString("item_id")] = record
+		}
+	}
+	return recordsByItemID, nil
 }
 
 func (s *Store) ListPlaybackStates(ctx context.Context, gatewayUserID string, filter gateway.PlaybackStateFilter) ([]gateway.PlaybackState, error) {

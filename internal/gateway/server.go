@@ -1543,13 +1543,17 @@ func (s *Server) applyChildCountsToAggregates(ctx context.Context, r *http.Reque
 			missing = append(missing, id)
 		}
 	}
+	toSave := make([]ItemChildCount, 0, len(missing))
 	for _, id := range missing {
 		count := s.fetchItemChildCount(ctx, r, session, gatewayToken, id)
 		if count <= 0 {
 			continue
 		}
 		applyAggregateTotal(aggregates, id, count)
-		_ = s.store.SaveItemChildCount(ctx, ItemChildCount{ItemID: id, ChildCount: count})
+		toSave = append(toSave, ItemChildCount{ItemID: id, ChildCount: count})
+	}
+	if len(toSave) > 0 {
+		_ = s.store.SaveItemChildCounts(ctx, toSave)
 	}
 }
 
@@ -1563,10 +1567,12 @@ func (s *Server) fetchItemChildCount(ctx context.Context, r *http.Request, sessi
 	if err != nil || status < 200 || status >= 300 {
 		return 0
 	}
-	if total, ok := totalRecordCount(value); ok {
+	// Limit=0 responses must expose TotalRecordCount; never trust len(Items)
+	// because a partial page would poison the child-count cache.
+	if total, ok := totalRecordCount(value); ok && total > 0 {
 		return total
 	}
-	return len(extractItems(value))
+	return 0
 }
 
 func applyAggregateTotal(aggregates *PlaybackAggregates, itemID string, count int) {
