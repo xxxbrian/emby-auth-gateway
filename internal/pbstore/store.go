@@ -513,24 +513,59 @@ func (s *Store) SaveItemChildCounts(ctx context.Context, counts []gateway.ItemCh
 		return err
 	}
 
+	// Best-effort per entry: one failure must not prevent later valid counts
+	// from being written (matches pre-batch independent SaveItemChildCount calls).
 	var collection *core.Collection
+	var firstErr error
 	for _, count := range deduped {
-		record := existing[count.ItemID]
-		if record == nil {
-			if collection == nil {
-				collection, err = s.app.FindCollectionByNameOrId("item_child_counts")
-				if err != nil {
-					return err
-				}
-			}
-			record = core.NewRecord(collection)
-			record.Set("item_id", count.ItemID)
-		}
-		record.Set("child_count", count.ChildCount)
-		if err := s.app.Save(record); err != nil {
-			return err
+		if err := s.upsertItemChildCount(ctx, count, existing, &collection); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
+	return firstErr
+}
+
+func (s *Store) upsertItemChildCount(ctx context.Context, count gateway.ItemChildCount, existing map[string]*core.Record, collection **core.Collection) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	record := existing[count.ItemID]
+	if record == nil {
+		if *collection == nil {
+			c, err := s.app.FindCollectionByNameOrId("item_child_counts")
+			if err != nil {
+				return err
+			}
+			*collection = c
+		}
+		record = core.NewRecord(*collection)
+		record.Set("item_id", count.ItemID)
+	}
+	record.Set("child_count", count.ChildCount)
+	if err := s.app.Save(record); err != nil {
+		if record.IsNew() && isUniqueConstraintError(err) {
+			// Concurrent create: reload and update the winner row.
+			records, loadErr := s.app.FindRecordsByFilter(
+				"item_child_counts",
+				"item_id = {:itemID}",
+				"",
+				1,
+				0,
+				dbx.Params{"itemID": count.ItemID},
+			)
+			if loadErr != nil {
+				return loadErr
+			}
+			if len(records) == 0 {
+				return err
+			}
+			record = records[0]
+			record.Set("child_count", count.ChildCount)
+			return s.app.Save(record)
+		}
+		return err
+	}
+	existing[count.ItemID] = record
 	return nil
 }
 
@@ -806,6 +841,7 @@ func isUniqueConstraintError(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "unique constraint failed") ||
+		strings.Contains(msg, "value must be unique") ||
 		(strings.Contains(msg, "constraint failed") && strings.Contains(msg, "unique"))
 }
 

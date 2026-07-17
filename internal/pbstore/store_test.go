@@ -878,6 +878,38 @@ func TestSaveItemChildCountsBatchUpserts(t *testing.T) {
 	}
 }
 
+func TestSaveItemChildCountsConcurrentUpsert(t *testing.T) {
+	app := newTestApp(t)
+	store := New(app)
+	ctx := context.Background()
+	const workers = 8
+	errCh := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		go func(n int) {
+			errCh <- store.SaveItemChildCounts(ctx, []gateway.ItemChildCount{
+				{ItemID: "race-show", ChildCount: 10 + n},
+				{ItemID: "race-movie", ChildCount: 100 + n},
+			})
+		}(i)
+	}
+	for i := 0; i < workers; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("concurrent SaveItemChildCounts: %v", err)
+		}
+	}
+	counts, err := store.ListItemChildCounts(ctx, []string{"race-show", "race-movie"})
+	if err != nil {
+		t.Fatalf("list after concurrent upsert: %v", err)
+	}
+	if counts["race-show"].ChildCount < 10 || counts["race-movie"].ChildCount < 100 {
+		t.Fatalf("unexpected concurrent counts: %#v", counts)
+	}
+	showRecords, err := app.FindRecordsByFilter("item_child_counts", "item_id = 'race-show'", "", 0, 0, nil)
+	if err != nil || len(showRecords) != 1 {
+		t.Fatalf("race-show records = %#v err=%v, want singleton", showRecords, err)
+	}
+}
+
 func TestPathPolicyDefaultAllowAndDeny(t *testing.T) {
 	app := newTestApp(t)
 	store := New(app)
