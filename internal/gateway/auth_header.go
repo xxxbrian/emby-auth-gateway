@@ -25,6 +25,109 @@ type ExtractedCredential struct {
 	QueryKey string
 }
 
+// ClientIdentity is the Emby client identity extracted for login sessions.
+type ClientIdentity struct {
+	Client   string
+	Device   string
+	DeviceID string
+	Version  string
+}
+
+// ExtractClientIdentity selects client identity fields with Emby-compatible
+// per-field precedence:
+//  1. Selected structured authorization header fields
+//  2. Matching standalone X-Emby-* header
+//  3. Matching exact-case query parameter
+//
+// Structured authorization selection uses the first trimmed non-empty
+// X-Emby-Authorization value, else the first trimmed non-empty Authorization
+// value. Once selected, the other header and later repeated values are not
+// inspected for structured fields; missing fields still fall back to
+// standalone headers and query parameters.
+func ExtractClientIdentity(r *http.Request) ClientIdentity {
+	var identity ClientIdentity
+	var auth AuthHeader
+	hasAuth := false
+	if first := firstNonEmptyHeaderValue(r.Header, "X-Emby-Authorization"); first != "" {
+		auth = ParseEmbyAuthHeader(first)
+		hasAuth = true
+	} else if first := firstNonEmptyHeaderValue(r.Header, "Authorization"); first != "" {
+		auth = ParseEmbyAuthHeader(first)
+		hasAuth = true
+	}
+
+	q := r.URL.Query()
+
+	if hasAuth {
+		if v := strings.TrimSpace(auth.Client); v != "" {
+			identity.Client = v
+		}
+	}
+	if identity.Client == "" {
+		if v := strings.TrimSpace(firstNonEmptyHeaderValue(r.Header, "X-Emby-Client")); v != "" {
+			identity.Client = v
+		}
+	}
+	if identity.Client == "" {
+		identity.Client = firstNonEmptyQueryValue(q["X-Emby-Client"])
+	}
+
+	if hasAuth {
+		if v := decodeDeviceName(auth.Device); v != "" {
+			identity.Device = v
+		}
+	}
+	if identity.Device == "" {
+		if v := decodeDeviceName(firstNonEmptyHeaderValue(r.Header, "X-Emby-Device-Name")); v != "" {
+			identity.Device = v
+		}
+	}
+	if identity.Device == "" {
+		identity.Device = firstNonEmptyQueryValue(q["X-Emby-Device-Name"])
+	}
+
+	if hasAuth {
+		if v := strings.TrimSpace(auth.DeviceID); v != "" {
+			identity.DeviceID = v
+		}
+	}
+	if identity.DeviceID == "" {
+		if v := strings.TrimSpace(firstNonEmptyHeaderValue(r.Header, "X-Emby-Device-Id")); v != "" {
+			identity.DeviceID = v
+		}
+	}
+	if identity.DeviceID == "" {
+		identity.DeviceID = firstNonEmptyQueryValue(q["X-Emby-Device-Id"])
+	}
+
+	if hasAuth {
+		if v := strings.TrimSpace(auth.Version); v != "" {
+			identity.Version = v
+		}
+	}
+	if identity.Version == "" {
+		if v := strings.TrimSpace(firstNonEmptyHeaderValue(r.Header, "X-Emby-Client-Version")); v != "" {
+			identity.Version = v
+		}
+	}
+	if identity.Version == "" {
+		identity.Version = firstNonEmptyQueryValue(q["X-Emby-Client-Version"])
+	}
+
+	return identity
+}
+
+func decodeDeviceName(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if decoded, err := url.QueryUnescape(raw); err == nil {
+		return strings.TrimSpace(decoded)
+	}
+	return raw
+}
+
 func ParseEmbyAuthHeader(value string) AuthHeader {
 	value = strings.TrimSpace(value)
 	if value == "" {

@@ -1175,6 +1175,57 @@ func TestAuthenticateByNameAcceptsJSONPasswordField(t *testing.T) {
 	}
 }
 
+func TestAuthenticateByNamePersistsQueryClientIdentity(t *testing.T) {
+	backend := testAuthBackend(t)
+	defer backend.Close()
+
+	store := testStore(backend.URL + "/emby")
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	loginURL := gw.URL + "/emby/Users/authenticatebyname" +
+		"?X-Emby-Client=QueryClient" +
+		"&X-Emby-Device-Name=QueryDevice" +
+		"&X-Emby-Device-Id=query-device-id" +
+		"&X-Emby-Client-Version=9.9.9"
+	req := mustJSONLoginRequest(t, loginURL, `{"Username":"alice","Pw":"alice-pass"}`)
+	resp := do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("login status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var login map[string]any
+	decodeJSON(t, resp.Body, &login)
+	accessToken, _ := login["AccessToken"].(string)
+	if accessToken == "" {
+		t.Fatalf("missing AccessToken: %#v", login)
+	}
+	sessionInfo, ok := login["SessionInfo"].(map[string]any)
+	if !ok {
+		t.Fatalf("SessionInfo missing: %#v", login)
+	}
+	if sessionInfo["Client"] != "QueryClient" ||
+		sessionInfo["DeviceName"] != "QueryDevice" ||
+		sessionInfo["DeviceId"] != "query-device-id" ||
+		sessionInfo["ApplicationVersion"] != "9.9.9" {
+		t.Fatalf("SessionInfo identity mismatch: %#v", sessionInfo)
+	}
+
+	session, err := store.FindSessionByTokenHash(context.Background(), HashToken(accessToken))
+	if err != nil {
+		t.Fatalf("FindSessionByTokenHash: %v", err)
+	}
+	if session.Client != "QueryClient" ||
+		session.Device != "QueryDevice" ||
+		session.DeviceID != "query-device-id" ||
+		session.Version != "9.9.9" {
+		t.Fatalf("persisted session identity = {Client:%q Device:%q DeviceID:%q Version:%q}",
+			session.Client, session.Device, session.DeviceID, session.Version)
+	}
+}
+
 func TestSuccessfulLoginClearsFailureCount(t *testing.T) {
 	backend := testAuthBackend(t)
 	defer backend.Close()

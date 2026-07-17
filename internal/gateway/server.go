@@ -151,7 +151,7 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientAuth := firstAuthHeader(r)
+	identity := ExtractClientIdentity(r)
 
 	s.logins.clear(key)
 
@@ -166,10 +166,10 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 		GatewayUserID:    user.ID,
 		GatewayUsername:  user.Username,
 		SyntheticUserID:  user.SyntheticUserID,
-		Client:           clientAuth.Client,
-		Device:           clientAuth.Device,
-		DeviceID:         clientAuth.DeviceID,
-		Version:          clientAuth.Version,
+		Client:           identity.Client,
+		Device:           identity.Device,
+		DeviceID:         identity.DeviceID,
+		Version:          identity.Version,
 		RemoteIP:         remoteIP(r),
 		CreatedAt:        now,
 		ExpiresAt:        now.Add(defaultSessionTTL),
@@ -2045,15 +2045,6 @@ func (s *Server) gatewayBaseForRequest(r *http.Request) string {
 		}
 	}
 	return strings.TrimRight(scheme+"://"+host, "/") + strings.TrimRight(s.cfg.GatewayBasePath, "/")
-}
-
-func firstAuthHeader(r *http.Request) AuthHeader {
-	for _, name := range []string{"X-Emby-Authorization", "Authorization"} {
-		if value := r.Header.Get(name); value != "" {
-			return ParseEmbyAuthHeader(value)
-		}
-	}
-	return AuthHeader{Scheme: "Emby", Fields: map[string]string{}}
 }
 
 func userDTO(user GatewayUser, serverID string) map[string]any {

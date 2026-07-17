@@ -196,6 +196,140 @@ func TestExtractCredentialPrecedence(t *testing.T) {
 	}
 }
 
+func TestExtractClientIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		header   http.Header
+		rawQuery string
+		want     ClientIdentity
+	}{
+		{
+			name: "structured authorization only with encoded device",
+			header: headerPairs(
+				"X-Emby-Authorization",
+				`Emby Client="SenPlayer", Device="My%20Phone", DeviceId="dev-1", Version="6.1.3"`,
+			),
+			want: ClientIdentity{Client: "SenPlayer", Device: "My Phone", DeviceID: "dev-1", Version: "6.1.3"},
+		},
+		{
+			name:     "query only all four exact-case params",
+			rawQuery: "X-Emby-Client=QueryClient&X-Emby-Device-Name=QueryDevice&X-Emby-Device-Id=query-dev&X-Emby-Client-Version=2.0",
+			want:     ClientIdentity{Client: "QueryClient", Device: "QueryDevice", DeviceID: "query-dev", Version: "2.0"},
+		},
+		{
+			name: "standalone headers only with encoded device name",
+			header: headerPairs(
+				"X-Emby-Client", "HeaderClient",
+				"X-Emby-Device-Name", "My%20Phone",
+				"X-Emby-Device-Id", "header-dev",
+				"X-Emby-Client-Version", "3.0",
+			),
+			want: ClientIdentity{Client: "HeaderClient", Device: "My Phone", DeviceID: "header-dev", Version: "3.0"},
+		},
+		{
+			name: "mixed authorization device fields with query client",
+			header: headerPairs(
+				"Authorization",
+				`Emby Device="AuthDevice", DeviceId="auth-dev", Version="4.0"`,
+			),
+			rawQuery: "X-Emby-Client=QueryClient",
+			want:     ClientIdentity{Client: "QueryClient", Device: "AuthDevice", DeviceID: "auth-dev", Version: "4.0"},
+		},
+		{
+			name: "empty request",
+			want: ClientIdentity{},
+		},
+		{
+			name: "structured value beats standalone and query",
+			header: headerPairs(
+				"X-Emby-Authorization",
+				`Emby Client="AuthClient", Device="AuthDevice", DeviceId="auth-dev", Version="1.0"`,
+				"X-Emby-Client", "HeaderClient",
+				"X-Emby-Device-Name", "HeaderDevice",
+				"X-Emby-Device-Id", "header-dev",
+				"X-Emby-Client-Version", "2.0",
+			),
+			rawQuery: "X-Emby-Client=QueryClient&X-Emby-Device-Name=QueryDevice&X-Emby-Device-Id=query-dev&X-Emby-Client-Version=3.0",
+			want:     ClientIdentity{Client: "AuthClient", Device: "AuthDevice", DeviceID: "auth-dev", Version: "1.0"},
+		},
+		{
+			name: "standalone header beats query",
+			header: headerPairs(
+				"X-Emby-Client", "HeaderClient",
+				"X-Emby-Device-Name", "HeaderDevice",
+				"X-Emby-Device-Id", "header-dev",
+				"X-Emby-Client-Version", "2.0",
+			),
+			rawQuery: "X-Emby-Client=QueryClient&X-Emby-Device-Name=QueryDevice&X-Emby-Device-Id=query-dev&X-Emby-Client-Version=3.0",
+			want:     ClientIdentity{Client: "HeaderClient", Device: "HeaderDevice", DeviceID: "header-dev", Version: "2.0"},
+		},
+		{
+			name: "x-emby-authorization selection does not merge authorization fields",
+			header: headerPairs(
+				"X-Emby-Authorization", `Emby Client="OnlyClient"`,
+				"Authorization", `Emby Device="AuthDevice", DeviceId="auth-dev", Version="9.0"`,
+			),
+			want: ClientIdentity{Client: "OnlyClient"},
+		},
+		{
+			name: "repeated header values use first trimmed non-empty",
+			header: func() http.Header {
+				h := make(http.Header)
+				h.Add("X-Emby-Client", "  ")
+				h.Add("X-Emby-Client", "FirstClient")
+				h.Add("X-Emby-Client", "SecondClient")
+				h.Add("X-Emby-Device-Name", "  ")
+				h.Add("X-Emby-Device-Name", "FirstDevice")
+				h.Add("X-Emby-Device-Id", "first-dev")
+				h.Add("X-Emby-Device-Id", "second-dev")
+				h.Add("X-Emby-Client-Version", "1.0")
+				h.Add("X-Emby-Client-Version", "2.0")
+				return h
+			}(),
+			want: ClientIdentity{Client: "FirstClient", Device: "FirstDevice", DeviceID: "first-dev", Version: "1.0"},
+		},
+		{
+			name: "malformed device escape remains raw",
+			header: headerPairs(
+				"X-Emby-Authorization",
+				`Emby Device="%"`,
+			),
+			want: ClientIdentity{Device: "%"},
+		},
+		{
+			name: "percent 2B becomes literal plus",
+			header: headerPairs(
+				"X-Emby-Device-Name", "%2B",
+			),
+			want: ClientIdentity{Device: "+"},
+		},
+		{
+			name:     "query percent 2520 becomes percent 20 without second decode",
+			rawQuery: "X-Emby-Device-Name=%2520",
+			want:     ClientIdentity{Device: "%20"},
+		},
+		{
+			name:     "lowercase query keys ignored",
+			rawQuery: "x-emby-client=LowerClient&X-Emby-Device-Name=KeepDevice",
+			want:     ClientIdentity{Device: "KeepDevice"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/emby", nil)
+			if tc.rawQuery != "" {
+				req.URL.RawQuery = tc.rawQuery
+			}
+			if tc.header != nil {
+				req.Header = tc.header
+			}
+			got := ExtractClientIdentity(req)
+			if got != tc.want {
+				t.Fatalf("ExtractClientIdentity() = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestIsGatewayShapedToken(t *testing.T) {
 	token, _, err := NewOpaqueToken()
 	if err != nil {
