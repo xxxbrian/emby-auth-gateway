@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/xxxbrian/emby-auth-gateway/internal/controlplane"
+
 	"github.com/pocketbase/pocketbase/core"
 )
 
@@ -63,9 +65,9 @@ func TestCurrentSourceOwnershipQueryFailureFailsClosed(t *testing.T) {
 	}))
 	defer server.Close()
 	lookupErr := errors.New("table not found")
-	readCurrentTokenSource = func(core.App) (*core.Record, error) { return nil, lookupErr }
+	controlplane.ReadCurrentTokenSource = func(core.App) (*core.Record, error) { return nil, lookupErr }
 	t.Cleanup(func() {
-		readCurrentTokenSource = func(app core.App) (*core.Record, error) {
+		controlplane.ReadCurrentTokenSource = func(app core.App) (*core.Record, error) {
 			return app.FindFirstRecordByData(upstreamSources, "key", defaultUpstreamKey)
 		}
 	})
@@ -93,8 +95,8 @@ func TestPrimaryStateLoaderFailureStopsBeforeProbe(t *testing.T) {
 	}))
 	defer server.Close()
 	stateErr := errors.New("table not found")
-	loadUpstreamStateForCreate = func(core.App) (upstreamState, error) { return upstreamState{}, stateErr }
-	t.Cleanup(func() { loadUpstreamStateForCreate = loadUpstreamState })
+	controlplane.LoadUpstreamStateForCreate = func(core.App) (upstreamState, error) { return upstreamState{}, stateErr }
+	t.Cleanup(func() { controlplane.LoadUpstreamStateForCreate = loadUpstreamState })
 
 	err := runUpstreamCreate(context.Background(), app, upstreamOptions{EmbyBaseURL: server.URL, BackendUsername: "u", BackendPassword: "p"})
 	if !errors.Is(err, stateErr) {
@@ -141,9 +143,9 @@ func TestCurrentSourceSQLNoRowsAllowsFreshCreate(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	readCurrentTokenSource = func(core.App) (*core.Record, error) { return nil, sql.ErrNoRows }
+	controlplane.ReadCurrentTokenSource = func(core.App) (*core.Record, error) { return nil, sql.ErrNoRows }
 	t.Cleanup(func() {
-		readCurrentTokenSource = func(app core.App) (*core.Record, error) {
+		controlplane.ReadCurrentTokenSource = func(app core.App) (*core.Record, error) {
 			return app.FindFirstRecordByData(upstreamSources, "key", defaultUpstreamKey)
 		}
 	})

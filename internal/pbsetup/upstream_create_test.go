@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/xxxbrian/emby-auth-gateway/internal/controlplane"
+
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/hook"
 )
@@ -268,8 +270,8 @@ func TestUpstreamCreateCancellationAfterAuthDoesNotWriteAndCleansToken(t *testin
 		}
 	}))
 	defer server.Close()
-	afterUpstreamProbe = cancel
-	t.Cleanup(func() { afterUpstreamProbe = nil })
+	controlplane.AfterUpstreamProbe = cancel
+	t.Cleanup(func() { controlplane.AfterUpstreamProbe = nil })
 	err := runUpstreamCreate(ctx, app, upstreamOptions{EmbyBaseURL: server.URL, BackendUsername: "u", BackendPassword: "p"})
 	if err == nil || logout != 1 {
 		t.Fatalf("err=%v logout=%d", err, logout)
@@ -282,7 +284,7 @@ func TestUpstreamCreateCancellationAfterAuthDoesNotWriteAndCleansToken(t *testin
 func TestLogoutAcceptsEmptySuccessBody(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
 	defer server.Close()
-	if err := upstreamRequest(context.Background(), newUpstreamHTTPClient(), http.MethodPost, server.URL, nil, upstreamOptions{}.identity(), "device", "user", "token", &struct{}{}, true); err != nil {
+	if err := upstreamRequest(context.Background(), controlplane.NewUpstreamHTTPClient(), http.MethodPost, server.URL, nil, upstreamOptions{}.identity(), "device", "user", "token", &struct{}{}, true); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -321,16 +323,16 @@ func TestUpstreamFingerprintIsTypedAndIncludesEndpointRelation(t *testing.T) {
 	endpoint.Set("source", "source")
 	endpoint.Set("key", "primary")
 	endpoint.Set("base_url", "https://emby.example.com")
-	first := upstreamFingerprint(upstreamState{source: source, allEndpoints: []*core.Record{endpoint}})
+	first := upstreamFingerprint(upstreamState{Source: source, AllEndpoints: []*core.Record{endpoint}})
 	source.Set("backend_username", "left")
 	source.Set("backend_password", "right\x01value")
-	second := upstreamFingerprint(upstreamState{source: source, allEndpoints: []*core.Record{endpoint}})
+	second := upstreamFingerprint(upstreamState{Source: source, AllEndpoints: []*core.Record{endpoint}})
 	if first == second {
 		t.Fatal("control-character field drift was not detected")
 	}
 	source.Set("backend_username", "left\x00right\x01value")
 	endpoint.Set("source", "other-source")
-	if first == upstreamFingerprint(upstreamState{source: source, allEndpoints: []*core.Record{endpoint}}) {
+	if first == upstreamFingerprint(upstreamState{Source: source, AllEndpoints: []*core.Record{endpoint}}) {
 		t.Fatal("endpoint source relation drift was not detected")
 	}
 }
@@ -417,8 +419,8 @@ func TestUpstreamCreateCancellationDuringTransactionRollsBack(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	afterUpstreamSourceSave = cancel
-	t.Cleanup(func() { afterUpstreamSourceSave = nil })
+	controlplane.AfterUpstreamSourceSave = cancel
+	t.Cleanup(func() { controlplane.AfterUpstreamSourceSave = nil })
 	if err := runUpstreamCreate(ctx, app, upstreamOptions{EmbyBaseURL: server.URL, BackendUsername: "u", BackendPassword: "p"}); err == nil {
 		t.Fatal("cancelled transaction succeeded")
 	}
@@ -443,7 +445,7 @@ func TestUpstreamCreateRejectsSourceAndEndpointFingerprintDriftAndCleansNewToken
 			endpoint, _ := app.FindFirstRecordByData(upstreamEndpoints, "source", source.Id)
 			logout := 0
 			upstreamTestToken = "new-token"
-			afterUpstreamProbe = func() {
+			controlplane.AfterUpstreamProbe = func() {
 				if mutate == "source" {
 					source.Set("backend_password", "concurrent")
 					_ = app.Save(source)
@@ -455,7 +457,7 @@ func TestUpstreamCreateRejectsSourceAndEndpointFingerprintDriftAndCleansNewToken
 					_ = app.Save(endpoint)
 				}
 			}
-			t.Cleanup(func() { afterUpstreamProbe = nil; upstreamTestLogout = nil; upstreamTestToken = "" })
+			t.Cleanup(func() { controlplane.AfterUpstreamProbe = nil; upstreamTestLogout = nil; upstreamTestToken = "" })
 			upstreamTestLogout = func(token string) {
 				if token == "new-token" {
 					logout++

@@ -8,17 +8,13 @@ import (
 
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/spf13/cobra"
+	"github.com/xxxbrian/emby-auth-gateway/internal/controlplane"
 )
 
 type userOptions struct {
 	GatewayUsername string
 	GatewayPassword string
 	SyntheticUserID string
-}
-
-func internalEmail(username string) string {
-	replacer := strings.NewReplacer("@", "_at_", " ", "_", "/", "_", "\\", "_")
-	return strings.ToLower(replacer.Replace(username)) + "@gateway.local"
 }
 
 func newUserCommand(app core.App) *cobra.Command {
@@ -62,26 +58,9 @@ func (o userOptions) validate() error {
 }
 
 func runUser(ctx context.Context, app core.App, opts userOptions) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	return app.RunInTransaction(func(txApp core.App) error {
-		record, err := txApp.FindFirstRecordByData("users", "username", opts.GatewayUsername)
-		if err != nil {
-			collection, findErr := txApp.FindCollectionByNameOrId("users")
-			if findErr != nil {
-				return findErr
-			}
-			record = core.NewRecord(collection)
-		}
-		record.Set("username", opts.GatewayUsername)
-		record.SetEmail(internalEmail(opts.GatewayUsername))
-		if !record.ValidatePassword(opts.GatewayPassword) {
-			record.SetPassword(opts.GatewayPassword)
-		}
-		record.SetVerified(true)
-		record.Set("synthetic_user_id", opts.SyntheticUserID)
-		record.Set("enabled", true)
-		return txApp.Save(record)
+	return controlplane.UpsertUser(ctx, app, controlplane.UpsertUserInput{
+		Username:        opts.GatewayUsername,
+		Password:        opts.GatewayPassword,
+		SyntheticUserID: opts.SyntheticUserID,
 	})
 }

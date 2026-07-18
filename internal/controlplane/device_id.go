@@ -1,4 +1,4 @@
-package pbsetup
+package controlplane
 
 import (
 	"crypto/rand"

@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/xxxbrian/emby-auth-gateway/internal/controlplane"
+
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/xxxbrian/emby-auth-gateway/internal/gateway"
 )
@@ -184,8 +186,8 @@ func TestUpstreamGenerationConcurrencySetupUpdate(t *testing.T) {
 	upstream := genConcurrentNewUpstream(t, false)
 	opts := genConcurrentSetupState(t, app, upstream.server.URL)
 	gate := genConcurrentNewGate()
-	afterUpstreamProbe = gate.wait
-	t.Cleanup(func() { afterUpstreamProbe = nil })
+	controlplane.AfterUpstreamProbe = gate.wait
+	t.Cleanup(func() { controlplane.AfterUpstreamProbe = nil })
 
 	results := genConcurrentRunPair(func() error { return runUpstreamCreate(context.Background(), app, opts) })
 	genConcurrentWait(t, gate)
@@ -204,8 +206,8 @@ func TestUpstreamGenerationConcurrencyEmptyCreate(t *testing.T) {
 	upstream := genConcurrentNewUpstream(t, false)
 	opts := upstreamOptions{EmbyBaseURL: upstream.server.URL, BackendUsername: "backend", BackendPassword: "password"}
 	gate := genConcurrentNewGate()
-	afterUpstreamProbe = gate.wait
-	t.Cleanup(func() { afterUpstreamProbe = nil })
+	controlplane.AfterUpstreamProbe = gate.wait
+	t.Cleanup(func() { controlplane.AfterUpstreamProbe = nil })
 
 	results := genConcurrentRunPair(func() error { return runUpstreamCreate(context.Background(), app, opts) })
 	genConcurrentWait(t, gate)
@@ -230,8 +232,8 @@ func TestUpstreamGenerationConcurrencyReturnedTokenCollision(t *testing.T) {
 	upstream := genConcurrentNewUpstream(t, true)
 	opts := genConcurrentSetupState(t, app, upstream.server.URL)
 	gate := genConcurrentNewGate()
-	afterUpstreamProbe = gate.wait
-	t.Cleanup(func() { afterUpstreamProbe = nil })
+	controlplane.AfterUpstreamProbe = gate.wait
+	t.Cleanup(func() { controlplane.AfterUpstreamProbe = nil })
 
 	results := genConcurrentRunPair(func() error { return runUpstreamCreate(context.Background(), app, opts) })
 	genConcurrentWait(t, gate)

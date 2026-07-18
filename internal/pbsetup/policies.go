@@ -5,7 +5,7 @@ import (
 
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/spf13/cobra"
-	"github.com/xxxbrian/emby-auth-gateway/internal/pathpolicy"
+	"github.com/xxxbrian/emby-auth-gateway/internal/controlplane"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pbschema"
 )
 
@@ -29,41 +29,5 @@ func newPoliciesCommand(app core.App) *cobra.Command {
 }
 
 func installDefaults(app core.App) (created, preserved int, err error) {
-	err = app.RunInTransaction(func(tx core.App) error {
-		collection, err := tx.FindCollectionByNameOrId("path_policies")
-		if err != nil {
-			return err
-		}
-		records, err := tx.FindRecordsByFilter("path_policies", "", "", 0, 0)
-		if err != nil {
-			return err
-		}
-		existing := map[string]bool{}
-		for _, r := range records {
-			m, p := pathpolicy.NormalizedIdentity(r.GetString("method"), r.GetString("path"))
-			existing[m+"\x00"+p] = true
-		}
-		for _, p := range pathpolicy.Defaults() {
-			m, path := pathpolicy.NormalizedIdentity(p.Method, p.Path)
-			key := m + "\x00" + path
-			if existing[key] {
-				preserved++
-				continue
-			}
-			r := core.NewRecord(collection)
-			r.Set("method", p.Method)
-			r.Set("path", p.Path)
-			r.Set("action", p.Action)
-			r.Set("reason", p.Reason)
-			r.Set("priority", p.Priority)
-			r.Set("enabled", p.Enabled)
-			if err := tx.Save(r); err != nil {
-				return err
-			}
-			existing[key] = true
-			created++
-		}
-		return nil
-	})
-	return
+	return controlplane.InstallDefaultPolicies(app)
 }

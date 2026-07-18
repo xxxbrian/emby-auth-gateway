@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/xxxbrian/emby-auth-gateway/internal/controlplane"
 )
 
 func TestGenerationRotatesOnUpdatesAndStaysOnNoop(t *testing.T) {
@@ -34,12 +36,12 @@ func TestGenerationOnlyDriftCleansOnlyInvocationToken(t *testing.T) {
 	source, _ := app.FindFirstRecordByData(upstreamSources, "key", defaultUpstreamKey)
 	logouts := []string{}
 	upstreamTestLogout = func(token string) { logouts = append(logouts, token) }
-	afterUpstreamProbe = func() {
+	controlplane.AfterUpstreamProbe = func() {
 		record, _ := app.FindRecordById(upstreamSources, source.Id)
 		record.Set("auth_generation_id", "concurrent-generation")
 		_ = app.Save(record)
 	}
-	t.Cleanup(func() { afterUpstreamProbe = nil; upstreamTestLogout = nil; upstreamTestToken = "" })
+	t.Cleanup(func() { controlplane.AfterUpstreamProbe = nil; upstreamTestLogout = nil; upstreamTestToken = "" })
 	if err := runUpstreamCreate(context.Background(), app, opts); err == nil {
 		t.Fatal("generation-only drift was accepted")
 	}

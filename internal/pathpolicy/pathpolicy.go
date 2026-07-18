@@ -4,6 +4,7 @@ package pathpolicy
 import (
 	"sort"
 	"strings"
+	"time"
 )
 
 type Policy struct {
@@ -14,6 +15,8 @@ type Policy struct {
 	Reason   string
 	Priority int
 	Enabled  bool
+	// Updated is populated from storage when available (optimistic concurrency).
+	Updated time.Time
 }
 
 func (p Policy) Deny() bool { return strings.EqualFold(p.Action, "deny") }

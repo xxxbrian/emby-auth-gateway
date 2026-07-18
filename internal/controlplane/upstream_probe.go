@@ -1,4 +1,4 @@
-package pbsetup
+package controlplane
 
 import (
 	"bytes"
@@ -41,11 +41,33 @@ type upstreamProbeResult struct {
 	serverID, serverName, version, token, userID string
 }
 
-var newUpstreamHTTPClient = func() *http.Client {
+// NewUpstreamHTTPClient is a test hook for injecting HTTP clients.
+var NewUpstreamHTTPClient = func() *http.Client {
 	return &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }
 
-func normalizeUpstreamURL(raw string) (string, error) {
+// ProbeUpstream probes the public Emby system info endpoint and returns identity plus latency.
+func ProbeUpstream(ctx context.Context, in UpstreamReconfigureInput) (serverID, serverName, serverVersion string, latencyMS int64, err error) {
+	baseURL, err := NormalizeUpstreamURL(in.EmbyBaseURL)
+	if err != nil {
+		return "", "", "", 0, err
+	}
+	identity := in.identity()
+	deviceID, err := newBackendDeviceID()
+	if err != nil {
+		return "", "", "", 0, err
+	}
+	start := time.Now()
+	public, publicID, err := probeUpstreamPublic(ctx, NewUpstreamHTTPClient(), baseURL, deviceID, "", identity)
+	latencyMS = time.Since(start).Milliseconds()
+	if err != nil {
+		return "", "", "", latencyMS, err
+	}
+	return publicID, public.Name, public.Version, latencyMS, nil
+}
+
+// NormalizeUpstreamURL validates and normalizes an Emby base URL.
+func NormalizeUpstreamURL(raw string) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || !u.IsAbs() || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
 		return "", fmt.Errorf("--emby-url must be an absolute http(s) URL without userinfo, query, or fragment")
@@ -62,7 +84,7 @@ func embyAuthorization(identity gateway.BackendClientIdentity, deviceID, userID,
 func upstreamURL(baseURL, suffix string) string { return strings.TrimRight(baseURL, "/") + suffix }
 
 func probeUpstream(ctx context.Context, baseURL, username, password, deviceID, expectedServerID string, identity gateway.BackendClientIdentity) (upstreamProbeResult, error) {
-	client := newUpstreamHTTPClient()
+	client := NewUpstreamHTTPClient()
 	public, publicID, err := probeUpstreamPublic(ctx, client, baseURL, deviceID, expectedServerID, identity)
 	if err != nil {
 		return upstreamProbeResult{}, err
@@ -72,7 +94,7 @@ func probeUpstream(ctx context.Context, baseURL, username, password, deviceID, e
 
 func probeUpstreamPublic(ctx context.Context, client *http.Client, baseURL, deviceID, expectedServerID string, identity gateway.BackendClientIdentity) (upstreamPublicInfo, string, error) {
 	public := upstreamPublicInfo{}
-	if err := upstreamRequest(ctx, client, http.MethodGet, upstreamURL(baseURL, "/System/Info/Public"), nil, identity, deviceID, "", "", &public, false); err != nil {
+	if err := UpstreamRequest(ctx, client, http.MethodGet, upstreamURL(baseURL, "/System/Info/Public"), nil, identity, deviceID, "", "", &public, false); err != nil {
 		return public, "", fmt.Errorf("public info probe: %w", err)
 	}
 	publicID := firstNonEmptyTrimmed(public.ID, public.ServerID)
@@ -91,7 +113,7 @@ func authenticateUpstream(ctx context.Context, client *http.Client, baseURL, use
 		return upstreamProbeResult{}, fmt.Errorf("encode authentication request: %w", err)
 	}
 	var rawAuth json.RawMessage
-	if err := upstreamRequest(ctx, client, http.MethodPost, upstreamURL(baseURL, "/Users/AuthenticateByName"), body, identity, deviceID, "", "", &rawAuth, false); err != nil {
+	if err := UpstreamRequest(ctx, client, http.MethodPost, upstreamURL(baseURL, "/Users/AuthenticateByName"), body, identity, deviceID, "", "", &rawAuth, false); err != nil {
 		return upstreamProbeResult{}, fmt.Errorf("authentication probe: %w", err)
 	}
 	result, auth, err := decodeUpstreamAuth(rawAuth)
@@ -128,7 +150,8 @@ func decodeUpstreamAuth(raw json.RawMessage) (upstreamProbeResult, upstreamAuthI
 	return result, auth, nil
 }
 
-func upstreamRequest(ctx context.Context, client *http.Client, method, endpoint string, body []byte, identity gateway.BackendClientIdentity, deviceID, userID, token string, output any, allowEmptySuccess bool) error {
+// UpstreamRequest performs an Emby HTTP request (exported for tests via pbsetup wrappers).
+func UpstreamRequest(ctx context.Context, client *http.Client, method, endpoint string, body []byte, identity gateway.BackendClientIdentity, deviceID, userID, token string, output any, allowEmptySuccess bool) error {
 	reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, method, endpoint, bytes.NewReader(body))
