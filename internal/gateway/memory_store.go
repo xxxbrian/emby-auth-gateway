@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -491,26 +493,59 @@ func (m *MemoryStore) SaveDisplayPreference(ctx context.Context, preference Disp
 	return nil
 }
 
-func (m *MemoryStore) SaveSession(ctx context.Context, session *Session) error {
+func (m *MemoryStore) CreateSession(ctx context.Context, session Session) (*Session, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	copySession := *session
-	m.Sessions[session.GatewayTokenHash] = &copySession
-	return nil
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if m.Sessions == nil {
+		m.Sessions = map[string]*Session{}
+	}
+	now := time.Now().UTC()
+	prepared, err := prepareNewSession(session, now)
+	if err != nil {
+		return nil, err
+	}
+	if _, exists := m.Sessions[prepared.GatewayTokenHash]; exists {
+		return nil, fmt.Errorf("session token hash already exists")
+	}
+	for _, existing := range m.Sessions {
+		if existing != nil && existing.PublicID == prepared.PublicID {
+			return nil, fmt.Errorf("session public id already exists")
+		}
+	}
+	stored := cloneSession(&prepared)
+	m.Sessions[prepared.GatewayTokenHash] = stored
+	return cloneSession(stored), nil
 }
 
 func (m *MemoryStore) FindSessionByTokenHash(ctx context.Context, tokenHash string) (*Session, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	session, ok := m.Sessions[tokenHash]
 	if !ok {
 		return nil, ErrNotFound
 	}
-	copySession := *session
-	return &copySession, nil
+	if err := repairSessionAggregate(session, time.Now().UTC()); err != nil {
+		return nil, err
+	}
+	return cloneSession(session), nil
 }
 
 func (m *MemoryStore) SessionTokenExists(ctx context.Context, tokenHash string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	_, ok := m.Sessions[tokenHash]
@@ -518,6 +553,9 @@ func (m *MemoryStore) SessionTokenExists(ctx context.Context, tokenHash string) 
 }
 
 func (m *MemoryStore) RevokeSession(ctx context.Context, tokenHash string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if session, ok := m.Sessions[tokenHash]; ok {
@@ -526,6 +564,95 @@ func (m *MemoryStore) RevokeSession(ctx context.Context, tokenHash string) error
 		return nil
 	}
 	return ErrNotFound
+}
+
+func (m *MemoryStore) UpdateSessionCapabilities(ctx context.Context, tokenHash string, capabilities SessionCapabilities, at time.Time) (*Session, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session, ok := m.Sessions[tokenHash]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	raw := capabilities.RawJSON
+	if raw == "" {
+		raw = defaultCapabilitiesJSON
+	}
+	caps, err := ParseSessionCapabilities(raw)
+	if err != nil {
+		return nil, err
+	}
+	if at.IsZero() {
+		at = time.Now().UTC()
+	} else {
+		at = at.UTC()
+	}
+	session.Capabilities = caps
+	session.LastActivityAt = at
+	if err := repairSessionAggregate(session, at); err != nil {
+		return nil, err
+	}
+	return cloneSession(session), nil
+}
+
+func (m *MemoryStore) TouchSessionActivity(ctx context.Context, tokenHash string, at time.Time, minInterval time.Duration) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session, ok := m.Sessions[tokenHash]
+	if !ok {
+		return false, ErrNotFound
+	}
+	if at.IsZero() {
+		at = time.Now().UTC()
+	} else {
+		at = at.UTC()
+	}
+	if err := repairSessionAggregate(session, at); err != nil {
+		return false, err
+	}
+	if !session.LastActivityAt.IsZero() && at.Sub(session.LastActivityAt) < minInterval {
+		return false, nil
+	}
+	session.LastActivityAt = at
+	return true, nil
+}
+
+func (m *MemoryStore) ListActiveSessions(ctx context.Context, gatewayUserID string, now time.Time) ([]Session, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	out := make([]Session, 0)
+	for _, session := range m.Sessions {
+		if session == nil || session.GatewayUserID != gatewayUserID {
+			continue
+		}
+		if err := repairSessionAggregate(session, now); err != nil {
+			return nil, err
+		}
+		if !session.Active(now) {
+			continue
+		}
+		out = append(out, *cloneSession(session))
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if !out[i].LastActivityAt.Equal(out[j].LastActivityAt) {
+			return out[i].LastActivityAt.After(out[j].LastActivityAt)
+		}
+		return out[i].PublicID < out[j].PublicID
+	})
+	return out, nil
 }
 
 func playbackStateKey(gatewayUserID, itemID string) string {

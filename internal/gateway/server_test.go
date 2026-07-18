@@ -1740,8 +1740,12 @@ func TestPlaybackPingAndCapabilitiesAreLocalOnly(t *testing.T) {
 		req.Header.Set("Content-Type", "application/json")
 		resp := do(t, req)
 		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusNoContent {
-			t.Fatalf("%s status = %d, want 204", path, resp.StatusCode)
+		want := http.StatusNoContent
+		if path != "/Sessions/Playing/Ping" {
+			want = http.StatusOK // capabilities return empty 200
+		}
+		if resp.StatusCode != want {
+			t.Fatalf("%s status = %d, want %d", path, resp.StatusCode, want)
 		}
 	}
 	if len(forwarded) != 0 || len(store.PlaybackEvents) != 0 || len(store.PlaybackStates) != 0 {
@@ -3042,24 +3046,17 @@ func TestNextUpUsesGatewaySeriesState(t *testing.T) {
 }
 
 func TestDisplayPreferencesAndSessionsAreUserScoped(t *testing.T) {
+	// GET /Sessions is fully local (zero upstream). Display preferences remain local too.
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/emby/Sessions" {
-			t.Fatalf("unexpected backend request %s", r.URL.String())
-		}
-		writeTestJSON(w, []any{
-			map[string]any{"DeviceId": "device-1", "NowPlayingItem": map[string]any{"Id": "visible"}},
-			map[string]any{"DeviceId": "device-2", "NowPlayingItem": map[string]any{"Id": "hidden"}},
-		})
+		t.Fatalf("unexpected backend request %s", r.URL.String())
 	}))
 	defer backend.Close()
 
 	store := NewMemoryStore()
 	configureTestUpstream(store, backend.URL+"/emby")
-	source := store.UpstreamSources["source"]
-	source.ClientIdentity = backendIdentityForTest("device-1")
-	store.UpstreamSources["source"] = source
 	session := testSession()
 	session.DeviceID = "client-device"
+	session.PublicID = "session-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	store.Sessions[HashToken("gateway-token")] = session
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
@@ -3080,10 +3077,16 @@ func TestDisplayPreferencesAndSessionsAreUserScoped(t *testing.T) {
 
 	sessionsResp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Sessions?api_key=gateway-token", nil))
 	defer sessionsResp.Body.Close()
+	if sessionsResp.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("Cache-Control = %q", sessionsResp.Header.Get("Cache-Control"))
+	}
 	var sessions []any
 	decodeJSON(t, sessionsResp.Body, &sessions)
-	if len(sessions) != 1 || sessions[0].(map[string]any)["DeviceId"] != "device-1" {
-		t.Fatalf("sessions = %#v, want only device-1", sessions)
+	if len(sessions) != 1 || sessions[0].(map[string]any)["DeviceId"] != "client-device" {
+		t.Fatalf("sessions = %#v, want local client-device", sessions)
+	}
+	if sessions[0].(map[string]any)["Id"] != session.PublicID {
+		t.Fatalf("session Id = %#v, want public id", sessions[0])
 	}
 }
 
@@ -4020,8 +4023,8 @@ type failingSaveStore struct {
 	*MemoryStore
 }
 
-func (f *failingSaveStore) SaveSession(ctx context.Context, session *Session) error {
-	return errors.New("save failed")
+func (f *failingSaveStore) CreateSession(ctx context.Context, session Session) (*Session, error) {
+	return nil, errors.New("save failed")
 }
 
 type countingPlaybackStore struct {
@@ -4299,13 +4302,18 @@ func backendIdentityForTest(deviceID string) BackendClientIdentity {
 }
 
 func testSession() *Session {
+	now := time.Now().UTC()
+	// Fixtures that set PublicID explicitly must also carry profile fields.
+	// Default test sessions leave PublicID empty so missing-profile repair applies.
 	return &Session{
 		GatewayTokenHash: HashToken("gateway-token"),
 		GatewayUserID:    "u1",
 		GatewayUsername:  "alice",
 		SyntheticUserID:  "gateway-user",
-		CreatedAt:        time.Now().UTC(),
-		ExpiresAt:        time.Now().UTC().Add(time.Hour),
+		CreatedAt:        now,
+		ExpiresAt:        now.Add(time.Hour),
+		LastActivityAt:   now,
+		Capabilities:     defaultSessionCapabilities(),
 	}
 }
 

@@ -128,7 +128,7 @@ func TestSuperuserCreateBootstrapsCanonicalSchema(t *testing.T) {
 		t.Fatalf("bootstrap %s: %v", dataDir, err)
 	}
 	defer func() { _ = app.ResetBootstrapState() }()
-	for _, name := range []string{"users", "gateway_sessions", "audit_logs", "playback_events", "user_item_data", "item_child_counts", "display_preferences", "path_policies", "upstream_sources", "upstream_endpoints"} {
+	for _, name := range []string{"users", "gateway_sessions", "gateway_session_profiles", "audit_logs", "playback_events", "user_item_data", "item_child_counts", "display_preferences", "path_policies", "upstream_sources", "upstream_endpoints"} {
 		if _, err := app.FindCollectionByNameOrId(name); err != nil {
 			t.Fatalf("missing canonical collection %q: %v", name, err)
 		}

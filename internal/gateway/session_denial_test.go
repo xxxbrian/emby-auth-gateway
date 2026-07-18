@@ -355,8 +355,8 @@ func TestLocalSessionRoutesRemainAccepted(t *testing.T) {
 		{http.MethodPost, "/Sessions/Playing/Progress", `{"ItemId":"item-1","PlaybackPositionTicks":250}`, http.StatusNoContent},
 		{http.MethodPost, "/Sessions/Playing/Stopped", `{"ItemId":"item-1","PositionTicks":900}`, http.StatusNoContent},
 		{http.MethodPost, "/Sessions/Playing/Ping", `{}`, http.StatusNoContent},
-		{http.MethodPost, "/Sessions/Capabilities", `{}`, http.StatusNoContent},
-		{http.MethodPost, "/Sessions/Capabilities/Full", `{}`, http.StatusNoContent},
+		{http.MethodPost, "/Sessions/Capabilities", `{}`, http.StatusOK},
+		{http.MethodPost, "/Sessions/Capabilities/Full", `{}`, http.StatusOK},
 	} {
 		t.Run(tc.method+tc.path, func(t *testing.T) {
 			req := mustRequest(t, tc.method, gw.URL+"/emby"+tc.path+"?api_key=gateway-token", strings.NewReader(tc.body))
@@ -369,24 +369,25 @@ func TestLocalSessionRoutesRemainAccepted(t *testing.T) {
 		})
 	}
 
-	// GET /Sessions remains local-handled (filtered), not denied.
-	// Backend may be hit for upstream sessions list; that is existing behavior.
-	sessionsBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/emby/Sessions" {
-			t.Fatalf("unexpected path %s", r.URL.Path)
-		}
-		writeTestJSON(w, []any{})
+	// GET /Sessions is fully local (zero upstream).
+	sessionsBackend := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("GET /Sessions must not dial upstream")
 	}))
 	defer sessionsBackend.Close()
 	store2 := NewMemoryStore()
 	configureTestUpstream(store2, sessionsBackend.URL+"/emby")
-	store2.Sessions[HashToken("gateway-token")] = testSession()
+	sess := testSession()
+	sess.PublicID = "session-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	store2.Sessions[HashToken("gateway-token")] = sess
 	gw2 := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store2))
 	defer gw2.Close()
 	resp := do(t, mustRequest(t, http.MethodGet, gw2.URL+"/emby/Sessions?api_key=gateway-token", nil))
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /Sessions status = %d, want 200", resp.StatusCode)
+	}
+	if resp.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("Cache-Control = %q", resp.Header.Get("Cache-Control"))
 	}
 }
 
@@ -712,16 +713,22 @@ func TestSessionRouteUnhandledFailClosed(t *testing.T) {
 	defer gw.Close()
 
 	// Known LocalSession ops must not fail-closed to 404.
-	for _, path := range []string{"/Sessions/Playing/Ping", "/Sessions/Capabilities"} {
-		req := mustRequest(t, http.MethodPost, gw.URL+"/emby"+path+"?api_key=gateway-token", strings.NewReader(`{}`))
+	for _, tc := range []struct {
+		path string
+		want int
+	}{
+		{"/Sessions/Playing/Ping", http.StatusNoContent},
+		{"/Sessions/Capabilities", http.StatusOK},
+	} {
+		req := mustRequest(t, http.MethodPost, gw.URL+"/emby"+tc.path+"?api_key=gateway-token", strings.NewReader(`{}`))
 		req.Header.Set("Content-Type", "application/json")
 		resp := do(t, req)
 		_ = resp.Body.Close()
 		if resp.StatusCode == http.StatusNotFound {
-			t.Fatalf("%s returned 404 fail-closed unexpectedly", path)
+			t.Fatalf("%s returned 404 fail-closed unexpectedly", tc.path)
 		}
-		if resp.StatusCode != http.StatusNoContent {
-			t.Fatalf("%s status = %d, want 204", path, resp.StatusCode)
+		if resp.StatusCode != tc.want {
+			t.Fatalf("%s status = %d, want %d", tc.path, resp.StatusCode, tc.want)
 		}
 	}
 }

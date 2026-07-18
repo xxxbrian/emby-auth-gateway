@@ -7,6 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xxxbrian/emby-auth-gateway/internal/pbschema"
+	"github.com/xxxbrian/emby-auth-gateway/internal/sessionid"
+
 	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/core"
 )
@@ -142,6 +145,135 @@ func TestCleanupGatewaySessionsKeepsOnlyRecentActiveOrRevokedSessions(t *testing
 	}
 }
 
+func TestCleanupGatewaySessionsDeletesProfilesWithParentsAndPreservesActive(t *testing.T) {
+	app := newProductionGatewayApp(t)
+	ensureSessionProfilesCollection(t, app)
+
+	userID := createTestUser(t, app)
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	expiredID := createGatewaySession(t, app, userID, "expired-old", now.Add(-8*24*time.Hour), nil)
+	activeID := createGatewaySession(t, app, userID, "active", now.Add(24*time.Hour), nil)
+	createGatewaySessionProfile(t, app, expiredID, "session-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", now.Add(-8*24*time.Hour))
+	createGatewaySessionProfile(t, app, activeID, "session-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", now)
+
+	if err := cleanupGatewaySessions(app, now); err != nil {
+		t.Fatalf("cleanup gateway sessions: %v", err)
+	}
+
+	sessions, err := app.FindAllRecords("gateway_sessions")
+	if err != nil {
+		t.Fatalf("query gateway sessions: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].Id != activeID {
+		t.Fatalf("remaining sessions = %#v, want only active %q", sessions, activeID)
+	}
+
+	profiles, err := app.FindAllRecords("gateway_session_profiles")
+	if err != nil {
+		t.Fatalf("query gateway_session_profiles: %v", err)
+	}
+	if len(profiles) != 1 || profiles[0].GetString("gateway_session") != activeID {
+		t.Fatalf("remaining profiles = %#v, want only active profile", profiles)
+	}
+	if profiles[0].GetString("public_session_id") != "session-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" {
+		t.Fatalf("active profile public id = %q", profiles[0].GetString("public_session_id"))
+	}
+}
+
+func TestCleanupGatewaySessionsPurgesOrphanProfiles(t *testing.T) {
+	app := newProductionGatewayApp(t)
+	ensureSessionProfilesCollection(t, app)
+
+	userID := createTestUser(t, app)
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	activeID := createGatewaySession(t, app, userID, "active", now.Add(24*time.Hour), nil)
+	createGatewaySessionProfile(t, app, activeID, "session-cccccccccccccccccccccccccccccccc", now)
+	insertOrphanSessionProfile(t, app, "missing-session-id", "session-dddddddddddddddddddddddddddddddd", now.Add(-30*24*time.Hour))
+
+	if err := cleanupGatewaySessions(app, now); err != nil {
+		t.Fatalf("cleanup gateway sessions: %v", err)
+	}
+
+	profiles, err := app.FindAllRecords("gateway_session_profiles")
+	if err != nil {
+		t.Fatalf("query gateway_session_profiles: %v", err)
+	}
+	if len(profiles) != 1 || profiles[0].GetString("gateway_session") != activeID {
+		t.Fatalf("remaining profiles = %#v, want only active profile", profiles)
+	}
+}
+
+func TestCleanupGatewaySessionsCompatibleWhenSidecarAbsent(t *testing.T) {
+	app := newProductionGatewayApp(t)
+	// Simulate old/pre-migration binary: physical sidecar table is gone.
+	if _, err := app.DB().NewQuery(`drop table if exists gateway_session_profiles`).Execute(); err != nil {
+		t.Fatalf("drop gateway_session_profiles: %v", err)
+	}
+	if app.HasTable("gateway_session_profiles") {
+		t.Fatal("expected gateway_session_profiles table to be absent")
+	}
+
+	userID := createTestUser(t, app)
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	createGatewaySession(t, app, userID, "expired-old", now.Add(-8*24*time.Hour), nil)
+	createGatewaySession(t, app, userID, "active", now.Add(24*time.Hour), nil)
+
+	if err := cleanupGatewaySessions(app, now); err != nil {
+		t.Fatalf("cleanup without sidecar table: %v", err)
+	}
+
+	records, err := app.FindAllRecords("gateway_sessions")
+	if err != nil {
+		t.Fatalf("query gateway sessions: %v", err)
+	}
+	if len(records) != 1 || records[0].GetString("gateway_token_hash") != "active" {
+		t.Fatalf("remaining gateway sessions = %#v, want only active", records)
+	}
+}
+
+func TestCleanupGatewaySessionsTransactionFailureRollsBack(t *testing.T) {
+	app := newProductionGatewayApp(t)
+	ensureSessionProfilesCollection(t, app)
+
+	userID := createTestUser(t, app)
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	expiredID := createGatewaySession(t, app, userID, "expired-old", now.Add(-8*24*time.Hour), nil)
+	createGatewaySessionProfile(t, app, expiredID, "session-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", now.Add(-8*24*time.Hour))
+
+	// Block parent deletion so the transaction fails after profile deletes begin.
+	if _, err := app.DB().NewQuery(`
+create table cleanup_fk_block (
+	id text primary key not null,
+	session_id text not null references gateway_sessions(id)
+)`).Execute(); err != nil {
+		t.Fatalf("create fk block table: %v", err)
+	}
+	if _, err := app.DB().NewQuery(`
+insert into cleanup_fk_block (id, session_id) values ('block', {:session})
+`).Bind(map[string]any{"session": expiredID}).Execute(); err != nil {
+		t.Fatalf("seed fk block: %v", err)
+	}
+
+	if err := cleanupGatewaySessions(app, now); err == nil {
+		t.Fatal("cleanup expected to fail under foreign-key block")
+	}
+
+	sessions, err := app.FindAllRecords("gateway_sessions")
+	if err != nil {
+		t.Fatalf("query gateway sessions: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].Id != expiredID {
+		t.Fatalf("sessions after failed cleanup = %#v, want rolled-back parent", sessions)
+	}
+	profiles, err := app.FindAllRecords("gateway_session_profiles")
+	if err != nil {
+		t.Fatalf("query gateway_session_profiles: %v", err)
+	}
+	if len(profiles) != 1 || profiles[0].GetString("gateway_session") != expiredID {
+		t.Fatalf("profiles after failed cleanup = %#v, want rolled-back profile", profiles)
+	}
+}
+
 func createTestUser(t *testing.T, app core.App) string {
 	t.Helper()
 	return createTestUserWithName(t, app, "alice", "gateway-user")
@@ -182,7 +314,7 @@ func createPlaybackEvent(t *testing.T, app core.App, userID, itemID string, occu
 	}
 }
 
-func createGatewaySession(t *testing.T, app core.App, userID, tokenHash string, expiresAt time.Time, revokedAt *time.Time) {
+func createGatewaySession(t *testing.T, app core.App, userID, tokenHash string, expiresAt time.Time, revokedAt *time.Time) string {
 	t.Helper()
 	sessions, err := app.FindCollectionByNameOrId("gateway_sessions")
 	if err != nil {
@@ -199,5 +331,62 @@ func createGatewaySession(t *testing.T, app core.App, userID, tokenHash string, 
 	}
 	if err := app.Save(record); err != nil {
 		t.Fatalf("save gateway session: %v", err)
+	}
+	return record.Id
+}
+
+func ensureSessionProfilesCollection(t *testing.T, app core.App) *core.Collection {
+	t.Helper()
+	if collection, err := app.FindCollectionByNameOrId(pbschema.SessionProfilesCollection); err == nil {
+		return collection
+	}
+	sessions, err := app.FindCollectionByNameOrId("gateway_sessions")
+	if err != nil {
+		t.Fatalf("find gateway_sessions: %v", err)
+	}
+	if err := app.Save(pbschema.SessionProfiles(sessions.Id)); err != nil {
+		t.Fatalf("save gateway_session_profiles collection: %v", err)
+	}
+	persisted, err := app.FindCollectionByNameOrId(pbschema.SessionProfilesCollection)
+	if err != nil {
+		t.Fatalf("reload gateway_session_profiles: %v", err)
+	}
+	return persisted
+}
+
+func createGatewaySessionProfile(t *testing.T, app core.App, sessionID, publicSessionID string, lastActivityAt time.Time) string {
+	t.Helper()
+	if !sessionid.Valid(publicSessionID) {
+		t.Fatalf("invalid test public session id %q", publicSessionID)
+	}
+	profiles := ensureSessionProfilesCollection(t, app)
+	record := core.NewRecord(profiles)
+	record.Set("gateway_session", sessionID)
+	record.Set("public_session_id", publicSessionID)
+	record.Set("capabilities_json", "{}")
+	record.Set("last_activity_at", lastActivityAt)
+	if err := app.Save(record); err != nil {
+		t.Fatalf("save gateway session profile: %v", err)
+	}
+	return record.Id
+}
+
+func insertOrphanSessionProfile(t *testing.T, app core.App, missingSessionID, publicSessionID string, lastActivityAt time.Time) {
+	t.Helper()
+	if !sessionid.Valid(publicSessionID) {
+		t.Fatalf("invalid test public session id %q", publicSessionID)
+	}
+	ensureSessionProfilesCollection(t, app)
+	// Bypass relation validation so we can simulate old-binary leftovers.
+	if _, err := app.DB().NewQuery(`
+insert into gateway_session_profiles (id, gateway_session, public_session_id, capabilities_json, last_activity_at, created, updated)
+values ({:id}, {:session}, {:public_id}, '{}', {:activity}, {:activity}, {:activity})
+`).Bind(map[string]any{
+		"id":        "orphanprofile01",
+		"session":   missingSessionID,
+		"public_id": publicSessionID,
+		"activity":  lastActivityAt.UTC().Format("2006-01-02 15:04:05.000Z"),
+	}).Execute(); err != nil {
+		t.Fatalf("insert orphan profile: %v", err)
 	}
 }

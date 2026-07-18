@@ -165,9 +165,13 @@ func TestApplyExactPredecessorCheckFailsBeforeMutationAndHistory(t *testing.T) {
 
 // applyPrivate runs the unexported apply helper with a private MigrationsList
 // runner. Tests must never touch global core.AppMigrations.
+//
+// A nil validate callback is a no-op so runner-unit tests stay independent of
+// the production Phase 3 sidecar validator (use validateExtensions explicitly
+// when testing that seam).
 func applyPrivate(app core.App, list core.MigrationsList, validate func(core.App) error) error {
 	if validate == nil {
-		validate = validateExtensions
+		validate = func(core.App) error { return nil }
 	}
 	return apply(app, func(tx core.App) error {
 		_, err := core.NewMigrationsRunner(tx, list).Up()

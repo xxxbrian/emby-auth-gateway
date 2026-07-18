@@ -239,8 +239,8 @@ func TestPersonalDomainLocalMutationZeroEgressMatrix(t *testing.T) {
 		{name: "sessions_progress", method: http.MethodPost, path: "/Sessions/Playing/Progress", body: `{"ItemId":"item-1","PlaybackPositionTicks":250,"RunTimeTicks":10000000,"PlayedPercentage":50.5}`, wantStatus: http.StatusNoContent},
 		{name: "sessions_stopped", method: http.MethodPost, path: "/Sessions/Playing/Stopped", body: `{"Item":{"Id":"item-1","RunTimeTicks":10000000},"PositionTicks":5000000}`, wantStatus: http.StatusNoContent},
 		{name: "sessions_ping", method: http.MethodPost, path: "/Sessions/Playing/Ping", body: `{}`, wantStatus: http.StatusNoContent},
-		{name: "sessions_capabilities", method: http.MethodPost, path: "/Sessions/Capabilities", body: `{}`, wantStatus: http.StatusNoContent},
-		{name: "sessions_capabilities_full", method: http.MethodPost, path: "/Sessions/Capabilities/Full", body: `{}`, wantStatus: http.StatusNoContent},
+		{name: "sessions_capabilities", method: http.MethodPost, path: "/Sessions/Capabilities", body: `{}`, wantStatus: http.StatusOK},
+		{name: "sessions_capabilities_full", method: http.MethodPost, path: "/Sessions/Capabilities/Full", body: `{}`, wantStatus: http.StatusOK},
 	}
 
 	for _, tc := range cases {

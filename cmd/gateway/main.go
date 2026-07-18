@@ -333,8 +333,28 @@ func cleanupPlaybackEvents(app core.App, now time.Time) error {
 
 func cleanupGatewaySessions(app core.App, now time.Time) error {
 	cutoff := now.UTC().Add(-7 * 24 * time.Hour)
-	_, err := app.DB().NewQuery("delete from gateway_sessions where expires_at < {:cutoff} or (revoked_at is not null and revoked_at != '' and revoked_at < {:cutoff})").Bind(map[string]any{"cutoff": cutoff}).Execute()
-	return err
+	return app.RunInTransaction(func(tx core.App) error {
+		// Sidecar may be absent on old/pre-migration binaries; only touch it when present.
+		if tx.HasTable("gateway_session_profiles") {
+			// Explicitly delete profiles for expired/revoked parents before parents.
+			// Do not rely solely on CascadeDelete (raw SQL and old leftovers).
+			if _, err := tx.DB().NewQuery(
+				"delete from gateway_session_profiles where gateway_session in (select id from gateway_sessions where expires_at < {:cutoff} or (revoked_at is not null and revoked_at != '' and revoked_at < {:cutoff}))",
+			).Bind(map[string]any{"cutoff": cutoff}).Execute(); err != nil {
+				return err
+			}
+			// Purge orphan profiles whose parent session no longer exists.
+			if _, err := tx.DB().NewQuery(
+				"delete from gateway_session_profiles where not exists (select 1 from gateway_sessions s where s.id = gateway_session_profiles.gateway_session)",
+			).Execute(); err != nil {
+				return err
+			}
+		}
+		_, err := tx.DB().NewQuery(
+			"delete from gateway_sessions where expires_at < {:cutoff} or (revoked_at is not null and revoked_at != '' and revoked_at < {:cutoff})",
+		).Bind(map[string]any{"cutoff": cutoff}).Execute()
+		return err
+	})
 }
 
 func envDefault(name, fallback string) string {

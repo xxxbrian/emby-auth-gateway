@@ -2,7 +2,6 @@ package pbstore
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -923,78 +922,6 @@ func addPlaybackAggregate(aggregate gateway.PlaybackAggregate, state gateway.Pla
 		aggregate.LastActivityDate = &t
 	}
 	return aggregate
-}
-
-func (s *Store) SaveSession(ctx context.Context, session *gateway.Session) error {
-	collection, err := s.app.FindCollectionByNameOrId("gateway_sessions")
-	if err != nil {
-		return err
-	}
-	record := core.NewRecord(collection)
-	record.Set("gateway_token_hash", session.GatewayTokenHash)
-	record.Set("gateway_user", session.GatewayUserID)
-	record.Set("gateway_username", session.GatewayUsername)
-	record.Set("synthetic_user_id", session.SyntheticUserID)
-	record.Set("client", session.Client)
-	record.Set("device", session.Device)
-	record.Set("device_id", session.DeviceID)
-	record.Set("version", session.Version)
-	record.Set("remote_ip", session.RemoteIP)
-	record.Set("expires_at", session.ExpiresAt)
-	return s.app.Save(record)
-}
-
-func (s *Store) SessionTokenExists(ctx context.Context, tokenHash string) (bool, error) {
-	// Resolve the collection first so a missing/broken schema is an operational
-	// error rather than a false "not found".
-	if _, err := s.app.FindCollectionByNameOrId("gateway_sessions"); err != nil {
-		return false, err
-	}
-	_, err := s.app.FindFirstRecordByData("gateway_sessions", "gateway_token_hash", tokenHash)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
-}
-
-func (s *Store) FindSessionByTokenHash(ctx context.Context, tokenHash string) (*gateway.Session, error) {
-	record, err := s.app.FindFirstRecordByData("gateway_sessions", "gateway_token_hash", tokenHash)
-	if err != nil {
-		return nil, gateway.ErrNotFound
-	}
-	createdAt := record.GetDateTime("created").Time()
-	expiresAt := record.GetDateTime("expires_at").Time()
-	var revokedAt *time.Time
-	if !record.GetDateTime("revoked_at").IsZero() {
-		t := record.GetDateTime("revoked_at").Time()
-		revokedAt = &t
-	}
-	return &gateway.Session{
-		GatewayTokenHash: record.GetString("gateway_token_hash"),
-		GatewayUserID:    record.GetString("gateway_user"),
-		GatewayUsername:  record.GetString("gateway_username"),
-		SyntheticUserID:  record.GetString("synthetic_user_id"),
-		Client:           record.GetString("client"),
-		Device:           record.GetString("device"),
-		DeviceID:         record.GetString("device_id"),
-		Version:          record.GetString("version"),
-		RemoteIP:         record.GetString("remote_ip"),
-		CreatedAt:        createdAt,
-		ExpiresAt:        expiresAt,
-		RevokedAt:        revokedAt,
-	}, nil
-}
-
-func (s *Store) RevokeSession(ctx context.Context, tokenHash string) error {
-	record, err := s.app.FindFirstRecordByData("gateway_sessions", "gateway_token_hash", tokenHash)
-	if err != nil {
-		return gateway.ErrNotFound
-	}
-	record.Set("revoked_at", time.Now().UTC())
-	return s.app.Save(record)
 }
 
 func (s *Store) enabledPathPolicies() ([]gateway.PathPolicy, error) {

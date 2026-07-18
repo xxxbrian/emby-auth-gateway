@@ -39,7 +39,7 @@ func (s *Server) handlePersonalDataRequest(w http.ResponseWriter, r *http.Reques
 		s.writeLatestItems(w, r, rel, session, gatewayToken)
 		return true
 	case isSessionsPath(rel):
-		s.writeFilteredSessions(w, r, rel, session, gatewayToken)
+		s.writeLocalSessions(w, r, session)
 		return true
 	case queryHasPersonalFilter(r.URL.Query()) && !isAllowedPersonalItemListPath(rel) && !isClearlyNonItemEndpoint(rel):
 		http.Error(w, "unsupported personal filter path", http.StatusBadRequest)
@@ -65,8 +65,15 @@ func (s *Server) handleLocalSessionStateRequest(w http.ResponseWriter, r *http.R
 		}
 		w.WriteHeader(http.StatusNoContent)
 		return true
-	case isPlaybackKeepaliveRequest(r.Method, rel), isSessionCapabilitiesRequest(r.Method, rel):
+	case isPlaybackKeepaliveRequest(r.Method, rel):
 		w.WriteHeader(http.StatusNoContent)
+		return true
+	case isSessionCapabilitiesRequest(r.Method, rel):
+		if equalPath(rel, "/Sessions/Capabilities/Full") {
+			s.handleSessionCapabilitiesFull(w, r, session)
+			return true
+		}
+		s.handleSessionCapabilitiesSlim(w, r, session)
 		return true
 	default:
 		return false
@@ -297,22 +304,29 @@ func (s *Server) writeLatestItems(w http.ResponseWriter, r *http.Request, rel st
 	writeJSON(w, status, items)
 }
 
-func (s *Server) writeFilteredSessions(w http.ResponseWriter, r *http.Request, rel string, session *Session, gatewayToken string) {
-	value, status, upstream, err := s.fetchBackendJSON(r.Context(), r, rel, r.URL.RawQuery, session, gatewayToken)
+// writeLocalSessions serves GET /Sessions from gateway-owned session state only.
+// Zero upstream Ensure/dial. Returns a raw SessionInfo array with no-store.
+func (s *Server) writeLocalSessions(w http.ResponseWriter, r *http.Request, session *Session) {
+	now := time.Now().UTC()
+	sessions, err := s.sessions.ListActiveSessions(r.Context(), session.GatewayUserID, now)
 	if err != nil {
-		http.Error(w, "backend unavailable", http.StatusBadGateway)
+		s.audit(r.Context(), AuditLog{
+			GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID,
+			Event: "session_list_failed", Message: "session list failed",
+			RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusInternalServerError,
+			ErrorKind: "session_list",
+		})
+		w.Header().Set("Cache-Control", "no-store")
+		http.Error(w, "sessions unavailable", http.StatusInternalServerError)
 		return
 	}
-	rewritten := s.rewriteProxyJSONValueForRequestWithSnapshot(r.Context(), r, value, session, upstream, gatewayToken, s.gatewayBaseForRequest(r))
-	deviceID := upstream.identity.WithDefaults().DeviceID
-	if deviceID == "" {
-		writeJSON(w, status, []any{})
-		return
+	filtered := filterLocalSessions(sessions, session, r.URL.Query())
+	items := make([]any, 0, len(filtered))
+	for i := range filtered {
+		items = append(items, sessionInfoDTO(&filtered[i], s.cfg.GatewayServerID))
 	}
-	writeJSON(w, status, filterItemsValue(rewritten, func(item map[string]any) bool {
-		id, _ := stringField(item, "DeviceId")
-		return id == deviceID
-	}))
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, items)
 }
 
 func (s *Server) writeNextUpItems(w http.ResponseWriter, r *http.Request, session *Session, gatewayToken string) {

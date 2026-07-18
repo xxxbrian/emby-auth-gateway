@@ -368,7 +368,7 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	session := &Session{
+	session := Session{
 		GatewayTokenHash: tokenHash,
 		GatewayUserID:    user.ID,
 		GatewayUsername:  user.Username,
@@ -380,8 +380,10 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 		RemoteIP:         remoteIP(r),
 		CreatedAt:        now,
 		ExpiresAt:        now.Add(defaultSessionTTL),
+		LastActivityAt:   now,
 	}
-	if err := s.sessions.SaveSession(ctx, session); err != nil {
+	persisted, err := s.sessions.CreateSession(ctx, session)
+	if err != nil {
 		s.audit(ctx, AuditLog{GatewayUserID: user.ID, SyntheticUserID: user.SyntheticUserID, Event: "session_save_failure", Message: "session save failed", RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusInternalServerError})
 		s.emit(observe.Event{
 			Kind:       observe.KindAuthLogin,
@@ -406,8 +408,8 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 	})
 
 	w.Header().Set("Cache-Control", "no-store")
-	s.setResourceCookie(w, token, session.ExpiresAt)
-	writeJSON(w, http.StatusOK, authenticationResultDTO(*user, session, token, s.cfg.GatewayServerID))
+	s.setResourceCookie(w, token, persisted.ExpiresAt)
+	writeJSON(w, http.StatusOK, authenticationResultDTO(*user, persisted, token, s.cfg.GatewayServerID))
 }
 
 type authenticateForm struct {
@@ -548,6 +550,7 @@ func (s *Server) handleCurrentUser(w http.ResponseWriter, r *http.Request, rel s
 		return
 	}
 	s.noteSession(session, decision)
+	s.touchSessionActivityBestEffort(r.Context(), session, r)
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, privateUserDTO(session.GatewayUsername, session.SyntheticUserID, s.cfg.GatewayServerID))
 }
@@ -593,6 +596,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string,
 	}
 	if s.handlePersonalDataRequest(w, r, rel, session, gatewayToken) {
 		s.noteSession(session, decision)
+		// Capability updates always write activity themselves; skip coalesced touch.
+		if !isSessionCapabilitiesRequest(r.Method, rel) {
+			s.touchSessionActivityBestEffort(r.Context(), session, r)
+		}
 		return
 	}
 	// Fail closed: LocalSession must be consumed by a local handler, never proxied.
@@ -601,6 +608,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string,
 		return
 	}
 	s.noteSession(session, decision)
+	s.touchSessionActivityBestEffort(r.Context(), session, r)
 	runtime, err := s.upstreamAuth.Ensure(r.Context())
 	if err != nil {
 		if r.Context().Err() != nil || errors.Is(err, context.Canceled) {
@@ -949,7 +957,24 @@ func (s *Server) lookupActiveSession(w http.ResponseWriter, r *http.Request, tok
 		return nil, false
 	}
 	session, err := s.sessions.FindSessionByTokenHash(r.Context(), HashToken(token))
-	if err != nil || session == nil || !session.Active(time.Now().UTC()) {
+	if err != nil {
+		if r.Context().Err() != nil || errors.Is(err, context.Canceled) {
+			panic(http.ErrAbortHandler)
+		}
+		if errors.Is(err, ErrNotFound) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return nil, false
+		}
+		// Operational/repair failures are not auth denials.
+		s.audit(r.Context(), AuditLog{
+			Event: "session_lookup_failed", Message: "session lookup failed",
+			RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusInternalServerError,
+			ErrorKind: "session_lookup",
+		})
+		http.Error(w, "session unavailable", http.StatusInternalServerError)
+		return nil, false
+	}
+	if session == nil || !session.Active(time.Now().UTC()) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return nil, false
 	}
@@ -2684,23 +2709,11 @@ func userDTO(user GatewayUser, serverID string) map[string]any {
 
 func authenticationResultDTO(user GatewayUser, session *Session, token, serverID string) map[string]any {
 	userObj := privateUserDTO(user.Username, user.SyntheticUserID, serverID)
-	sessionInfo := map[string]any{
-		"ServerId":           serverID,
-		"UserId":             user.SyntheticUserID,
-		"UserName":           user.Username,
-		"Client":             session.Client,
-		"DeviceName":         session.Device,
-		"DeviceId":           session.DeviceID,
-		"ApplicationVersion": session.Version,
-		"SupportedCommands":  []any{},
-		"PlayableMediaTypes": []any{},
-		"AdditionalUsers":    []any{},
-	}
 	return map[string]any{
 		"AccessToken": token,
 		"ServerId":    serverID,
 		"User":        userObj,
-		"SessionInfo": sessionInfo,
+		"SessionInfo": sessionInfoDTO(session, serverID),
 	}
 }
 

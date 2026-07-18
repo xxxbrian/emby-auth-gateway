@@ -1,15 +1,16 @@
 // Package pbmigrations applies native PocketBase AppMigrations as a
 // single-writer application-migration operation.
 //
-// Production migrations register on core.AppMigrations (via migrations.Register
-// or equivalent). Apply is the Gateway entrypoint that runs those native
-// migrations and a write-free final extension validator seam reserved for
-// Phase 3 sidecar collection checks. Operational upgrades remain single-writer;
-// there is no process-level migration flock beyond SQLite busy timeout/retry.
+// Production migrations register on core.AppMigrations (via init Register in
+// this package). Apply is the Gateway entrypoint that runs those native
+// migrations and a write-free final extension validator for Phase 3 sidecar
+// collection checks. Operational upgrades remain single-writer; there is no
+// process-level migration flock beyond SQLite busy timeout/retry.
 package pbmigrations
 
 import (
 	"github.com/pocketbase/pocketbase/core"
+	"github.com/xxxbrian/emby-auth-gateway/internal/pbschema"
 )
 
 // Apply runs native AppMigrations and a write-free final extension validator.
@@ -25,7 +26,7 @@ func Apply(app core.App) error {
 }
 
 // apply is the testable migration runner. Production uses Apply (native
-// AppMigrations + no-op validateExtensions). Tests inject a private
+// AppMigrations + validateExtensions). Tests inject a private
 // core.MigrationsList runner and custom validators so they never mutate
 // global core.AppMigrations.
 func apply(app core.App, run func(tx core.App) error, validate func(tx core.App) error) error {
@@ -39,8 +40,9 @@ func apply(app core.App, run func(tx core.App) error, validate func(tx core.App)
 	})
 }
 
-// validateExtensions is the Phase 3 extension-validator seam.
-// Phase 2 is intentionally a no-op; Phase 3 will assert sidecar collections.
-func validateExtensions(core.App) error {
-	return nil
+// validateExtensions is the write-free Phase 3 extension validator.
+// It asserts exact gateway_session_profiles schema/DDL only and deliberately
+// does not require row coverage (runtime repair handles auth-row holes).
+func validateExtensions(app core.App) error {
+	return pbschema.ValidateSessionProfiles(app)
 }

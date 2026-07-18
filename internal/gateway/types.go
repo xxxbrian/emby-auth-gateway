@@ -394,6 +394,21 @@ type Session struct {
 	CreatedAt        time.Time
 	ExpiresAt        time.Time
 	RevokedAt        *time.Time
+
+	// Sidecar-hydrated projection fields (not gateway_sessions columns).
+	PublicID       string
+	Capabilities   SessionCapabilities
+	LastActivityAt time.Time
+}
+
+// SessionCapabilities is the client capability projection stored as canonical JSON
+// with known fields hydrated for SessionInfo and local session listing.
+type SessionCapabilities struct {
+	RawJSON              string
+	PlayableMediaTypes   []string
+	SupportedCommands    []string
+	SupportsMediaControl bool
+	SupportsSync         bool
 }
 
 func (s *Session) Active(now time.Time) bool {
