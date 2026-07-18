@@ -503,14 +503,25 @@ func TestValidateExtensionsShapeOnlyAllowsRowHole(t *testing.T) {
 	if err := app.Save(pbschema.SessionProfiles(sessions.Id)); err != nil {
 		t.Fatal(err)
 	}
+	// Session profiles alone is insufficient: final validator requires both.
+	if err := validateExtensions(app); err == nil {
+		t.Fatal("expected missing current playbacks failure")
+	}
+	if err := app.Save(pbschema.CurrentPlaybacks(sessions.Id)); err != nil {
+		t.Fatal(err)
+	}
 	userID := saveUser(t, app, "hole", "syn-hole")
 	saveSession(t, app, userID, "hash-hole")
-	before := countProfiles(t, app)
+	beforeProfiles := countProfiles(t, app)
+	beforePlaybacks := countCurrentPlaybacks(t, app)
 	if err := validateExtensions(app); err != nil {
-		t.Fatalf("validateExtensions with hole: %v", err)
+		t.Fatalf("validateExtensions with holes: %v", err)
 	}
-	if countProfiles(t, app) != before {
+	if countProfiles(t, app) != beforeProfiles {
 		t.Fatal("validateExtensions wrote profile rows")
+	}
+	if countCurrentPlaybacks(t, app) != beforePlaybacks {
+		t.Fatal("validateExtensions wrote current playback rows")
 	}
 }
 
@@ -589,7 +600,7 @@ func TestApplyFinalValidatorRequiresSidecar(t *testing.T) {
 	list.Register(func(core.App) error { return nil }, nil, "1_noop.go")
 	err := applyPrivate(app, list, validateExtensions)
 	if err == nil {
-		t.Fatal("expected final validator to fail without sidecar")
+		t.Fatal("expected final validator to fail without sidecars")
 	}
 }
 
@@ -605,7 +616,14 @@ func TestProductionApplyCreatesSidecar(t *testing.T) {
 		t.Fatalf("Apply: %v", err)
 	}
 	assertMigrationHistory(t, app, migrationGatewaySessionProfiles, true)
+	assertMigrationHistory(t, app, migrationGatewayCurrentPlaybacks, true)
 	assertFullCoverage(t, app, 1)
+	if err := pbschema.ValidateCurrentPlaybacks(app); err != nil {
+		t.Fatalf("current playbacks after Apply: %v", err)
+	}
+	if countCurrentPlaybacks(t, app) != 0 {
+		t.Fatal("current playbacks must start empty (no backfill)")
+	}
 	// Second Apply is history no-op + write-free validator.
 	if err := Apply(app); err != nil {
 		t.Fatalf("second Apply: %v", err)
@@ -631,12 +649,28 @@ func TestIsRecognizedUniqueCollision(t *testing.T) {
 	}
 }
 
-// applySessionProfilesMigration runs the production up function via a private
+// applySessionProfilesMigration runs the Phase 3 up function via a private
 // MigrationsList so tests never reset global core.AppMigrations.
+//
+// Final validation is limited to SessionProfiles so Phase 3 tests stay isolated
+// from the Phase 4 current-playbacks sidecar (production Apply validates both).
 func applySessionProfilesMigration(app core.App) error {
 	list := core.MigrationsList{}
 	list.Register(upGatewaySessionProfiles, downGatewaySessionProfiles, migrationGatewaySessionProfiles)
-	return applyPrivate(app, list, validateExtensions)
+	return applyPrivate(app, list, pbschema.ValidateSessionProfiles)
+}
+
+func countCurrentPlaybacks(t *testing.T, app core.App) int {
+	t.Helper()
+	// Collection may be absent in pre-migration fixtures.
+	if _, err := app.FindCollectionByNameOrId(pbschema.CurrentPlaybacksCollection); err != nil {
+		return 0
+	}
+	records, err := app.FindAllRecords(pbschema.CurrentPlaybacksCollection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(records)
 }
 
 func saveUser(t *testing.T, app core.App, username, synthetic string) string {

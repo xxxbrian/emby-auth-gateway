@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -1680,9 +1681,16 @@ func TestPlaybackEventsAndStateAreRecordedWithoutForwarding(t *testing.T) {
 		httpReq := mustRequest(t, http.MethodPost, gw.URL+"/emby"+req.path+"?api_key="+gatewayToken, strings.NewReader(req.body))
 		httpReq.Header.Set("Content-Type", "application/json")
 		resp := do(t, httpReq)
+		body, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusNoContent {
-			t.Fatalf("%s status = %d, want 204", req.path, resp.StatusCode)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s status = %d, want 200", req.path, resp.StatusCode)
+		}
+		if resp.Header.Get("Cache-Control") != "no-store" {
+			t.Fatalf("%s Cache-Control = %q, want no-store", req.path, resp.Header.Get("Cache-Control"))
+		}
+		if len(bytes.TrimSpace(body)) != 0 {
+			t.Fatalf("%s body = %q, want empty", req.path, body)
 		}
 	}
 	if len(forwarded) != 0 || len(store.PlaybackEvents) != 3 {
@@ -1713,8 +1721,11 @@ func TestPlaybackReportsSucceedWhenBackendUnavailable(t *testing.T) {
 	req := mustRequest(t, http.MethodPost, gw.URL+"/emby/Sessions/Playing/Progress?api_key=gateway-token&ItemId=item-1&PlaybackPositionTicks=700", nil)
 	resp := do(t, req)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("playback status = %d, want 204", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("playback status = %d, want 200", resp.StatusCode)
+	}
+	if resp.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", resp.Header.Get("Cache-Control"))
 	}
 	state, err := store.FindPlaybackState(context.Background(), "u1", "item-1")
 	if err != nil || state.PlaybackPositionTicks != 700 {
@@ -1740,12 +1751,11 @@ func TestPlaybackPingAndCapabilitiesAreLocalOnly(t *testing.T) {
 		req.Header.Set("Content-Type", "application/json")
 		resp := do(t, req)
 		_ = resp.Body.Close()
-		want := http.StatusNoContent
-		if path != "/Sessions/Playing/Ping" {
-			want = http.StatusOK // capabilities return empty 200
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s status = %d, want 200", path, resp.StatusCode)
 		}
-		if resp.StatusCode != want {
-			t.Fatalf("%s status = %d, want %d", path, resp.StatusCode, want)
+		if resp.Header.Get("Cache-Control") != "no-store" {
+			t.Fatalf("%s Cache-Control = %q, want no-store", path, resp.Header.Get("Cache-Control"))
 		}
 	}
 	if len(forwarded) != 0 || len(store.PlaybackEvents) != 0 || len(store.PlaybackStates) != 0 {
@@ -1784,23 +1794,36 @@ func TestRemoteControlPlaybackRequestIsDenied(t *testing.T) {
 }
 
 func TestStoppedPlaybackUsesEmbyTicksForResumeThresholds(t *testing.T) {
-	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
-	state := &PlaybackState{
-		GatewayUserID:         "u1",
-		SyntheticUserID:       "gateway-user",
-		ItemID:                "movie-1",
-		RunTimeTicks:          30 * 60 * embyTicksPerSecond,
-		PlaybackPositionTicks: 3 * 60 * embyTicksPerSecond,
+	// Production path: HTTP Stopped report + MemoryStore (default Config thresholds).
+	store := NewMemoryStore()
+	store.Sessions[HashToken("gateway-token")] = testSession()
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	// 10% into a 30 minute video with default min/max should remain resumable.
+	runtime := 30 * 60 * embyTicksPerSecond
+	pos := 3 * 60 * embyTicksPerSecond
+	body := fmt.Sprintf(`{"ItemId":"movie-1","PositionTicks":%d,"RunTimeTicks":%d}`, pos, runtime)
+	req := mustRequest(t, http.MethodPost, gw.URL+"/emby/Sessions/Playing/Stopped?api_key=gateway-token", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := do(t, req)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
 	}
-	applyStoppedPlaybackState(state, now, false, resumePolicy{MinPct: defaultMinResumePct, MaxPct: defaultMaxResumePct, MinDurationSeconds: defaultMinResumeDurationSeconds})
-	if state.Played || state.PlaybackPositionTicks != 3*60*embyTicksPerSecond || state.PlayCount != 0 || state.LastPlayedDate != nil {
-		t.Fatalf("10%% into a 30 minute video should remain resumable: %#v", state)
+	state, err := store.FindPlaybackState(context.Background(), "u1", "movie-1")
+	if err != nil || state.Played || state.PlaybackPositionTicks != pos || state.PlayCount != 0 || state.LastPlayedDate != nil {
+		t.Fatalf("10%% into a 30 minute video should remain resumable: %#v err=%v", state, err)
 	}
 
-	unknownRuntime := &PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "movie-2", PlaybackPositionTicks: 1000}
-	applyStoppedPlaybackState(unknownRuntime, now, false, resumePolicy{MinPct: defaultMinResumePct, MaxPct: defaultMaxResumePct, MinDurationSeconds: defaultMinResumeDurationSeconds})
-	if unknownRuntime.Played || unknownRuntime.PlaybackPositionTicks != 1000 || unknownRuntime.PlayCount != 0 {
-		t.Fatalf("unknown runtime should keep resume position instead of completing: %#v", unknownRuntime)
+	// Unknown runtime preserves resume (no percentage-only completion).
+	req = mustRequest(t, http.MethodPost, gw.URL+"/emby/Sessions/Playing/Stopped?api_key=gateway-token", strings.NewReader(`{"ItemId":"movie-2","PositionTicks":1000}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp = do(t, req)
+	_ = resp.Body.Close()
+	unknown, err := store.FindPlaybackState(context.Background(), "u1", "movie-2")
+	if err != nil || unknown.Played || unknown.PlaybackPositionTicks != 1000 || unknown.PlayCount != 0 {
+		t.Fatalf("unknown runtime should keep resume position: %#v err=%v", unknown, err)
 	}
 }
 
@@ -2859,8 +2882,8 @@ func TestPlaybackReportsCanUseFormBodyAndQueryParameters(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp := do(t, req)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("form playback status = %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("form playback status = %d, want 200", resp.StatusCode)
 	}
 	state, err := store.FindPlaybackState(context.Background(), "u1", "form-item")
 	if err != nil || state.PlaybackPositionTicks != 300 || state.RunTimeTicks != 1000 {
@@ -2869,8 +2892,8 @@ func TestPlaybackReportsCanUseFormBodyAndQueryParameters(t *testing.T) {
 
 	resp = do(t, mustRequest(t, http.MethodPost, gw.URL+"/emby/Sessions/Playing/Progress?api_key=gateway-token&ItemId=query-item&PlaybackPositionTicks=700", nil))
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("query playback status = %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("query playback status = %d, want 200", resp.StatusCode)
 	}
 	state, err = store.FindPlaybackState(context.Background(), "u1", "query-item")
 	if err != nil || state.PlaybackPositionTicks != 700 {
@@ -2881,8 +2904,8 @@ func TestPlaybackReportsCanUseFormBodyAndQueryParameters(t *testing.T) {
 	jsonReq.Header.Set("Content-Type", "application/json")
 	resp = do(t, jsonReq)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("json/query playback status = %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("json/query playback status = %d, want 200", resp.StatusCode)
 	}
 	state, err = store.FindPlaybackState(context.Background(), "u1", "json-query-item")
 	if err != nil || state.PlaybackPositionTicks != 900 || state.RunTimeTicks != 1800 {

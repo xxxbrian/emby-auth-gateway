@@ -3,12 +3,16 @@
 //
 // Production migrations register on core.AppMigrations (via init Register in
 // this package). Apply is the Gateway entrypoint that runs those native
-// migrations and a write-free final extension validator for Phase 3 sidecar
-// collection checks. Operational upgrades remain single-writer; there is no
-// process-level migration flock beyond SQLite busy timeout/retry.
+// migrations and a write-free final extension validator for sidecar collection
+// checks (session profiles and current playbacks). Operational upgrades remain
+// single-writer; there is no process-level migration flock beyond SQLite busy
+// timeout/retry.
 package pbmigrations
 
 import (
+	"fmt"
+
+	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pbschema"
 )
@@ -17,7 +21,7 @@ import (
 //
 // The run and validate steps execute inside an atomic nested
 // AuxRunInTransaction -> RunInTransaction boundary so nested native migration
-// transactions reuse the callback app and any Phase 3 validator failure rolls
+// transactions reuse the callback app and any extension validator failure rolls
 // back with the migration work.
 func Apply(app core.App) error {
 	return apply(app, func(tx core.App) error {
@@ -40,9 +44,29 @@ func apply(app core.App, run func(tx core.App) error, validate func(tx core.App)
 	})
 }
 
-// validateExtensions is the write-free Phase 3 extension validator.
-// It asserts exact gateway_session_profiles schema/DDL only and deliberately
-// does not require row coverage (runtime repair handles auth-row holes).
+// validateExtensions is the write-free extension validator for all gateway
+// sidecars. Every bootstrap strictly validates both gateway_session_profiles
+// and gateway_current_playbacks schema/DDL. It deliberately does not require
+// row coverage (runtime repair handles auth-row and playback holes).
 func validateExtensions(app core.App) error {
-	return pbschema.ValidateSessionProfiles(app)
+	if err := pbschema.ValidateSessionProfiles(app); err != nil {
+		return err
+	}
+	return pbschema.ValidateCurrentPlaybacks(app)
+}
+
+// requirePredecessorApplied fails when the exact native migration history row
+// for file is missing. Callers must invoke this before any mutation so a
+// missing predecessor aborts without partial schema changes.
+func requirePredecessorApplied(app core.App, file string) error {
+	var exists int
+	err := app.DB().Select("(1)").
+		From(core.DefaultMigrationsTable).
+		Where(dbx.HashExp{"file": file}).
+		Limit(1).
+		Row(&exists)
+	if err != nil || exists == 0 {
+		return fmt.Errorf("exact predecessor %q is not applied", file)
+	}
+	return nil
 }

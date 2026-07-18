@@ -15,68 +15,65 @@ import (
 	"time"
 )
 
-func (s *Server) handlePersonalDataRequest(w http.ResponseWriter, r *http.Request, rel string, session *Session, gatewayToken string) bool {
-	if s.handleLocalSessionStateRequest(w, r, rel, session, gatewayToken) {
-		return true
+type personalDataHandlingOutcome struct {
+	Handled              bool
+	NoteSuccess          bool
+	AllowGenericActivity bool
+}
+
+var handledPersonalData = personalDataHandlingOutcome{Handled: true, NoteSuccess: true, AllowGenericActivity: true}
+
+func (s *Server) handlePersonalDataRequest(w http.ResponseWriter, r *http.Request, rel string, session *Session, gatewayToken string) personalDataHandlingOutcome {
+	if outcome := s.handleLocalSessionStateRequest(w, r, rel, session, gatewayToken); outcome.Handled {
+		return outcome
 	}
 	if s.handleDisplayPreferences(w, r, rel, session) {
-		return true
+		return handledPersonalData
 	}
 	if s.handlePersonalStateWrite(w, r, rel, session, gatewayToken) {
-		return true
+		return handledPersonalData
 	}
 	if r.Method != http.MethodGet {
-		return false
+		return personalDataHandlingOutcome{}
 	}
 	switch {
 	case isResumePath(rel):
 		s.writeResumeItems(w, r, session, gatewayToken)
-		return true
+		return handledPersonalData
 	case isNextUpPath(rel):
 		s.writeNextUpItems(w, r, session, gatewayToken)
-		return true
+		return handledPersonalData
 	case isLatestItemsPath(rel):
 		s.writeLatestItems(w, r, rel, session, gatewayToken)
-		return true
+		return handledPersonalData
 	case isSessionsPath(rel):
 		s.writeLocalSessions(w, r, session)
-		return true
+		return handledPersonalData
 	case queryHasPersonalFilter(r.URL.Query()) && !isAllowedPersonalItemListPath(rel) && !isClearlyNonItemEndpoint(rel):
 		http.Error(w, "unsupported personal filter path", http.StatusBadRequest)
-		return true
+		return handledPersonalData
 	case shouldLocalizePersonalFilter(rel, r.URL.Query()):
 		s.writePersonalFilteredItems(w, r, rel, session, gatewayToken)
-		return true
+		return handledPersonalData
 	default:
-		return false
+		return personalDataHandlingOutcome{}
 	}
 }
 
-func (s *Server) handleLocalSessionStateRequest(w http.ResponseWriter, r *http.Request, rel string, session *Session, gatewayToken string) bool {
+func (s *Server) handleLocalSessionStateRequest(w http.ResponseWriter, r *http.Request, rel string, session *Session, gatewayToken string) personalDataHandlingOutcome {
 	switch {
-	case isPlaybackReportRequest(r.Method, rel):
-		if err := s.recordPlaybackRequest(r, rel, session, gatewayToken); err != nil {
-			if errors.Is(err, ErrBadRequest) {
-				http.Error(w, "bad request body", http.StatusBadRequest)
-				return true
-			}
-			http.Error(w, "playback state unavailable", http.StatusInternalServerError)
-			return true
-		}
-		w.WriteHeader(http.StatusNoContent)
-		return true
-	case isPlaybackKeepaliveRequest(r.Method, rel):
-		w.WriteHeader(http.StatusNoContent)
-		return true
+	case isPlaybackReportRequest(r.Method, rel), isPlaybackKeepaliveRequest(r.Method, rel):
+		success := s.handlePlaybackReport(w, r, rel, session, gatewayToken)
+		return personalDataHandlingOutcome{Handled: true, NoteSuccess: success}
 	case isSessionCapabilitiesRequest(r.Method, rel):
 		if equalPath(rel, "/Sessions/Capabilities/Full") {
 			s.handleSessionCapabilitiesFull(w, r, session)
-			return true
+			return personalDataHandlingOutcome{Handled: true, NoteSuccess: true}
 		}
 		s.handleSessionCapabilitiesSlim(w, r, session)
-		return true
+		return personalDataHandlingOutcome{Handled: true, NoteSuccess: true}
 	default:
-		return false
+		return personalDataHandlingOutcome{}
 	}
 }
 
@@ -305,7 +302,9 @@ func (s *Server) writeLatestItems(w http.ResponseWriter, r *http.Request, rel st
 }
 
 // writeLocalSessions serves GET /Sessions from gateway-owned session state only.
-// Zero upstream Ensure/dial. Returns a raw SessionInfo array with no-store.
+// Zero upstream Ensure/dial (including no /Sessions proxy). Filter first, then
+// one batched ListCurrentPlaybacks and optional batched local UserData load.
+// Returns a raw SessionInfo array with no-store.
 func (s *Server) writeLocalSessions(w http.ResponseWriter, r *http.Request, session *Session) {
 	now := time.Now().UTC()
 	sessions, err := s.sessions.ListActiveSessions(r.Context(), session.GatewayUserID, now)
@@ -321,9 +320,114 @@ func (s *Server) writeLocalSessions(w http.ResponseWriter, r *http.Request, sess
 		return
 	}
 	filtered := filterLocalSessions(sessions, session, r.URL.Query())
+
+	// Collect token hashes after filter; one batch current-playback load (no N+1).
+	hashes := make([]string, 0, len(filtered))
+	for i := range filtered {
+		if h := filtered[i].GatewayTokenHash; h != "" {
+			hashes = append(hashes, h)
+		}
+	}
+
+	currents := map[string]CurrentPlayback{}
+	if len(hashes) > 0 {
+		repo, repoErr := s.playbackRepo()
+		if repoErr != nil {
+			s.audit(r.Context(), AuditLog{
+				GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID,
+				Event: "session_current_playback_list_failed", Message: "current playback list unavailable",
+				RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusInternalServerError,
+				ErrorKind: "current_playback_list",
+			})
+			w.Header().Set("Cache-Control", "no-store")
+			http.Error(w, "sessions unavailable", http.StatusInternalServerError)
+			return
+		}
+		listed, listErr := repo.ListCurrentPlaybacks(r.Context(), hashes)
+		if listErr != nil {
+			s.audit(r.Context(), AuditLog{
+				GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID,
+				Event: "session_current_playback_list_failed", Message: "current playback list failed",
+				RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusInternalServerError,
+				ErrorKind: "current_playback_list",
+			})
+			w.Header().Set("Cache-Control", "no-store")
+			http.Error(w, "sessions unavailable", http.StatusInternalServerError)
+			return
+		}
+		if listed != nil {
+			currents = listed
+		}
+	}
+
+	// Validate currents (fail closed on integrity) and collect item IDs for UserData.
+	itemIDs := make([]string, 0, len(currents))
+	seenItems := make(map[string]struct{}, len(currents))
+	validated := make(map[string]CurrentPlayback, len(currents))
+	for i := range filtered {
+		hash := filtered[i].GatewayTokenHash
+		cp, ok := currents[hash]
+		if !ok {
+			continue
+		}
+		if err := ValidateCurrentPlayback(&cp, hash); err != nil {
+			s.audit(r.Context(), AuditLog{
+				GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID,
+				Event: "session_current_playback_corrupt", Message: "current playback integrity failure",
+				RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusInternalServerError,
+				ErrorKind: "current_playback_integrity",
+			})
+			w.Header().Set("Cache-Control", "no-store")
+			http.Error(w, "sessions unavailable", http.StatusInternalServerError)
+			return
+		}
+		validated[hash] = cp
+		if _, seen := seenItems[cp.ItemID]; !seen && cp.ItemID != "" {
+			seenItems[cp.ItemID] = struct{}{}
+			itemIDs = append(itemIDs, cp.ItemID)
+		}
+	}
+
+	// Batch gateway-local UserData for the authenticated gateway user only.
+	states := map[string]*PlaybackState{}
+	if len(itemIDs) > 0 {
+		loaded, loadErr := s.store.ListPlaybackStatesByItemIDs(r.Context(), session.GatewayUserID, itemIDs)
+		if loadErr != nil {
+			s.audit(r.Context(), AuditLog{
+				GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID,
+				Event: "session_playback_state_list_failed", Message: "playback state list failed",
+				RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusInternalServerError,
+				ErrorKind: "playback_state_list",
+			})
+			w.Header().Set("Cache-Control", "no-store")
+			http.Error(w, "sessions unavailable", http.StatusInternalServerError)
+			return
+		}
+		if loaded != nil {
+			states = loaded
+		}
+	}
+
 	items := make([]any, 0, len(filtered))
 	for i := range filtered {
-		items = append(items, sessionInfoDTO(&filtered[i], s.cfg.GatewayServerID))
+		hash := filtered[i].GatewayTokenHash
+		var currentPtr *CurrentPlayback
+		var userData map[string]any
+		if cp, ok := validated[hash]; ok {
+			// Copy into local so each session keeps its own row (no shared pointer).
+			cpCopy := cp
+			currentPtr = &cpCopy
+			state := states[cp.ItemID]
+			if state == nil {
+				state = &PlaybackState{
+					GatewayUserID:   session.GatewayUserID,
+					SyntheticUserID: session.SyntheticUserID,
+					ItemID:          cp.ItemID,
+				}
+			}
+			userData = userDataDTO(state)
+		}
+		items = append(items, sessionInfoDTO(&filtered[i], s.cfg.GatewayServerID, currentPtr, userData))
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, items)
@@ -873,8 +977,10 @@ func mergeItemMetadata(state *PlaybackState, item map[string]any) {
 }
 
 func itemFingerprint(item map[string]any) string {
+	// Stable overlapping facets only. Name is intentionally excluded so renames
+	// and partial metadata cannot create false fingerprint mismatches.
 	parts := []string{}
-	for _, key := range []string{"Type", "Name", "SeriesId"} {
+	for _, key := range []string{"Type", "SeriesId"} {
 		if v, ok := stringField(item, key); ok {
 			parts = append(parts, strings.ToLower(key)+"="+v)
 		}

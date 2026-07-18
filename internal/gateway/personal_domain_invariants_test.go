@@ -235,10 +235,11 @@ func TestPersonalDomainLocalMutationZeroEgressMatrix(t *testing.T) {
 		{name: "post_rating_likes_false", method: http.MethodPost, path: "/Users/gateway-user/Items/" + itemID + "/Rating?Likes=false", wantStatus: http.StatusOK, allowMetaReads: true},
 		{name: "delete_rating", method: http.MethodDelete, path: "/Users/gateway-user/Items/" + itemID + "/Rating", wantStatus: http.StatusOK, allowMetaReads: true},
 		{name: "post_userdata", method: http.MethodPost, path: "/Users/gateway-user/Items/" + itemID + "/UserData", body: `{"PlaybackPositionTicks":321,"PlayedPercentage":33.3}`, wantStatus: http.StatusOK, allowMetaReads: true},
-		{name: "sessions_playing", method: http.MethodPost, path: "/Sessions/Playing", body: `{"Item":{"Id":"item-1","RunTimeTicks":10000000},"PositionTicks":100}`, wantStatus: http.StatusNoContent},
-		{name: "sessions_progress", method: http.MethodPost, path: "/Sessions/Playing/Progress", body: `{"ItemId":"item-1","PlaybackPositionTicks":250,"RunTimeTicks":10000000,"PlayedPercentage":50.5}`, wantStatus: http.StatusNoContent},
-		{name: "sessions_stopped", method: http.MethodPost, path: "/Sessions/Playing/Stopped", body: `{"Item":{"Id":"item-1","RunTimeTicks":10000000},"PositionTicks":5000000}`, wantStatus: http.StatusNoContent},
-		{name: "sessions_ping", method: http.MethodPost, path: "/Sessions/Playing/Ping", body: `{}`, wantStatus: http.StatusNoContent},
+		// Nested Name+Type is sufficient so Playing does not best-effort-resolve upstream metadata.
+		{name: "sessions_playing", method: http.MethodPost, path: "/Sessions/Playing", body: `{"Item":{"Id":"item-1","Name":"Item 1","Type":"Movie","RunTimeTicks":10000000},"PositionTicks":100}`, wantStatus: http.StatusOK},
+		{name: "sessions_progress", method: http.MethodPost, path: "/Sessions/Playing/Progress", body: `{"ItemId":"item-1","PlaybackPositionTicks":250,"RunTimeTicks":10000000,"PlayedPercentage":50.5}`, wantStatus: http.StatusOK},
+		{name: "sessions_stopped", method: http.MethodPost, path: "/Sessions/Playing/Stopped", body: `{"Item":{"Id":"item-1","RunTimeTicks":10000000},"PositionTicks":5000000}`, wantStatus: http.StatusOK},
+		{name: "sessions_ping", method: http.MethodPost, path: "/Sessions/Playing/Ping", body: `{}`, wantStatus: http.StatusOK},
 		{name: "sessions_capabilities", method: http.MethodPost, path: "/Sessions/Capabilities", body: `{}`, wantStatus: http.StatusOK},
 		{name: "sessions_capabilities_full", method: http.MethodPost, path: "/Sessions/Capabilities/Full", body: `{}`, wantStatus: http.StatusOK},
 	}
@@ -322,7 +323,7 @@ func TestPersonalDomainTwoUserStateIsolationMatrix(t *testing.T) {
 	postJSON(t, tokenA, "/Users/gateway-user-a/PlayedItems/"+itemID, "", http.StatusOK)
 	postJSON(t, tokenA, "/Users/gateway-user-a/FavoriteItems/"+itemID, "", http.StatusOK)
 	postJSON(t, tokenA, "/Users/gateway-user-a/Items/"+itemID+"/Rating?Likes=true", "", http.StatusOK)
-	postJSON(t, tokenA, "/Sessions/Playing/Progress", `{"ItemId":"shared-item","PlaybackPositionTicks":7777,"RunTimeTicks":20000000,"PlayedPercentage":12.5}`, http.StatusNoContent)
+	postJSON(t, tokenA, "/Sessions/Playing/Progress", `{"ItemId":"shared-item","PlaybackPositionTicks":7777,"RunTimeTicks":20000000,"PlayedPercentage":12.5}`, http.StatusOK)
 	// Progress after played-mark may still update position; force resume-like userdata write.
 	postJSON(t, tokenA, "/Users/gateway-user-a/Items/"+itemID+"/UserData", `{"PlaybackPositionTicks":4321,"Played":false,"PlayedPercentage":21.6}`, http.StatusOK)
 	postJSON(t, tokenA, "/DisplayPreferences/home?Client=web", `{"SortBy":"DateCreated","Owner":"alice"}`, http.StatusOK)
@@ -519,15 +520,9 @@ func TestPersonalDomainNeutralMetadataLocalUserDataWins(t *testing.T) {
 // TestPersonalDomainUnknownRuntimeDoesNotCompleteFromPlayedPercentage encodes the
 // architecture invariant: unknown/zero runtime must not establish completion solely
 // from PlayedPercentage (or a high position without runtime).
-//
-// TODO(gateway-personal-domain-architecture#phase-4-current-playback-aggregate):
-// require known RunTimeTicks before percentage-based completion, then enable this
-// regression test. Current applyStoppedPlaybackState completes on PlayedPercentage
-// alone when runtime is unknown.
 func TestPersonalDomainUnknownRuntimeDoesNotCompleteFromPlayedPercentage(t *testing.T) {
-	t.Skip("TODO(gateway-personal-domain-architecture#phase-4-current-playback-aggregate): require known RunTimeTicks before percentage-based completion, then enable this regression test")
-
-	t.Run("unit_apply_stopped", func(t *testing.T) {
+	t.Run("unit_apply_durable_stopped", func(t *testing.T) {
+		// Production reducer path (applyDurableStoppedState), not removed legacy helper.
 		now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
 		pct := 95.0
 		state := &PlaybackState{
@@ -539,11 +534,7 @@ func TestPersonalDomainUnknownRuntimeDoesNotCompleteFromPlayedPercentage(t *test
 			RunTimeTicks:          0,
 			Played:                false,
 		}
-		applyStoppedPlaybackState(state, now, false, resumePolicy{
-			MinPct:             defaultMinResumePct,
-			MaxPct:             defaultMaxResumePct,
-			MinDurationSeconds: defaultMinResumeDurationSeconds,
-		})
+		applyDurableStoppedState(state, now, false, DefaultPlaybackResumePolicy(), false)
 		if state.Played {
 			t.Fatalf("unknown runtime must not complete from PlayedPercentage alone: %#v", state)
 		}
@@ -578,8 +569,11 @@ func TestPersonalDomainUnknownRuntimeDoesNotCompleteFromPlayedPercentage(t *test
 		req.Header.Set("Content-Type", "application/json")
 		resp := do(t, req)
 		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusNoContent {
-			t.Fatalf("stopped status = %d, want 204", resp.StatusCode)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("stopped status = %d, want 200", resp.StatusCode)
+		}
+		if resp.Header.Get("Cache-Control") != "no-store" {
+			t.Fatalf("Cache-Control = %q, want no-store", resp.Header.Get("Cache-Control"))
 		}
 
 		state, err := store.FindPlaybackState(context.Background(), "u1", "unknown-runtime-1")

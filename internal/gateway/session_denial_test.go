@@ -351,10 +351,10 @@ func TestLocalSessionRoutesRemainAccepted(t *testing.T) {
 		method, path, body string
 		want               int
 	}{
-		{http.MethodPost, "/Sessions/Playing", `{"Item":{"Id":"item-1","RunTimeTicks":10000000},"PositionTicks":100}`, http.StatusNoContent},
-		{http.MethodPost, "/Sessions/Playing/Progress", `{"ItemId":"item-1","PlaybackPositionTicks":250}`, http.StatusNoContent},
-		{http.MethodPost, "/Sessions/Playing/Stopped", `{"ItemId":"item-1","PositionTicks":900}`, http.StatusNoContent},
-		{http.MethodPost, "/Sessions/Playing/Ping", `{}`, http.StatusNoContent},
+		{http.MethodPost, "/Sessions/Playing", `{"Item":{"Id":"item-1","Name":"M","Type":"Movie","RunTimeTicks":10000000},"PositionTicks":100}`, http.StatusOK},
+		{http.MethodPost, "/Sessions/Playing/Progress", `{"ItemId":"item-1","PlaybackPositionTicks":250}`, http.StatusOK},
+		{http.MethodPost, "/Sessions/Playing/Stopped", `{"ItemId":"item-1","PositionTicks":900,"RunTimeTicks":1000}`, http.StatusOK},
+		{http.MethodPost, "/Sessions/Playing/Ping", `{}`, http.StatusOK},
 		{http.MethodPost, "/Sessions/Capabilities", `{}`, http.StatusOK},
 		{http.MethodPost, "/Sessions/Capabilities/Full", `{}`, http.StatusOK},
 	} {
@@ -521,8 +521,8 @@ func TestSessionEncodedPathNeverProxies(t *testing.T) {
 			method:      http.MethodPost,
 			encodedPath: "/emby/Sessions/Playing%20",
 			// Path decodes to "/Sessions/Playing " then routeclass TrimSpace → exact Playing.
-			// May be local-handled (204) or fail-closed/denied; never proxy.
-			wantStatuses: []int{http.StatusNoContent, http.StatusForbidden, http.StatusNotFound, http.StatusMethodNotAllowed},
+			// May be local-handled (empty 200) or fail-closed/denied; never proxy.
+			wantStatuses: []int{http.StatusOK, http.StatusForbidden, http.StatusNotFound, http.StatusMethodNotAllowed},
 			wantAudits:   []string{"session_access_denied", "session_route_unhandled", "session_method_not_allowed"},
 		},
 		{
@@ -606,8 +606,8 @@ func TestSessionEncodedPathNeverProxies(t *testing.T) {
 				if reqs[0].RouteClass == observe.RouteOther {
 					t.Fatalf("denied RouteClass must not be RouteOther: %#v", reqs[0])
 				}
-			case http.StatusNoContent:
-				// Local handler accepted after normalize; still zero egress (asserted above).
+			case http.StatusNoContent, http.StatusOK:
+				// Local handler accepted after normalize (empty 200 for playback reports); still zero egress.
 			}
 		})
 	}
@@ -717,7 +717,7 @@ func TestSessionRouteUnhandledFailClosed(t *testing.T) {
 		path string
 		want int
 	}{
-		{"/Sessions/Playing/Ping", http.StatusNoContent},
+		{"/Sessions/Playing/Ping", http.StatusOK},
 		{"/Sessions/Capabilities", http.StatusOK},
 	} {
 		req := mustRequest(t, http.MethodPost, gw.URL+"/emby"+tc.path+"?api_key=gateway-token", strings.NewReader(`{}`))

@@ -174,15 +174,25 @@ func (s *Store) RevokeSession(ctx context.Context, tokenHash string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	record, err := s.app.FindFirstRecordByData(collectionGatewaySessions, "gateway_token_hash", tokenHash)
-	if err != nil {
-		if isNotFoundError(err) {
-			return gateway.ErrNotFound
+	return s.app.RunInTransaction(func(tx core.App) error {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		return err
-	}
-	record.Set("revoked_at", time.Now().UTC())
-	return s.app.Save(record)
+		record, err := tx.FindFirstRecordByData(collectionGatewaySessions, "gateway_token_hash", tokenHash)
+		if err != nil {
+			if isNotFoundError(err) {
+				return gateway.ErrNotFound
+			}
+			return err
+		}
+		// Explicitly delete current-playback rows before revoking the parent
+		// session. Do not rely solely on cascade delete.
+		if err := deleteCurrentPlaybackForSessionTx(tx, record.Id); err != nil {
+			return err
+		}
+		record.Set("revoked_at", time.Now().UTC())
+		return tx.Save(record)
+	})
 }
 
 func (s *Store) UpdateSessionCapabilities(ctx context.Context, tokenHash string, capabilities gateway.SessionCapabilities, at time.Time) (*gateway.Session, error) {

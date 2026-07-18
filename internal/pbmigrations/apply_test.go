@@ -167,8 +167,8 @@ func TestApplyExactPredecessorCheckFailsBeforeMutationAndHistory(t *testing.T) {
 // runner. Tests must never touch global core.AppMigrations.
 //
 // A nil validate callback is a no-op so runner-unit tests stay independent of
-// the production Phase 3 sidecar validator (use validateExtensions explicitly
-// when testing that seam).
+// the production sidecar validator (use validateExtensions explicitly when
+// testing that seam).
 func applyPrivate(app core.App, list core.MigrationsList, validate func(core.App) error) error {
 	if validate == nil {
 		validate = func(core.App) error { return nil }
@@ -177,19 +177,6 @@ func applyPrivate(app core.App, list core.MigrationsList, validate func(core.App
 		_, err := core.NewMigrationsRunner(tx, list).Up()
 		return err
 	}, validate)
-}
-
-func requirePredecessorApplied(app core.App, file string) error {
-	var exists int
-	err := app.DB().Select("(1)").
-		From(core.DefaultMigrationsTable).
-		Where(dbx.HashExp{"file": file}).
-		Limit(1).
-		Row(&exists)
-	if err != nil || exists == 0 {
-		return fmt.Errorf("exact predecessor %q is not applied", file)
-	}
-	return nil
 }
 
 func newTestApp(t *testing.T) *tests.TestApp {

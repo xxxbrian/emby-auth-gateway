@@ -10,6 +10,7 @@ import (
 
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
+	"github.com/xxxbrian/emby-auth-gateway/internal/pbschema"
 )
 
 // ErrUserExists is returned when CreateUser is called for an existing username.
@@ -177,6 +178,11 @@ func RevokeUserSessions(ctx context.Context, app core.App, userID string) (int, 
 }
 
 // RevokeSessionByID revokes a single gateway session by record id.
+//
+// Current-playback rows for the targeted session are deleted inside the same
+// transaction before the parent is marked revoked. Already-revoked sessions are
+// idempotent: leftover current rows are still purged, and revoked_at is left
+// unchanged.
 func RevokeSessionByID(ctx context.Context, app core.App, sessionID string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -188,6 +194,10 @@ func RevokeSessionByID(ctx context.Context, app core.App, sessionID string) erro
 	return app.RunInTransaction(func(txApp core.App) error {
 		record, err := txApp.FindRecordById("gateway_sessions", sessionID)
 		if err != nil {
+			return err
+		}
+		// Clear current rows before parent mutation (including already-revoked leftovers).
+		if err := deleteCurrentPlaybacksForSessionTx(txApp, record.Id); err != nil {
 			return err
 		}
 		if !record.GetDateTime("revoked_at").IsZero() {
@@ -227,6 +237,10 @@ func revokeUserSessionsTx(txApp core.App, userID string) (int, error) {
 		if !record.GetDateTime("revoked_at").IsZero() {
 			continue
 		}
+		// Clear current rows before parent mutation; failure aborts the whole revoke batch.
+		if err := deleteCurrentPlaybacksForSessionTx(txApp, record.Id); err != nil {
+			return n, err
+		}
 		record.Set("revoked_at", now)
 		if err := txApp.Save(record); err != nil {
 			return n, err
@@ -234,6 +248,33 @@ func revokeUserSessionsTx(txApp core.App, userID string) (int, error) {
 		n++
 	}
 	return n, nil
+}
+
+// deleteCurrentPlaybacksForSessionTx removes all gateway_current_playbacks rows
+// for sessionID. The collection is required (control plane runs after migrations);
+// absence is an operational error, not a silent skip. Do not rely solely on
+// CascadeDelete — callers invoke this before parent revocation.
+func deleteCurrentPlaybacksForSessionTx(txApp core.App, sessionID string) error {
+	if _, err := txApp.FindCollectionByNameOrId(pbschema.CurrentPlaybacksCollection); err != nil {
+		return fmt.Errorf("find %s: %w", pbschema.CurrentPlaybacksCollection, err)
+	}
+	records, err := txApp.FindRecordsByFilter(
+		pbschema.CurrentPlaybacksCollection,
+		"gateway_session = {:session}",
+		"",
+		0,
+		0,
+		dbx.Params{"session": sessionID},
+	)
+	if err != nil {
+		return fmt.Errorf("list current playbacks for session %q: %w", sessionID, err)
+	}
+	for _, record := range records {
+		if err := txApp.Delete(record); err != nil {
+			return fmt.Errorf("delete current playback %q for session %q: %w", record.Id, sessionID, err)
+		}
+	}
+	return nil
 }
 
 func internalEmail(username string) string {

@@ -16,6 +16,7 @@ type MemoryStore struct {
 	PathPolicies       []PathPolicy
 	PlaybackEvents     []PlaybackEvent
 	PlaybackStates     map[string]*PlaybackState
+	CurrentPlaybacks   map[string]*CurrentPlayback
 	ItemChildCounts    map[string]ItemChildCount
 	DisplayPreferences map[string]*DisplayPreference
 	UpstreamSources    map[string]UpstreamSource
@@ -23,6 +24,7 @@ type MemoryStore struct {
 }
 
 var _ SessionRepository = (*MemoryStore)(nil)
+var _ PlaybackRepository = (*MemoryStore)(nil)
 
 type MemoryUser struct {
 	GatewayUser
@@ -34,6 +36,7 @@ func NewMemoryStore() *MemoryStore {
 		Users:              map[string]MemoryUser{},
 		Sessions:           map[string]*Session{},
 		PlaybackStates:     map[string]*PlaybackState{},
+		CurrentPlaybacks:   map[string]*CurrentPlayback{},
 		ItemChildCounts:    map[string]ItemChildCount{},
 		DisplayPreferences: map[string]*DisplayPreference{},
 		UpstreamSources:    map[string]UpstreamSource{},
@@ -559,11 +562,185 @@ func (m *MemoryStore) RevokeSession(ctx context.Context, tokenHash string) error
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if session, ok := m.Sessions[tokenHash]; ok {
+		// Remove current playback before revoking the parent session.
+		if m.CurrentPlaybacks != nil {
+			delete(m.CurrentPlaybacks, tokenHash)
+		}
 		now := time.Now().UTC()
 		session.RevokedAt = &now
 		return nil
 	}
 	return ErrNotFound
+}
+
+// ApplyPlaybackReport applies one local playback report under a single lock:
+// session/profile activity, playback event, durable item state, and current playback.
+//
+// Order: prepare command → lookup → clone/repair session off-map → reduce once →
+// validate plan → mutate. Prepare/reduce/plan failures leave live session repairs,
+// activity, events, durable, and current untouched.
+func (m *MemoryStore) ApplyPlaybackReport(ctx context.Context, cmd PlaybackReportCommand) (PlaybackReportResult, error) {
+	if err := ctx.Err(); err != nil {
+		return PlaybackReportResult{}, err
+	}
+	// Prepare before any lookup so token/item keys are canonical.
+	prepared, err := PreparePlaybackReportCommand(cmd)
+	if err != nil {
+		return PlaybackReportResult{}, err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return PlaybackReportResult{}, err
+	}
+
+	live, ok := m.Sessions[prepared.GatewayTokenHash]
+	if !ok || live == nil {
+		return PlaybackReportResult{}, ErrNotFound
+	}
+	if !live.Active(time.Now().UTC()) {
+		return PlaybackReportResult{}, ErrUnauthorized
+	}
+	now := prepared.ReceivedAt
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+
+	// Repair only a clone; live map stays untouched until plan validation succeeds.
+	sessionCopy := cloneSession(live)
+	if err := repairSessionAggregate(sessionCopy, now); err != nil {
+		return PlaybackReportResult{}, err
+	}
+
+	var current *CurrentPlayback
+	if m.CurrentPlaybacks != nil {
+		if row, ok := m.CurrentPlaybacks[prepared.GatewayTokenHash]; ok {
+			// Fail closed on present invalid prestate; never omit/repair as idle.
+			if err := ValidateCurrentPlayback(row, prepared.GatewayTokenHash); err != nil {
+				return PlaybackReportResult{}, err
+			}
+			current = cloneCurrentPlayback(row)
+		}
+	}
+
+	var durable *PlaybackState
+	if prepared.ItemID != "" && m.PlaybackStates != nil {
+		if state, ok := m.PlaybackStates[playbackStateKey(sessionCopy.GatewayUserID, prepared.ItemID)]; ok && state != nil {
+			durable = clonePlaybackState(state)
+		}
+	}
+
+	// Reduce once with the prepared command (Prepare is idempotent).
+	plan, err := ReducePlaybackReport(PlaybackReduceInput{
+		Command: prepared,
+		Session: *sessionCopy,
+		Current: current,
+		Durable: durable,
+	})
+	if err != nil {
+		return PlaybackReportResult{}, err
+	}
+	if err := ValidatePlaybackMutationPlan(plan, prepared, *sessionCopy); err != nil {
+		return PlaybackReportResult{}, err
+	}
+
+	// Commit live session repair fields only after validation.
+	live.PublicID = sessionCopy.PublicID
+	live.Capabilities = sessionCopy.Capabilities
+	if !sessionCopy.LastActivityAt.IsZero() && (live.LastActivityAt.IsZero() || sessionCopy.LastActivityAt.After(live.LastActivityAt)) {
+		// Hole-repair may fill LastActivityAt; do not advance past plan activity yet.
+		live.LastActivityAt = sessionCopy.LastActivityAt
+	}
+
+	// Apply all effects only after prepare + reduce + plan validation.
+	if plan.Event != nil {
+		ev := *plan.Event
+		if ev.CreatedAt.IsZero() {
+			ev.CreatedAt = now
+		}
+		m.PlaybackEvents = append(m.PlaybackEvents, ev)
+	}
+	if plan.WriteDurable && plan.Durable != nil {
+		if m.PlaybackStates == nil {
+			m.PlaybackStates = map[string]*PlaybackState{}
+		}
+		stored := clonePlaybackState(plan.Durable)
+		m.PlaybackStates[playbackStateKey(stored.GatewayUserID, stored.ItemID)] = stored
+	}
+	switch plan.CurrentAction {
+	case PlaybackCurrentUpsert:
+		if plan.Current != nil {
+			if m.CurrentPlaybacks == nil {
+				m.CurrentPlaybacks = map[string]*CurrentPlayback{}
+			}
+			m.CurrentPlaybacks[prepared.GatewayTokenHash] = cloneCurrentPlayback(plan.Current)
+		}
+	case PlaybackCurrentDelete:
+		if m.CurrentPlaybacks != nil {
+			delete(m.CurrentPlaybacks, prepared.GatewayTokenHash)
+		}
+	case PlaybackCurrentPreserve, PlaybackCurrentNone:
+		// no current mutation
+	}
+	if plan.ActivityAt != nil {
+		at := plan.ActivityAt.UTC()
+		if live.LastActivityAt.IsZero() || at.After(live.LastActivityAt) {
+			live.LastActivityAt = at
+		}
+	}
+
+	result := plan.Result
+	result.PublicSessionID = live.PublicID
+	result.GatewayUserID = live.GatewayUserID
+	result.SyntheticUserID = live.SyntheticUserID
+	// Re-derive result views from post-commit store state for clone isolation.
+	if result.Applied {
+		if row, ok := m.CurrentPlaybacks[prepared.GatewayTokenHash]; ok {
+			result.Current = cloneCurrentPlayback(row)
+		} else {
+			result.Current = nil
+		}
+		if plan.WriteDurable && plan.Durable != nil {
+			if state, ok := m.PlaybackStates[playbackStateKey(live.GatewayUserID, plan.Durable.ItemID)]; ok {
+				result.Durable = clonePlaybackState(state)
+				result.ItemID = state.ItemID
+			}
+		}
+	}
+	return result, nil
+}
+
+// ListCurrentPlaybacks returns cloned current-playback rows for the requested token hashes.
+// Missing hashes are omitted. Any present invalid current row fails the entire call
+// (fail closed; corrupt active state is never silently presented as idle).
+func (m *MemoryStore) ListCurrentPlaybacks(ctx context.Context, tokenHashes []string) (map[string]CurrentPlayback, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	out := make(map[string]CurrentPlayback, len(tokenHashes))
+	if m.CurrentPlaybacks == nil {
+		return out, nil
+	}
+	for _, hash := range tokenHashes {
+		if hash == "" {
+			continue
+		}
+		row, ok := m.CurrentPlaybacks[hash]
+		if !ok {
+			continue
+		}
+		if err := ValidateCurrentPlayback(row, hash); err != nil {
+			return nil, err
+		}
+		out[hash] = cloneCurrentPlaybackValue(*row)
+	}
+	return out, nil
 }
 
 func (m *MemoryStore) UpdateSessionCapabilities(ctx context.Context, tokenHash string, capabilities SessionCapabilities, at time.Time) (*Session, error) {

@@ -54,8 +54,11 @@ func TestConcurrentPlaybackDenialNormalizesAndSuppressesReports(t *testing.T) {
 	report.Header.Set("Content-Type", "application/json")
 	resp = do(t, report)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent || len(store.PlaybackEvents) != 0 || len(store.PlaybackStates) != 0 {
+	if resp.StatusCode != http.StatusOK || len(store.PlaybackEvents) != 0 || len(store.PlaybackStates) != 0 {
 		t.Fatalf("suppressed report status/events/states = %d/%d/%d", resp.StatusCode, len(store.PlaybackEvents), len(store.PlaybackStates))
+	}
+	if resp.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("suppressed Cache-Control = %q, want no-store", resp.Header.Get("Cache-Control"))
 	}
 	if !hasAuditEvent(store, "playback_concurrency_denied") || !hasAuditEvent(store, "playback_report_suppressed") {
 		t.Fatalf("missing concurrency audits: %#v", store.AuditLogs)

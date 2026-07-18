@@ -33,9 +33,9 @@ func TestPlaybackGuardScopesAndAllowsDirectPlayedItems(t *testing.T) {
 	defer gw.Close()
 
 	mustPlaybackInfoStatus(t, gw.URL, tokenOne, "item-1", http.StatusForbidden)
-	mustPlaybackReportStatus(t, gw.URL, tokenOne, "item-1", http.StatusNoContent)
-	mustPlaybackReportStatus(t, gw.URL, tokenOne, "item-2", http.StatusNoContent)
-	mustPlaybackReportStatus(t, gw.URL, tokenTwo, "item-1", http.StatusNoContent)
+	mustPlaybackReportStatus(t, gw.URL, tokenOne, "item-1", http.StatusOK)
+	mustPlaybackReportStatus(t, gw.URL, tokenOne, "item-2", http.StatusOK)
+	mustPlaybackReportStatus(t, gw.URL, tokenTwo, "item-1", http.StatusOK)
 	if len(store.PlaybackEvents) != 2 {
 		t.Fatalf("playback events = %d, want reports for other item and session", len(store.PlaybackEvents))
 	}
@@ -63,8 +63,32 @@ func TestSuppressedPlaybackReportDoesNotRequireUpstream(t *testing.T) {
 	req := mustRequest(t, http.MethodPost, "http://gateway/emby/Sessions/Playing/Stopped?api_key="+token, strings.NewReader(`{"ItemId":"item-1","Played":true}`))
 	req.Header.Set("Content-Type", "application/json")
 	server.ServeHTTP(recorder, req)
-	if recorder.Code != http.StatusNoContent || len(store.PlaybackEvents) != 0 {
+	if recorder.Code != http.StatusOK || len(store.PlaybackEvents) != 0 {
 		t.Fatalf("status/events = %d/%d", recorder.Code, len(store.PlaybackEvents))
+	}
+	if recorder.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", recorder.Header().Get("Cache-Control"))
+	}
+}
+
+func TestPlaybackGuardUsesCanonicalPreparedItemID(t *testing.T) {
+	const token = "gateway-token"
+	store := &faultInjectPlaybackStore{MemoryStore: NewMemoryStore()}
+	session := testSession()
+	store.Sessions[HashToken(token)] = session
+	server := NewServer(Config{GatewayBasePath: "/emby"}, store)
+	server.playbackGuards.deny(playbackGuardKey{GatewayTokenHash: session.GatewayTokenHash, ItemID: "item-1"})
+
+	recorder := httptest.NewRecorder()
+	req := mustRequest(t, http.MethodPost, "http://gateway/emby/Sessions/Playing/Progress?api_key="+token, strings.NewReader(`{"ItemId":" item-1 ","PositionTicks":10}`))
+	req.Header.Set("Content-Type", "application/json")
+	server.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	if store.applyCalls != 0 {
+		t.Fatalf("ApplyPlaybackReport calls = %d, want 0", store.applyCalls)
 	}
 }
 
@@ -90,7 +114,7 @@ func TestPlaybackInfoSuccessClearsGuard(t *testing.T) {
 	mustPlaybackInfoStatus(t, gw.URL, token, "item-1", http.StatusForbidden)
 	deny.Store(false)
 	mustPlaybackInfoStatus(t, gw.URL, token, "item-1", http.StatusOK)
-	mustPlaybackReportStatus(t, gw.URL, token, "item-1", http.StatusNoContent)
+	mustPlaybackReportStatus(t, gw.URL, token, "item-1", http.StatusOK)
 	if len(store.PlaybackEvents) != 1 {
 		t.Fatalf("cleared guard still suppressed lifecycle report: %#v", store.PlaybackEvents)
 	}
@@ -138,7 +162,7 @@ func TestOldPlaybackInfoSuccessCannotClearNewDenial(t *testing.T) {
 	if status := <-oldStatus; status != http.StatusOK {
 		t.Fatalf("old PlaybackInfo status = %d, want %d", status, http.StatusOK)
 	}
-	mustPlaybackReportStatus(t, gw.URL, token, "item-1", http.StatusNoContent)
+	mustPlaybackReportStatus(t, gw.URL, token, "item-1", http.StatusOK)
 	if len(store.PlaybackEvents) != 0 {
 		t.Fatal("old success cleared newer denial guard")
 	}
@@ -184,12 +208,12 @@ func TestPlaybackConcurrencyAuditCooldown(t *testing.T) {
 
 	for range 2 {
 		mustPlaybackInfoStatus(t, gw.URL, token, "item-1", http.StatusForbidden)
-		mustPlaybackReportStatus(t, gw.URL, token, "item-1", http.StatusNoContent)
+		mustPlaybackReportStatus(t, gw.URL, token, "item-1", http.StatusOK)
 	}
 	assertConcurrencyAudits(t, store, 1, 1)
 	now = now.Add(playbackAuditCooldown)
 	mustPlaybackInfoStatus(t, gw.URL, token, "item-1", http.StatusForbidden)
-	mustPlaybackReportStatus(t, gw.URL, token, "item-1", http.StatusNoContent)
+	mustPlaybackReportStatus(t, gw.URL, token, "item-1", http.StatusOK)
 	assertConcurrencyAudits(t, store, 2, 2)
 }
 
@@ -205,7 +229,7 @@ func assertConcurrencyAudits(t *testing.T, store *MemoryStore, denials, suppress
 			}
 		case "playback_report_suppressed":
 			gotSuppressions++
-			if entry.Status != http.StatusNoContent || entry.Message != "playback report suppressed after concurrent playback denial" || strings.Contains(entry.Path, "?") {
+			if entry.Status != http.StatusOK || entry.Message != "playback report suppressed after concurrent playback denial" || strings.Contains(entry.Path, "?") {
 				t.Fatalf("bad suppression audit: %#v", entry)
 			}
 		}

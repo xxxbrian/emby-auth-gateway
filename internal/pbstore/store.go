@@ -18,7 +18,10 @@ type Store struct {
 	app core.App
 }
 
-var _ gateway.SessionRepository = (*Store)(nil)
+var (
+	_ gateway.SessionRepository  = (*Store)(nil)
+	_ gateway.PlaybackRepository = (*Store)(nil)
+)
 
 const playbackStateItemIDBatchLimit = 50
 

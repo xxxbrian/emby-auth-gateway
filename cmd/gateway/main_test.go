@@ -180,6 +180,79 @@ func TestCleanupGatewaySessionsDeletesProfilesWithParentsAndPreservesActive(t *t
 	}
 }
 
+func TestCleanupGatewaySessionsDeletesCurrentPlaybacksWithParentsAndPreservesActive(t *testing.T) {
+	app := newProductionGatewayApp(t)
+	ensureSessionProfilesCollection(t, app)
+	ensureCurrentPlaybacksCollection(t, app)
+
+	userID := createTestUser(t, app)
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	expiredID := createGatewaySession(t, app, userID, "expired-old", now.Add(-8*24*time.Hour), nil)
+	revokedOld := now.Add(-8 * 24 * time.Hour)
+	revokedID := createGatewaySession(t, app, userID, "revoked-old", now.Add(24*time.Hour), &revokedOld)
+	activeID := createGatewaySession(t, app, userID, "active", now.Add(24*time.Hour), nil)
+	createGatewaySessionProfile(t, app, expiredID, "session-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", now.Add(-8*24*time.Hour))
+	createGatewaySessionProfile(t, app, revokedID, "session-ffffffffffffffffffffffffffffffff", now.Add(-8*24*time.Hour))
+	createGatewaySessionProfile(t, app, activeID, "session-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", now)
+	createGatewayCurrentPlayback(t, app, expiredID, "item-expired", now.Add(-8*24*time.Hour))
+	createGatewayCurrentPlayback(t, app, revokedID, "item-revoked", now.Add(-8*24*time.Hour))
+	createGatewayCurrentPlayback(t, app, activeID, "item-active", now)
+
+	if err := cleanupGatewaySessions(app, now); err != nil {
+		t.Fatalf("cleanup gateway sessions: %v", err)
+	}
+
+	sessions, err := app.FindAllRecords("gateway_sessions")
+	if err != nil {
+		t.Fatalf("query gateway sessions: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].Id != activeID {
+		t.Fatalf("remaining sessions = %#v, want only active %q", sessions, activeID)
+	}
+
+	currents, err := app.FindAllRecords(pbschema.CurrentPlaybacksCollection)
+	if err != nil {
+		t.Fatalf("query gateway_current_playbacks: %v", err)
+	}
+	if len(currents) != 1 || currents[0].GetString("gateway_session") != activeID {
+		t.Fatalf("remaining current playbacks = %#v, want only active row", currents)
+	}
+	if currents[0].GetString("item_id") != "item-active" {
+		t.Fatalf("active current item_id = %q", currents[0].GetString("item_id"))
+	}
+
+	profiles, err := app.FindAllRecords(pbschema.SessionProfilesCollection)
+	if err != nil {
+		t.Fatalf("query gateway_session_profiles: %v", err)
+	}
+	if len(profiles) != 1 || profiles[0].GetString("gateway_session") != activeID {
+		t.Fatalf("remaining profiles = %#v, want only active profile", profiles)
+	}
+}
+
+func TestCleanupGatewaySessionsPurgesOrphanCurrentPlaybacks(t *testing.T) {
+	app := newProductionGatewayApp(t)
+	ensureCurrentPlaybacksCollection(t, app)
+
+	userID := createTestUser(t, app)
+	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	activeID := createGatewaySession(t, app, userID, "active", now.Add(24*time.Hour), nil)
+	createGatewayCurrentPlayback(t, app, activeID, "item-active", now)
+	insertOrphanCurrentPlayback(t, app, "missing-session-id", "item-orphan", now.Add(-30*24*time.Hour))
+
+	if err := cleanupGatewaySessions(app, now); err != nil {
+		t.Fatalf("cleanup gateway sessions: %v", err)
+	}
+
+	currents, err := app.FindAllRecords(pbschema.CurrentPlaybacksCollection)
+	if err != nil {
+		t.Fatalf("query gateway_current_playbacks: %v", err)
+	}
+	if len(currents) != 1 || currents[0].GetString("gateway_session") != activeID {
+		t.Fatalf("remaining current playbacks = %#v, want only active row", currents)
+	}
+}
+
 func TestCleanupGatewaySessionsPurgesOrphanProfiles(t *testing.T) {
 	app := newProductionGatewayApp(t)
 	ensureSessionProfilesCollection(t, app)
@@ -205,12 +278,18 @@ func TestCleanupGatewaySessionsPurgesOrphanProfiles(t *testing.T) {
 
 func TestCleanupGatewaySessionsCompatibleWhenSidecarAbsent(t *testing.T) {
 	app := newProductionGatewayApp(t)
-	// Simulate old/pre-migration binary: physical sidecar table is gone.
+	// Simulate old/pre-migration binary: physical sidecar tables are gone.
 	if _, err := app.DB().NewQuery(`drop table if exists gateway_session_profiles`).Execute(); err != nil {
 		t.Fatalf("drop gateway_session_profiles: %v", err)
 	}
+	if _, err := app.DB().NewQuery(`drop table if exists gateway_current_playbacks`).Execute(); err != nil {
+		t.Fatalf("drop gateway_current_playbacks: %v", err)
+	}
 	if app.HasTable("gateway_session_profiles") {
 		t.Fatal("expected gateway_session_profiles table to be absent")
+	}
+	if app.HasTable("gateway_current_playbacks") {
+		t.Fatal("expected gateway_current_playbacks table to be absent")
 	}
 
 	userID := createTestUser(t, app)
@@ -234,13 +313,16 @@ func TestCleanupGatewaySessionsCompatibleWhenSidecarAbsent(t *testing.T) {
 func TestCleanupGatewaySessionsTransactionFailureRollsBack(t *testing.T) {
 	app := newProductionGatewayApp(t)
 	ensureSessionProfilesCollection(t, app)
+	ensureCurrentPlaybacksCollection(t, app)
 
 	userID := createTestUser(t, app)
 	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
 	expiredID := createGatewaySession(t, app, userID, "expired-old", now.Add(-8*24*time.Hour), nil)
 	createGatewaySessionProfile(t, app, expiredID, "session-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", now.Add(-8*24*time.Hour))
+	createGatewayCurrentPlayback(t, app, expiredID, "item-expired", now.Add(-8*24*time.Hour))
 
-	// Block parent deletion so the transaction fails after profile deletes begin.
+	// Block parent deletion so the transaction fails after sidecar deletes begin.
+	// Proves current-row and profile deletes do not commit without parent deletion.
 	if _, err := app.DB().NewQuery(`
 create table cleanup_fk_block (
 	id text primary key not null,
@@ -271,6 +353,13 @@ insert into cleanup_fk_block (id, session_id) values ('block', {:session})
 	}
 	if len(profiles) != 1 || profiles[0].GetString("gateway_session") != expiredID {
 		t.Fatalf("profiles after failed cleanup = %#v, want rolled-back profile", profiles)
+	}
+	currents, err := app.FindAllRecords(pbschema.CurrentPlaybacksCollection)
+	if err != nil {
+		t.Fatalf("query gateway_current_playbacks: %v", err)
+	}
+	if len(currents) != 1 || currents[0].GetString("gateway_session") != expiredID {
+		t.Fatalf("current playbacks after failed cleanup = %#v, want rolled-back current row", currents)
 	}
 }
 
@@ -388,5 +477,60 @@ values ({:id}, {:session}, {:public_id}, '{}', {:activity}, {:activity}, {:activ
 		"activity":  lastActivityAt.UTC().Format("2006-01-02 15:04:05.000Z"),
 	}).Execute(); err != nil {
 		t.Fatalf("insert orphan profile: %v", err)
+	}
+}
+
+func ensureCurrentPlaybacksCollection(t *testing.T, app core.App) *core.Collection {
+	t.Helper()
+	if collection, err := app.FindCollectionByNameOrId(pbschema.CurrentPlaybacksCollection); err == nil {
+		return collection
+	}
+	sessions, err := app.FindCollectionByNameOrId("gateway_sessions")
+	if err != nil {
+		t.Fatalf("find gateway_sessions: %v", err)
+	}
+	if err := app.Save(pbschema.CurrentPlaybacks(sessions.Id)); err != nil {
+		t.Fatalf("save gateway_current_playbacks collection: %v", err)
+	}
+	persisted, err := app.FindCollectionByNameOrId(pbschema.CurrentPlaybacksCollection)
+	if err != nil {
+		t.Fatalf("reload gateway_current_playbacks: %v", err)
+	}
+	return persisted
+}
+
+func createGatewayCurrentPlayback(t *testing.T, app core.App, sessionID, itemID string, reportedAt time.Time) string {
+	t.Helper()
+	currents := ensureCurrentPlaybacksCollection(t, app)
+	record := core.NewRecord(currents)
+	record.Set("gateway_session", sessionID)
+	record.Set("item_id", itemID)
+	record.Set("item_snapshot_json", `{"Id":"`+itemID+`"}`)
+	record.Set("play_state_json", `{"PositionTicks":0}`)
+	record.Set("started_at", reportedAt)
+	record.Set("last_reported_at", reportedAt)
+	if err := app.Save(record); err != nil {
+		t.Fatalf("save gateway current playback: %v", err)
+	}
+	return record.Id
+}
+
+func insertOrphanCurrentPlayback(t *testing.T, app core.App, missingSessionID, itemID string, reportedAt time.Time) {
+	t.Helper()
+	ensureCurrentPlaybacksCollection(t, app)
+	// Bypass relation validation so we can simulate old-binary leftovers.
+	stamp := reportedAt.UTC().Format("2006-01-02 15:04:05.000Z")
+	if _, err := app.DB().NewQuery(`
+insert into gateway_current_playbacks (id, gateway_session, item_id, play_session_id, media_source_id, item_snapshot_json, play_state_json, run_time_ticks, started_at, last_reported_at, created, updated)
+values ({:id}, {:session}, {:item}, '', '', {:snapshot}, {:state}, 0, {:stamp}, {:stamp}, {:stamp}, {:stamp})
+`).Bind(map[string]any{
+		"id":       "orphancurrent01",
+		"session":  missingSessionID,
+		"item":     itemID,
+		"snapshot": `{"Id":"` + itemID + `"}`,
+		"state":    `{"PositionTicks":0}`,
+		"stamp":    stamp,
+	}).Execute(); err != nil {
+		t.Fatalf("insert orphan current playback: %v", err)
 	}
 }

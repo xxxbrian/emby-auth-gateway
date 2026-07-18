@@ -61,16 +61,18 @@ func TestProductionBootstrapMigratesFrozenV060ThenIsWriteFree(t *testing.T) {
 		t.Fatalf("reset fixture database: %v", err)
 	}
 
-	// Stage 1: first current-binary bootstrap is allowed to apply the additive
-	// gateway_session_profiles migration and backfill profiles.
+	// Stage 1: first current-binary bootstrap is allowed to apply additive
+	// gateway_session_profiles (backfill) and gateway_current_playbacks (empty create).
 	app := newGatewayApp()
 	if err := app.Bootstrap(); err != nil {
 		t.Fatalf("production bootstrap frozen schema: %v", err)
 	}
 	assertSeededApplicationDataPreserved(t, app, seedMarkers)
 	assertSessionProfilesBackfilled(t, app, seedMarkers.sessionIDs)
+	assertCurrentPlaybacksCreatedEmpty(t, app)
 	assertCurrentApplicationCollectionSet(t, app)
 	assertSessionProfilesLockedAndDefaults(t, app)
+	assertCurrentPlaybacksLocked(t, app)
 	assertFixtureIntegrity(t, app)
 	afterMigration := fixtureFingerprint(t, app)
 	if err := app.ResetBootstrapState(); err != nil {
@@ -88,7 +90,8 @@ func TestProductionBootstrapMigratesFrozenV060ThenIsWriteFree(t *testing.T) {
 	}
 	assertFixtureIntegrity(t, reopened)
 
-	// Stage 3: old-binary base validator accepts the upgraded DB write-free.
+	// Stage 3: old-binary base validator accepts the upgraded DB write-free,
+	// including the exact extra current-playback sidecar (outside requiredNames).
 	beforeEnsure := fixtureFingerprint(t, reopened)
 	if err := pbschema.Ensure(reopened); err != nil {
 		t.Fatalf("old-base pbschema.Ensure on upgraded DB: %v", err)
@@ -96,6 +99,8 @@ func TestProductionBootstrapMigratesFrozenV060ThenIsWriteFree(t *testing.T) {
 	if after := fixtureFingerprint(t, reopened); after != beforeEnsure {
 		t.Fatal("old-base pbschema.Ensure wrote upgraded durable state")
 	}
+	// Sidecar remains exact and empty after write-free Ensure.
+	assertCurrentPlaybacksCreatedEmpty(t, reopened)
 }
 
 func seedFrozenState(t *testing.T, app core.App) {
@@ -270,6 +275,38 @@ func assertSessionProfilesLockedAndDefaults(t *testing.T, app core.App) {
 	}
 }
 
+func assertCurrentPlaybacksCreatedEmpty(t *testing.T, app core.App) {
+	t.Helper()
+	if !app.HasTable(pbschema.CurrentPlaybacksCollection) {
+		t.Fatal("expected gateway_current_playbacks after migration bootstrap")
+	}
+	if err := pbschema.ValidateCurrentPlaybacks(app); err != nil {
+		t.Fatalf("gateway_current_playbacks exact schema: %v", err)
+	}
+	records, err := app.FindAllRecords(pbschema.CurrentPlaybacksCollection)
+	if err != nil {
+		t.Fatalf("list gateway_current_playbacks: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("gateway_current_playbacks rows = %d, want 0 (no backfill)", len(records))
+	}
+}
+
+func assertCurrentPlaybacksLocked(t *testing.T, app core.App) {
+	t.Helper()
+	if err := pbschema.ValidateCurrentPlaybacks(app); err != nil {
+		t.Fatalf("gateway_current_playbacks exact schema: %v", err)
+	}
+	collection, err := app.FindCollectionByNameOrId(pbschema.CurrentPlaybacksCollection)
+	if err != nil {
+		t.Fatalf("find gateway_current_playbacks: %v", err)
+	}
+	if collection.ListRule != nil || collection.ViewRule != nil || collection.CreateRule != nil || collection.UpdateRule != nil || collection.DeleteRule != nil {
+		t.Fatalf("gateway_current_playbacks rules are not fully locked: list=%v view=%v create=%v update=%v delete=%v",
+			collection.ListRule, collection.ViewRule, collection.CreateRule, collection.UpdateRule, collection.DeleteRule)
+	}
+}
+
 func fixtureRecord(t *testing.T, app core.App, collectionName string, values map[string]any) *core.Record {
 	t.Helper()
 	collection, err := app.FindCollectionByNameOrId(collectionName)
@@ -374,7 +411,7 @@ func assertV060ApplicationCollectionSet(t *testing.T, app core.App) {
 func assertCurrentApplicationCollectionSet(t *testing.T, app core.App) {
 	t.Helper()
 	assertApplicationCollectionSet(t, app, []string{
-		"audit_logs", "display_preferences", "gateway_session_profiles", "gateway_sessions", "item_child_counts",
+		"audit_logs", "display_preferences", "gateway_current_playbacks", "gateway_session_profiles", "gateway_sessions", "item_child_counts",
 		"path_policies", "playback_events", "upstream_endpoints", "upstream_sources", "user_item_data", "users",
 	})
 }

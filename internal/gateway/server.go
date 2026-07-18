@@ -36,6 +36,7 @@ type Server struct {
 	cfg                  Config
 	store                Store
 	sessions             SessionRepository
+	playback             PlaybackRepository // required; obtained from store (no legacy fallback)
 	client               *http.Client
 	proxyClient          *http.Client
 	emitter              *observe.Emitter
@@ -145,7 +146,27 @@ func NewServer(cfg Config, store Store) *Server {
 		client = &http.Client{Timeout: backendAuthTimeout}
 	}
 	proxyClient := newProxyClient(cfg.HTTPClient)
-	return &Server{cfg: cfg, store: store, sessions: store, client: client, proxyClient: proxyClient, emitter: cfg.Emitter, meter: cfg.Meter, upstreamAuth: newUpstreamAuthenticator(store, client), logins: newLoginFailureLimiter(), playbackGuards: newPlaybackGuardTracker(), mediaBuffer: configuredMediaBuffer(cfg.MediaBuffer), mediaBufferLive: cfg.MediaBufferLive, anonymousImageNow: time.Now, anonymousImageSlots: make(chan struct{}, anonymousImageValidationConcurrency)}
+	s := &Server{cfg: cfg, store: store, sessions: store, client: client, proxyClient: proxyClient, emitter: cfg.Emitter, meter: cfg.Meter, upstreamAuth: newUpstreamAuthenticator(store, client), logins: newLoginFailureLimiter(), playbackGuards: newPlaybackGuardTracker(), mediaBuffer: configuredMediaBuffer(cfg.MediaBuffer), mediaBufferLive: cfg.MediaBufferLive, anonymousImageNow: time.Now, anonymousImageSlots: make(chan struct{}, anonymousImageValidationConcurrency)}
+	// Playback reports require PlaybackRepository; MemoryStore implements it.
+	// Missing implementation fails closed at request time (no silent legacy path).
+	if pr, ok := store.(PlaybackRepository); ok {
+		s.playback = pr
+	}
+	return s
+}
+
+// playbackRepo returns the required PlaybackRepository boundary.
+func (s *Server) playbackRepo() (PlaybackRepository, error) {
+	if s == nil {
+		return nil, fmt.Errorf("%w: playback repository unavailable", ErrStoreUnavailable)
+	}
+	if s.playback != nil {
+		return s.playback, nil
+	}
+	if pr, ok := s.store.(PlaybackRepository); ok {
+		return pr, nil
+	}
+	return nil, fmt.Errorf("%w: playback repository unavailable", ErrStoreUnavailable)
 }
 
 // Emitter returns the optional non-blocking observe emitter (nil if unset).
@@ -594,10 +615,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string,
 	if isPlaybackInfo {
 		guardGeneration = s.playbackGuards.snapshot(guardKey)
 	}
-	if s.handlePersonalDataRequest(w, r, rel, session, gatewayToken) {
-		s.noteSession(session, decision)
-		// Capability updates always write activity themselves; skip coalesced touch.
-		if !isSessionCapabilitiesRequest(r.Method, rel) {
+	if outcome := s.handlePersonalDataRequest(w, r, rel, session, gatewayToken); outcome.Handled {
+		if outcome.NoteSuccess {
+			s.noteSession(session, decision)
+		}
+		if outcome.AllowGenericActivity {
 			s.touchSessionActivityBestEffort(r.Context(), session, r)
 		}
 		return
@@ -1316,225 +1338,669 @@ func isSessionCapabilitiesRequest(method, rel string) bool {
 	}
 }
 
-func (s *Server) recordPlaybackRequest(r *http.Request, rel string, session *Session, gatewayToken string) error {
-	var data []byte
-	if r.Body != nil {
-		var err error
-		data, err = io.ReadAll(http.MaxBytesReader(nilResponseWriter{}, r.Body, 10<<20))
-		r.Body = io.NopCloser(bytes.NewReader(data))
-		if err != nil {
-			return fmt.Errorf("%w: read playback body: %w", ErrBadRequest, err)
-		}
+// handlePlaybackReport serves authenticated local Playing/Progress/Stopped/Ping.
+// Success is empty HTTP 200 with Cache-Control: no-store. Exactly one
+// ApplyPlaybackReport is used for non-suppressed reports; there is no legacy
+// RecordPlaybackEvent/SavePlaybackState path.
+func (s *Server) handlePlaybackReport(w http.ResponseWriter, r *http.Request, rel string, session *Session, gatewayToken string) bool {
+	kind, ok := playbackReportKindFromRel(rel)
+	if !ok {
+		writeEmptyPlaybackError(w, http.StatusBadRequest, "bad request")
+		return false
 	}
-	details, ok := playbackDetailsFromRequest(r, data)
-	if !ok || details.ItemID == "" {
-		return nil
-	}
-	eventName := playbackEventName(rel)
-	s.emit(observe.Event{
-		Kind:          observe.KindPlayback,
-		Outcome:       observe.OutcomeOK,
-		RouteClass:    observe.RoutePlayback,
-		UserID:        session.GatewayUserID,
-		Username:      session.GatewayUsername,
-		SessionID:     session.GatewayTokenHash,
-		Device:        session.Device,
-		ItemID:        details.ItemID,
-		ItemName:      details.ItemName,
-		PositionTicks: details.PositionTicks,
-		PlaybackEvent: eventName,
-	})
-	key := playbackGuardKey{GatewayTokenHash: session.GatewayTokenHash, ItemID: details.ItemID}
-	if active, auditEligible := s.playbackGuards.suppress(key); active {
-		if auditEligible {
-			s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "playback_report_suppressed", Message: "playback report suppressed after concurrent playback denial", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusNoContent})
+
+	data, err := readPlaybackReportBody(r)
+	if err != nil {
+		if errors.Is(err, ErrBadRequest) {
+			writeEmptyPlaybackError(w, http.StatusBadRequest, "bad request body")
+			return false
 		}
-		return nil
+		writeEmptyPlaybackError(w, http.StatusBadRequest, "bad request body")
+		return false
+	}
+	r.Body = io.NopCloser(bytes.NewReader(data))
+
+	details, _, err := playbackDetailsFromRequestChecked(r, data)
+	if err != nil {
+		if errors.Is(err, ErrBadRequest) {
+			writeEmptyPlaybackError(w, http.StatusBadRequest, "bad request")
+			return false
+		}
+		writeEmptyPlaybackError(w, http.StatusBadRequest, "bad request")
+		return false
 	}
 	now := time.Now().UTC()
-	if err := s.store.RecordPlaybackEvent(r.Context(), PlaybackEvent{
-		GatewayUserID:    session.GatewayUserID,
-		SyntheticUserID:  session.SyntheticUserID,
-		ItemID:           details.ItemID,
-		Event:            eventName,
-		PositionTicks:    details.PositionTicks,
-		Played:           details.Played,
-		PlayedPercentage: details.PlayedPercentage,
-		RemoteIP:         remoteIP(r),
-		CreatedAt:        now,
-	}); err != nil {
-		s.audit(r.Context(), AuditLog{
-			GatewayUserID:   session.GatewayUserID,
-			SyntheticUserID: session.SyntheticUserID,
-			Event:           "playback_event_persist_failed",
-			Message:         "playback event persist failed",
-			RemoteIP:        remoteIP(r),
-			Method:          r.Method,
-			Path:            rel,
+	cmd := playbackReportCommandFromDetails(kind, session.GatewayTokenHash, now, remoteIP(r), details)
+	// Body SessionId is never authoritative; command builder already ignores it.
+	cmd.Policy = s.playbackResumePolicyFromConfig()
+	cmd, err = PreparePlaybackReportCommand(cmd)
+	if err != nil {
+		if errors.Is(err, ErrBadRequest) {
+			writeEmptyPlaybackError(w, http.StatusBadRequest, "bad request")
+			return false
+		}
+		s.auditPlaybackReportFailure(r, rel, session, "playback_report_prepare_failed", "playback report preparation failed")
+		writeEmptyPlaybackError(w, http.StatusInternalServerError, "playback state unavailable")
+		return false
+	}
+	// Guard suppression is a true no-op success: no activity/event/durable/current.
+	if cmd.ItemID != "" {
+		key := playbackGuardKey{GatewayTokenHash: session.GatewayTokenHash, ItemID: cmd.ItemID}
+		if active, auditEligible := s.playbackGuards.suppress(key); active {
+			if auditEligible {
+				s.audit(r.Context(), AuditLog{
+					GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID,
+					Event: "playback_report_suppressed", Message: "playback report suppressed after concurrent playback denial",
+					RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusOK,
+				})
+			}
+			writeEmptyPlaybackOK(w)
+			return true
+		}
+	}
+
+	repo, err := s.playbackRepo()
+	if err != nil {
+		s.auditPlaybackReportFailure(r, rel, session, "playback_repository_unavailable", "playback repository unavailable")
+		writeEmptyPlaybackError(w, http.StatusInternalServerError, "playback state unavailable")
+		return false
+	}
+
+	// Best-effort metadata resolution before the repository transaction.
+	// Cancellation aborts without write or response body.
+	if cmd.ItemID != "" && shouldResolvePlaybackMetadata(kind, details) {
+		resolved, metadataConfirmed, resolveErr := s.resolvePlaybackItemSnapshot(r.Context(), r, session, gatewayToken, cmd.ItemID)
+		if resolveErr != nil {
+			if r.Context().Err() != nil || errors.Is(resolveErr, context.Canceled) {
+				panic(http.ErrAbortHandler)
+			}
+			// Soft failure: continue with partial reported data.
+		} else if metadataConfirmed {
+			details.ItemID = cmd.ItemID
+			details.ItemSnapshotID = cmd.ItemSnapshot.ID
+			merged := mergePlaybackDetailsWithSnapshot(details, resolved)
+			candidate := playbackReportCommandFromDetails(kind, session.GatewayTokenHash, now, remoteIP(r), merged)
+			candidate.Policy = s.playbackResumePolicyFromConfig()
+			if prepared, prepareErr := PreparePlaybackReportCommand(candidate); prepareErr == nil && prepared.ItemID == cmd.ItemID {
+				prepared.MetadataConfirmed = true
+				cmd = prepared
+			}
+		}
+	}
+
+	result, err := repo.ApplyPlaybackReport(r.Context(), cmd)
+	if err != nil {
+		if r.Context().Err() != nil || errors.Is(err, context.Canceled) {
+			panic(http.ErrAbortHandler)
+		}
+		if errors.Is(err, ErrBadRequest) {
+			writeEmptyPlaybackError(w, http.StatusBadRequest, "bad request")
+			return false
+		}
+		if errors.Is(err, ErrUnauthorized) {
+			writeEmptyPlaybackError(w, http.StatusUnauthorized, "unauthorized")
+			return false
+		}
+		s.auditPlaybackReportFailure(r, rel, session, "playback_report_apply_failed", "playback report apply failed")
+		writeEmptyPlaybackError(w, http.StatusInternalServerError, "playback state unavailable")
+		return false
+	}
+
+	// Telemetry only after successful commit, only when the report applied.
+	if result.Applied {
+		pos := int64(0)
+		if cmd.PlayState.PositionTicks != nil {
+			pos = *cmd.PlayState.PositionTicks
+		}
+		s.emit(observe.Event{
+			Kind:          observe.KindPlayback,
+			Outcome:       observe.OutcomeOK,
+			RouteClass:    observe.RoutePlayback,
+			UserID:        result.GatewayUserID,
+			Username:      session.GatewayUsername,
+			SessionID:     result.PublicSessionID, // never token hash
+			Device:        session.Device,
+			ItemID:        result.ItemID,
+			ItemName:      cmd.ItemSnapshot.Name,
+			PositionTicks: pos,
+			PlaybackEvent: playbackReportEventName(kind),
 		})
 	}
-	state, err := s.stateForItem(r.Context(), session, details.ItemID)
+	writeEmptyPlaybackOK(w)
+	return true
+}
+
+func writeEmptyPlaybackOK(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+}
+
+func writeEmptyPlaybackError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Cache-Control", "no-store")
+	http.Error(w, msg, status)
+}
+
+func (s *Server) auditPlaybackReportFailure(r *http.Request, rel string, session *Session, event, message string) {
+	if session == nil {
+		return
+	}
+	s.audit(r.Context(), AuditLog{
+		GatewayUserID:   session.GatewayUserID,
+		SyntheticUserID: session.SyntheticUserID,
+		Event:           event,
+		Message:         message,
+		RemoteIP:        remoteIP(r),
+		Method:          r.Method,
+		Path:            rel,
+		Status:          http.StatusInternalServerError,
+	})
+}
+
+// shouldResolvePlaybackMetadata implements Phase 4 resolve policy:
+// Playing only when nested snapshot is insufficient; Progress/Ping never;
+// Stopped only when runtime is unknown.
+func shouldResolvePlaybackMetadata(kind PlaybackReportKind, details playbackDetails) bool {
+	switch kind {
+	case PlaybackReportPlaying:
+		return playbackItemSnapshotInsufficient(details.itemSnapshot())
+	case PlaybackReportStopped:
+		return !details.HasRunTimeTicks || details.RunTimeTicks <= 0
+	default:
+		return false
+	}
+}
+
+func playbackItemSnapshotInsufficient(snap PlaybackItemSnapshot) bool {
+	return strings.TrimSpace(snap.Type) == "" && strings.TrimSpace(snap.Name) == ""
+}
+
+// resolvePlaybackItemSnapshot best-effort loads allowlisted item metadata from upstream.
+// Soft failures (network, non-2xx, invalid JSON, ID mismatch) return an empty snapshot
+// without error. Request cancellation returns a cancel error for abort handling.
+// No repository writes occur here.
+func (s *Server) resolvePlaybackItemSnapshot(ctx context.Context, r *http.Request, session *Session, gatewayToken, itemID string) (PlaybackItemSnapshot, bool, error) {
+	if itemID == "" {
+		return PlaybackItemSnapshot{}, false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return PlaybackItemSnapshot{}, false, err
+	}
+	value, status, _, err := s.fetchBackendJSON(ctx, r, "/Users/"+session.SyntheticUserID+"/Items/"+itemID, "", session, gatewayToken)
 	if err != nil {
-		return err
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			return PlaybackItemSnapshot{}, false, err
+		}
+		return PlaybackItemSnapshot{}, false, nil
 	}
-	if details.ItemName != "" {
-		state.ItemName = details.ItemName
+	if status < 200 || status >= 300 {
+		return PlaybackItemSnapshot{}, false, nil
 	}
-	if details.ItemType != "" {
-		state.ItemType = details.ItemType
+	item, ok := value.(map[string]any)
+	if !ok {
+		return PlaybackItemSnapshot{}, false, nil
 	}
-	if details.SeriesID != "" {
-		state.SeriesID = details.SeriesID
+	if err := validateCaseInsensitiveJSONKey(item, "Id"); err != nil {
+		return PlaybackItemSnapshot{}, false, nil
 	}
-	if details.SeriesName != "" {
-		state.SeriesName = details.SeriesName
+	id, _ := stringField(item, "Id")
+	if id != itemID {
+		return PlaybackItemSnapshot{}, false, nil
 	}
-	if details.SeasonID != "" {
-		state.SeasonID = details.SeasonID
+	tmp := playbackDetails{ItemID: itemID}
+	applyPlaybackItemSnapshotFields(&tmp, item)
+	snap := tmp.itemSnapshot()
+	return snap, true, nil
+}
+
+func mergePlaybackDetailsWithSnapshot(details playbackDetails, snap PlaybackItemSnapshot) playbackDetails {
+	// This merge is used only for exact-ID confirmed upstream metadata. Stable
+	// hierarchy and catalog fields are authoritative even when omitted upstream,
+	// so client values cannot be certified under MetadataConfirmed. The narrow
+	// compatibility fallback is display text only: Name and SeriesName.
+	details.ItemSnapshotID = snap.ID
+	if snap.Name != "" {
+		details.ItemName = snap.Name
 	}
-	if details.HasIndexNumber {
-		state.IndexNumber = details.IndexNumber
+	details.ItemType = snap.Type
+	details.MediaType = snap.MediaType
+	details.SeriesID = snap.SeriesID
+	if snap.SeriesName != "" {
+		details.SeriesName = snap.SeriesName
 	}
-	if details.HasParentIndexNumber {
-		state.ParentIndexNumber = details.ParentIndexNumber
+	details.SeasonID = snap.SeasonID
+	details.ParentID = snap.ParentID
+	details.IndexNumber = snap.IndexNumber
+	details.HasIndexNumber = snap.IndexNumber != 0
+	details.ParentIndexNumber = snap.ParentIndexNumber
+	details.HasParentIndexNumber = snap.ParentIndexNumber != 0
+	details.RunTimeTicks = snap.RunTimeTicks
+	details.HasRunTimeTicks = snap.RunTimeTicks > 0
+	details.ProductionYear = snap.ProductionYear
+	details.HasProductionYear = snap.ProductionYear != 0
+	details.PremiereDate = snap.PremiereDate
+	details.CommunityRating = snap.CommunityRating
+	details.HasCommunityRating = snap.CommunityRating != 0
+	details.OfficialRating = snap.OfficialRating
+	if len(snap.ImageTags) > 0 {
+		tags := make(map[string]string, len(snap.ImageTags))
+		for k, v := range snap.ImageTags {
+			tags[k] = v
+		}
+		details.ImageTags = tags
+	} else {
+		details.ImageTags = nil
+	}
+	details.Fingerprint = snapshotFingerprint(snap)
+	return details
+}
+
+// playbackReportBodyLimit is the maximum accepted playback report body size (1 MiB).
+const playbackReportBodyLimit = 1 << 20
+
+// readPlaybackReportBody reads a playback report body, enforcing playbackReportBodyLimit.
+func readPlaybackReportBody(r *http.Request) ([]byte, error) {
+	if r.Body == nil {
+		return nil, nil
+	}
+	data, err := io.ReadAll(http.MaxBytesReader(nilResponseWriter{}, r.Body, playbackReportBodyLimit))
+	if err != nil {
+		return data, fmt.Errorf("%w: read playback body: %w", ErrBadRequest, err)
+	}
+	return data, nil
+}
+
+// playbackReportKindFromRel maps an authenticated playback report route to its kind.
+func playbackReportKindFromRel(rel string) (PlaybackReportKind, bool) {
+	switch {
+	case equalPath(rel, "/Sessions/Playing"):
+		return PlaybackReportPlaying, true
+	case equalPath(rel, "/Sessions/Playing/Progress"):
+		return PlaybackReportProgress, true
+	case equalPath(rel, "/Sessions/Playing/Stopped"):
+		return PlaybackReportStopped, true
+	case equalPath(rel, "/Sessions/Playing/Ping"):
+		return PlaybackReportPing, true
+	default:
+		return "", false
+	}
+}
+
+// playbackReportCommandFromDetails maps request route kind + authoritative gateway
+// token hash + receive time/remote IP + parsed details into a PlaybackReportCommand.
+// Missing item still produces a valid no-op command contract. Body SessionId is never
+// used as GatewayTokenHash.
+func playbackReportCommandFromDetails(
+	kind PlaybackReportKind,
+	gatewayTokenHash string,
+	receivedAt time.Time,
+	remoteIP string,
+	details playbackDetails,
+) PlaybackReportCommand {
+	cmd := PlaybackReportCommand{
+		GatewayTokenHash: gatewayTokenHash,
+		Kind:             kind,
+		ReceivedAt:       receivedAt,
+		RemoteIP:         remoteIP,
+		ItemID:           details.ItemID,
+		PlaySessionID:    details.PlaySessionID,
+		MediaSourceID:    details.MediaSourceID,
+		EventName:        details.EventName,
+		Played:           details.Played,
+		PlayedPercentage: details.PlayedPercentage,
+		ItemSnapshot:     details.itemSnapshot(),
+		PlayState:        details.playState(),
 	}
 	if details.HasRunTimeTicks {
-		state.RunTimeTicks = details.RunTimeTicks
+		cmd.RunTimeTicks = details.RunTimeTicks
 	}
-	if details.Fingerprint != "" {
-		state.Fingerprint = details.Fingerprint
-	}
-	if details.HasPositionTicks {
-		state.PlaybackPositionTicks = details.PositionTicks
-	}
-	if details.PlayedPercentage != nil {
-		percentage := *details.PlayedPercentage
-		state.PlayedPercentage = &percentage
-	}
-	wasPlayed := state.Played
-	if details.Played != nil {
-		state.Played = *details.Played
-	}
-	if eventName == "stopped" {
-		if state.RunTimeTicks <= 0 {
-			s.enrichPlaybackStateMetadata(r.Context(), r, session, gatewayToken, state)
-		}
-		applyStoppedPlaybackState(state, now, wasPlayed, s.resumePolicyForState(state))
-	}
-	state.UpdatedAt = now
-	if err := s.store.SavePlaybackState(r.Context(), *state); err != nil {
-		return err
-	}
-	return nil
+	// details.SessionID is intentionally ignored for ownership.
+	_ = details.SessionID
+	return cmd
 }
 
 func playbackDetailsFromRequest(r *http.Request, data []byte) (playbackDetails, bool) {
+	details, ok, _ := playbackDetailsFromRequestChecked(r, data)
+	return details, ok
+}
+
+func playbackDetailsFromRequestChecked(r *http.Request, data []byte) (playbackDetails, bool, error) {
 	ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if len(bytes.TrimSpace(data)) > 0 {
 		if ct == "application/x-www-form-urlencoded" {
 			values, err := url.ParseQuery(string(data))
 			if err == nil {
-				merged := cloneQuery(r.URL.Query())
-				for key, vals := range values {
-					merged[key] = append([]string(nil), vals...)
+				formDetails, _, parseErr := playbackDetailsFromValuesChecked(values)
+				if parseErr != nil {
+					return playbackDetails{}, false, parseErr
 				}
-				return playbackDetailsFromValues(merged)
+				queryDetails, _, parseErr := playbackDetailsFromValuesChecked(r.URL.Query())
+				if parseErr != nil {
+					return playbackDetails{}, false, parseErr
+				}
+				merged := mergePlaybackDetails(formDetails, queryDetails)
+				return merged, merged.hasItemIdentity(), nil
 			}
 		}
 		if ct == "" || isJSONContentType(ct) || looksLikeJSON(data) {
+			if err := validateRawPlaybackJSONIdentityKeys(data); err != nil {
+				return playbackDetails{}, false, err
+			}
 			decoder := json.NewDecoder(bytes.NewReader(data))
 			decoder.UseNumber()
 			var body any
 			if err := decoder.Decode(&body); err == nil {
-				if details, ok := playbackDetailsFromJSON(body); ok {
-					return mergePlaybackDetails(details, r.URL.Query()), true
+				bodyDetails, _, parseErr := playbackDetailsFromJSONChecked(body)
+				if parseErr != nil {
+					return playbackDetails{}, false, parseErr
 				}
-				if details, ok := playbackDetailsFromValues(r.URL.Query()); ok {
-					if bodyDetails, bodyOK := playbackDetailsFromJSON(body); bodyOK || bodyDetails.HasPositionTicks || bodyDetails.HasRunTimeTicks || bodyDetails.Played != nil || bodyDetails.PlayedPercentage != nil {
-						return mergePlaybackDetails(bodyDetails, r.URL.Query()), true
-					}
-					return details, true
+				queryDetails, _, parseErr := playbackDetailsFromValuesChecked(r.URL.Query())
+				if parseErr != nil {
+					return playbackDetails{}, false, parseErr
 				}
+				merged := mergePlaybackDetails(bodyDetails, queryDetails)
+				return merged, merged.hasItemIdentity(), nil
 			}
 		}
 	}
-	return playbackDetailsFromValues(r.URL.Query())
+	return playbackDetailsFromValuesChecked(r.URL.Query())
 }
 
-func mergePlaybackDetails(details playbackDetails, values url.Values) playbackDetails {
-	queryDetails, ok := playbackDetailsFromValues(values)
-	if !ok {
-		return details
-	}
+// mergePlaybackDetails overlays lower-priority details without collapsing the
+// independent top-level ItemId and nested Item.Id identity channels.
+func mergePlaybackDetails(details, lower playbackDetails) playbackDetails {
 	if details.ItemID == "" {
-		details.ItemID = queryDetails.ItemID
+		details.ItemID = lower.ItemID
 	}
-	if !details.HasPositionTicks && queryDetails.HasPositionTicks {
-		details.PositionTicks = queryDetails.PositionTicks
+	mergeLowerSnapshotMetadata := true
+	if details.ItemSnapshotID == "" {
+		details.ItemSnapshotID = lower.ItemSnapshotID
+	} else if lower.ItemSnapshotID != "" && strings.TrimSpace(details.ItemSnapshotID) != strings.TrimSpace(lower.ItemSnapshotID) {
+		// Source precedence keeps the higher nested identity. Metadata tied to a
+		// different lower nested identity must not be attached to it.
+		mergeLowerSnapshotMetadata = false
+	}
+	if !details.HasPositionTicks && lower.HasPositionTicks {
+		details.PositionTicks = lower.PositionTicks
 		details.HasPositionTicks = true
 	}
-	if !details.HasRunTimeTicks && queryDetails.HasRunTimeTicks {
-		details.RunTimeTicks = queryDetails.RunTimeTicks
+	if !details.HasRunTimeTicks && lower.HasRunTimeTicks {
+		details.RunTimeTicks = lower.RunTimeTicks
 		details.HasRunTimeTicks = true
 	}
-	if details.Played == nil && queryDetails.Played != nil {
-		details.Played = queryDetails.Played
+	if details.Played == nil && lower.Played != nil {
+		details.Played = lower.Played
 	}
-	if details.PlayedPercentage == nil && queryDetails.PlayedPercentage != nil {
-		details.PlayedPercentage = queryDetails.PlayedPercentage
+	if details.PlayedPercentage == nil && lower.PlayedPercentage != nil {
+		details.PlayedPercentage = lower.PlayedPercentage
+	}
+	if details.PlaySessionID == "" {
+		details.PlaySessionID = lower.PlaySessionID
+	}
+	if details.MediaSourceID == "" {
+		details.MediaSourceID = lower.MediaSourceID
+	}
+	if details.EventName == "" {
+		details.EventName = lower.EventName
+	}
+	if details.SessionID == "" {
+		details.SessionID = lower.SessionID
+	}
+	if details.CanSeek == nil {
+		details.CanSeek = lower.CanSeek
+	}
+	if details.IsPaused == nil {
+		details.IsPaused = lower.IsPaused
+	}
+	if details.IsMuted == nil {
+		details.IsMuted = lower.IsMuted
+	}
+	if details.PlayMethod == nil {
+		details.PlayMethod = lower.PlayMethod
+	}
+	if details.AudioStreamIndex == nil {
+		details.AudioStreamIndex = lower.AudioStreamIndex
+	}
+	if details.SubtitleStreamIndex == nil {
+		details.SubtitleStreamIndex = lower.SubtitleStreamIndex
+	}
+	if details.VolumeLevel == nil {
+		details.VolumeLevel = lower.VolumeLevel
+	}
+	if details.PlaybackRate == nil {
+		details.PlaybackRate = lower.PlaybackRate
+	}
+	if details.RepeatMode == nil {
+		details.RepeatMode = lower.RepeatMode
+	}
+	if details.Shuffle == nil {
+		details.Shuffle = lower.Shuffle
+	}
+	if details.SubtitleOffset == nil {
+		details.SubtitleOffset = lower.SubtitleOffset
+	}
+	if mergeLowerSnapshotMetadata && details.ItemName == "" {
+		details.ItemName = lower.ItemName
+	}
+	if mergeLowerSnapshotMetadata && details.ItemType == "" {
+		details.ItemType = lower.ItemType
+	}
+	if mergeLowerSnapshotMetadata && details.MediaType == "" {
+		details.MediaType = lower.MediaType
+	}
+	if mergeLowerSnapshotMetadata && details.SeriesID == "" {
+		details.SeriesID = lower.SeriesID
+	}
+	if mergeLowerSnapshotMetadata && details.SeriesName == "" {
+		details.SeriesName = lower.SeriesName
+	}
+	if mergeLowerSnapshotMetadata && details.SeasonID == "" {
+		details.SeasonID = lower.SeasonID
+	}
+	if mergeLowerSnapshotMetadata && details.ParentID == "" {
+		details.ParentID = lower.ParentID
+	}
+	if mergeLowerSnapshotMetadata && !details.HasIndexNumber && lower.HasIndexNumber {
+		details.IndexNumber = lower.IndexNumber
+		details.HasIndexNumber = true
+	}
+	if mergeLowerSnapshotMetadata && !details.HasParentIndexNumber && lower.HasParentIndexNumber {
+		details.ParentIndexNumber = lower.ParentIndexNumber
+		details.HasParentIndexNumber = true
+	}
+	if mergeLowerSnapshotMetadata && !details.HasProductionYear && lower.HasProductionYear {
+		details.ProductionYear = lower.ProductionYear
+		details.HasProductionYear = true
+	}
+	if mergeLowerSnapshotMetadata && details.PremiereDate == "" {
+		details.PremiereDate = lower.PremiereDate
+	}
+	if mergeLowerSnapshotMetadata && !details.HasCommunityRating && lower.HasCommunityRating {
+		details.CommunityRating = lower.CommunityRating
+		details.HasCommunityRating = true
+	}
+	if mergeLowerSnapshotMetadata && details.OfficialRating == "" {
+		details.OfficialRating = lower.OfficialRating
+	}
+	if mergeLowerSnapshotMetadata && len(details.ImageTags) == 0 && len(lower.ImageTags) > 0 {
+		details.ImageTags = lower.ImageTags
+	}
+	if mergeLowerSnapshotMetadata && details.Fingerprint == "" {
+		details.Fingerprint = lower.Fingerprint
 	}
 	return details
 }
 
 type playbackDetails struct {
 	ItemID               string
+	ItemSnapshotID       string
 	PositionTicks        int64
 	HasPositionTicks     bool
 	Played               *bool
 	PlayedPercentage     *float64
 	ItemName             string
 	ItemType             string
+	MediaType            string
 	SeriesID             string
 	SeriesName           string
 	SeasonID             string
+	ParentID             string
 	IndexNumber          int
 	ParentIndexNumber    int
 	RunTimeTicks         int64
 	HasIndexNumber       bool
 	HasParentIndexNumber bool
 	HasRunTimeTicks      bool
+	ProductionYear       int
+	HasProductionYear    bool
+	PremiereDate         string
+	CommunityRating      float64
+	HasCommunityRating   bool
+	OfficialRating       string
+	ImageTags            map[string]string
 	Fingerprint          string
+
+	PlaySessionID       string
+	MediaSourceID       string
+	EventName           string
+	SessionID           string // body/query SessionId; never authoritative GatewayTokenHash
+	CanSeek             *bool
+	IsPaused            *bool
+	IsMuted             *bool
+	PlayMethod          *string
+	AudioStreamIndex    *int
+	SubtitleStreamIndex *int
+	VolumeLevel         *int
+	PlaybackRate        *float64
+	RepeatMode          *string
+	Shuffle             *bool
+	SubtitleOffset      *float64
+}
+
+func (d playbackDetails) hasPlayStateFields() bool {
+	return d.CanSeek != nil || d.IsPaused != nil || d.IsMuted != nil ||
+		d.PlayMethod != nil || d.AudioStreamIndex != nil || d.SubtitleStreamIndex != nil ||
+		d.VolumeLevel != nil || d.PlaybackRate != nil || d.RepeatMode != nil ||
+		d.Shuffle != nil || d.SubtitleOffset != nil
+}
+
+func (d playbackDetails) hasItemIdentity() bool {
+	return d.ItemID != "" || d.ItemSnapshotID != ""
+}
+
+func (d playbackDetails) itemSnapshot() PlaybackItemSnapshot {
+	snap := PlaybackItemSnapshot{
+		ID:             d.ItemSnapshotID,
+		Name:           d.ItemName,
+		Type:           d.ItemType,
+		MediaType:      d.MediaType,
+		SeriesID:       d.SeriesID,
+		SeriesName:     d.SeriesName,
+		SeasonID:       d.SeasonID,
+		ParentID:       d.ParentID,
+		PremiereDate:   d.PremiereDate,
+		OfficialRating: d.OfficialRating,
+	}
+	if d.HasIndexNumber {
+		snap.IndexNumber = d.IndexNumber
+	}
+	if d.HasParentIndexNumber {
+		snap.ParentIndexNumber = d.ParentIndexNumber
+	}
+	if d.HasRunTimeTicks {
+		snap.RunTimeTicks = d.RunTimeTicks
+	}
+	if d.HasProductionYear {
+		snap.ProductionYear = d.ProductionYear
+	}
+	if d.HasCommunityRating {
+		snap.CommunityRating = d.CommunityRating
+	}
+	if len(d.ImageTags) > 0 {
+		tags := make(map[string]string, len(d.ImageTags))
+		for k, v := range d.ImageTags {
+			tags[k] = v
+		}
+		snap.ImageTags = tags
+	}
+	return snap
+}
+
+func (d playbackDetails) playState() PlaybackPlayState {
+	ps := PlaybackPlayState{}
+	if d.HasPositionTicks {
+		v := d.PositionTicks
+		ps.PositionTicks = &v
+	}
+	if d.CanSeek != nil {
+		v := *d.CanSeek
+		ps.CanSeek = &v
+	}
+	if d.IsPaused != nil {
+		v := *d.IsPaused
+		ps.IsPaused = &v
+	}
+	if d.IsMuted != nil {
+		v := *d.IsMuted
+		ps.IsMuted = &v
+	}
+	if d.VolumeLevel != nil {
+		v := *d.VolumeLevel
+		ps.VolumeLevel = &v
+	}
+	if d.AudioStreamIndex != nil {
+		v := *d.AudioStreamIndex
+		ps.AudioStreamIndex = &v
+	}
+	if d.SubtitleStreamIndex != nil {
+		v := *d.SubtitleStreamIndex
+		ps.SubtitleStreamIndex = &v
+	}
+	if d.MediaSourceID != "" {
+		v := d.MediaSourceID
+		ps.MediaSourceID = &v
+	}
+	if d.PlayMethod != nil {
+		v := *d.PlayMethod
+		ps.PlayMethod = &v
+	}
+	if d.PlaybackRate != nil {
+		v := *d.PlaybackRate
+		ps.PlaybackRate = &v
+	}
+	if d.RepeatMode != nil {
+		v := *d.RepeatMode
+		ps.RepeatMode = &v
+	}
+	if d.Shuffle != nil {
+		v := *d.Shuffle
+		ps.Shuffle = &v
+	}
+	if d.SubtitleOffset != nil {
+		v := *d.SubtitleOffset
+		ps.SubtitleOffset = &v
+	}
+	return ps
 }
 
 func playbackDetailsFromJSON(v any) (playbackDetails, bool) {
+	details, ok, _ := playbackDetailsFromJSONChecked(v)
+	return details, ok
+}
+
+func playbackDetailsFromJSONChecked(v any) (playbackDetails, bool, error) {
 	obj, ok := v.(map[string]any)
 	if !ok {
-		return playbackDetails{}, false
+		return playbackDetails{}, false, nil
+	}
+	if err := validatePlaybackJSONIdentityKeys(obj); err != nil {
+		return playbackDetails{}, false, err
 	}
 	details := playbackDetails{}
 	if itemID, ok := stringField(obj, "ItemId"); ok {
 		details.ItemID = itemID
-	} else if item, ok := mapField(obj, "Item"); ok {
-		details.ItemID, _ = stringField(item, "Id")
 	}
 	if item, ok := mapField(obj, "Item"); ok {
-		details.ItemName, _ = stringField(item, "Name")
-		details.ItemType, _ = stringField(item, "Type")
-		details.SeriesID, _ = stringField(item, "SeriesId")
-		details.SeriesName, _ = stringField(item, "SeriesName")
-		details.SeasonID, _ = stringField(item, "SeasonId")
-		if v, ok := int64Field(item, "IndexNumber"); ok {
-			details.IndexNumber = int(v)
-			details.HasIndexNumber = true
-		}
-		if v, ok := int64Field(item, "ParentIndexNumber"); ok {
-			details.ParentIndexNumber = int(v)
-			details.HasParentIndexNumber = true
-		}
-		if v, ok := int64Field(item, "RunTimeTicks"); ok {
-			details.RunTimeTicks = v
-			details.HasRunTimeTicks = true
-		}
+		applyPlaybackItemSnapshotFields(&details, item)
 		details.Fingerprint = itemFingerprint(item)
 	}
 	if ticks, ok := int64Field(obj, "PositionTicks"); ok {
@@ -1554,12 +2020,129 @@ func playbackDetailsFromJSON(v any) (playbackDetails, bool) {
 	if percentage, ok := float64Field(obj, "PlayedPercentage"); ok {
 		details.PlayedPercentage = &percentage
 	}
-	return details, details.ItemID != ""
+	if s, ok := stringField(obj, "PlaySessionId"); ok {
+		details.PlaySessionID = s
+	}
+	if s, ok := stringField(obj, "MediaSourceId"); ok {
+		details.MediaSourceID = s
+	}
+	if s, ok := stringField(obj, "EventName"); ok {
+		details.EventName = s
+	}
+	// SessionId may be present on client payloads; never authoritative for ownership.
+	if s, ok := stringField(obj, "SessionId"); ok {
+		details.SessionID = s
+	}
+	if v, ok := boolField(obj, "CanSeek"); ok {
+		details.CanSeek = &v
+	}
+	if v, ok := boolField(obj, "IsPaused"); ok {
+		details.IsPaused = &v
+	}
+	if v, ok := boolField(obj, "IsMuted"); ok {
+		details.IsMuted = &v
+	}
+	if s, ok := stringField(obj, "PlayMethod"); ok {
+		details.PlayMethod = &s
+	}
+	if v, ok := int64Field(obj, "AudioStreamIndex"); ok {
+		i := int(v)
+		details.AudioStreamIndex = &i
+	}
+	if v, ok := int64Field(obj, "SubtitleStreamIndex"); ok {
+		i := int(v)
+		details.SubtitleStreamIndex = &i
+	}
+	if v, ok := int64Field(obj, "VolumeLevel"); ok {
+		i := int(v)
+		details.VolumeLevel = &i
+	}
+	if v, ok := float64Field(obj, "PlaybackRate"); ok {
+		details.PlaybackRate = &v
+	}
+	if s, ok := stringField(obj, "RepeatMode"); ok {
+		details.RepeatMode = &s
+	}
+	if v, ok := boolField(obj, "Shuffle"); ok {
+		details.Shuffle = &v
+	}
+	if v, ok := float64Field(obj, "SubtitleOffset"); ok {
+		details.SubtitleOffset = &v
+	}
+	return details, details.ItemID != "" || details.ItemSnapshotID != "", nil
+}
+
+func applyPlaybackItemSnapshotFields(details *playbackDetails, item map[string]any) {
+	details.ItemSnapshotID, _ = stringField(item, "Id")
+	details.ItemName, _ = stringField(item, "Name")
+	details.ItemType, _ = stringField(item, "Type")
+	details.MediaType, _ = stringField(item, "MediaType")
+	details.SeriesID, _ = stringField(item, "SeriesId")
+	details.SeriesName, _ = stringField(item, "SeriesName")
+	details.SeasonID, _ = stringField(item, "SeasonId")
+	details.ParentID, _ = stringField(item, "ParentId")
+	if v, ok := int64Field(item, "IndexNumber"); ok {
+		details.IndexNumber = int(v)
+		details.HasIndexNumber = true
+	}
+	if v, ok := int64Field(item, "ParentIndexNumber"); ok {
+		details.ParentIndexNumber = int(v)
+		details.HasParentIndexNumber = true
+	}
+	if v, ok := int64Field(item, "RunTimeTicks"); ok {
+		details.RunTimeTicks = v
+		details.HasRunTimeTicks = true
+	}
+	if v, ok := int64Field(item, "ProductionYear"); ok {
+		details.ProductionYear = int(v)
+		details.HasProductionYear = true
+	}
+	details.PremiereDate, _ = stringField(item, "PremiereDate")
+	if v, ok := float64Field(item, "CommunityRating"); ok {
+		details.CommunityRating = v
+		details.HasCommunityRating = true
+	}
+	details.OfficialRating, _ = stringField(item, "OfficialRating")
+	if tags, ok := stringMapField(item, "ImageTags"); ok {
+		details.ImageTags = tags
+	}
+}
+
+func stringMapField(obj map[string]any, name string) (map[string]string, bool) {
+	raw, ok := mapField(obj, name)
+	if !ok || len(raw) == 0 {
+		return nil, false
+	}
+	out := make(map[string]string, len(raw))
+	for k, v := range raw {
+		s, ok := v.(string)
+		if !ok {
+			continue
+		}
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		out[k] = s
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
 }
 
 func playbackDetailsFromValues(values url.Values) (playbackDetails, bool) {
+	details, ok, _ := playbackDetailsFromValuesChecked(values)
+	return details, ok
+}
+
+func playbackDetailsFromValuesChecked(values url.Values) (playbackDetails, bool, error) {
+	if err := validatePlaybackValuesIdentityKeys(values); err != nil {
+		return playbackDetails{}, false, err
+	}
 	details := playbackDetails{}
-	details.ItemID = firstValue(values, "ItemId", "ItemID", "Item.Id", "Id")
+	details.ItemID = firstValue(values, "ItemId", "ItemID", "Id")
+	details.ItemSnapshotID = firstValue(values, "Item.Id")
 	if ticks, ok := int64Value(values, "PositionTicks", "PlaybackPositionTicks"); ok {
 		details.PositionTicks = ticks
 		details.HasPositionTicks = true
@@ -1574,7 +2157,227 @@ func playbackDetailsFromValues(values url.Values) (playbackDetails, bool) {
 	if percentage, ok := float64Value(values, "PlayedPercentage"); ok {
 		details.PlayedPercentage = &percentage
 	}
-	return details, details.ItemID != ""
+	details.PlaySessionID = firstValue(values, "PlaySessionId")
+	details.MediaSourceID = firstValue(values, "MediaSourceId")
+	details.EventName = firstValue(values, "EventName")
+	details.SessionID = firstValue(values, "SessionId")
+	if v, ok := boolValue(values, "CanSeek"); ok {
+		details.CanSeek = &v
+	}
+	if v, ok := boolValue(values, "IsPaused"); ok {
+		details.IsPaused = &v
+	}
+	if v, ok := boolValue(values, "IsMuted"); ok {
+		details.IsMuted = &v
+	}
+	if s := firstValue(values, "PlayMethod"); s != "" {
+		details.PlayMethod = &s
+	}
+	if v, ok := int64Value(values, "AudioStreamIndex"); ok {
+		i := int(v)
+		details.AudioStreamIndex = &i
+	}
+	if v, ok := int64Value(values, "SubtitleStreamIndex"); ok {
+		i := int(v)
+		details.SubtitleStreamIndex = &i
+	}
+	if v, ok := int64Value(values, "VolumeLevel"); ok {
+		i := int(v)
+		details.VolumeLevel = &i
+	}
+	if v, ok := float64Value(values, "PlaybackRate"); ok {
+		details.PlaybackRate = &v
+	}
+	if s := firstValue(values, "RepeatMode"); s != "" {
+		details.RepeatMode = &s
+	}
+	if v, ok := boolValue(values, "Shuffle"); ok {
+		details.Shuffle = &v
+	}
+	if v, ok := float64Value(values, "SubtitleOffset"); ok {
+		details.SubtitleOffset = &v
+	}
+	details.ItemName = firstValue(values, "Item.Name", "Name")
+	details.ItemType = firstValue(values, "Item.Type", "Type")
+	details.MediaType = firstValue(values, "Item.MediaType", "MediaType")
+	details.SeriesID = firstValue(values, "Item.SeriesId", "SeriesId")
+	details.SeriesName = firstValue(values, "Item.SeriesName", "SeriesName")
+	details.SeasonID = firstValue(values, "Item.SeasonId", "SeasonId")
+	details.ParentID = firstValue(values, "Item.ParentId", "ParentId")
+	if v, ok := int64Value(values, "Item.IndexNumber", "IndexNumber"); ok {
+		details.IndexNumber = int(v)
+		details.HasIndexNumber = true
+	}
+	if v, ok := int64Value(values, "Item.ParentIndexNumber", "ParentIndexNumber"); ok {
+		details.ParentIndexNumber = int(v)
+		details.HasParentIndexNumber = true
+	}
+	if v, ok := int64Value(values, "Item.ProductionYear", "ProductionYear"); ok {
+		details.ProductionYear = int(v)
+		details.HasProductionYear = true
+	}
+	details.PremiereDate = firstValue(values, "Item.PremiereDate", "PremiereDate")
+	if v, ok := float64Value(values, "Item.CommunityRating", "CommunityRating"); ok {
+		details.CommunityRating = v
+		details.HasCommunityRating = true
+	}
+	details.OfficialRating = firstValue(values, "Item.OfficialRating", "OfficialRating")
+	return details, details.hasItemIdentity(), nil
+}
+
+func validatePlaybackJSONIdentityKeys(obj map[string]any) error {
+	if err := validateCaseInsensitiveJSONKey(obj, "ItemId"); err != nil {
+		return err
+	}
+	if err := validateCaseInsensitiveJSONKey(obj, "Item"); err != nil {
+		return err
+	}
+	if item, ok := mapField(obj, "Item"); ok {
+		if err := validateCaseInsensitiveJSONKey(item, "Id"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type playbackJSONIdentityScope uint8
+
+const (
+	playbackJSONIdentityNone playbackJSONIdentityScope = iota
+	playbackJSONIdentityTop
+	playbackJSONIdentityItem
+)
+
+// validateRawPlaybackJSONIdentityKeys scans tokens before map decoding can
+// collapse exact duplicate keys. Syntax errors retain the existing query
+// fallback behavior; identity ambiguity is always an ErrBadRequest.
+func validateRawPlaybackJSONIdentityKeys(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	token, err := decoder.Token()
+	if err != nil {
+		return nil
+	}
+	delim, ok := token.(json.Delim)
+	if !ok || delim != '{' {
+		return nil
+	}
+	if err := scanPlaybackJSONObject(decoder, playbackJSONIdentityTop); err != nil {
+		if errors.Is(err, ErrBadRequest) {
+			return err
+		}
+		return nil
+	}
+	return nil
+}
+
+func scanPlaybackJSONObject(decoder *json.Decoder, scope playbackJSONIdentityScope) error {
+	itemIDKeys := 0
+	itemObjectKeys := 0
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := token.(string)
+		if !ok {
+			return fmt.Errorf("invalid JSON object key")
+		}
+
+		valueScope := playbackJSONIdentityNone
+		switch scope {
+		case playbackJSONIdentityTop:
+			if strings.EqualFold(key, "ItemId") {
+				itemIDKeys++
+				if itemIDKeys > 1 {
+					return fmt.Errorf("%w: duplicate ItemId key", ErrBadRequest)
+				}
+			}
+			if strings.EqualFold(key, "Item") {
+				itemObjectKeys++
+				if itemObjectKeys > 1 {
+					return fmt.Errorf("%w: duplicate Item key", ErrBadRequest)
+				}
+				valueScope = playbackJSONIdentityItem
+			}
+		case playbackJSONIdentityItem:
+			if strings.EqualFold(key, "Id") {
+				itemIDKeys++
+				if itemIDKeys > 1 {
+					return fmt.Errorf("%w: duplicate nested Id key", ErrBadRequest)
+				}
+			}
+		}
+		if err := scanPlaybackJSONValue(decoder, valueScope); err != nil {
+			return err
+		}
+	}
+	_, err := decoder.Token()
+	return err
+}
+
+func scanPlaybackJSONValue(decoder *json.Decoder, objectScope playbackJSONIdentityScope) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		return scanPlaybackJSONObject(decoder, objectScope)
+	case '[':
+		for decoder.More() {
+			if err := scanPlaybackJSONValue(decoder, playbackJSONIdentityNone); err != nil {
+				return err
+			}
+		}
+		_, err := decoder.Token()
+		return err
+	default:
+		return fmt.Errorf("invalid JSON delimiter")
+	}
+}
+
+func validateCaseInsensitiveJSONKey(obj map[string]any, name string) error {
+	count := 0
+	for key := range obj {
+		if strings.EqualFold(key, name) {
+			count++
+		}
+	}
+	if count > 1 {
+		return fmt.Errorf("%w: ambiguous case-variant %s keys", ErrBadRequest, name)
+	}
+	return nil
+}
+
+func validatePlaybackValuesIdentityKeys(values url.Values) error {
+	topKeys := 0
+	nestedKeys := 0
+	for key := range values {
+		switch {
+		case strings.EqualFold(key, "ItemId") || strings.EqualFold(key, "Id"):
+			if len(values[key]) > 1 {
+				return fmt.Errorf("%w: repeated ItemId values", ErrBadRequest)
+			}
+			topKeys++
+		case strings.EqualFold(key, "Item.Id"):
+			if len(values[key]) > 1 {
+				return fmt.Errorf("%w: repeated Item.Id values", ErrBadRequest)
+			}
+			nestedKeys++
+		}
+	}
+	if topKeys > 1 {
+		return fmt.Errorf("%w: ambiguous case-variant ItemId keys", ErrBadRequest)
+	}
+	if nestedKeys > 1 {
+		return fmt.Errorf("%w: ambiguous case-variant Item.Id keys", ErrBadRequest)
+	}
+	return nil
 }
 
 func firstValue(values url.Values, names ...string) string {
@@ -1616,65 +2419,18 @@ func boolValue(values url.Values, names ...string) (bool, bool) {
 	return false, false
 }
 
-type resumePolicy struct {
-	MinPct             float64
-	MaxPct             float64
-	MinDurationSeconds float64
-}
-
-func (s *Server) resumePolicyForState(state *PlaybackState) resumePolicy {
-	policy := resumePolicy{MinPct: s.cfg.MinResumePct, MaxPct: s.cfg.MaxResumePct, MinDurationSeconds: s.cfg.MinResumeDurationSeconds}
-	if state != nil && (strings.EqualFold(state.ItemType, "AudioBook") || strings.EqualFold(state.ItemType, "Book")) {
-		policy.MinDurationSeconds = 0
+// playbackResumePolicyFromConfig maps Config resume thresholds onto the report
+// command policy. Uses MinResumePct, MaxResumePct, MinResumeDurationSeconds.
+// NewServer fills non-positive config zeros with package defaults; Prepare then
+// preserves explicit nonzero command values and fills any remaining zeros.
+func (s *Server) playbackResumePolicyFromConfig() PlaybackResumePolicy {
+	if s == nil {
+		return PlaybackResumePolicy{}
 	}
-	return policy
-}
-
-func applyStoppedPlaybackState(state *PlaybackState, now time.Time, wasPlayed bool, policy resumePolicy) {
-	completed := state.Played
-	position := state.PlaybackPositionTicks
-	if position < 0 {
-		position = 0
-	}
-	runtime := state.RunTimeTicks
-	if !completed && runtime > 0 && position > 0 {
-		percentage := (float64(position) / float64(runtime)) * 100
-		durationSeconds := float64(runtime) / float64(embyTicksPerSecond)
-		switch {
-		case percentage < policy.MinPct:
-			position = 0
-			state.PlayedPercentage = nil
-		case percentage > policy.MaxPct || position >= runtime-embyTicksPerSecond:
-			completed = true
-		case policy.MinDurationSeconds > 0 && durationSeconds < policy.MinDurationSeconds:
-			completed = true
-		}
-	}
-	if !completed && state.PlayedPercentage != nil && *state.PlayedPercentage >= policy.MaxPct {
-		completed = true
-	}
-	if completed {
-		lastPlayed := now
-		state.LastPlayedDate = &lastPlayed
-		state.Played = true
-		state.PlaybackPositionTicks = 0
-		state.PlayedPercentage = floatPtr(100)
-		if !wasPlayed {
-			state.PlayCount++
-		}
-		return
-	}
-	state.PlaybackPositionTicks = position
-}
-
-func playbackEventName(rel string) string {
-	switch {
-	case equalPath(rel, "/Sessions/Playing/Progress"):
-		return "progress"
-	case equalPath(rel, "/Sessions/Playing/Stopped"):
-		return "stopped"
-	default:
-		return "playing"
+	return PlaybackResumePolicy{
+		MinPct:             s.cfg.MinResumePct,
+		MaxPct:             s.cfg.MaxResumePct,
+		MinDurationSeconds: s.cfg.MinResumeDurationSeconds,
 	}
 }
 
@@ -2713,7 +3469,8 @@ func authenticationResultDTO(user GatewayUser, session *Session, token, serverID
 		"AccessToken": token,
 		"ServerId":    serverID,
 		"User":        userObj,
-		"SessionInfo": sessionInfoDTO(session, serverID),
+		// Login is always idle: no current playback projection.
+		"SessionInfo": sessionInfoDTO(session, serverID, nil, nil),
 	}
 }
 
