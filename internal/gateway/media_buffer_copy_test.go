@@ -227,6 +227,79 @@ func TestMediaBufferCopyCancellationWhileWaitingForCapacity(t *testing.T) {
 	closeMediaBufferCopyRequests(t, blocker, request)
 }
 
+func TestMediaBufferCopyPendingGrantCanceledBeforeAcceptancePreservesDownstreamResult(t *testing.T) {
+	writeErr := errors.New("downstream write failed")
+	for _, tt := range []struct {
+		name      string
+		blocking  bool
+		writerN   int
+		writerErr error
+	}{
+		{name: "immediate notify write error", writerN: 0, writerErr: writeErr},
+		{name: "blocking notify short write", blocking: true, writerN: mediaCopyBufferSize - 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			budget := mediaBufferChunkSize
+			if tt.blocking {
+				budget = 2 * mediaBufferChunkSize
+			}
+			controller := mustMediaBufferCopyController(t, budget)
+			var blocker *mediaBufferRequest
+			var blockerLeases []mediaBufferLease
+			if tt.blocking {
+				blocker = controller.register()
+				blockerLeases = []mediaBufferLease{acceptMediaBufferCopyLease(t, blocker), acceptMediaBufferCopyLease(t, blocker)}
+			}
+			request := controller.register()
+			notified := make(chan struct{})
+			allowAccept := make(chan struct{})
+			cleanupCanceled := make(chan struct{})
+			optionalWait := make(chan struct{})
+			var notifiedOnce, cleanupOnce, waitOnce sync.Once
+			hooks := &mediaBufferCopyHooks{
+				onOptionalWait: func() { waitOnce.Do(func() { close(optionalWait) }) },
+				onOptionalNotified: func() {
+					notifiedOnce.Do(func() { close(notified) })
+					<-allowAccept
+				},
+				onCleanupCanceled: func() { cleanupOnce.Do(func() { close(cleanupCanceled) }) },
+			}
+			writer := &mediaBufferNotifiedFailureWriter{notified: notified, n: tt.writerN, err: tt.writerErr}
+			source := newMediaBufferTestSource(bytes.NewReader(bytes.Repeat([]byte("p"), 2*mediaCopyBufferSize)), nil)
+			resultCh := make(chan mediaCopyResult, 1)
+			go func() {
+				resultCh <- copyBufferedMediaBodyWithHooks(context.Background(), writer, source, source, make([]byte, mediaCopyBufferSize), request, -1, hooks)
+			}()
+			if tt.blocking {
+				awaitMediaBufferSignal(t, optionalWait)
+				if err := blocker.releaseOptional(blockerLeases[0]); err != nil {
+					t.Fatal(err)
+				}
+			}
+			awaitMediaBufferSignal(t, notified)
+			awaitMediaBufferSignal(t, cleanupCanceled)
+			if got := request.snapshot(); got.Owned != 0 || got.Pending || got.Requesting {
+				t.Fatalf("request after pending reclaim=%+v", got)
+			}
+			requireNoMediaBufferResult(t, resultCh)
+			close(allowAccept)
+			result := awaitMediaBufferResult(t, resultCh)
+			syncResult := copyMediaBody(&mediaBufferInvalidWriter{n: tt.writerN, err: tt.writerErr}, bytes.NewReader(bytes.Repeat([]byte("p"), mediaCopyBufferSize)), -1)
+			assertMediaCopyParity(t, result, syncResult)
+			if errors.Is(result.Err, errMediaBufferCopyInvariant) {
+				t.Fatalf("expected cancellation race produced invariant: %v", result.Err)
+			}
+			if tt.blocking {
+				if err := blocker.releaseOptional(blockerLeases[1]); err != nil {
+					t.Fatal(err)
+				}
+				closeMediaBufferCopyRequests(t, blocker)
+			}
+			closeMediaBufferCopyRequests(t, request)
+		})
+	}
+}
+
 func TestMediaBufferCopyCancellationUnblocksReadAndJoins(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	reader := &mediaBufferJoinReader{started: make(chan struct{}), closed: make(chan struct{}), closeObserved: make(chan struct{}), allowReturn: make(chan struct{})}
@@ -474,6 +547,17 @@ type mediaBufferInvalidWriter struct {
 }
 
 func (w *mediaBufferInvalidWriter) Write([]byte) (int, error) { return w.n, w.err }
+
+type mediaBufferNotifiedFailureWriter struct {
+	notified <-chan struct{}
+	n        int
+	err      error
+}
+
+func (w *mediaBufferNotifiedFailureWriter) Write([]byte) (int, error) {
+	<-w.notified
+	return w.n, w.err
+}
 
 type mediaBufferTerminalBarrierWriter struct{ terminalPublished <-chan struct{} }
 

@@ -12,11 +12,13 @@ var errMediaBufferCopyState = errors.New("invalid media buffer copy state")
 var errMediaBufferCopyInvariant = errors.New("media buffer copy ownership invariant failed")
 
 type mediaBufferCopyHooks struct {
-	onOptionalWait   func()
-	onPublished      func(terminal bool)
-	onBeforeDequeue  func(terminal bool)
-	injectReleaseErr error
-	injectCancelErr  error
+	onOptionalWait     func()
+	onOptionalNotified func()
+	onCleanupCanceled  func()
+	onPublished        func(terminal bool)
+	onBeforeDequeue    func(terminal bool)
+	injectReleaseErr   error
+	injectCancelErr    error
 }
 
 type mediaBufferCopyBuffer struct {
@@ -124,6 +126,9 @@ func copyBufferedMediaBodyWithHooks(ctx context.Context, dst io.Writer, src io.R
 	var invariantErr error
 	if cancelErr := cancelBufferedOptionalRequest(request, hooks); cancelErr != nil {
 		invariantErr = errors.Join(invariantErr, cancelErr)
+	}
+	if hooks != nil && hooks.onCleanupCanceled != nil {
+		hooks.onCleanupCanceled()
 	}
 	_ = source.Close()
 	producerResult := <-producerDone
@@ -275,11 +280,7 @@ func acquireBufferedCopyBuffer(ctx context.Context, request *mediaBufferRequest,
 	}
 	select {
 	case <-notify:
-		lease, acceptErr := request.acceptOptional()
-		if acceptErr != nil {
-			return mediaBufferCopyBuffer{}, mediaBufferCopyInvariantError(acceptErr)
-		}
-		return mediaBufferCopyBuffer{data: lease.bytes(), lease: lease}, nil
+		return acceptBufferedOptionalNotification(ctx, request, hooks)
 	default:
 	}
 	if hooks != nil && hooks.onOptionalWait != nil {
@@ -297,12 +298,22 @@ func acquireBufferedCopyBuffer(ctx context.Context, request *mediaBufferRequest,
 		if !ok {
 			return mediaBufferCopyBuffer{}, mediaBufferCopyInvariantError(errMediaBufferClosed)
 		}
-		lease, acceptErr := request.acceptOptional()
-		if acceptErr != nil {
-			return mediaBufferCopyBuffer{}, mediaBufferCopyInvariantError(acceptErr)
-		}
+		return acceptBufferedOptionalNotification(ctx, request, hooks)
+	}
+}
+
+func acceptBufferedOptionalNotification(ctx context.Context, request *mediaBufferRequest, hooks *mediaBufferCopyHooks) (mediaBufferCopyBuffer, error) {
+	if hooks != nil && hooks.onOptionalNotified != nil {
+		hooks.onOptionalNotified()
+	}
+	lease, err := request.acceptOptional()
+	if err == nil {
 		return mediaBufferCopyBuffer{data: lease.bytes(), lease: lease}, nil
 	}
+	if errors.Is(err, errMediaBufferNoGrant) && ctx.Err() != nil {
+		return mediaBufferCopyBuffer{}, ctx.Err()
+	}
+	return mediaBufferCopyBuffer{}, mediaBufferCopyInvariantError(err)
 }
 
 func releaseProducerBuffer(request *mediaBufferRequest, buffer mediaBufferCopyBuffer, hooks *mediaBufferCopyHooks) error {
