@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pocketbase/pocketbase/core"
 	"github.com/xxxbrian/emby-auth-gateway/internal/gateway"
 )
 
@@ -49,24 +50,104 @@ var NewUpstreamHTTPClient = func() *http.Client {
 	return &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }
 
-// ProbeUpstream probes the public Emby system info endpoint and returns identity plus latency.
-func ProbeUpstream(ctx context.Context, in UpstreamReconfigureInput) (serverID, serverName, serverVersion string, latencyMS int64, err error) {
+// ResolveBackendPassword returns a non-empty backend password for probe/reconfigure.
+// When password is empty and an existing upstream source stores a password, that
+// stored secret is reused only if targetBaseURL exactly matches the currently
+// configured upstream endpoint base after NormalizeUpstreamURL (no path
+// equivalence shortcuts). This prevents a compromised admin session from
+// probing attacker URLs with the stored credential. Empty password with no
+// reusable secret returns a clear error.
+func ResolveBackendPassword(app core.App, password, targetBaseURL string) (string, error) {
+	password = strings.TrimSpace(password)
+	if password != "" {
+		return password, nil
+	}
+	if app == nil {
+		return "", fmt.Errorf("backend password is required")
+	}
+	state, err := LoadUpstreamStateForCreate(app)
+	if err != nil {
+		return "", err
+	}
+	if state.Source == nil {
+		return "", fmt.Errorf("backend password is required (no stored upstream password to reuse)")
+	}
+	stored := strings.TrimSpace(state.Source.GetString("backend_password"))
+	if stored == "" {
+		return "", fmt.Errorf("backend password is required (no stored upstream password to reuse)")
+	}
+	target, err := NormalizeUpstreamURL(targetBaseURL)
+	if err != nil {
+		return "", err
+	}
+	// Prefer active endpoint base_url; fall back to any endpoint.
+	var configured string
+	for _, ep := range state.Endpoints {
+		if ep == nil {
+			continue
+		}
+		base := strings.TrimSpace(ep.GetString("base_url"))
+		if base == "" {
+			continue
+		}
+		if ep.GetBool("active") || configured == "" {
+			configured = base
+		}
+		if ep.GetBool("active") {
+			break
+		}
+	}
+	if configured == "" {
+		return "", fmt.Errorf("backend password is required (no configured upstream URL to match for reuse)")
+	}
+	cfgNorm, err := NormalizeUpstreamURL(configured)
+	if err != nil {
+		return "", fmt.Errorf("backend password is required (stored upstream URL invalid)")
+	}
+	// Exact normalized base only. Do not treat /emby as equivalent: different
+	// path roots can route to different services and would leak credentials.
+	if target != cfgNorm {
+		return "", fmt.Errorf("backend password is required when probing a URL other than the configured upstream (%s)", cfgNorm)
+	}
+	return stored, nil
+}
+
+// ProbeUpstream performs a full upstream check: public system info plus AuthenticateByName.
+// On success it returns server identity, backend user id, and latency. The temporary
+// access token is logged out and never returned. Wrong credentials fail the probe.
+// When password is empty, app may be used to reuse the stored upstream password
+// (same as reconfigure); pass nil app to require an explicit password.
+func ProbeUpstream(ctx context.Context, app core.App, in UpstreamReconfigureInput) (serverID, serverName, serverVersion, backendUserID string, latencyMS int64, err error) {
 	baseURL, err := NormalizeUpstreamURL(in.EmbyBaseURL)
 	if err != nil {
-		return "", "", "", 0, err
+		return "", "", "", "", 0, err
+	}
+	username := strings.TrimSpace(in.BackendUsername)
+	password, err := ResolveBackendPassword(app, in.BackendPassword, baseURL)
+	if err != nil {
+		return "", "", "", "", 0, err
+	}
+	if username == "" {
+		return "", "", "", "", 0, fmt.Errorf("backend username is required")
 	}
 	identity := in.identity()
 	deviceID, err := newBackendDeviceID()
 	if err != nil {
-		return "", "", "", 0, err
+		return "", "", "", "", 0, err
 	}
 	start := time.Now()
-	public, publicID, _, err := probeUpstreamPublic(ctx, NewUpstreamHTTPClient(), baseURL, deviceID, "", identity)
+	probe, effectiveBase, err := probeUpstream(ctx, baseURL, username, password, deviceID, "", identity)
 	latencyMS = time.Since(start).Milliseconds()
-	if err != nil {
-		return "", "", "", latencyMS, err
+	if effectiveBase != "" {
+		baseURL = effectiveBase
 	}
-	return publicID, public.Name, public.Version, latencyMS, nil
+	if probe.token != "" {
+		_ = logoutUpstream(ctx, baseURL, identity, deviceID, probe.userID, probe.token)
+	}
+	if err != nil {
+		return "", "", "", "", latencyMS, err
+	}
+	return probe.serverID, probe.serverName, probe.version, probe.userID, latencyMS, nil
 }
 
 // NormalizeUpstreamURL validates and normalizes an Emby base URL.

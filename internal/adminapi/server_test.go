@@ -282,6 +282,22 @@ func TestCreateUserReturnsUserDTO(t *testing.T) {
 		t.Fatalf("enabled=%v", created["enabled"])
 	}
 
+	// Successful create must write admin audit log (no secrets).
+	audits, err := app.FindRecordsByFilter("audit_logs", `event = "admin_user_create"`, "-created", 5, 0, nil)
+	if err != nil {
+		t.Fatalf("list audits: %v", err)
+	}
+	if len(audits) == 0 {
+		t.Fatal("expected admin_user_create audit log")
+	}
+	msg := audits[0].GetString("message")
+	if !strings.Contains(msg, "admin-create@example.test") || !strings.Contains(msg, "dto_user") {
+		t.Fatalf("audit message missing actor/username: %q", msg)
+	}
+	if strings.Contains(strings.ToLower(msg), "password") || strings.Contains(msg, "DtoPass") {
+		t.Fatalf("audit message must not contain password material: %q", msg)
+	}
+
 	// Duplicate must be 409, not password overwrite.
 	rr = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodPost, "/admin/api/v1/users", bytes.NewReader(userBody))
@@ -292,6 +308,79 @@ func TestCreateUserReturnsUserDTO(t *testing.T) {
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusConflict {
 		t.Fatalf("duplicate code=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestUpstreamProbeFailsOnBadPassword(t *testing.T) {
+	app := newTestApp(t)
+	su := createSuperuser(t, app, "probe@example.test", "SuperSecret1!")
+	token, err := su.NewAuthToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions := adminauth.NewStore(10)
+	h := buildHandler(t, app, sessions)
+
+	// Session + CSRF.
+	body, _ := json.Marshal(map[string]string{"token": token})
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/v1/session", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", testOrigin)
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("session create code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var sess map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &sess); err != nil {
+		t.Fatal(err)
+	}
+	csrf, _ := sess["csrf"].(string)
+	var sessionCookie *http.Cookie
+	for _, c := range rr.Result().Cookies() {
+		if c.Name == adminauth.CookieDev || c.Name == adminauth.CookieSecure {
+			sessionCookie = c
+			break
+		}
+	}
+	if sessionCookie == nil || csrf == "" {
+		t.Fatal("missing session cookie or csrf")
+	}
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/System/Info/Public":
+			_, _ = w.Write([]byte(`{"Id":"server","ServerName":"Probe","Version":"1.0"}`))
+		case "/Users/AuthenticateByName":
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"message":"Invalid user or password"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer backend.Close()
+
+	probeBody, _ := json.Marshal(map[string]any{
+		"emby_base_url":     backend.URL,
+		"backend_username":  "u",
+		"backend_password":  "bad",
+		"backend_user_agent": "ua",
+		"backend_authorization_client": "c",
+		"backend_authorization_device": "d",
+		"backend_authorization_version": "v",
+	})
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/admin/api/v1/upstream/probe", bytes.NewReader(probeBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", testOrigin)
+	req.Header.Set(adminauth.CSRFHeader, csrf)
+	req.AddCookie(sessionCookie)
+	h.ServeHTTP(rr, req)
+	if rr.Code == http.StatusOK {
+		t.Fatalf("probe with bad password must not succeed: body=%s", rr.Body.String())
+	}
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("probe code=%d body=%s", rr.Code, rr.Body.String())
 	}
 }
 

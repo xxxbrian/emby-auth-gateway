@@ -519,3 +519,41 @@ jobs:
             BUILD_DATE=unknown
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  admin-ui:
+    name: Admin UI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/admin/package-lock.json
+
+      - name: Admin SPA check and build
+        working-directory: web/admin
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run check
+          npm run build
+
+      # Full Playwright e2e via the closure runner (builds SPA + temp gateway).
+      # Skip browser reinstall when playwright install chromium is slow on cold runners.
+      - name: Admin e2e (Playwright)
+        run: |
+          set -euo pipefail
+          chmod +x web/admin/scripts/run-admin-e2e.sh
+          bash web/admin/scripts/run-admin-e2e.sh
+        env:
+          CI: "true"

@@ -2,12 +2,17 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pathpolicy"
 )
+
+// ErrPolicyConflict is returned when an optional optimistic concurrency token
+// (updated timestamp) does not match the stored record.
+var ErrPolicyConflict = errors.New("policy was modified; reload and retry")
 
 // InstallDefaultPolicies inserts missing default path policies without overwriting existing matches.
 func InstallDefaultPolicies(app core.App) (created, preserved int, err error) {
@@ -67,6 +72,8 @@ func ListPolicies(ctx context.Context, app core.App) ([]pathpolicy.Policy, error
 }
 
 // UpsertPolicy creates or updates a path policy. Action must be allow/deny; method/path are normalized.
+// When p.ID is set and p.Updated is non-zero, the stored record's updated timestamp
+// must match (optimistic concurrency); otherwise ErrPolicyConflict is returned.
 func UpsertPolicy(ctx context.Context, app core.App, p pathpolicy.Policy) (pathpolicy.Policy, error) {
 	if err := ctx.Err(); err != nil {
 		return pathpolicy.Policy{}, err
@@ -90,6 +97,13 @@ func UpsertPolicy(ctx context.Context, app core.App, p pathpolicy.Policy) (pathp
 			record, err = txApp.FindRecordById("path_policies", id)
 			if err != nil {
 				return err
+			}
+			if !p.Updated.IsZero() {
+				stored := record.GetDateTime("updated").Time().UTC()
+				// Millisecond precision matches PocketBase DateTime storage.
+				if stored.UnixMilli() != p.Updated.UTC().UnixMilli() {
+					return ErrPolicyConflict
+				}
 			}
 		} else {
 			record = core.NewRecord(collection)

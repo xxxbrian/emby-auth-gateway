@@ -214,6 +214,8 @@ export interface PolicyForm {
   reason: string;
   priority: number;
   enabled: boolean;
+  /** Optimistic concurrency token from list (RFC3339). */
+  updated?: string;
 }
 
 // --- Request bodies ---
@@ -235,6 +237,8 @@ export interface PolicyBody {
   reason: string;
   priority: number;
   enabled: boolean;
+  /** Optional optimistic concurrency token (RFC3339). */
+  updated?: string;
 }
 
 export interface UpstreamBody {
@@ -281,7 +285,19 @@ export interface UpstreamProbeResult {
   server_id: string;
   server_name: string;
   server_version: string;
+  backend_user_id?: string;
   latency_ms: number;
+}
+
+export interface PolicyPreviewResult {
+  Allowed?: boolean;
+  Action?: string;
+  PolicyID?: string;
+  Reason?: string;
+  allowed?: boolean;
+  action?: string;
+  policy_id?: string;
+  reason?: string;
 }
 
 export interface ApiErrorBody {

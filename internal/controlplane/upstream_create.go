@@ -214,6 +214,9 @@ func activeEndpoint(endpoints []*core.Record) (*core.Record, error) {
 }
 
 // ReconfigureUpstream creates or updates the singleton upstream configuration.
+// When BackendPassword is empty and an existing source is present, the stored
+// password is reused. An empty password with no existing source is an error.
+// CLI setup still requires --backend-password via flag validation.
 func ReconfigureUpstream(parent context.Context, app core.App, opts UpstreamReconfigureInput) (UpstreamReconfigureResult, error) {
 	result := UpstreamReconfigureResult{}
 	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
@@ -232,6 +235,12 @@ func ReconfigureUpstream(parent context.Context, app core.App, opts UpstreamReco
 	if state.Source == nil && !opts.AllowCreate {
 		return result, fmt.Errorf("upstream source does not exist; create is not allowed")
 	}
+	// Empty password on update reuses the stored secret; create/CLI still need one.
+	resolvedPassword, err := ResolveBackendPassword(app, opts.BackendPassword, opts.EmbyBaseURL)
+	if err != nil {
+		return result, err
+	}
+	opts.BackendPassword = resolvedPassword
 	identity := opts.identity()
 	var deviceID string
 	var active *core.Record

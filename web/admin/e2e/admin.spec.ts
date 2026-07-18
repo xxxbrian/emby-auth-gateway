@@ -120,7 +120,7 @@ test.describe('Admin SPA regression', () => {
       { link: 'Users', heading: 'Users' },
       { link: 'Activity', heading: 'Activity' },
       { link: 'Traffic', heading: 'Traffic & Audit' },
-      { link: 'System', heading: 'System & Upstream' },
+      { link: 'System', heading: 'System' },
       { link: 'Overview', heading: 'Overview' },
     ];
 
@@ -153,7 +153,7 @@ test.describe('Admin SPA regression', () => {
         r.request().method() === 'POST' &&
         r.status() !== 0,
     );
-    await page.getByRole('button', { name: 'Save' }).click();
+    await page.getByRole('button', { name: 'Save User' }).click();
     const createResp = await createRespPromise;
     expect(createResp.status()).toBe(200);
     const createdBody = (await createResp.json()) as {
@@ -181,7 +181,7 @@ test.describe('Admin SPA regression', () => {
     await page.fill('#username', username);
     await page.fill('#password', userPassword);
     await page.fill('#syn_id', `other-${syntheticId}`);
-    await page.getByRole('button', { name: 'Save' }).click();
+    await page.getByRole('button', { name: 'Save User' }).click();
 
     await expect(page.locator('.error-message')).toBeVisible();
     await expect(page.locator('.error-message')).toContainText(
@@ -198,21 +198,29 @@ test.describe('Admin SPA regression', () => {
     await page.getByRole('link', { name: 'Users', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Users', exact: true })).toBeVisible();
 
-    // Ensure at least one row with action buttons exists.
-    let actionButtons = page.locator('.action-row button');
-    if ((await actionButtons.count()) === 0) {
+    // Ensure at least one row with Disable/Enable action buttons exists.
+    const disableButtons = page.getByRole('button', { name: 'Disable' });
+    const enableButtons = page.getByRole('button', { name: 'Enable' });
+    if ((await disableButtons.count()) === 0 && (await enableButtons.count()) === 0) {
       const suffix = `m${Date.now()}`;
       await page.getByRole('button', { name: 'Create User' }).click();
       await page.fill('#username', `e2e_mobile_${suffix}`);
       await page.fill('#password', 'E2ePass123!');
       await page.fill('#syn_id', `syn-m-${suffix}`);
-      await page.getByRole('button', { name: 'Save' }).click();
+      await page.getByRole('button', { name: 'Save User' }).click();
       await expect(page.getByText(`e2e_mobile_${suffix}`, { exact: true })).toBeVisible();
-      actionButtons = page.locator('.action-row button');
     }
 
-    await expect(actionButtons.first()).toBeVisible();
-    const count = await actionButtons.count();
+    const actionBtn =
+      (await disableButtons.count()) > 0
+        ? disableButtons.first()
+        : enableButtons.first();
+    await expect(actionBtn).toBeVisible();
+
+    // Also check row action cluster (Disable/Enable, Pwd, Kick) for the first user row.
+    const rowActionButtons = page.locator('table tbody tr').first().getByRole('button');
+    await expect(rowActionButtons.first()).toBeVisible();
+    const count = await rowActionButtons.count();
     expect(count).toBeGreaterThan(0);
 
     // No horizontal document overflow (do not scroll before measuring).
@@ -227,7 +235,7 @@ test.describe('Admin SPA regression', () => {
 
     // Each action button fully within the viewport without scrolling into view.
     for (let i = 0; i < count; i++) {
-      const btn = actionButtons.nth(i);
+      const btn = rowActionButtons.nth(i);
       const box = await btn.boundingBox();
       expect(box, `button ${i} missing bounding box`).not.toBeNull();
       if (!box) continue;
@@ -239,6 +247,27 @@ test.describe('Admin SPA regression', () => {
       expect(box.y + box.height, `button ${i} bottom edge`).toBeLessThanOrEqual(
         viewport.height + 1,
       );
+    }
+  });
+
+  test('System Path Policies tab lists policies without error', async ({ page }) => {
+    await loginAsAdmin(page);
+    await page.getByRole('link', { name: 'System', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'System', exact: true })).toBeVisible();
+
+    await page.getByRole('tab', { name: 'Path Policies' }).click();
+
+    // Expect either a policy table with rows or the empty-state message.
+    // Must not show a page-level API error or leave a 404 path.
+    await expect(page.locator('.error-message')).toHaveCount(0);
+    const empty = page.getByText('No path policies configured.');
+    const table = page.locator('table');
+    await expect(table).toBeVisible();
+    const emptyCount = await empty.count();
+    if (emptyCount === 0) {
+      await expect(page.locator('table tbody tr').first()).toBeVisible();
+    } else {
+      await expect(empty).toBeVisible();
     }
   });
 

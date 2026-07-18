@@ -41,9 +41,10 @@ ops surface. Schema is 0.7 canonical/exact-validate with no application migratio
 
 ### Enablement
 
-- `GATEWAY_ADMIN_ENABLED=1` required to mount admin.
-- `GATEWAY_ADMIN_ORIGIN` required when enabled (exact trusted origin).
-- Invalid enablement config fails startup closed.
+- Admin control plane is always mounted (no feature flag).
+- Trusted origin for CSRF: prefer `GATEWAY_ADMIN_ORIGIN`; else derive
+  `scheme://host` from `GATEWAY_PUBLIC_URL` (path such as `/emby` is stripped).
+- Missing or invalid origin fails startup closed (origin is required for CSRF).
 - Telemetry may run independently; telemetry failure never blocks gateway start.
 
 ### Isolation
@@ -75,10 +76,16 @@ No schema changes for last_seen or metric series. Series live in memory only.
 - Users: create; enable/disable; password reset. Username and synthetic_user_id
   immutable after create. Disable/password reset revoke all sessions transactionally.
 - Sessions: revoke one or all for a user.
-- Policies: CRUD + install-defaults + preview; pathpolicy validation; optimistic concurrency.
+- Policies: CRUD + install-defaults + preview; pathpolicy validation; optional
+  optimistic concurrency via `updated` (RFC3339) on update → 409 on mismatch.
 - Upstream: reconfigure existing singleton only (no first-time create in admin).
-  Requires fresh reauth ticket bound to admin session. Block while active
-  playbacks/transfers unless audited force. Reuse setup probe/ownership/CAS/cleanup.
+  Requires fresh reauth ticket bound to admin session (password + MFA when
+  enabled). Empty backend password reuses the stored secret for probe and
+  reconfigure when a source exists. Block while active playbacks/transfers
+  unless audited force. Reuse setup probe/ownership/CAS/cleanup.
+- Audit: mutation success is not rolled back solely because `audit_logs` write
+  fails; failures are logged. Force reconfigure returns `audit_warning` in JSON
+  when audit write fails after a successful mutation.
 - Never return backend password/token. Never accept token/device_id/generation in body.
 
 ### Retention
@@ -95,7 +102,7 @@ No schema changes for last_seen or metric series. Series live in memory only.
 
 ## Consequences
 
-- Public admin increases attack surface; enablement defaults off and requires origin.
+- Public admin increases attack surface; always-on mount requires a valid trusted origin at startup.
 - Opaque sessions reset on process restart (acceptable for ops UI).
 - Unindexed audit queries remain bounded; historical deep search is out of scope for 0.7.
 - Upstream reconfigure can disrupt active streams; force path is explicit and audited.

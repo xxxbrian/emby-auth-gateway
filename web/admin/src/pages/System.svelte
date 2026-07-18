@@ -1,11 +1,12 @@
 <script lang="ts">
     import { onMount } from 'svelte';
-    import { apiRequest, session, reauth } from '../lib/api';
+    import { apiRequest, session, reauth, completeReauthMfa, requestMfaOtp } from '../lib/api';
     import type {
         ItemsResponse,
         Policy,
         PolicyBody,
         PolicyForm,
+        PolicyPreviewResult,
         SystemInfo,
         UpstreamBody,
         UpstreamDTO,
@@ -28,6 +29,12 @@
     let showPolicyModal = $state(false);
     let policyError = $state<string | null>(null);
     let policySaving = $state(false);
+
+    let previewMethod = $state('GET');
+    let previewPath = $state('');
+    let previewResult = $state<PolicyPreviewResult | null>(null);
+    let previewError = $state<string | null>(null);
+    let previewing = $state(false);
     
     // Using explicit object structure instead of Partial<PolicyForm> 
     // because Svelte 5 state needs to know all property keys upfront sometimes.
@@ -38,7 +45,8 @@
         action: 'deny',
         reason: '',
         priority: 100,
-        enabled: true
+        enabled: true,
+        updated: '',
     });
     let isEditingPolicy = $state(false);
 
@@ -60,6 +68,11 @@
     let reauthError = $state<string | null>(null);
     let reauthLoading = $state(false);
     let reauthTicket = $state<string | null>(null);
+    let reauthStep = $state<'password' | 'otp'>('password');
+    let reauthMfaId = $state('');
+    let reauthOtpId = $state('');
+    let reauthOtp = $state('');
+    let reauthOtpHint = $state('');
     let pendingAction: (() => Promise<void>) | null = null;
 
     async function loadData() {
@@ -125,7 +138,25 @@
         pendingAction = action;
         reauthError = null;
         reauthPassword = '';
+        reauthStep = 'password';
+        reauthMfaId = '';
+        reauthOtpId = '';
+        reauthOtp = '';
+        reauthOtpHint = '';
         showReauthModal = true;
+    }
+
+    async function finishReauthWithTicket(ticket: string) {
+        reauthTicket = ticket;
+        showReauthModal = false;
+        if (!pendingAction) return;
+        try {
+            await pendingAction();
+            pendingAction = null;
+            reauthTicket = null;
+        } catch {
+            // pendingAction surfaces its own error (e.g. probeError)
+        }
     }
 
     async function performApply() {
@@ -159,6 +190,7 @@
             reason: '',
             priority: 100,
             enabled: true,
+            updated: '',
         };
         isEditingPolicy = false;
         policyError = null;
@@ -174,6 +206,7 @@
             reason: p.Reason || p.reason || '',
             priority: p.Priority ?? p.priority ?? 100,
             enabled: p.Enabled ?? p.enabled ?? true,
+            updated: p.Updated || p.updated || '',
         };
         isEditingPolicy = true;
         policyError = null;
@@ -195,6 +228,9 @@
             };
             
             if (isEditingPolicy && currentPolicy.id) {
+                if (currentPolicy.updated) {
+                    body.updated = currentPolicy.updated;
+                }
                 await apiRequest(`/path-policies/${currentPolicy.id}`, {
                     method: 'PUT',
                     body: JSON.stringify(body),
@@ -235,6 +271,24 @@
         }
     }
 
+    async function handlePreviewPolicy(e: Event) {
+        e.preventDefault();
+        previewError = null;
+        previewResult = null;
+        previewing = true;
+        try {
+            const qs = new URLSearchParams({
+                method: previewMethod,
+                path: previewPath,
+            });
+            previewResult = await apiRequest<PolicyPreviewResult>(`/path-policies/preview?${qs}`);
+        } catch (err) {
+            previewError = err instanceof Error ? err.message : String(err);
+        } finally {
+            previewing = false;
+        }
+    }
+
     async function handleReauthSubmit(e: Event) {
         e.preventDefault();
         if (!pendingAction) {
@@ -246,17 +300,73 @@
         try {
             const identity = $session?.email || $session?.superuser_id;
             if (!identity) throw new Error('No active session identity found');
-            
-            reauthTicket = await reauth(identity, reauthPassword);
-            showReauthModal = false;
-            await pendingAction();
-            pendingAction = null;
-            reauthTicket = null;
+
+            if (reauthStep === 'password') {
+                const result = await reauth(identity, reauthPassword);
+                if (result.status === 'mfa') {
+                    reauthMfaId = result.mfaId;
+                    if (identity.includes('@')) {
+                        try {
+                            const req = await requestMfaOtp(identity);
+                            reauthOtpId = req.otpId;
+                            reauthOtpHint = `OTP sent to ${identity}`;
+                        } catch (otpErr) {
+                            reauthOtpHint = otpErr instanceof Error ? otpErr.message : String(otpErr);
+                        }
+                    } else {
+                        reauthOtpHint = 'Enter the one-time password from your email.';
+                    }
+                    reauthStep = 'otp';
+                    return;
+                }
+                await finishReauthWithTicket(result.ticket);
+                return;
+            }
+
+            // OTP step
+            let otpId = reauthOtpId;
+            if (!otpId) {
+                if (!identity.includes('@')) {
+                    throw new Error('Email required to request OTP');
+                }
+                const req = await requestMfaOtp(identity);
+                otpId = req.otpId;
+                reauthOtpId = otpId;
+            }
+            const ticket = await completeReauthMfa(reauthMfaId, otpId, reauthOtp);
+            await finishReauthWithTicket(ticket);
         } catch (err) {
             reauthError = err instanceof Error ? err.message : String(err);
         } finally {
             reauthLoading = false;
         }
+    }
+
+    async function resendReauthOtp() {
+        reauthError = null;
+        reauthLoading = true;
+        try {
+            const identity = $session?.email || '';
+            if (!identity.includes('@')) {
+                throw new Error('Email required to request OTP');
+            }
+            const req = await requestMfaOtp(identity);
+            reauthOtpId = req.otpId;
+            reauthOtpHint = `OTP sent to ${identity}`;
+        } catch (err) {
+            reauthError = err instanceof Error ? err.message : String(err);
+        } finally {
+            reauthLoading = false;
+        }
+    }
+
+    function reauthBackToPassword() {
+        reauthStep = 'password';
+        reauthMfaId = '';
+        reauthOtpId = '';
+        reauthOtp = '';
+        reauthOtpHint = '';
+        reauthError = null;
     }
 </script>
 
@@ -375,7 +485,7 @@
                         </div>
                         <div>
                             <label class="text-sm text-secondary block mb-1" for="backend_password">Backend Password</label>
-                            <input type="password" id="backend_password" bind:value={probeForm.backend_password} placeholder={upstream?.password_set ? '(unchanged)' : ''} />
+                            <input type="password" id="backend_password" bind:value={probeForm.backend_password} placeholder="leave blank to reuse stored password when already configured" />
                         </div>
                         <div style="grid-column: 1 / -1;">
                             <label class="text-sm text-secondary block mb-1" for="backend_user_agent">User-Agent</label>
@@ -395,13 +505,56 @@
                         </div>
                     </div>
                     <div class="mt-4 flex justify-end">
-                        <button type="submit" disabled={probing}>{probing ? 'Probing...' : 'Probe & Setup'}</button>
+                        <button type="submit" disabled={probing}>{probing ? 'Probing...' : 'Probe (validates credentials)'}</button>
                     </div>
                 </form>
             </div>
         {/if}
 
         {#if activeTab === 'policies'}
+            <div class="panel mb-4">
+                <div class="metric-label mb-2">Matching rules</div>
+                <p class="text-sm text-secondary mb-2">
+                    Paths use exact match, trailing <span class="mono">*</span> prefix match, or single-segment
+                    <span class="mono">{'{id}'}</span> parameters (not regular expressions).
+                    Higher priority wins among the same action; <strong>deny always beats allow</strong>.
+                    Examples: <span class="mono">/Users/*</span>, <span class="mono">/Items/{'{id}'}</span>.
+                </p>
+                <form class="flex gap-2 items-end flex-wrap" onsubmit={handlePreviewPolicy}>
+                    <div>
+                        <label class="text-sm text-secondary block mb-1" for="preview_method">Method</label>
+                        <select id="preview_method" bind:value={previewMethod}>
+                            <option value="GET">GET</option>
+                            <option value="POST">POST</option>
+                            <option value="PUT">PUT</option>
+                            <option value="DELETE">DELETE</option>
+                        </select>
+                    </div>
+                    <div style="flex: 1; min-width: 180px;">
+                        <label class="text-sm text-secondary block mb-1" for="preview_path">Path</label>
+                        <input type="text" id="preview_path" class="mono" bind:value={previewPath} required placeholder="/Items/abc" />
+                    </div>
+                    <button type="submit" class="secondary" disabled={previewing}>{previewing ? 'Checking...' : 'Preview'}</button>
+                </form>
+                {#if previewError}
+                    <div class="error-message mt-2">{previewError}</div>
+                {/if}
+                {#if previewResult}
+                    <div class="text-sm mt-2">
+                        Decision:
+                        <span class={(previewResult.Allowed ?? previewResult.allowed) ? 'status-ok' : 'status-err'}>
+                            {(previewResult.Action || previewResult.action || ((previewResult.Allowed ?? previewResult.allowed) ? 'allow' : 'deny')).toString().toUpperCase()}
+                        </span>
+                        {#if previewResult.Reason || previewResult.reason}
+                            <span class="text-secondary"> — {previewResult.Reason || previewResult.reason}</span>
+                        {/if}
+                        {#if previewResult.PolicyID || previewResult.policy_id}
+                            <span class="text-secondary mono"> (policy {previewResult.PolicyID || previewResult.policy_id})</span>
+                        {/if}
+                    </div>
+                {/if}
+            </div>
+
             <div class="panel" style="padding: 0;">
                 <div class="flex justify-between items-center" style="padding: 1rem 1.5rem; border-bottom: 1px solid var(--border-color);">
                     <div class="metric-label" style="margin:0">Path Policies</div>
@@ -473,16 +626,26 @@
                     <div class="error-message">{probeError}</div>
                 {:else if probeResult}
                     <div class="mb-4">
-                        <div class="metric-label mb-2">Probe Successful</div>
+                        <div class="metric-label mb-2">Probe Successful (credentials validated)</div>
                         <div class="data-grid" style="grid-template-columns: 1fr;">
                             <div class="metric-box">
                                 <div class="metric-label">Server Name</div>
                                 <div class="metric-value" style="font-size: 16px;">{probeResult.server_name}</div>
                             </div>
                             <div class="metric-box">
+                                <div class="metric-label">Server ID</div>
+                                <div class="metric-value mono" style="font-size: 14px;">{probeResult.server_id}</div>
+                            </div>
+                            <div class="metric-box">
                                 <div class="metric-label">Server Version</div>
                                 <div class="metric-value mono" style="font-size: 16px;">{probeResult.server_version}</div>
                             </div>
+                            {#if probeResult.backend_user_id}
+                                <div class="metric-box">
+                                    <div class="metric-label">Backend User ID</div>
+                                    <div class="metric-value mono" style="font-size: 14px;">{probeResult.backend_user_id}</div>
+                                </div>
+                            {/if}
                             <div class="metric-box">
                                 <div class="metric-label">Latency</div>
                                 <div class="metric-value mono" style="font-size: 16px;">{probeResult.latency_ms} ms</div>
@@ -490,7 +653,8 @@
                         </div>
                     </div>
                     <div class="text-sm text-secondary">
-                        <span class="status-warn font-bold">WARNING:</span> Applying this configuration will forcefully replace backend tokens and immediately disconnect all currently active gateway sessions.
+                        Applying replaces the stored upstream token and credentials used for backend access.
+                        Gateway client sessions are not revoked by this action.
                     </div>
                 {/if}
             </div>
@@ -498,7 +662,7 @@
             <div class="drawer-footer">
                 <button class="secondary" onclick={() => showProbeModal = false}>Cancel</button>
                 {#if !probing && probeResult}
-                    <button class="danger" onclick={requestApply}>Apply & Disconnect Sessions</button>
+                    <button class="danger" onclick={requestApply}>Apply Configuration</button>
                 {/if}
             </div>
         </div>
@@ -529,8 +693,11 @@
                         </select>
                     </div>
                     <div class="mb-4">
-                        <label class="text-sm text-secondary block mb-1" for="p_path">Path (Regex)</label>
-                        <input type="text" id="p_path" bind:value={currentPolicy.path} required placeholder="^/emby/users" class="mono" />
+                        <label class="text-sm text-secondary block mb-1" for="p_path">Path</label>
+                        <input type="text" id="p_path" bind:value={currentPolicy.path} required placeholder="/Users/*" class="mono" />
+                        <p class="text-sm text-secondary mt-1">
+                            Exact path, trailing <span class="mono">*</span> prefix, or <span class="mono">/Items/{'{id}'}</span> single-segment params.
+                        </p>
                     </div>
                     <div class="mb-4">
                         <label class="text-sm text-secondary block mb-1" for="p_action">Action</label>
@@ -544,7 +711,7 @@
                         <input type="text" id="p_reason" bind:value={currentPolicy.reason} />
                     </div>
                     <div class="mb-4">
-                        <label class="text-sm text-secondary block mb-1" for="p_priority">Priority (lower runs first)</label>
+                        <label class="text-sm text-secondary block mb-1" for="p_priority">Priority (higher number wins; deny always beats allow)</label>
                         <input type="number" id="p_priority" bind:value={currentPolicy.priority} />
                     </div>
                     <div class="mb-4 flex items-center gap-2">
@@ -564,31 +731,55 @@
 
 {#if showReauthModal}
     <div class="overlay" style="z-index: 100;" onclick={() => showReauthModal = false}>
-        <div class="drawer" style="width: 350px; justify-content: center; max-height: 350px; border-radius: 4px; margin: auto; height: auto;" onclick={(e) => e.stopPropagation()}>
+        <div class="drawer" style="width: 350px; justify-content: center; max-height: 420px; border-radius: 4px; margin: auto; height: auto;" onclick={(e) => e.stopPropagation()}>
             <div class="drawer-header">
-                <h3 class="drawer-title">Confirm Change</h3>
+                <h3 class="drawer-title">{reauthStep === 'otp' ? 'Two-factor authentication' : 'Confirm Change'}</h3>
                 <button class="icon" onclick={() => showReauthModal = false}>✕</button>
             </div>
             
             <div class="drawer-body">
-                <p class="text-sm text-secondary mb-4">
-                    Re-enter your admin password to apply this change.
-                    {#if $session?.email}
-                        <br />Identity: <span class="mono">{$session.email}</span>
+                {#if reauthStep === 'password'}
+                    <p class="text-sm text-secondary mb-4">
+                        Re-enter your admin password to apply this change.
+                        {#if $session?.email}
+                            <br />Identity: <span class="mono">{$session.email}</span>
+                        {/if}
+                    </p>
+                {:else}
+                    <p class="text-sm text-secondary mb-4">
+                        Enter the one-time password to finish re-authentication.
+                    </p>
+                    {#if reauthOtpHint}
+                        <div class="text-sm text-secondary mb-4">{reauthOtpHint}</div>
                     {/if}
-                </p>
+                {/if}
                 {#if reauthError}
                     <div class="error-message">{reauthError}</div>
                 {/if}
                 <form id="reauth-form" onsubmit={handleReauthSubmit}>
-                    <input type="password" placeholder="Admin Password" bind:value={reauthPassword} required autofocus />
+                    {#if reauthStep === 'password'}
+                        <input type="password" placeholder="Admin Password" bind:value={reauthPassword} required autofocus autocomplete="current-password" />
+                    {:else}
+                        <input type="text" placeholder="One-time password" bind:value={reauthOtp} required autofocus autocomplete="one-time-code" inputmode="numeric" />
+                    {/if}
                 </form>
             </div>
 
-            <div class="drawer-footer">
-                <button class="secondary" onclick={() => showReauthModal = false}>Cancel</button>
+            <div class="drawer-footer" style="flex-wrap: wrap; gap: 0.5rem;">
+                {#if reauthStep === 'otp'}
+                    <button type="button" class="secondary" disabled={reauthLoading} onclick={resendReauthOtp}>Resend OTP</button>
+                    <button type="button" class="secondary" disabled={reauthLoading} onclick={reauthBackToPassword}>Back</button>
+                {:else}
+                    <button class="secondary" onclick={() => showReauthModal = false}>Cancel</button>
+                {/if}
                 <button type="submit" form="reauth-form" disabled={reauthLoading} class="danger">
-                    {reauthLoading ? 'Verifying...' : 'Confirm'}
+                    {#if reauthLoading}
+                        Verifying...
+                    {:else if reauthStep === 'otp'}
+                        Verify OTP
+                    {:else}
+                        Confirm
+                    {/if}
                 </button>
             </div>
         </div>

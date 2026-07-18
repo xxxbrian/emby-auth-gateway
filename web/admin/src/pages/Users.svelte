@@ -115,36 +115,36 @@
     {:else if users.length === 0}
         <div class="text-secondary">No users found.</div>
     {:else}
-        <div class="table-container panel" style="padding: 0;">
-            <table style="min-width: 800px;">
+        <div class="table-container panel users-table-wrap" style="padding: 0;">
+            <table class="users-table">
                 <thead>
                     <tr>
-                        <th style="width: 15%">Username</th>
-                        <th style="width: 10%">Status</th>
-                        <th style="width: 20%">ID</th>
-                        <th style="width: 25%">Synthetic ID</th>
-                        <th style="width: 15%">Created</th>
-                        <th style="width: 15%; text-align: right;">Actions</th>
+                        <th>Username</th>
+                        <th>Status</th>
+                        <th class="col-optional">ID</th>
+                        <th class="col-optional">Synthetic ID</th>
+                        <th class="col-optional">Created</th>
+                        <th style="text-align: right;">Actions</th>
                     </tr>
                 </thead>
                 <tbody>
                     {#each users as user}
                         <tr>
-                            <td><strong>{user.username}</strong></td>
+                            <td><strong class="truncate" title={user.username}>{user.username}</strong></td>
                             <td>
                                 <span class={user.enabled ? 'status-ok' : 'status-err'}>
                                     {user.enabled ? 'Enabled' : 'Disabled'}
                                 </span>
                             </td>
-                            <td>
+                            <td class="col-optional">
                                 <div class="mono truncate" style="max-width: 120px;" title={user.id}>{user.id}</div>
                             </td>
-                            <td>
+                            <td class="col-optional">
                                 <div class="mono text-secondary truncate" style="max-width: 160px;" title={user.synthetic_user_id || '-'}>{user.synthetic_user_id || '-'}</div>
                             </td>
-                            <td>{fmtTime(user.created)}</td>
+                            <td class="col-optional">{fmtTime(user.created)}</td>
                             <td>
-                                <div class="flex gap-2 justify-end">
+                                <div class="flex gap-2 justify-end user-actions">
                                     <button class="secondary text-xs" onclick={() => toggleEnable(user)}>
                                         {user.enabled ? 'Disable' : 'Enable'}
                                     </button>
@@ -220,4 +220,40 @@
 <style>
     .justify-end { justify-content: flex-end; }
     .block { display: block; }
+    .users-table {
+        width: 100%;
+        min-width: 0;
+    }
+    .user-actions {
+        flex-wrap: wrap;
+    }
+    .truncate {
+        display: block;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        max-width: 140px;
+    }
+    @media (max-width: 768px) {
+        .users-table-wrap {
+            overflow-x: hidden;
+        }
+        .users-table .col-optional {
+            display: none;
+        }
+        .users-table th,
+        .users-table td {
+            padding: 8px 6px;
+        }
+        .user-actions {
+            gap: 0.25rem;
+        }
+        .user-actions button {
+            padding: 2px 8px;
+            font-size: 11px;
+        }
+        .truncate {
+            max-width: 110px;
+        }
+    }
 </style>

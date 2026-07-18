@@ -17,7 +17,9 @@ Gateway environment variables:
 
 | Name | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `GATEWAY_PUBLIC_URL` | No, but set it in production | Request host/proxy headers | Externally reachable gateway Emby base URL, including the fixed `/emby` path, for example `https://media.example.com/emby`. Without it, URL rewriting follows the inbound request host, which can produce unusable `127.0.0.1` URLs behind some proxies. |
+| `GATEWAY_PUBLIC_URL` | **Yes for serve** (or set `GATEWAY_ADMIN_ORIGIN`) | Request host/proxy headers for Emby URL rewrite when unset | Externally reachable gateway Emby base URL, including the fixed `/emby` path, for example `https://media.example.com/emby`. Also used to derive the admin CSRF trusted origin (`scheme://host`, path stripped) when `GATEWAY_ADMIN_ORIGIN` is unset. Without a valid origin, `serve` fails closed. Without this URL, Emby URL rewriting may follow the inbound request host and produce unusable `127.0.0.1` URLs behind some proxies. |
+| `GATEWAY_ADMIN_ORIGIN` | No (prefer explicit in production) | Derived from `GATEWAY_PUBLIC_URL` | Exact trusted browser origin for the always-on admin control plane CSRF checks, for example `https://media.example.com` (no path). Prefer setting this when the public Emby base path differs from the origin clients use for `/admin`. |
+| `GATEWAY_ADMIN_AUDIT_RETENTION_DAYS` | No | `30` | Days to retain `audit_logs` rows for admin mutation history. |
 | `GATEWAY_SERVER_ID` | No | `emby-auth-gateway` | Synthetic server id returned to clients instead of the backend Emby server id. |
 | `GATEWAY_WEB_ASSETS_DIR` | No | unset (Web disabled) | Absolute or relative path to the Web assets root. Blank/unset disables Web: `/emby/web` returns 404 and never falls through to the authenticated API. |
 
@@ -73,7 +75,26 @@ For Docker Compose:
 docker compose run --rm gateway superuser create admin@example.com 'replace-with-a-strong-password'
 ```
 
-The PocketBase Admin UI is available at `http://localhost:8090/_/` when the gateway is running.
+The PocketBase Admin UI is available at `http://localhost:8090/_/` when the gateway is running (keep `/_/` and `/api` on a private management origin in production).
+
+### Admin control plane (always on)
+
+The gateway always mounts a public superuser admin SPA and JSON API under `/admin` and `/admin/api/v1`. There is no feature flag to disable it.
+
+**Breaking change:** `serve` requires a trusted origin for CSRF. Set either:
+
+- `GATEWAY_ADMIN_ORIGIN` to the exact browser origin (e.g. `https://media.example.com`), or
+- `GATEWAY_PUBLIC_URL` to an absolute Emby base URL (e.g. `https://media.example.com/emby`); the gateway derives `scheme://host`.
+
+Missing or invalid origin fails startup closed. Sign in with a PocketBase superuser (including MFA when enabled). The SPA exchanges the superuser JWT for an opaque admin session cookie and never stores the JWT in browser storage.
+
+Local example:
+
+```sh
+GATEWAY_PUBLIC_URL="http://localhost:8090/emby" \
+./bin/gateway serve --http=127.0.0.1:8090
+# Admin UI: http://localhost:8090/admin/
+```
 
 ## Gateway Setup
 

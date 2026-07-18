@@ -15,23 +15,73 @@ import (
 )
 
 func TestAdminConfigFromEnv(t *testing.T) {
-	t.Setenv("GATEWAY_ADMIN_ENABLED", "")
 	t.Setenv("GATEWAY_ADMIN_ORIGIN", "")
+	t.Setenv("GATEWAY_PUBLIC_URL", "")
 	t.Setenv("GATEWAY_ADMIN_AUDIT_RETENTION_DAYS", "")
 	cfg := adminConfigFromEnv()
-	if cfg.Enabled {
-		t.Fatal("default disabled")
+	if cfg.Origin != "" {
+		t.Fatalf("expected empty origin with no env, got %q", cfg.Origin)
 	}
 	if cfg.AuditRetentionDays != 30 {
 		t.Fatalf("days=%d", cfg.AuditRetentionDays)
 	}
 
-	t.Setenv("GATEWAY_ADMIN_ENABLED", "1")
+	// Prefer GATEWAY_ADMIN_ORIGIN over PUBLIC_URL.
 	t.Setenv("GATEWAY_ADMIN_ORIGIN", "https://emby.example.com/")
+	t.Setenv("GATEWAY_PUBLIC_URL", "https://other.example.com/emby")
 	t.Setenv("GATEWAY_ADMIN_AUDIT_RETENTION_DAYS", "14")
 	cfg = adminConfigFromEnv()
-	if !cfg.Enabled || cfg.Origin != "https://emby.example.com" || cfg.AuditRetentionDays != 14 {
+	if cfg.Origin != "https://emby.example.com" || cfg.AuditRetentionDays != 14 {
 		t.Fatalf("%+v", cfg)
+	}
+
+	// Derive scheme://host from GATEWAY_PUBLIC_URL when ADMIN_ORIGIN unset.
+	t.Setenv("GATEWAY_ADMIN_ORIGIN", "")
+	t.Setenv("GATEWAY_PUBLIC_URL", "https://emby.example.com/emby")
+	cfg = adminConfigFromEnv()
+	if cfg.Origin != "https://emby.example.com" {
+		t.Fatalf("derived origin=%q want https://emby.example.com", cfg.Origin)
+	}
+
+	// PUBLIC_URL with port and path.
+	t.Setenv("GATEWAY_PUBLIC_URL", "http://127.0.0.1:8090/emby")
+	cfg = adminConfigFromEnv()
+	if cfg.Origin != "http://127.0.0.1:8090" {
+		t.Fatalf("derived origin=%q", cfg.Origin)
+	}
+}
+
+func TestOriginFromPublicURL(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in      string
+		want    string
+		wantErr string
+	}{
+		{in: "https://emby.example.com/emby", want: "https://emby.example.com"},
+		{in: "https://emby.example.com:8443/emby/", want: "https://emby.example.com:8443"},
+		{in: "http://127.0.0.1:8090/emby", want: "http://127.0.0.1:8090"},
+		{in: "", wantErr: "empty"},
+		{in: "emby.example.com/emby", wantErr: "absolute"},
+		{in: "ftp://emby.example.com/emby", wantErr: "http or https"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			t.Parallel()
+			got, err := originFromPublicURL(tc.in)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err=%v want substring %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("got=%q want=%q", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -41,9 +91,12 @@ func TestMountAdminRequiresOrigin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = mountAdmin(r, app, adminConfig{Enabled: true, Origin: ""}, nil, nil, nil, false, time.Now(), "boot")
-	if err == nil || !strings.Contains(err.Error(), "GATEWAY_ADMIN_ORIGIN") {
+	err = mountAdmin(r, app, adminConfig{Origin: ""}, nil, nil, nil, false, time.Now(), "boot")
+	if err == nil || !strings.Contains(err.Error(), "trusted origin") {
 		t.Fatalf("err=%v", err)
+	}
+	if !strings.Contains(err.Error(), "GATEWAY_ADMIN_ORIGIN") {
+		t.Fatalf("err should mention GATEWAY_ADMIN_ORIGIN: %v", err)
 	}
 }
 
@@ -97,7 +150,7 @@ func TestMountAdminRejectsInvalidOrigin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = mountAdmin(r, app, adminConfig{Enabled: true, Origin: "http://emby.example.com"}, nil, nil, nil, false, time.Now(), "boot")
+	err = mountAdmin(r, app, adminConfig{Origin: "http://emby.example.com"}, nil, nil, nil, false, time.Now(), "boot")
 	if err == nil || !strings.Contains(err.Error(), "loopback") {
 		t.Fatalf("err=%v", err)
 	}
@@ -211,7 +264,7 @@ func TestIsSuperuserAuthRateLimitedPath(t *testing.T) {
 	}
 }
 
-func TestRegistrationPathNotCapturedBySPAWhenAdminEnabledWebDisabled(t *testing.T) {
+func TestRegistrationPathNotCapturedBySPAWhenAdminMountedWebDisabled(t *testing.T) {
 	app := newTestApp(t)
 	if err := pbschema.Ensure(app); err != nil {
 		t.Fatal(err)
@@ -225,8 +278,7 @@ func TestRegistrationPathNotCapturedBySPAWhenAdminEnabledWebDisabled(t *testing.
 
 	reg := telemetry.New(nil)
 	err := mountAdmin(r, app, adminConfig{
-		Enabled: true,
-		Origin:  "https://admin.example.test",
+		Origin: "https://admin.example.test",
 	}, reg, nil, nil, false /* web not ready */, time.Now().UTC(), "boot")
 	if err != nil {
 		t.Fatal(err)
@@ -279,8 +331,7 @@ func TestRegistrationHandlerWhenWebReadyStillWorksWithAdmin(t *testing.T) {
 	mountGatewayRoutes(r, http.NotFoundHandler(), http.NotFoundHandler(), true)
 
 	err := mountAdmin(r, app, adminConfig{
-		Enabled: true,
-		Origin:  "https://admin.example.test",
+		Origin: "https://admin.example.test",
 	}, nil, nil, nil, true, time.Now().UTC(), "boot")
 	if err != nil {
 		t.Fatal(err)

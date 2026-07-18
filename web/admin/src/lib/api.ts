@@ -17,25 +17,11 @@ function errorMessage(data: ApiErrorBody | null | undefined, fallback: string): 
   return (data && data.message) || fallback;
 }
 
-export async function login(identity: string, password: string): Promise<SessionPublic> {
-  const res = await fetch(`${PB_API}/auth-with-password`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ identity, password }),
-  });
+export type LoginResult =
+  | { status: 'ok'; session: SessionPublic }
+  | { status: 'mfa'; mfaId: string };
 
-  const data = (await res.json()) as ApiErrorBody & { token?: string };
-
-  if (!res.ok) {
-    if (data.mfaId) {
-      throw new Error('MFA required; complete via PocketBase admin first');
-    }
-    throw new Error(errorMessage(data, 'Login failed'));
-  }
-
-  const token = data.token;
-  if (!token) throw new Error('No token returned');
-
+async function exchangeSession(token: string): Promise<SessionPublic> {
   const sessRes = await fetch(`${ADMIN_API}/session`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -51,11 +37,14 @@ export async function login(identity: string, password: string): Promise<Session
   const sessData = (await sessRes.json()) as SessionPublic;
   csrfToken = sessData.csrf || null;
   session.set(sessData);
-
   return sessData;
 }
 
-export async function reauth(identity: string, password: string): Promise<string> {
+/**
+ * Password login against PocketBase superusers.
+ * When MFA is enabled, auth-with-password returns 401 + mfaId (no token).
+ */
+export async function login(identity: string, password: string): Promise<LoginResult> {
   const res = await fetch(`${PB_API}/auth-with-password`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -63,13 +52,67 @@ export async function reauth(identity: string, password: string): Promise<string
   });
 
   const data = (await res.json()) as ApiErrorBody & { token?: string };
+
   if (!res.ok) {
-    throw new Error(errorMessage(data, 'Re-auth failed'));
+    if (data.mfaId) {
+      return { status: 'mfa', mfaId: data.mfaId };
+    }
+    throw new Error(errorMessage(data, 'Login failed'));
   }
 
   const token = data.token;
   if (!token) throw new Error('No token returned');
 
+  const sessData = await exchangeSession(token);
+  return { status: 'ok', session: sessData };
+}
+
+/**
+ * Complete MFA by requesting an OTP (email) then authenticating with otpId + OTP password.
+ * PB 0.39 flow: request-otp → auth-with-otp (with mfaId query/body).
+ */
+export async function requestMfaOtp(email: string): Promise<{ otpId: string }> {
+  const res = await fetch(`${PB_API}/request-otp`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email }),
+  });
+  const data = (await res.json().catch(() => ({}))) as ApiErrorBody & { otpId?: string };
+  if (!res.ok) {
+    throw new Error(errorMessage(data, 'OTP request failed'));
+  }
+  if (!data.otpId) throw new Error('No otpId returned');
+  return { otpId: data.otpId };
+}
+
+/**
+ * Finish MFA second factor via auth-with-otp (otpId + one-time password + mfaId).
+ */
+export async function completeMfa(
+  mfaId: string,
+  otpId: string,
+  otp: string,
+): Promise<SessionPublic> {
+  const res = await fetch(`${PB_API}/auth-with-otp`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ otpId, password: otp, mfaId }),
+  });
+
+  const data = (await res.json()) as ApiErrorBody & { token?: string };
+  if (!res.ok) {
+    throw new Error(errorMessage(data, 'MFA verification failed'));
+  }
+  const token = data.token;
+  if (!token) throw new Error('No token returned');
+  return exchangeSession(token);
+}
+
+export type ReauthResult =
+  | { status: 'ok'; ticket: string }
+  | { status: 'mfa'; mfaId: string };
+
+async function exchangeReauthTicket(token: string): Promise<string> {
   const sessRes = await fetch(`${ADMIN_API}/session/reauth`, {
     method: 'POST',
     headers: {
@@ -97,6 +140,55 @@ export async function reauth(identity: string, password: string): Promise<string
     });
   }
   return sessData.reauth_ticket;
+}
+
+/**
+ * Password re-auth for sensitive admin mutations (upstream reconfigure).
+ * When MFA is enabled, returns mfaId so the caller can complete OTP then
+ * call completeReauthMfa (same PB flow as login).
+ */
+export async function reauth(identity: string, password: string): Promise<ReauthResult> {
+  const res = await fetch(`${PB_API}/auth-with-password`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ identity, password }),
+  });
+
+  const data = (await res.json()) as ApiErrorBody & { token?: string };
+  if (!res.ok) {
+    if (data.mfaId) {
+      return { status: 'mfa', mfaId: data.mfaId };
+    }
+    throw new Error(errorMessage(data, 'Re-auth failed'));
+  }
+
+  const token = data.token;
+  if (!token) throw new Error('No token returned');
+  const ticket = await exchangeReauthTicket(token);
+  return { status: 'ok', ticket };
+}
+
+/**
+ * Finish MFA second factor for reauth and return a reauth_ticket.
+ */
+export async function completeReauthMfa(
+  mfaId: string,
+  otpId: string,
+  otp: string,
+): Promise<string> {
+  const res = await fetch(`${PB_API}/auth-with-otp`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ otpId, password: otp, mfaId }),
+  });
+
+  const data = (await res.json()) as ApiErrorBody & { token?: string };
+  if (!res.ok) {
+    throw new Error(errorMessage(data, 'MFA verification failed'));
+  }
+  const token = data.token;
+  if (!token) throw new Error('No token returned');
+  return exchangeReauthTicket(token);
 }
 
 export async function logout(): Promise<void> {

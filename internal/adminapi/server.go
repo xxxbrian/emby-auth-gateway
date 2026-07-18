@@ -521,6 +521,61 @@ func (s *Server) handleGetUpstream(e *core.RequestEvent) error {
 	return e.JSON(http.StatusOK, up)
 }
 
+// --- audit ---
+
+// auditAdmin records a successful admin mutation into audit_logs.
+// Message must be a short non-secret summary (no passwords/tokens).
+// Returns an error when the audit row cannot be written; callers may still
+// succeed the mutation but should surface the failure (log / audit_warning).
+func (s *Server) auditAdmin(e *core.RequestEvent, event, message string) error {
+	if e == nil || e.App == nil || e.Request == nil {
+		return fmt.Errorf("audit context unavailable")
+	}
+	col, err := e.App.FindCollectionByNameOrId("audit_logs")
+	if err != nil {
+		logAuditFailure(e, event, err)
+		return err
+	}
+	rec := core.NewRecord(col)
+	rec.Set("event", event)
+	rec.Set("message", message)
+	rec.Set("remote_ip", e.RealIP())
+	rec.Set("method", e.Request.Method)
+	rec.Set("path", e.Request.URL.Path)
+	rec.Set("status", http.StatusOK)
+	if err := e.App.Save(rec); err != nil {
+		logAuditFailure(e, event, err)
+		return err
+	}
+	return nil
+}
+
+func logAuditFailure(e *core.RequestEvent, event string, err error) {
+	if e == nil || e.App == nil || err == nil {
+		return
+	}
+	e.App.Logger().Error("admin audit log save failed", "event", event, "error", err)
+}
+
+func actorSummary(e *core.RequestEvent) string {
+	sess := sessionFromEvent(e)
+	if sess == nil {
+		return "unknown"
+	}
+	email := strings.TrimSpace(sess.Email)
+	id := strings.TrimSpace(sess.SuperuserID)
+	switch {
+	case email != "" && id != "":
+		return email + " (" + id + ")"
+	case email != "":
+		return email
+	case id != "":
+		return id
+	default:
+		return "unknown"
+	}
+}
+
 // --- write handlers ---
 
 type createUserBody struct {
@@ -556,6 +611,7 @@ func (s *Server) handleCreateUser(e *core.RequestEvent) error {
 	if err != nil {
 		return e.InternalServerError("created user lookup failed", err)
 	}
+	_ = s.auditAdmin(e, "admin_user_create", fmt.Sprintf("actor=%s created user username=%s id=%s", actorSummary(e), user.Username, user.ID))
 	return e.JSON(http.StatusOK, user)
 }
 
@@ -564,6 +620,7 @@ func (s *Server) handleEnableUser(e *core.RequestEvent) error {
 	if err := controlplane.SetUserEnabled(e.Request.Context(), e.App, id, true); err != nil {
 		return e.BadRequestError(err.Error(), err)
 	}
+	_ = s.auditAdmin(e, "admin_user_enable", fmt.Sprintf("actor=%s enabled user id=%s", actorSummary(e), id))
 	return e.JSON(http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -572,6 +629,7 @@ func (s *Server) handleDisableUser(e *core.RequestEvent) error {
 	if err := controlplane.SetUserEnabled(e.Request.Context(), e.App, id, false); err != nil {
 		return e.BadRequestError(err.Error(), err)
 	}
+	_ = s.auditAdmin(e, "admin_user_disable", fmt.Sprintf("actor=%s disabled user id=%s", actorSummary(e), id))
 	return e.JSON(http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -588,6 +646,7 @@ func (s *Server) handleResetPassword(e *core.RequestEvent) error {
 	if err := controlplane.ResetUserPassword(e.Request.Context(), e.App, id, body.Password); err != nil {
 		return e.BadRequestError(err.Error(), err)
 	}
+	_ = s.auditAdmin(e, "admin_user_password", fmt.Sprintf("actor=%s reset password for user id=%s", actorSummary(e), id))
 	return e.JSON(http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -597,6 +656,7 @@ func (s *Server) handleRevokeUserSessions(e *core.RequestEvent) error {
 	if err != nil {
 		return e.BadRequestError(err.Error(), err)
 	}
+	_ = s.auditAdmin(e, "admin_session_revoke", fmt.Sprintf("actor=%s revoked all sessions for user id=%s count=%d", actorSummary(e), id, n))
 	return e.JSON(http.StatusOK, map[string]any{"revoked": n})
 }
 
@@ -605,6 +665,7 @@ func (s *Server) handleRevokeSession(e *core.RequestEvent) error {
 	if err := controlplane.RevokeSessionByID(e.Request.Context(), e.App, id); err != nil {
 		return e.BadRequestError(err.Error(), err)
 	}
+	_ = s.auditAdmin(e, "admin_session_revoke", fmt.Sprintf("actor=%s revoked session id=%s", actorSummary(e), id))
 	return e.JSON(http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -615,6 +676,8 @@ type policyBody struct {
 	Reason   string `json:"reason"`
 	Priority int    `json:"priority"`
 	Enabled  *bool  `json:"enabled"`
+	// Updated is an optional optimistic concurrency token (RFC3339 from list).
+	Updated string `json:"updated"`
 }
 
 func (s *Server) handleCreatePolicy(e *core.RequestEvent) error {
@@ -637,6 +700,7 @@ func (s *Server) handleCreatePolicy(e *core.RequestEvent) error {
 	if err != nil {
 		return e.BadRequestError(err.Error(), err)
 	}
+	_ = s.auditAdmin(e, "admin_policy_create", fmt.Sprintf("actor=%s created policy id=%s method=%s path=%s action=%s", actorSummary(e), p.ID, p.Method, p.Path, p.Action))
 	return e.JSON(http.StatusOK, p)
 }
 
@@ -650,6 +714,17 @@ func (s *Server) handleUpdatePolicy(e *core.RequestEvent) error {
 	if body.Enabled != nil {
 		enabled = *body.Enabled
 	}
+	var expectedUpdated time.Time
+	if raw := strings.TrimSpace(body.Updated); raw != "" {
+		t, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			t, err = time.Parse(time.RFC3339, raw)
+		}
+		if err != nil {
+			return e.BadRequestError("updated must be RFC3339", err)
+		}
+		expectedUpdated = t.UTC()
+	}
 	p, err := controlplane.UpsertPolicy(e.Request.Context(), e.App, pathpolicy.Policy{
 		ID:       id,
 		Method:   body.Method,
@@ -658,10 +733,18 @@ func (s *Server) handleUpdatePolicy(e *core.RequestEvent) error {
 		Reason:   body.Reason,
 		Priority: body.Priority,
 		Enabled:  enabled,
+		Updated:  expectedUpdated,
 	})
 	if err != nil {
+		if errors.Is(err, controlplane.ErrPolicyConflict) {
+			return e.JSON(http.StatusConflict, map[string]any{
+				"error":   "policy_conflict",
+				"message": "policy was modified; reload and retry",
+			})
+		}
 		return e.BadRequestError(err.Error(), err)
 	}
+	_ = s.auditAdmin(e, "admin_policy_update", fmt.Sprintf("actor=%s updated policy id=%s method=%s path=%s action=%s", actorSummary(e), p.ID, p.Method, p.Path, p.Action))
 	return e.JSON(http.StatusOK, p)
 }
 
@@ -670,6 +753,7 @@ func (s *Server) handleDeletePolicy(e *core.RequestEvent) error {
 	if err := controlplane.DeletePolicy(e.Request.Context(), e.App, id); err != nil {
 		return e.BadRequestError(err.Error(), err)
 	}
+	_ = s.auditAdmin(e, "admin_policy_delete", fmt.Sprintf("actor=%s deleted policy id=%s", actorSummary(e), id))
 	return e.JSON(http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -678,6 +762,7 @@ func (s *Server) handleInstallDefaults(e *core.RequestEvent) error {
 	if err != nil {
 		return e.InternalServerError("install defaults failed", err)
 	}
+	_ = s.auditAdmin(e, "admin_policy_install_defaults", fmt.Sprintf("actor=%s installed default policies created=%d preserved=%d", actorSummary(e), created, preserved))
 	return e.JSON(http.StatusOK, map[string]any{"created": created, "preserved": preserved})
 }
 
@@ -697,7 +782,7 @@ func (s *Server) handleUpstreamProbe(e *core.RequestEvent) error {
 	if err := e.BindBody(&body); err != nil {
 		return e.BadRequestError("invalid body", err)
 	}
-	serverID, name, ver, latency, err := controlplane.ProbeUpstream(e.Request.Context(), controlplane.UpstreamReconfigureInput{
+	serverID, name, ver, backendUserID, latency, err := controlplane.ProbeUpstream(e.Request.Context(), e.App, controlplane.UpstreamReconfigureInput{
 		EmbyBaseURL:                 body.EmbyBaseURL,
 		BackendUsername:             body.BackendUsername,
 		BackendPassword:             body.BackendPassword,
@@ -709,11 +794,13 @@ func (s *Server) handleUpstreamProbe(e *core.RequestEvent) error {
 	if err != nil {
 		return e.BadRequestError(err.Error(), err)
 	}
+	_ = s.auditAdmin(e, "admin_upstream_probe", fmt.Sprintf("actor=%s probed upstream server_id=%s latency_ms=%d", actorSummary(e), serverID, latency))
 	return e.JSON(http.StatusOK, map[string]any{
-		"server_id":      serverID,
-		"server_name":    name,
-		"server_version": ver,
-		"latency_ms":     latency,
+		"server_id":       serverID,
+		"server_name":     name,
+		"server_version":  ver,
+		"backend_user_id": backendUserID,
+		"latency_ms":      latency,
 	})
 }
 
@@ -768,9 +855,14 @@ func (s *Server) handleUpstreamReconfigure(e *core.RequestEvent) error {
 	if err != nil {
 		return e.BadRequestError(err.Error(), err)
 	}
-	up, _ := s.cfg.Query.GetUpstream(e.Request.Context())
-	return e.JSON(http.StatusOK, map[string]any{
-		"upstream":        up,
+	resp := map[string]any{
 		"cleanup_warning": result.CleanupWarning,
-	})
+	}
+	if auditErr := s.auditAdmin(e, "admin_upstream_reconfigure", fmt.Sprintf("actor=%s reconfigured upstream force=%t", actorSummary(e), body.Force)); auditErr != nil {
+		// Mutation succeeded; do not fail solely on audit write, but make it visible.
+		resp["audit_warning"] = "audit log write failed: " + auditErr.Error()
+	}
+	up, _ := s.cfg.Query.GetUpstream(e.Request.Context())
+	resp["upstream"] = up
+	return e.JSON(http.StatusOK, resp)
 }

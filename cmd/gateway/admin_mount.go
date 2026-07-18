@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -21,15 +22,14 @@ import (
 )
 
 // adminConfig is loaded from environment for the public admin control plane.
+// Admin is always mounted; Origin is required for CSRF (exact trusted origin).
 type adminConfig struct {
-	Enabled            bool
 	Origin             string
 	AuditRetentionDays int
 }
 
 func adminConfigFromEnv() adminConfig {
-	enabled := envTruthy(os.Getenv("GATEWAY_ADMIN_ENABLED"))
-	origin := strings.TrimRight(strings.TrimSpace(os.Getenv("GATEWAY_ADMIN_ORIGIN")), "/")
+	origin := resolveAdminOriginFromEnv()
 	days := 30
 	if v := strings.TrimSpace(os.Getenv("GATEWAY_ADMIN_AUDIT_RETENTION_DAYS")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -37,26 +37,53 @@ func adminConfigFromEnv() adminConfig {
 		}
 	}
 	return adminConfig{
-		Enabled:            enabled,
 		Origin:             origin,
 		AuditRetentionDays: days,
 	}
 }
 
-func envTruthy(v string) bool {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
+// resolveAdminOriginFromEnv prefers GATEWAY_ADMIN_ORIGIN; otherwise derives
+// scheme://host from GATEWAY_PUBLIC_URL (path like /emby is stripped).
+// Returns empty string when neither yields a usable candidate; mountAdmin
+// validates and fails startup closed.
+func resolveAdminOriginFromEnv() string {
+	if raw := strings.TrimSpace(os.Getenv("GATEWAY_ADMIN_ORIGIN")); raw != "" {
+		return strings.TrimRight(raw, "/")
 	}
+	if derived, err := originFromPublicURL(os.Getenv("GATEWAY_PUBLIC_URL")); err == nil {
+		return derived
+	}
+	return ""
 }
 
-// mountAdmin mounts the admin API and SPA when enabled.
+// originFromPublicURL derives scheme://host from a public base URL, stripping any path.
+func originFromPublicURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("GATEWAY_PUBLIC_URL is empty")
+	}
+	if !strings.Contains(raw, "://") {
+		return "", fmt.Errorf("GATEWAY_PUBLIC_URL must be an absolute http or https URL")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("GATEWAY_PUBLIC_URL is invalid: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("GATEWAY_PUBLIC_URL must use http or https scheme")
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("GATEWAY_PUBLIC_URL must include a host")
+	}
+	return u.Scheme + "://" + u.Host, nil
+}
+
+// mountAdmin always mounts the admin API and SPA.
 // Always reserves /admin/service/registration/{path} so the SPA cannot capture it:
 // registration handler when webReady, deliberate 404 otherwise.
 // acquireReconfigure is the preferred reconfigure exclusion gate; activeMediaLoad
 // is the fallback when acquireReconfigure is nil.
+// Origin must be a valid trusted origin (CSRF); invalid config fails startup closed.
 func mountAdmin(
 	r *router.Router[*core.RequestEvent],
 	app core.App,
@@ -82,12 +109,9 @@ func mountAdmin(
 		})
 	}
 
-	if !cfg.Enabled {
-		return nil
-	}
 	origin, err := validateAdminOrigin(cfg.Origin)
 	if err != nil {
-		return fmt.Errorf("GATEWAY_ADMIN_ENABLED is set but %w", err)
+		return fmt.Errorf("admin control plane requires a trusted origin (set GATEWAY_ADMIN_ORIGIN or a valid GATEWAY_PUBLIC_URL): %w", err)
 	}
 	cfg.Origin = origin
 
