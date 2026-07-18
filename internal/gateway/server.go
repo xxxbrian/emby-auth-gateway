@@ -630,6 +630,13 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 			s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh_failure", refreshErr.Error(), http.StatusUnauthorized)
 		}
 	}
+	if resp.StatusCode == http.StatusForbidden {
+		if fallback, fallbackErr := s.tryDownloadDirectStreamFallback(r, rel, session, upstream, gatewayToken); fallbackErr == nil {
+			_ = resp.Body.Close()
+			resp = fallback
+			defer resp.Body.Close()
+		}
+	}
 	if isPlaybackInfo && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
 		s.playbackGuards.clearIfGeneration(guardKey, guardGeneration)
 	}
