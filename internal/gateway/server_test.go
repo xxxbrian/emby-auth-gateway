@@ -1749,7 +1749,7 @@ func TestPlaybackPingAndCapabilitiesAreLocalOnly(t *testing.T) {
 	}
 }
 
-func TestRemoteControlPlaybackRequestStillForwards(t *testing.T) {
+func TestRemoteControlPlaybackRequestIsDenied(t *testing.T) {
 	var forwarded []string
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		forwarded = append(forwarded, r.Method+" "+r.URL.Path)
@@ -1765,11 +1765,17 @@ func TestRemoteControlPlaybackRequestStillForwards(t *testing.T) {
 
 	resp := do(t, mustRequest(t, http.MethodPost, gw.URL+"/emby/Sessions/session-1/Playing/Pause?api_key=gateway-token", nil))
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("remote control status = %d, want 204", resp.StatusCode)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("remote control status = %d, want 403", resp.StatusCode)
 	}
-	if len(forwarded) != 1 || forwarded[0] != "POST /emby/Sessions/session-1/Playing/Pause" {
-		t.Fatalf("forwarded = %v, want remote control request", forwarded)
+	if resp.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", resp.Header.Get("Cache-Control"))
+	}
+	if len(forwarded) != 0 {
+		t.Fatalf("forwarded = %v, want zero egress", forwarded)
+	}
+	if !hasAuditEvent(store, "session_access_denied") {
+		t.Fatalf("missing session_access_denied audit in %#v", store.AuditLogs)
 	}
 }
 

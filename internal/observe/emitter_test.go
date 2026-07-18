@@ -5,6 +5,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/xxxbrian/emby-auth-gateway/internal/routeclass"
 )
 
 func TestNewEmitterDefaultBuffer(t *testing.T) {
@@ -143,7 +145,7 @@ func TestClassifyRoute(t *testing.T) {
 	}{
 		{"POST", "/Users/AuthenticateByName", RouteAuth},
 		{"POST", "/Sessions/Logout", RouteAuth},
-		{"GET", "/Items/abc/PlaybackInfo", RoutePlayback},
+		{"GET", "/Items/abc/PlaybackInfo", RouteMetadata},
 		{"POST", "/Sessions/Playing/Progress", RoutePlayback},
 		{"GET", "/Videos/item1/stream", RouteMedia},
 		{"GET", "/Audio/item1/stream.mp3", RouteMedia},
@@ -153,11 +155,83 @@ func TestClassifyRoute(t *testing.T) {
 		{"GET", "/Users/u/Items", RouteMetadata},
 		{"GET", "/System/Info/Public", RouteMetadata},
 		{"GET", "/unknown/path", RouteOther},
+		// Compatibility: ClassifyRoute sanitizes query/fragment/whitespace before routeclass.
 		{"GET", "Items/x?api_key=secret", RouteMetadata},
+		{"POST", "/Sessions/Playing/Progress?api_key=secret#frag", RoutePlayback},
+		{"POST", "  /Sessions/Logout  ", RouteAuth},
+		{"GET", "/System/Info/Public?x=1", RouteMetadata},
+		{"GET", "/Sessions/PlayQueue", RoutePlayback},
+		{"POST", "/Sessions/sid/Playing/Pause", RoutePlayback},
+		{"GET", "/Sessions", RoutePlayback},
+		{"GET", "/Users/Me", RouteMetadata},
+		{"GET", "/DisplayPreferences/home", RouteUserdata},
+		{"GET", "/SessionsX", RouteOther},
 	}
 	for _, tc := range cases {
 		if got := ClassifyRoute(tc.method, tc.path); got != tc.want {
 			t.Fatalf("ClassifyRoute(%q,%q)=%q want %q", tc.method, tc.path, got, tc.want)
+		}
+	}
+}
+
+func TestClassifyRouteSanitizesBeforeRouteclass(t *testing.T) {
+	// routeclass treats ?/#/spaces as path data; the compat wrapper strips them.
+	if got := routeclass.Classify("POST", "/Sessions/Playing?x"); got.Ownership != routeclass.DeniedSession {
+		t.Fatalf("routeclass path-data: got %+v want DeniedSession", got)
+	}
+	if got := ClassifyRoute("POST", "/Sessions/Playing?x"); got != RoutePlayback {
+		t.Fatalf("compat wrapper: ClassifyRoute=/Sessions/Playing?x got %q want %q", got, RoutePlayback)
+	}
+	if got := ClassifyRoute("POST", "/Sessions/Playing#x"); got != RoutePlayback {
+		t.Fatalf("compat wrapper: ClassifyRoute=/Sessions/Playing#x got %q want %q", got, RoutePlayback)
+	}
+	if got := ClassifyRoute("POST", "  /Sessions/Playing  "); got != RoutePlayback {
+		t.Fatalf("compat wrapper: whitespace path got %q want %q", got, RoutePlayback)
+	}
+}
+
+func TestRouteClassOf(t *testing.T) {
+	cases := []struct {
+		name string
+		dec  routeclass.Decision
+		want string
+	}{
+		{"auth", routeclass.Decision{Ownership: routeclass.LocalPublic, Operation: routeclass.OperationAuthenticate}, RouteAuth},
+		{"logout", routeclass.Decision{Ownership: routeclass.LocalSession, Operation: routeclass.OperationLogout}, RouteAuth},
+		{"playback report", routeclass.Decision{Ownership: routeclass.LocalSession, Operation: routeclass.OperationPlaybackReport}, RoutePlayback},
+		{"session list", routeclass.Decision{Ownership: routeclass.LocalSession, Operation: routeclass.OperationSessionList}, RoutePlayback},
+		{"denied session", routeclass.Decision{Ownership: routeclass.DeniedSession, Operation: routeclass.OperationDeniedSession}, RoutePlayback},
+		{"current user", routeclass.Decision{Ownership: routeclass.LocalPersonal, Operation: routeclass.OperationCurrentUser}, RouteMetadata},
+		{"personal", routeclass.Decision{Ownership: routeclass.LocalPersonal, Operation: routeclass.OperationPersonal}, RouteUserdata},
+		{"metadata", routeclass.Decision{Ownership: routeclass.MetadataProxy}, RouteMetadata},
+		{"media", routeclass.Decision{Ownership: routeclass.MediaProxy}, RouteMedia},
+		{"legacy", routeclass.Decision{Ownership: routeclass.LegacyProxy}, RouteOther},
+		{"public system", routeclass.Decision{Ownership: routeclass.LocalPublic, Operation: routeclass.OperationPublicSystemInfo}, RouteMetadata},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := RouteClassOf(tc.dec); got != tc.want {
+				t.Fatalf("RouteClassOf(%+v)=%q want %q", tc.dec, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestClassifyRouteDelegatesToRouteclass(t *testing.T) {
+	// Compatibility: ClassifyRoute is RouteClassOf(routeclass.Classify(sanitize(path))).
+	paths := []struct{ method, path string }{
+		{"POST", "/Users/AuthenticateByName"},
+		{"GET", "/Sessions/PlayQueue"},
+		{"POST", "/Sessions/Playing/Pause"},
+		{"GET", "/Videos/x/stream"},
+		{"GET", "/unknown"},
+		{"POST", "/Sessions/Playing?x"},
+		{"GET", "  /System/Info/Public  "},
+	}
+	for _, tc := range paths {
+		want := RouteClassOf(routeclass.Classify(tc.method, sanitizeCompatPath(tc.path)))
+		if got := ClassifyRoute(tc.method, tc.path); got != want {
+			t.Fatalf("ClassifyRoute(%q,%q)=%q want %q", tc.method, tc.path, got, want)
 		}
 	}
 }

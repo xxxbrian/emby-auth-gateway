@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/xxxbrian/emby-auth-gateway/internal/observe"
+	"github.com/xxxbrian/emby-auth-gateway/internal/routeclass"
 	"github.com/xxxbrian/emby-auth-gateway/internal/telemetry"
 	"github.com/xxxbrian/emby-auth-gateway/internal/version"
 )
@@ -165,15 +166,16 @@ func (s *Server) emit(ev observe.Event) {
 	_ = s.emitter.TryEmit(ev)
 }
 
-// noteSession records lightweight session activity for telemetry.
-func (s *Server) noteSession(session *Session) {
+// noteSession records lightweight session activity for telemetry using the
+// authoritative routeclass decision for this request (never reclassifies).
+func (s *Server) noteSession(session *Session, decision routeclass.Decision) {
 	if session == nil {
 		return
 	}
 	s.emit(observe.Event{
 		Kind:       observe.KindRequest,
 		Outcome:    observe.OutcomeOK,
-		RouteClass: observe.RouteOther,
+		RouteClass: observe.RouteClassOf(decision),
 		UserID:     session.GatewayUserID,
 		Username:   session.GatewayUsername,
 		SessionID:  session.GatewayTokenHash,
@@ -236,6 +238,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// Classify exactly once after path validation and relative-path resolution.
+	// Pass by value through dispatch/handleProxy; never reclassify or store in context.
+	decision := routeclass.Classify(r.Method, rel)
 	// Credential-accepting routes reject malformed query encoding before any
 	// store operation (path policy, session, audit, etc.).
 	if acceptsClientCredentials(r.Method, rel) {
@@ -255,26 +260,51 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	switch {
-	case r.Method == http.MethodPost && equalPath(rel, "/Users/AuthenticateByName"):
-		s.handleAuthenticate(w, r)
-	case r.Method == http.MethodGet && equalPath(rel, "/System/Info/Public"):
-		s.handlePublicSystemInfo(w, r)
-	case (r.Method == http.MethodGet || r.Method == http.MethodPost) && equalPath(rel, "/System/Ping"):
-		s.handlePing(w, r)
-	case r.Method == http.MethodPost && equalPath(rel, "/Sessions/Logout"):
-		s.handleLogout(w, r, rel)
-	case r.Method == http.MethodGet && equalPath(rel, "/Users/Public"):
-		s.handlePublicUsers(w, r)
-	case r.Method == http.MethodGet && isSingleUserPath(rel):
-		s.handleCurrentUser(w, r, rel)
-	case r.Method == http.MethodGet && equalPath(rel, "/Branding/Configuration"):
-		s.handleBrandingConfiguration(w, r)
-	case r.Method == http.MethodGet && equalPath(rel, "/Branding/Css.css"):
-		s.handleBrandingCSS(w, r)
-	default:
-		s.handleProxy(w, r, rel)
+	// Public/local specials via operation. Wrong-method public routes fall through
+	// to handleProxy so existing non-Session method behavior is preserved.
+	switch decision.Operation {
+	case routeclass.OperationAuthenticate:
+		if decision.MethodAllowed {
+			s.handleAuthenticate(w, r)
+			return
+		}
+	case routeclass.OperationPublicSystemInfo:
+		if decision.MethodAllowed {
+			s.handlePublicSystemInfo(w, r)
+			return
+		}
+	case routeclass.OperationPing:
+		if decision.MethodAllowed {
+			s.handlePing(w, r)
+			return
+		}
+	case routeclass.OperationLogout:
+		if decision.MethodAllowed {
+			s.handleLogout(w, r, rel, decision)
+			return
+		}
+	case routeclass.OperationPublicUsers:
+		if decision.MethodAllowed {
+			s.handlePublicUsers(w, r)
+			return
+		}
+	case routeclass.OperationCurrentUser:
+		if decision.MethodAllowed {
+			s.handleCurrentUser(w, r, rel, decision)
+			return
+		}
+	case routeclass.OperationBrandingConfiguration:
+		if decision.MethodAllowed {
+			s.handleBrandingConfiguration(w, r)
+			return
+		}
+	case routeclass.OperationBrandingCSS:
+		if decision.MethodAllowed {
+			s.handleBrandingCSS(w, r)
+			return
+		}
 	}
+	s.handleProxy(w, r, rel, decision)
 }
 
 func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
@@ -405,13 +435,14 @@ func parseAuthenticateBody(w http.ResponseWriter, r *http.Request) (authenticate
 	return form, json.Unmarshal(body, &form)
 }
 
-func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, rel string) {
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, rel string, decision routeclass.Decision) {
 	token := ExtractToken(r)
 	session, ok := s.activeSession(w, r, token)
 	if !ok {
 		s.audit(r.Context(), AuditLog{Event: "logout_failure", Message: "session unavailable", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusUnauthorized})
 		return
 	}
+	s.noteSession(session, decision)
 	if err := s.store.RevokeSession(r.Context(), HashToken(token)); err != nil {
 		s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "logout_failure", Message: "session revoke failed", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusInternalServerError})
 		http.Error(w, "session revoke failed", http.StatusInternalServerError)
@@ -495,7 +526,7 @@ func (s *Server) handleBrandingCSS(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func (s *Server) handleCurrentUser(w http.ResponseWriter, r *http.Request, rel string) {
+func (s *Server) handleCurrentUser(w http.ResponseWriter, r *http.Request, rel string, decision routeclass.Decision) {
 	parts := strings.Split(strings.Trim(rel, "/"), "/")
 	if len(parts) != 2 {
 		http.NotFound(w, r)
@@ -515,11 +546,12 @@ func (s *Server) handleCurrentUser(w http.ResponseWriter, r *http.Request, rel s
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
+	s.noteSession(session, decision)
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, privateUserDTO(session.GatewayUsername, session.SyntheticUserID, s.cfg.GatewayServerID))
 }
 
-func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string) {
+func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string, decision routeclass.Decision) {
 	resourceKind := resourceRoute(r, rel)
 	if resourceKind != resourceRouteNone {
 		r = r.WithContext(context.WithValue(r.Context(), resourceCookieContextKey{}, resourceKind))
@@ -530,13 +562,27 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 	if gatewayToken == "" {
 		gatewayToken, _, cookieAuthenticated = resourceCookieToken(r, rel)
 	}
-	session, ok := s.activeSession(w, r, gatewayToken)
+	// Skip noteSession until after Session 405/denial so denied requests emit
+	// exactly one KindRequest OutcomeDenied event (not noteSession OK + denial).
+	session, ok := s.activeSessionNoNote(w, r, gatewayToken)
 	if !ok {
 		return
 	}
 	if err := s.guardProxyQueryCredentials(r.Context(), r.URL.RawQuery, gatewayToken); err != nil {
 		writeCredentialQueryError(w, err)
 		return
+	}
+	// Session method/denial: after activeSession + credential conflict guard,
+	// before personal-data handlers and before upstreamAuth.Ensure/load/dial.
+	if sessionMethodEnforced(decision) {
+		if !decision.MethodAllowed {
+			s.writeSessionMethodNotAllowed(w, r, rel, session, decision)
+			return
+		}
+		if decision.Ownership == routeclass.DeniedSession {
+			s.writeSessionAccessDenied(w, r, rel, session, decision)
+			return
+		}
 	}
 	playbackItemID, isPlaybackInfo := playbackInfoItemID(r.Method, rel)
 	guardKey := playbackGuardKey{GatewayTokenHash: session.GatewayTokenHash, ItemID: playbackItemID}
@@ -545,8 +591,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 		guardGeneration = s.playbackGuards.snapshot(guardKey)
 	}
 	if s.handlePersonalDataRequest(w, r, rel, session, gatewayToken) {
+		s.noteSession(session, decision)
 		return
 	}
+	// Fail closed: LocalSession must be consumed by a local handler, never proxied.
+	if decision.Ownership == routeclass.LocalSession {
+		s.writeSessionRouteUnhandled(w, r, rel, session, decision)
+		return
+	}
+	s.noteSession(session, decision)
 	runtime, err := s.upstreamAuth.Ensure(r.Context())
 	if err != nil {
 		if r.Context().Err() != nil || errors.Is(err, context.Canceled) {
@@ -877,18 +930,111 @@ func (s *Server) upstreamSnapshotUnauthorized(ctx context.Context, upstream upst
 	return resp.StatusCode == http.StatusUnauthorized, nil
 }
 
+// activeSession authenticates the gateway session without emitting telemetry.
+// Callers must call noteSession(session, decision) exactly once on accepted paths.
 func (s *Server) activeSession(w http.ResponseWriter, r *http.Request, token string) (*Session, bool) {
+	return s.lookupActiveSession(w, r, token)
+}
+
+// activeSessionNoNote is an alias for activeSession; retained for call-site clarity
+// at paths that defer noteSession until after Session denial checks.
+func (s *Server) activeSessionNoNote(w http.ResponseWriter, r *http.Request, token string) (*Session, bool) {
+	return s.lookupActiveSession(w, r, token)
+}
+
+func (s *Server) lookupActiveSession(w http.ResponseWriter, r *http.Request, token string) (*Session, bool) {
 	if token == "" {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return nil, false
 	}
 	session, err := s.store.FindSessionByTokenHash(r.Context(), HashToken(token))
-	if err != nil || !session.Active(time.Now().UTC()) {
+	if err != nil || session == nil || !session.Active(time.Now().UTC()) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return nil, false
 	}
-	s.noteSession(session)
 	return session, true
+}
+
+// sessionMethodEnforced reports whether 405/403 Session ownership rules apply.
+// Phase 1 limits method enforcement to LocalSession and DeniedSession only.
+func sessionMethodEnforced(decision routeclass.Decision) bool {
+	switch decision.Ownership {
+	case routeclass.LocalSession, routeclass.DeniedSession:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) writeSessionMethodNotAllowed(w http.ResponseWriter, r *http.Request, rel string, session *Session, decision routeclass.Decision) {
+	w.Header().Set("Cache-Control", "no-store")
+	if decision.Allow != "" {
+		w.Header().Set("Allow", decision.Allow)
+	}
+	s.audit(r.Context(), AuditLog{
+		GatewayUserID:   session.GatewayUserID,
+		SyntheticUserID: session.SyntheticUserID,
+		Event:           "session_method_not_allowed",
+		Message:         "session method not allowed",
+		RemoteIP:        remoteIP(r),
+		Method:          r.Method,
+		Path:            rel,
+		Status:          http.StatusMethodNotAllowed,
+	})
+	s.emitSessionDeniedRequest(session, r.Method, decision, http.StatusMethodNotAllowed)
+	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+}
+
+func (s *Server) writeSessionAccessDenied(w http.ResponseWriter, r *http.Request, rel string, session *Session, decision routeclass.Decision) {
+	w.Header().Set("Cache-Control", "no-store")
+	s.audit(r.Context(), AuditLog{
+		GatewayUserID:   session.GatewayUserID,
+		SyntheticUserID: session.SyntheticUserID,
+		Event:           "session_access_denied",
+		Message:         "session access denied",
+		RemoteIP:        remoteIP(r),
+		Method:          r.Method,
+		Path:            rel,
+		Status:          http.StatusForbidden,
+	})
+	s.emitSessionDeniedRequest(session, r.Method, decision, http.StatusForbidden)
+	http.Error(w, "forbidden", http.StatusForbidden)
+}
+
+// writeSessionRouteUnhandled fails closed when ownership is LocalSession but no
+// local handler consumed the request. Uses 404 (not 403) to distinguish from
+// DeniedSession access denial.
+func (s *Server) writeSessionRouteUnhandled(w http.ResponseWriter, r *http.Request, rel string, session *Session, decision routeclass.Decision) {
+	w.Header().Set("Cache-Control", "no-store")
+	s.audit(r.Context(), AuditLog{
+		GatewayUserID:   session.GatewayUserID,
+		SyntheticUserID: session.SyntheticUserID,
+		Event:           "session_route_unhandled",
+		Message:         "local session route unhandled",
+		RemoteIP:        remoteIP(r),
+		Method:          r.Method,
+		Path:            rel,
+		Status:          http.StatusNotFound,
+	})
+	s.emitSessionDeniedRequest(session, r.Method, decision, http.StatusNotFound)
+	http.Error(w, "not found", http.StatusNotFound)
+}
+
+// emitSessionDeniedRequest emits exactly one final KindRequest denial observation.
+// It must not emit KindPlayback or mutate active-playback telemetry.
+func (s *Server) emitSessionDeniedRequest(session *Session, method string, decision routeclass.Decision, status int) {
+	s.emit(observe.Event{
+		Kind:        observe.KindRequest,
+		Outcome:     observe.OutcomeDenied,
+		StatusClass: observe.Status4xx,
+		RouteClass:  observe.RouteClassOf(decision),
+		Method:      method,
+		UserID:      session.GatewayUserID,
+		Username:    session.GatewayUsername,
+		SessionID:   session.GatewayTokenHash,
+		Device:      session.Device,
+	})
+	_ = status // status class is fixed Status4xx for Session denials
 }
 
 func (s *Server) pathPolicyAllows(w http.ResponseWriter, r *http.Request, rel string) bool {
