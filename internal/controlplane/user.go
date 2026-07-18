@@ -2,6 +2,8 @@ package controlplane
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -9,6 +11,9 @@ import (
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 )
+
+// ErrUserExists is returned when CreateUser is called for an existing username.
+var ErrUserExists = errors.New("user already exists")
 
 // UpsertUserInput creates or updates a gateway user by username.
 type UpsertUserInput struct {
@@ -20,31 +25,19 @@ type UpsertUserInput struct {
 
 // UpsertUser creates a gateway user or updates the password for an existing username.
 // Username and synthetic_user_id are immutable after create; a synthetic ID mismatch returns an error.
+// Intended for CLI setup (pbsetup); admin create paths must use CreateUser instead.
 func UpsertUser(ctx context.Context, app core.App, in UpsertUserInput) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	username := strings.TrimSpace(in.Username)
-	password := in.Password
-	syntheticID := strings.TrimSpace(in.SyntheticUserID)
-	if username == "" || password == "" || syntheticID == "" {
-		return fmt.Errorf("username, password, and synthetic_user_id are required")
+	username, password, syntheticID, err := normalizeUserInput(in)
+	if err != nil {
+		return err
 	}
 	return app.RunInTransaction(func(txApp core.App) error {
 		record, err := txApp.FindFirstRecordByData("users", "username", username)
 		if err != nil {
-			collection, findErr := txApp.FindCollectionByNameOrId("users")
-			if findErr != nil {
-				return findErr
-			}
-			record = core.NewRecord(collection)
-			record.Set("username", username)
-			record.SetEmail(internalEmail(username))
-			record.SetPassword(password)
-			record.SetVerified(true)
-			record.Set("synthetic_user_id", syntheticID)
-			record.Set("enabled", true)
-			return txApp.Save(record)
+			return createUserRecord(txApp, username, password, syntheticID)
 		}
 		if existing := record.GetString("synthetic_user_id"); existing != "" && existing != syntheticID {
 			return fmt.Errorf("synthetic_user_id mismatch for user %q: stored %q, requested %q", username, existing, syntheticID)
@@ -59,6 +52,54 @@ func UpsertUser(ctx context.Context, app core.App, in UpsertUserInput) error {
 		}
 		return txApp.Save(record)
 	})
+}
+
+// CreateUser creates a gateway user. It fails with ErrUserExists if the username already exists
+// and never updates an existing user's password.
+func CreateUser(ctx context.Context, app core.App, in UpsertUserInput) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	username, password, syntheticID, err := normalizeUserInput(in)
+	if err != nil {
+		return err
+	}
+	return app.RunInTransaction(func(txApp core.App) error {
+		_, err := txApp.FindFirstRecordByData("users", "username", username)
+		if err == nil {
+			return ErrUserExists
+		}
+		// Not-found is the create path; any other lookup error is operational.
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		return createUserRecord(txApp, username, password, syntheticID)
+	})
+}
+
+func normalizeUserInput(in UpsertUserInput) (username, password, syntheticID string, err error) {
+	username = strings.TrimSpace(in.Username)
+	password = in.Password
+	syntheticID = strings.TrimSpace(in.SyntheticUserID)
+	if username == "" || password == "" || syntheticID == "" {
+		return "", "", "", fmt.Errorf("username, password, and synthetic_user_id are required")
+	}
+	return username, password, syntheticID, nil
+}
+
+func createUserRecord(txApp core.App, username, password, syntheticID string) error {
+	collection, findErr := txApp.FindCollectionByNameOrId("users")
+	if findErr != nil {
+		return findErr
+	}
+	record := core.NewRecord(collection)
+	record.Set("username", username)
+	record.SetEmail(internalEmail(username))
+	record.SetPassword(password)
+	record.SetVerified(true)
+	record.Set("synthetic_user_id", syntheticID)
+	record.Set("enabled", true)
+	return txApp.Save(record)
 }
 
 // SetUserEnabled sets the enabled flag for a gateway user.

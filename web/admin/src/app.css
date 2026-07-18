@@ -245,26 +245,33 @@ th {
     width: 100%;
     border-right: none;
     border-bottom: 1px solid var(--border-color);
-    padding: 0.75rem 0 0;
+    padding: 0;
   }
 
   .sidebar-title {
-    padding: 0 1rem 0.75rem;
-    margin-bottom: 0.5rem;
-    font-size: 1.1rem;
+    display: none;
   }
 
   .sidebar-nav {
     display: flex;
-    flex-wrap: wrap;
-    gap: 0.25rem;
-    padding: 0 0.5rem 0.5rem;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    gap: 0.5rem;
+    padding: 0.75rem 1rem;
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+    border-bottom: 1px solid var(--border-color);
+  }
+  
+  .sidebar-nav::-webkit-scrollbar {
+    display: none;
   }
 
   .nav-link {
     display: inline-block;
-    padding: 0.45rem 0.75rem;
+    padding: 0.4rem 0.75rem;
     border-radius: 999px;
+    white-space: nowrap;
   }
 
   .nav-link.active {
@@ -278,12 +285,15 @@ th {
     align-items: center;
     justify-content: space-between;
     gap: 0.75rem;
-    padding: 0.75rem 1rem;
+    padding: 0.5rem 1rem;
+    border-top: none;
   }
 
   .sidebar-logout {
     width: auto;
     flex-shrink: 0;
+    padding: 0.35rem 0.75rem;
+    font-size: 0.75rem;
   }
 
   .main-content {
@@ -306,25 +316,52 @@ th {
     margin-bottom: 1rem;
     border: 1px solid var(--border-color);
     border-radius: 6px;
-    padding: 0.5rem;
+    padding: 0;
+    overflow: hidden;
   }
 
   table.mobile-cards td {
+    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    flex-direction: column;
+    padding: 0.75rem 1rem;
+    text-align: left;
+    gap: 0.25rem;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
+  table.mobile-cards td:last-child {
     border-bottom: none;
-    position: relative;
-    padding-left: 40%;
-    text-align: right;
+  }
+
+  table.mobile-cards td .flex,
+  table.mobile-cards td .action-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    justify-content: flex-start !important;
+    width: 100%;
+  }
+
+  table.mobile-cards td .action-row button,
+  table.mobile-cards td .flex button {
+    flex: 1 1 auto;
+    min-width: 5.5rem;
+    white-space: nowrap;
+    overflow: visible;
+    text-overflow: clip;
   }
 
   table.mobile-cards td::before {
     content: attr(data-label);
-    position: absolute;
-    left: 0.5rem;
-    width: 35%;
-    padding-right: 10px;
-    white-space: nowrap;
-    text-align: left;
     font-weight: 600;
     color: var(--text-secondary);
+    font-size: 0.8rem;
+    margin-bottom: 0.25rem;
+  }
+
+  table.mobile-cards td .flex {
+    flex-wrap: wrap;
   }
 }

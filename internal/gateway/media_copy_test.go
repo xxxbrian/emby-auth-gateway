@@ -7,9 +7,179 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestActiveMediaCopiesTracksInflightCopy(t *testing.T) {
+	store := NewMemoryStore()
+	server := NewServer(Config{}, store)
+	if server.ActiveMediaCopies() != 0 {
+		t.Fatalf("initial ActiveMediaCopies=%d", server.ActiveMediaCopies())
+	}
+
+	// Block the copy until we observe the inflight counter.
+	started := make(chan struct{})
+	release := make(chan struct{})
+	src := &blockingMediaReader{started: started, release: release, payload: []byte("media")}
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Videos/item/stream", nil)
+	req.Header.Set("Range", "bytes=0-")
+	writer := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		server.copyMediaReaderOrAbort(writer, req, "/Videos/item/stream", src, int64(len(src.payload)), http.StatusOK, &Session{})
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("copy did not start")
+	}
+	if got := server.ActiveMediaCopies(); got != 1 {
+		t.Fatalf("during copy ActiveMediaCopies=%d want 1", got)
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("copy did not finish")
+	}
+	if got := server.ActiveMediaCopies(); got != 0 {
+		t.Fatalf("after copy ActiveMediaCopies=%d want 0", got)
+	}
+}
+
+func TestMediaGateBlocksReconfigureWhileCopyActive(t *testing.T) {
+	store := NewMemoryStore()
+	server := NewServer(Config{}, store)
+
+	// Hold a shared media-copy lock (simulates concurrent RLock copies).
+	server.beginMediaCopy()
+	if got := server.ActiveMediaCopies(); got != 1 {
+		t.Fatalf("ActiveMediaCopies=%d want 1", got)
+	}
+
+	// Non-force reconfigure must fail immediately while a copy holds RLock.
+	if _, err := server.TryAcquireReconfigure(false); !errors.Is(err, ErrActiveMedia) {
+		t.Fatalf("TryAcquireReconfigure(false) err=%v want ErrActiveMedia", err)
+	}
+
+	// Force reconfigure waits for copies; run it in a goroutine and release the copy.
+	type acquireResult struct {
+		release func()
+		err     error
+	}
+	acquired := make(chan acquireResult, 1)
+	go func() {
+		rel, err := server.TryAcquireReconfigure(true)
+		acquired <- acquireResult{release: rel, err: err}
+	}()
+
+	// Give the force path a moment to block on Lock.
+	select {
+	case res := <-acquired:
+		if res.release != nil {
+			res.release()
+		}
+		t.Fatalf("force reconfigure acquired while copy still held: err=%v", res.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	server.endMediaCopy()
+
+	var res acquireResult
+	select {
+	case res = <-acquired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("force reconfigure did not acquire after copy released")
+	}
+	if res.err != nil {
+		t.Fatalf("TryAcquireReconfigure(true) err=%v", res.err)
+	}
+
+	// While exclusive reconfigure holds the gate, new non-force attempts fail.
+	if _, err := server.TryAcquireReconfigure(false); !errors.Is(err, ErrActiveMedia) {
+		t.Fatalf("second TryAcquireReconfigure(false) while held: err=%v", err)
+	}
+
+	res.release()
+
+	// After release, non-force reconfigure succeeds.
+	rel, err := server.TryAcquireReconfigure(false)
+	if err != nil {
+		t.Fatalf("TryAcquireReconfigure(false) after drain: %v", err)
+	}
+	rel()
+
+	if got := server.ActiveMediaCopies(); got != 0 {
+		t.Fatalf("final ActiveMediaCopies=%d want 0", got)
+	}
+}
+
+func TestMediaGateConcurrentCopiesBlockTryLock(t *testing.T) {
+	store := NewMemoryStore()
+	server := NewServer(Config{}, store)
+
+	const n = 4
+	started := make(chan struct{}, n)
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			server.beginMediaCopy()
+			started <- struct{}{}
+			<-release
+			server.endMediaCopy()
+		}()
+	}
+	for i := 0; i < n; i++ {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("copy did not start")
+		}
+	}
+	if got := server.ActiveMediaCopies(); got != n {
+		t.Fatalf("ActiveMediaCopies=%d want %d", got, n)
+	}
+	if _, err := server.TryAcquireReconfigure(false); !errors.Is(err, ErrActiveMedia) {
+		t.Fatalf("TryLock while %d copies: err=%v", n, err)
+	}
+	close(release)
+	wg.Wait()
+	rel, err := server.TryAcquireReconfigure(false)
+	if err != nil {
+		t.Fatalf("after copies done: %v", err)
+	}
+	rel()
+}
+
+type blockingMediaReader struct {
+	started chan struct{}
+	release chan struct{}
+	payload []byte
+	once    bool
+	off     int
+}
+
+func (r *blockingMediaReader) Read(p []byte) (int, error) {
+	if !r.once {
+		r.once = true
+		close(r.started)
+		<-r.release
+	}
+	if r.off >= len(r.payload) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.payload[r.off:])
+	r.off += n
+	return n, nil
+}
 
 func TestCopyMediaBodyUsesExplicitLoopAndTracksExactLength(t *testing.T) {
 	payload := bytes.Repeat([]byte("media"), 7000)

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xxxbrian/emby-auth-gateway/internal/adminauth"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pbschema"
 	"github.com/xxxbrian/emby-auth-gateway/internal/telemetry"
 
@@ -40,9 +41,173 @@ func TestMountAdminRequiresOrigin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = mountAdmin(r, app, adminConfig{Enabled: true, Origin: ""}, nil, false, time.Now(), "boot")
+	err = mountAdmin(r, app, adminConfig{Enabled: true, Origin: ""}, nil, nil, nil, false, time.Now(), "boot")
 	if err == nil || !strings.Contains(err.Error(), "GATEWAY_ADMIN_ORIGIN") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestValidateAdminOrigin(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		in      string
+		want    string
+		wantErr string
+	}{
+		{name: "https ok", in: "https://emby.example.com", want: "https://emby.example.com"},
+		{name: "https trailing slash", in: "https://emby.example.com/", want: "https://emby.example.com"},
+		{name: "https with port", in: "https://emby.example.com:8443", want: "https://emby.example.com:8443"},
+		{name: "http loopback ipv4", in: "http://127.0.0.1:8090", want: "http://127.0.0.1:8090"},
+		{name: "http localhost", in: "http://localhost", want: "http://localhost"},
+		{name: "http loopback ipv6", in: "http://[::1]:8090", want: "http://[::1]:8090"},
+		{name: "empty", in: "", wantErr: "empty"},
+		{name: "path only", in: "/admin", wantErr: "absolute"},
+		{name: "scheme-less host", in: "emby.example.com", wantErr: "absolute"},
+		{name: "http non-loopback", in: "http://emby.example.com", wantErr: "loopback"},
+		{name: "ftp scheme", in: "ftp://emby.example.com", wantErr: "http or https"},
+		{name: "missing host", in: "https://", wantErr: "host"},
+		{name: "with path", in: "https://emby.example.com/admin", wantErr: "path"},
+		{name: "with query", in: "https://emby.example.com?x=1", wantErr: "query"},
+		{name: "with userinfo", in: "https://user:pass@emby.example.com", wantErr: "userinfo"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := validateAdminOrigin(tc.in)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err=%v want substring %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("got=%q want=%q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMountAdminRejectsInvalidOrigin(t *testing.T) {
+	app := newTestApp(t)
+	r, err := apis.NewRouter(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = mountAdmin(r, app, adminConfig{Enabled: true, Origin: "http://emby.example.com"}, nil, nil, nil, false, time.Now(), "boot")
+	if err == nil || !strings.Contains(err.Error(), "loopback") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestSuperuserAuthRateLimitMiddleware(t *testing.T) {
+	app := newTestApp(t)
+	r, err := apis.NewRouter(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Tight limit for a fast unit test; include resolved collection id.
+	ids := superuserAuthCollectionIDs(app)
+	bindSuperuserAuthRateLimit(r, adminauth.NewRateLimiter(2, time.Minute), ids...)
+
+	mux, err := r.BuildMux()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	passwordPath := "/api/collections/" + superuserCollectionName + "/auth-with-password"
+	refreshPath := "/api/collections/" + superuserCollectionName + "/auth-refresh"
+
+	post := func(path string) *httptest.ResponseRecorder {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"identity":"a","password":"b"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.RemoteAddr = "203.0.113.10:12345"
+		mux.ServeHTTP(rr, req)
+		return rr
+	}
+
+	// First two attempts on password auth are not rate-limited (may be 400 from PB).
+	for i := 0; i < 2; i++ {
+		rr := post(passwordPath)
+		if rr.Code == http.StatusTooManyRequests {
+			t.Fatalf("attempt %d unexpectedly rate limited: body=%q", i+1, rr.Body.String())
+		}
+	}
+	// Third attempt is blocked.
+	rr := post(passwordPath)
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d body=%q", rr.Code, rr.Body.String())
+	}
+	if rr.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("Cache-Control=%q", rr.Header().Get("Cache-Control"))
+	}
+	if !strings.Contains(rr.Body.String(), "rate limit") {
+		t.Fatalf("body=%q", rr.Body.String())
+	}
+
+	// Unrelated path is not limited by this middleware.
+	rr = post("/api/health")
+	if rr.Code == http.StatusTooManyRequests {
+		t.Fatalf("unrelated path rate limited: body=%q", rr.Body.String())
+	}
+
+	// auth-refresh shares the same limiter key (same IP already exhausted).
+	rr = post(refreshPath)
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("auth-refresh expected 429, got %d body=%q", rr.Code, rr.Body.String())
+	}
+
+	// Collection-id form of the path is also rate-limited (same IP key).
+	var idPath string
+	for _, id := range ids {
+		if id != superuserCollectionName {
+			idPath = "/api/collections/" + id + "/auth-with-password"
+			break
+		}
+	}
+	if idPath == "" {
+		t.Fatal("expected resolved superusers collection id")
+	}
+	rr = post(idPath)
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("collection-id auth path expected 429, got %d body=%q", rr.Code, rr.Body.String())
+	}
+}
+
+func TestIsSuperuserAuthRateLimitedPath(t *testing.T) {
+	t.Parallel()
+	// Fake collection id exercises the id-form matcher without needing a live app.
+	ids := []string{superuserCollectionName, "pbc_fake_superusers_id"}
+	passwordByName := "/api/collections/" + superuserCollectionName + "/auth-with-password"
+	refreshByName := "/api/collections/" + superuserCollectionName + "/auth-refresh"
+	passwordByID := "/api/collections/pbc_fake_superusers_id/auth-with-password"
+	refreshByID := "/api/collections/pbc_fake_superusers_id/auth-refresh"
+
+	if !isSuperuserAuthRateLimitedPath(passwordByName, ids) {
+		t.Fatal("password path by name")
+	}
+	if !isSuperuserAuthRateLimitedPath(refreshByName, ids) {
+		t.Fatal("refresh path by name")
+	}
+	if !isSuperuserAuthRateLimitedPath(passwordByID, ids) {
+		t.Fatal("password path by collection id")
+	}
+	if !isSuperuserAuthRateLimitedPath(refreshByID, ids) {
+		t.Fatal("refresh path by collection id")
+	}
+	if isSuperuserAuthRateLimitedPath("/api/collections/users/auth-with-password", ids) {
+		t.Fatal("users collection must not match")
+	}
+	if isSuperuserAuthRateLimitedPath("/admin/api/v1/session", ids) {
+		t.Fatal("admin session must not match")
+	}
+	// Default when no ids provided still matches name form.
+	if !isSuperuserAuthRateLimitedPath(passwordByName, nil) {
+		t.Fatal("nil ids should default to _superusers name")
 	}
 }
 
@@ -62,7 +227,7 @@ func TestRegistrationPathNotCapturedBySPAWhenAdminEnabledWebDisabled(t *testing.
 	err := mountAdmin(r, app, adminConfig{
 		Enabled: true,
 		Origin:  "https://admin.example.test",
-	}, reg, false /* web not ready */, time.Now().UTC(), "boot")
+	}, reg, nil, nil, false /* web not ready */, time.Now().UTC(), "boot")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +281,7 @@ func TestRegistrationHandlerWhenWebReadyStillWorksWithAdmin(t *testing.T) {
 	err := mountAdmin(r, app, adminConfig{
 		Enabled: true,
 		Origin:  "https://admin.example.test",
-	}, nil, true, time.Now().UTC(), "boot")
+	}, nil, nil, nil, true, time.Now().UTC(), "boot")
 	if err != nil {
 		t.Fatal(err)
 	}

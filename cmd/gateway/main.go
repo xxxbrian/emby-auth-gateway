@@ -201,7 +201,16 @@ func newGatewayApp() *pocketbase.PocketBase {
 		mountGatewayRoutes(e.Router, web, gw, webReady)
 
 		adminCfg := adminConfigFromEnv()
-		if err := mountAdmin(e.Router, e.App, adminCfg, registry, webReady, startedAt, registry.Snapshot().BootID); err != nil {
+		// Exclusive reconfigure gate: media copies (RWMutex) + active playbacks.
+		// force=false fails immediately if copies or playbacks are active;
+		// force=true waits for copies to drain (playbacks are not waited on).
+		acquireReconfigure := func(force bool) (func(), error) {
+			if !force && registry != nil && len(registry.ActivePlaybacks()) > 0 {
+				return nil, gateway.ErrActiveMedia
+			}
+			return gw.TryAcquireReconfigure(force)
+		}
+		if err := mountAdmin(e.Router, e.App, adminCfg, registry, nil, acquireReconfigure, webReady, startedAt, registry.Snapshot().BootID); err != nil {
 			return err
 		}
 

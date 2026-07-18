@@ -81,3 +81,47 @@ func TestListPolicies(t *testing.T) {
 		t.Fatal("expected default policies from schema ensure")
 	}
 }
+
+func TestListUsersAndSessionsUseBoundedLimits(t *testing.T) {
+	if MaxListLimit <= 0 {
+		t.Fatal("MaxListLimit must be positive")
+	}
+	if MaxListLimit > 500 {
+		t.Fatalf("MaxListLimit=%d exceeds hard cap 500", MaxListLimit)
+	}
+	app := newTestApp(t)
+	q := New(app, 2)
+	if _, err := q.ListUsers(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.ListSessions(context.Background(), ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.ListSessions(context.Background(), "missing-user"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestListAuditReleasesSemaphoreAfterQuery(t *testing.T) {
+	app := newTestApp(t)
+	q := New(app, 1)
+	now := time.Now().UTC()
+	from, to := now.Add(-time.Hour), now
+
+	// Fill the single concurrency slot via a successful audit query, then ensure
+	// a second call can still acquire (semaphore not leaked).
+	if _, err := q.ListAudit(context.Background(), from, to, 10, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.ListAudit(context.Background(), from, to, 10, ""); err != nil {
+		t.Fatalf("semaphore leak after ListAudit: %v", err)
+	}
+
+	// Validation failures must release immediately so later queries can proceed.
+	if _, err := q.ListAudit(context.Background(), now.Add(-48*time.Hour), now, 10, ""); err == nil {
+		t.Fatal("expected window error")
+	}
+	if _, err := q.ListAudit(context.Background(), from, to, 10, ""); err != nil {
+		t.Fatalf("semaphore leak after validation error: %v", err)
+	}
+}

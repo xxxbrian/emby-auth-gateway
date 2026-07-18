@@ -15,6 +15,7 @@ import (
 
 const (
 	DefaultConcurrency = 4
+	MaxListLimit       = 500
 	MaxAuditLimit      = 100
 	MaxAuditWindow     = 24 * time.Hour
 	AuditQueryTimeout  = 2 * time.Second
@@ -132,14 +133,14 @@ type UpstreamDTO struct {
 	EndpointActive               bool   `json:"endpoint_active,omitempty"`
 }
 
-// ListUsers returns gateway users.
+// ListUsers returns gateway users (hard-capped at MaxListLimit).
 func (q *Querier) ListUsers(ctx context.Context) ([]UserDTO, error) {
 	if err := q.acquire(ctx); err != nil {
 		return nil, err
 	}
 	defer q.release()
 
-	records, err := q.app.FindRecordsByFilter("users", "", "username", 0, 0)
+	records, err := q.app.FindRecordsByFilter("users", "", "username", MaxListLimit, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -169,6 +170,7 @@ func (q *Querier) GetUser(ctx context.Context, id string) (UserDTO, error) {
 }
 
 // ListSessions returns gateway sessions, optionally filtered by user id.
+// Always hard-capped at MaxListLimit (including when filtered by user).
 // Active = revoked_at empty and expires_at > now.
 func (q *Querier) ListSessions(ctx context.Context, userID string) ([]SessionDTO, error) {
 	if err := q.acquire(ctx); err != nil {
@@ -184,12 +186,12 @@ func (q *Querier) ListSessions(ctx context.Context, userID string) ([]SessionDTO
 			"gateway_sessions",
 			"gateway_user = {:user}",
 			"-created",
-			0,
+			MaxListLimit,
 			0,
 			dbx.Params{"user": userID},
 		)
 	} else {
-		records, err = q.app.FindRecordsByFilter("gateway_sessions", "", "-created", 500, 0)
+		records, err = q.app.FindRecordsByFilter("gateway_sessions", "", "-created", MaxListLimit, 0)
 	}
 	if err != nil {
 		return nil, err
@@ -266,29 +268,31 @@ func (q *Querier) GetUpstream(ctx context.Context) (UpstreamDTO, error) {
 
 // ListAudit returns audit rows in [from,to] with hard max window 24h and limit<=100.
 // Cursor is an opaque created timestamp (RFC3339Nano) for keyset pagination (created < cursor).
+//
+// The concurrency semaphore is held until the DB query finishes, even if the HTTP
+// timeout fires first, so a timed-out request cannot free a slot while the query still runs.
 func (q *Querier) ListAudit(ctx context.Context, from, to time.Time, limit int, cursor string) ([]AuditDTO, error) {
 	if err := q.acquire(ctx); err != nil {
 		return nil, err
 	}
-	defer q.release()
 
 	if from.IsZero() || to.IsZero() {
+		q.release()
 		return nil, fmt.Errorf("from and to are required")
 	}
 	from = from.UTC()
 	to = to.UTC()
 	if !to.After(from) {
+		q.release()
 		return nil, fmt.Errorf("to must be after from")
 	}
 	if to.Sub(from) > MaxAuditWindow {
+		q.release()
 		return nil, fmt.Errorf("audit window must be <= 24h")
 	}
 	if limit <= 0 || limit > MaxAuditLimit {
 		limit = MaxAuditLimit
 	}
-
-	qctx, cancel := context.WithTimeout(ctx, AuditQueryTimeout)
-	defer cancel()
 
 	filter := "created >= {:from} && created <= {:to}"
 	params := dbx.Params{"from": from, "to": to}
@@ -298,6 +302,7 @@ func (q *Querier) ListAudit(ctx context.Context, from, to time.Time, limit int, 
 			// try RFC3339
 			ct, err = time.Parse(time.RFC3339, c)
 			if err != nil {
+				q.release()
 				return nil, fmt.Errorf("invalid cursor")
 			}
 		}
@@ -305,13 +310,18 @@ func (q *Querier) ListAudit(ctx context.Context, from, to time.Time, limit int, 
 		params["cursor"] = ct.UTC()
 	}
 
+	qctx, cancel := context.WithTimeout(ctx, AuditQueryTimeout)
+	defer cancel()
+
 	// PocketBase FindRecordsByFilter does not take context; honor timeout around the call.
+	// The goroutine owns semaphore release so a timeout cannot free the slot early.
 	type result struct {
 		records []*core.Record
 		err     error
 	}
 	ch := make(chan result, 1)
 	go func() {
+		defer q.release()
 		recs, err := q.app.FindRecordsByFilter("audit_logs", filter, "-created", limit, 0, params)
 		ch <- result{recs, err}
 	}()

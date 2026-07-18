@@ -97,6 +97,7 @@ func TestMediaTransferOpenAndComplete(t *testing.T) {
 	base := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
 	r.now = func() time.Time { return base }
 
+	// Legacy open: empty phase, no outcome.
 	r.handle(observe.Event{
 		Kind:      observe.KindMediaTransfer,
 		At:        base,
@@ -112,6 +113,7 @@ func TestMediaTransferOpenAndComplete(t *testing.T) {
 		t.Fatal("expected media load from transfer")
 	}
 
+	// Legacy complete: empty phase with terminal outcome.
 	r.handle(observe.Event{
 		Kind:      observe.KindMediaTransfer,
 		At:        base.Add(time.Second),
@@ -123,6 +125,186 @@ func TestMediaTransferOpenAndComplete(t *testing.T) {
 	})
 	if got := len(r.ActiveTransfers()); got != 0 {
 		t.Fatalf("completed transfers: %d", got)
+	}
+}
+
+func TestMediaTransferPhaseStartEnd(t *testing.T) {
+	r := New(nil)
+	base := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	r.now = func() time.Time { return base }
+
+	// PhaseStart opens the transfer even if Outcome is accidentally set.
+	r.handle(observe.Event{
+		Kind:      observe.KindMediaTransfer,
+		At:        base,
+		Phase:     observe.PhaseStart,
+		SessionID: "s1",
+		ItemID:    "i1",
+		MediaMode: observe.MediaDirect,
+		Method:    "GET",
+		Outcome:   observe.OutcomeOK, // must not close on start
+	})
+	if got := len(r.ActiveTransfers()); got != 1 {
+		t.Fatalf("active during transfer: got %d want 1", got)
+	}
+	if !r.HasActiveMediaLoad() {
+		t.Fatal("HasActiveMediaLoad should be true while transfer is open")
+	}
+	// PhaseStart must not count a request (RPS stays 0).
+	if snap := r.Snapshot(); snap.Traffic.RPS != 0 {
+		t.Fatalf("PhaseStart must not increment Requests: rps=%v", snap.Traffic.RPS)
+	}
+
+	// Mid-stream: still active.
+	r.now = func() time.Time { return base.Add(30 * time.Second) }
+	if got := len(r.ActiveTransfers()); got != 1 {
+		t.Fatalf("still active mid-transfer: got %d", got)
+	}
+	if !r.HasActiveMediaLoad() {
+		t.Fatal("expected media load mid-transfer")
+	}
+
+	// PhaseEnd closes and counts bytes only (not Requests — KindRequest owns RPS).
+	endAt := base.Add(30 * time.Second)
+	r.handle(observe.Event{
+		Kind:       observe.KindMediaTransfer,
+		At:         endAt,
+		Phase:      observe.PhaseEnd,
+		SessionID:  "s1",
+		ItemID:     "i1",
+		MediaMode:  observe.MediaDirect,
+		Method:     "GET",
+		Outcome:    observe.OutcomeOK,
+		BytesOut:   9000,
+		DurationMS: 30000,
+	})
+	if got := len(r.ActiveTransfers()); got != 0 {
+		t.Fatalf("empty after end: got %d want 0", got)
+	}
+	if r.HasActiveMediaLoad() {
+		t.Fatal("HasActiveMediaLoad should be false after transfer ends")
+	}
+	// Media transfer events must not contribute to RPS, but still count bytes.
+	r.now = func() time.Time { return endAt }
+	snap := r.Snapshot()
+	if snap.Traffic.RPS != 0 {
+		t.Fatalf("start+end must not count Requests: rps=%v want 0", snap.Traffic.RPS)
+	}
+	// 9000 bytes over 10s window → MbpsOut > 0
+	if snap.Traffic.MbpsOut <= 0 {
+		t.Fatalf("PhaseEnd should still count bytes: mbpsOut=%v", snap.Traffic.MbpsOut)
+	}
+}
+
+func TestMediaTransferStartEndDoesNotCountRequests(t *testing.T) {
+	r := New(nil)
+	base := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	r.now = func() time.Time { return base }
+
+	r.handle(observe.Event{
+		Kind:      observe.KindMediaTransfer,
+		At:        base,
+		Phase:     observe.PhaseStart,
+		SessionID: "sess-count",
+		ItemID:    "item-count",
+		MediaMode: observe.MediaHLS,
+		Method:    "GET",
+	})
+	r.handle(observe.Event{
+		Kind:      observe.KindMediaTransfer,
+		At:        base,
+		Phase:     observe.PhaseEnd,
+		SessionID: "sess-count",
+		ItemID:    "item-count",
+		MediaMode: observe.MediaHLS,
+		Method:    "GET",
+		Outcome:   observe.OutcomeOK,
+		BytesOut:  100,
+	})
+	// Transfer events alone must not inflate RPS (KindRequest already counts the HTTP request).
+	snap := r.Snapshot()
+	if snap.Traffic.RPS != 0 {
+		t.Fatalf("rps=%v want 0 (media transfer must not increment Requests)", snap.Traffic.RPS)
+	}
+	if snap.Traffic.MbpsOut <= 0 {
+		t.Fatalf("bytes still counted: mbpsOut=%v", snap.Traffic.MbpsOut)
+	}
+}
+
+func TestMediaTransferKeyWithoutItemID(t *testing.T) {
+	r := New(nil)
+	base := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	r.now = func() time.Time { return base }
+
+	// Start/end without ItemID must share a stable key (session+mode+method).
+	r.handle(observe.Event{
+		Kind:      observe.KindMediaTransfer,
+		At:        base,
+		Phase:     observe.PhaseStart,
+		SessionID: "sess-a",
+		MediaMode: observe.MediaHLS,
+		Method:    "GET",
+	})
+	if got := len(r.ActiveTransfers()); got != 1 {
+		t.Fatalf("open without item: %d", got)
+	}
+	if !r.HasActiveMediaLoad() {
+		t.Fatal("expected active media load")
+	}
+	r.handle(observe.Event{
+		Kind:      observe.KindMediaTransfer,
+		At:        base.Add(time.Second),
+		Phase:     observe.PhaseEnd,
+		SessionID: "sess-a",
+		MediaMode: observe.MediaHLS,
+		Method:    "GET",
+		Outcome:   observe.OutcomeOK,
+		BytesOut:  100,
+	})
+	if got := len(r.ActiveTransfers()); got != 0 {
+		t.Fatalf("end without item should close: %d", got)
+	}
+}
+
+func TestRequestRefreshesSessionLastSeen(t *testing.T) {
+	r := New(nil)
+	base := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	r.now = func() time.Time { return base }
+
+	r.handle(observe.Event{
+		Kind:      observe.KindAuthLogin,
+		At:        base,
+		SessionID: "s1",
+		UserID:    "u1",
+		Username:  "alice",
+		Outcome:   observe.OutcomeOK,
+	})
+	if r.ActiveSessionCount() != 1 {
+		t.Fatal("expected session after login")
+	}
+
+	// Near expiry without refresh would drop; KindRequest should keep it alive.
+	nearExpiry := base.Add(4*time.Minute + 50*time.Second)
+	r.now = func() time.Time { return nearExpiry }
+	r.handle(observe.Event{
+		Kind:      observe.KindRequest,
+		At:        nearExpiry,
+		SessionID: "s1",
+		UserID:    "u1",
+		Username:  "alice",
+		Outcome:   observe.OutcomeOK,
+	})
+
+	// 4m50s after the request refresh — still within 5m TTL from last_seen.
+	r.now = func() time.Time { return nearExpiry.Add(4*time.Minute + 50*time.Second) }
+	if r.ActiveSessionCount() != 1 {
+		t.Fatal("KindRequest should refresh session last_seen")
+	}
+
+	// Past TTL from last request.
+	r.now = func() time.Time { return nearExpiry.Add(5*time.Minute + time.Second) }
+	if r.ActiveSessionCount() != 0 {
+		t.Fatalf("should expire after 5m without further activity, got %d", r.ActiveSessionCount())
 	}
 }
 

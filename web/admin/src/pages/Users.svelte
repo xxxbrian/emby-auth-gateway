@@ -194,7 +194,17 @@
         align-items: end;
     }
     .actions { padding-bottom: 0.1rem; }
-    .text-xs { font-size: 0.75rem; padding: 0.25rem 0.55rem; }
+    .text-xs { font-size: 0.75rem; padding: 0.35rem 0.65rem; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; }
-    .action-row { justify-content: flex-end; flex-wrap: wrap; }
+    .action-row { justify-content: flex-end; flex-wrap: wrap; gap: 0.5rem; }
+    @media (max-width: 768px) {
+        .action-row {
+            justify-content: stretch;
+            width: 100%;
+        }
+        .action-row button {
+            flex: 1 1 calc(50% - 0.25rem);
+            min-width: 0;
+        }
+    }
 </style>

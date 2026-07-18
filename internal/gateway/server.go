@@ -26,6 +26,10 @@ import (
 
 const gatewayVersionHeader = "X-Emby-Auth-Gateway-Version"
 
+// ErrActiveMedia is returned by TryAcquireReconfigure when force=false and
+// one or more media body copies hold the shared media gate.
+var ErrActiveMedia = errors.New("active media copies in progress")
+
 type Server struct {
 	cfg                  Config
 	store                Store
@@ -36,9 +40,71 @@ type Server struct {
 	upstreamAuth         *upstreamAuthenticator
 	playbackGuards       *playbackGuardTracker
 	mediaDeadlineWarning atomic.Bool
-	anonymousImages      anonymousImageNamespaceState
-	anonymousImageNow    func() time.Time
-	anonymousImageSlots  chan struct{}
+	// mediaGate excludes reconfigure from concurrent media body copies.
+	// Copies take RLock; reconfigure takes exclusive Lock (TryLock when !force).
+	mediaGate sync.RWMutex
+	// mediaInflight counts in-progress media body copies (metrics / ActiveMediaCopies).
+	mediaInflight       atomic.Int64
+	anonymousImages     anonymousImageNamespaceState
+	anonymousImageNow   func() time.Time
+	anonymousImageSlots chan struct{}
+}
+
+// ActiveMediaCopies returns the number of in-flight media body copies.
+// Never reports negative (defensive clamp if the counter is ever corrupted).
+func (s *Server) ActiveMediaCopies() int {
+	if s == nil {
+		return 0
+	}
+	n := s.mediaInflight.Load()
+	if n < 0 {
+		return 0
+	}
+	return int(n)
+}
+
+// beginMediaCopy acquires a shared hold on the media gate and increments the
+// inflight counter. Pair with endMediaCopy (typically via defer).
+func (s *Server) beginMediaCopy() {
+	if s == nil {
+		return
+	}
+	s.mediaGate.RLock()
+	s.mediaInflight.Add(1)
+}
+
+// endMediaCopy releases a shared media-gate hold and decrements the inflight counter.
+func (s *Server) endMediaCopy() {
+	if s == nil {
+		return
+	}
+	s.mediaInflight.Add(-1)
+	s.mediaGate.RUnlock()
+}
+
+// tryBeginReconfigure acquires the exclusive media gate for upstream reconfigure.
+// When force is false, TryLock fails immediately with ErrActiveMedia if any copy
+// is in progress. When force is true, Lock waits until all copies finish.
+// The returned release function must be called to unlock (safe to call once).
+func (s *Server) tryBeginReconfigure(force bool) (release func(), err error) {
+	if s == nil {
+		return func() {}, nil
+	}
+	if force {
+		s.mediaGate.Lock()
+	} else if !s.mediaGate.TryLock() {
+		return nil, ErrActiveMedia
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() { s.mediaGate.Unlock() })
+	}, nil
+}
+
+// TryAcquireReconfigure is the admin-facing exclusive reconfigure gate.
+// See tryBeginReconfigure.
+func (s *Server) TryAcquireReconfigure(force bool) (release func(), err error) {
+	return s.tryBeginReconfigure(force)
 }
 
 func NewServer(cfg Config, store Store) *Server {
@@ -1593,6 +1659,34 @@ func (s *Server) copyMediaBodyOrAbort(w http.ResponseWriter, r *http.Request, re
 }
 
 func (s *Server) copyMediaReaderOrAbort(w http.ResponseWriter, r *http.Request, rel string, src io.Reader, expectedLength int64, upstreamStatus int, session *Session) {
+	// Shared media gate + inflight counter for reconfigure exclusion (not async telemetry).
+	s.beginMediaCopy()
+	defer s.endMediaCopy()
+
+	mediaMode := mediaModeForRequest(r, rel)
+	method := ""
+	if r != nil {
+		method = r.Method
+	}
+	userID := sessionGatewayUserID(session)
+	username := sessionUsername(session)
+	sessionID := sessionTokenHash(session)
+	device := sessionDevice(session)
+
+	// Telemetry PhaseStart/PhaseEnd for dashboard ActiveTransfers display only.
+	// Reconfigure guard uses mediaInflight, not the async observe path.
+	s.emit(observe.Event{
+		Kind:       observe.KindMediaTransfer,
+		Phase:      observe.PhaseStart,
+		RouteClass: observe.RouteMedia,
+		MediaMode:  mediaMode,
+		Method:     method,
+		UserID:     userID,
+		Username:   username,
+		SessionID:  sessionID,
+		Device:     device,
+	})
+
 	result := copyMediaBody(w, src, expectedLength)
 	outcome := observe.OutcomeOK
 	if result.Err != nil {
@@ -1609,14 +1703,16 @@ func (s *Server) copyMediaReaderOrAbort(w http.ResponseWriter, r *http.Request, 
 	}
 	s.emit(observe.Event{
 		Kind:       observe.KindMediaTransfer,
+		Phase:      observe.PhaseEnd,
 		Outcome:    outcome,
 		RouteClass: observe.RouteMedia,
-		MediaMode:  mediaModeForRequest(r, rel),
+		MediaMode:  mediaMode,
+		Method:     method,
 		Direction:  direction,
-		UserID:     sessionGatewayUserID(session),
-		Username:   sessionUsername(session),
-		SessionID:  sessionTokenHash(session),
-		Device:     sessionDevice(session),
+		UserID:     userID,
+		Username:   username,
+		SessionID:  sessionID,
+		Device:     device,
 		BytesIn:    result.BytesRead,
 		BytesOut:   result.BytesWritten,
 		DurationMS: result.Duration.Milliseconds(),

@@ -22,8 +22,8 @@ import (
 
 // adminConfig is loaded from environment for the public admin control plane.
 type adminConfig struct {
-	Enabled           bool
-	Origin            string
+	Enabled            bool
+	Origin             string
 	AuditRetentionDays int
 }
 
@@ -55,11 +55,15 @@ func envTruthy(v string) bool {
 // mountAdmin mounts the admin API and SPA when enabled.
 // Always reserves /admin/service/registration/{path} so the SPA cannot capture it:
 // registration handler when webReady, deliberate 404 otherwise.
+// acquireReconfigure is the preferred reconfigure exclusion gate; activeMediaLoad
+// is the fallback when acquireReconfigure is nil.
 func mountAdmin(
 	r *router.Router[*core.RequestEvent],
 	app core.App,
 	cfg adminConfig,
 	registry *telemetry.Registry,
+	activeMediaLoad func() bool,
+	acquireReconfigure func(force bool) (release func(), err error),
 	webReady bool,
 	startedAt time.Time,
 	bootID string,
@@ -81,18 +85,26 @@ func mountAdmin(
 	if !cfg.Enabled {
 		return nil
 	}
-	if cfg.Origin == "" {
-		return fmt.Errorf("GATEWAY_ADMIN_ENABLED is set but GATEWAY_ADMIN_ORIGIN is empty")
+	origin, err := validateAdminOrigin(cfg.Origin)
+	if err != nil {
+		return fmt.Errorf("GATEWAY_ADMIN_ENABLED is set but %w", err)
 	}
+	cfg.Origin = origin
+
+	// SPA posts to PB superuser auth directly; rate-limit before session exchange.
+	// Match both collection name and resolved id (clients may use either).
+	bindSuperuserAuthRateLimit(r, adminauth.NewRateLimiter(superuserAuthRateLimit, superuserAuthRateWindow), superuserAuthCollectionIDs(app)...)
 
 	api, err := adminapi.New(adminapi.Config{
-		App:       app,
-		Origin:    cfg.Origin,
-		Sessions:  adminauth.NewStore(adminauth.DefaultMaxSessions),
-		Query:     adminquery.New(app, adminquery.DefaultConcurrency),
-		Telemetry: registry,
-		StartedAt: startedAt,
-		BootID:    bootID,
+		App:                app,
+		Origin:             cfg.Origin,
+		Sessions:           adminauth.NewStore(adminauth.DefaultMaxSessions),
+		Query:              adminquery.New(app, adminquery.DefaultConcurrency),
+		Telemetry:          registry,
+		AcquireReconfigure: acquireReconfigure,
+		ActiveMediaLoad:    activeMediaLoad,
+		StartedAt:          startedAt,
+		BootID:             bootID,
 	})
 	if err != nil {
 		return err

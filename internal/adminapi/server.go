@@ -33,11 +33,18 @@ type Config struct {
 	Origin      string // exact trusted origin, required
 	Sessions    *adminauth.Store
 	Query       *adminquery.Querier
-	Telemetry   *telemetry.Registry // optional
-	StartedAt   time.Time
-	BootID      string
-	LoginLimit  *adminauth.RateLimiter
-	APILimit    *adminauth.RateLimiter
+	Telemetry *telemetry.Registry // optional
+	// AcquireReconfigure, when set, is the preferred reconfigure exclusion gate
+	// (holds exclusive lock over media copies for the duration of reconfigure).
+	// force=false fails immediately if media is active; force=true waits.
+	AcquireReconfigure func(force bool) (release func(), err error)
+	// ActiveMediaLoad is the fallback reconfigure guard when AcquireReconfigure is nil
+	// (sync copies + playbacks). When both are nil, falls back to Telemetry.HasActiveMediaLoad().
+	ActiveMediaLoad func() bool
+	StartedAt       time.Time
+	BootID          string
+	LoginLimit      *adminauth.RateLimiter
+	APILimit        *adminauth.RateLimiter
 }
 
 // Server is the admin API handler set.
@@ -525,14 +532,20 @@ func (s *Server) handleCreateUser(e *core.RequestEvent) error {
 	if err := e.BindBody(&body); err != nil {
 		return e.BadRequestError("invalid body", err)
 	}
-	if err := controlplane.UpsertUser(e.Request.Context(), e.App, controlplane.UpsertUserInput{
+	if err := controlplane.CreateUser(e.Request.Context(), e.App, controlplane.UpsertUserInput{
 		Username:        body.Username,
 		Password:        body.Password,
 		SyntheticUserID: body.SyntheticUserID,
 	}); err != nil {
+		if errors.Is(err, controlplane.ErrUserExists) {
+			return e.JSON(http.StatusConflict, map[string]any{
+				"error":   "user_exists",
+				"message": "user already exists",
+			})
+		}
 		return e.BadRequestError(err.Error(), err)
 	}
-	// Return created/updated user by username lookup.
+	// Return created user by username lookup.
 	rec, err := e.App.FindFirstRecordByData("users", "username", strings.TrimSpace(body.Username))
 	if err != nil {
 		return e.JSON(http.StatusOK, map[string]any{"ok": true})
@@ -699,6 +712,18 @@ func (s *Server) handleUpstreamProbe(e *core.RequestEvent) error {
 	})
 }
 
+// hasActiveMediaLoad prefers the sync ActiveMediaLoad hook (copies + playbacks).
+// Falls back to telemetry when the hook is not wired.
+func (s *Server) hasActiveMediaLoad() bool {
+	if s == nil {
+		return false
+	}
+	if s.cfg.ActiveMediaLoad != nil {
+		return s.cfg.ActiveMediaLoad()
+	}
+	return s.cfg.Telemetry != nil && s.cfg.Telemetry.HasActiveMediaLoad()
+}
+
 func (s *Server) handleUpstreamReconfigure(e *core.RequestEvent) error {
 	sess := sessionFromEvent(e)
 	ticket := e.Request.Header.Get(adminauth.ReauthHeader)
@@ -709,7 +734,16 @@ func (s *Server) handleUpstreamReconfigure(e *core.RequestEvent) error {
 	if err := e.BindBody(&body); err != nil {
 		return e.BadRequestError("invalid body", err)
 	}
-	if s.cfg.Telemetry != nil && s.cfg.Telemetry.HasActiveMediaLoad() && !body.Force {
+	if s.cfg.AcquireReconfigure != nil {
+		release, err := s.cfg.AcquireReconfigure(body.Force)
+		if err != nil {
+			return e.JSON(http.StatusConflict, map[string]any{
+				"error":   "active_media_load",
+				"message": "active playbacks or transfers present; pass force=true to proceed",
+			})
+		}
+		defer release()
+	} else if !body.Force && s.hasActiveMediaLoad() {
 		return e.JSON(http.StatusConflict, map[string]any{
 			"error":   "active_media_load",
 			"message": "active playbacks or transfers present; pass force=true to proceed",

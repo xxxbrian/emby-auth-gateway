@@ -292,6 +292,18 @@ func (r *Registry) handle(ev observe.Event) {
 		if ev.Kind == observe.KindUpstreamRequest {
 			r.recordUpstreamLocked(at, ev)
 		}
+		// Refresh session liveness on requests that carry a session id.
+		if ev.SessionID != "" {
+			s := r.sessions[ev.SessionID]
+			if s == nil {
+				s = &sessionState{SessionID: ev.SessionID}
+				r.sessions[ev.SessionID] = s
+			}
+			s.UserID = firstNonEmpty(ev.UserID, s.UserID)
+			s.Username = firstNonEmpty(ev.Username, s.Username)
+			s.Device = firstNonEmpty(ev.Device, s.Device)
+			s.LastSeen = at
+		}
 	case observe.KindUpstreamAuthRefresh:
 		r.recordUpstreamAuthLocked(at, ev)
 		r.recordTrafficLocked(at, ev)
@@ -483,16 +495,16 @@ func (r *Registry) recordTransferLocked(at time.Time, ev observe.Event) {
 	if key == "" {
 		return
 	}
-	// Completion closes the transfer.
+	// Completion (PhaseEnd or legacy terminal outcome) closes the transfer and
+	// counts bytes/errors only. KindRequest/KindUpstreamRequest already count
+	// the HTTP request for RPS — never increment Requests on media transfer events.
 	if isTransferComplete(ev) {
-		// Still count bytes on completion.
 		fn := func(c *counters) {
 			c.BytesIn += ev.BytesIn
 			c.BytesOut += ev.BytesOut
 			if isErrorOutcome(ev) {
 				c.Errors++
 			}
-			c.Requests++
 		}
 		r.sec.add(at, fn)
 		r.min.add(at, fn)
@@ -500,6 +512,7 @@ func (r *Registry) recordTransferLocked(at time.Time, ev observe.Event) {
 		return
 	}
 
+	// PhaseStart / open: track transfer only; do NOT increment Requests.
 	tr := r.transfers[key]
 	if tr == nil {
 		tr = &transferState{Transfer: Transfer{
@@ -528,14 +541,6 @@ func (r *Registry) recordTransferLocked(at time.Time, ev observe.Event) {
 		tr.BytesOut = ev.BytesOut
 	}
 	tr.LastSeen = at
-
-	// Count open/progress bytes as traffic deltas are hard; count absolute on open is wrong.
-	// Only count request presence for open events.
-	fn := func(c *counters) {
-		c.Requests++
-	}
-	r.sec.add(at, fn)
-	r.min.add(at, fn)
 }
 
 func (r *Registry) expireLocked(now time.Time) {
@@ -585,7 +590,12 @@ func transferKey(ev observe.Event) string {
 	case ev.SessionID != "" && ev.ItemID != "":
 		return ev.SessionID + "\x00" + ev.ItemID + "\x00" + mode
 	case ev.SessionID != "":
-		return "s:" + ev.SessionID + "\x00" + mode
+		// Stable without ItemID: session + mode + method path class.
+		method := ev.Method
+		if method == "" {
+			method = "_"
+		}
+		return "s:" + ev.SessionID + "\x00" + mode + "\x00" + method
 	case ev.ItemID != "":
 		return "i:" + ev.ItemID + "\x00" + mode
 	default:
@@ -594,6 +604,14 @@ func transferKey(ev observe.Event) string {
 }
 
 func isTransferComplete(ev observe.Event) bool {
+	// Prefer explicit phase over outcome heuristics.
+	switch ev.Phase {
+	case observe.PhaseStart:
+		return false
+	case observe.PhaseEnd:
+		return true
+	}
+	// Legacy: empty phase with a terminal outcome means complete.
 	switch ev.Outcome {
 	case observe.OutcomeOK, observe.OutcomeError, observe.OutcomeTimeout, observe.OutcomeDenied:
 		return true

@@ -67,6 +67,12 @@ const (
 	PlaybackStopped  = "stopped"
 )
 
+// Transfer phase values (low cardinality).
+const (
+	PhaseStart = "start"
+	PhaseEnd   = "end"
+)
+
 // Event is a fixed-schema observation. Series labels must stay low-cardinality;
 // identity fields (UserID, ItemName, etc.) are for current-state maps only.
 type Event struct {
@@ -81,6 +87,7 @@ type Event struct {
 	MediaMode   string // direct|hls|range|unknown
 	Direction   string // upstream|downstream|""
 	Method      string
+	Phase       string // start|end|"" (media transfer lifecycle)
 
 	// Identity for current-state maps only (not time-series labels).
 	UserID    string
