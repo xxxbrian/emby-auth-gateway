@@ -21,3 +21,8 @@ AGENTS.md
 .slim/worktrees/
 .slim/worktrees.json
 # END oh-my-opencode-slim worktrees
+
+.agents/
+.playwright-cli/
+skills-lock.json
+.DS_Store
