@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/xxxbrian/emby-auth-gateway/internal/observe"
+	"github.com/xxxbrian/emby-auth-gateway/internal/telemetry"
 	"github.com/xxxbrian/emby-auth-gateway/internal/version"
 )
 
@@ -36,6 +37,7 @@ type Server struct {
 	client               *http.Client
 	proxyClient          *http.Client
 	emitter              *observe.Emitter
+	meter                TrafficMeter
 	logins               *loginFailureLimiter
 	upstreamAuth         *upstreamAuthenticator
 	playbackGuards       *playbackGuardTracker
@@ -131,7 +133,7 @@ func NewServer(cfg Config, store Store) *Server {
 		client = &http.Client{Timeout: backendAuthTimeout}
 	}
 	proxyClient := newProxyClient(cfg.HTTPClient)
-	return &Server{cfg: cfg, store: store, client: client, proxyClient: proxyClient, emitter: cfg.Emitter, upstreamAuth: newUpstreamAuthenticator(store, client), logins: newLoginFailureLimiter(), playbackGuards: newPlaybackGuardTracker(), anonymousImageNow: time.Now, anonymousImageSlots: make(chan struct{}, anonymousImageValidationConcurrency)}
+	return &Server{cfg: cfg, store: store, client: client, proxyClient: proxyClient, emitter: cfg.Emitter, meter: cfg.Meter, upstreamAuth: newUpstreamAuthenticator(store, client), logins: newLoginFailureLimiter(), playbackGuards: newPlaybackGuardTracker(), anonymousImageNow: time.Now, anonymousImageSlots: make(chan struct{}, anonymousImageValidationConcurrency)}
 }
 
 // Emitter returns the optional non-blocking observe emitter (nil if unset).
@@ -1473,9 +1475,14 @@ func (s *Server) writeProxyResponseWithSnapshot(w http.ResponseWriter, r *http.R
 			s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_read_failed", AuditMessage: "backend response read failed", ClientBody: "response read failed", FallbackKind: "upstream_read_error", Duration: time.Since(readStarted), UpstreamStatus: resp.StatusCode})
 			return
 		}
+		if s.meter != nil && len(data) > 0 {
+			s.meter.AddIngress(int64(len(data)))
+		}
+		rewritten := rewriteM3U8WithSnapshot(data, rel, session, upstream, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
 		w.Header().Del("Content-Length")
 		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(rewriteM3U8WithSnapshot(data, rel, session, upstream, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID))
+		dst := newCountedWriter(w, s.meter, 0)
+		_, _ = dst.Write(rewritten)
 		return
 	}
 
@@ -1656,7 +1663,10 @@ func (v *imageStreamValidator) validate() error {
 }
 
 func (s *Server) copyProxyBodyOrAbort(w http.ResponseWriter, r *http.Request, rel string, body io.Reader, session *Session) {
-	if _, err := io.Copy(w, body); err != nil {
+	// Count generic proxied body bytes as live forwarded traffic.
+	dst := newCountedWriter(w, s.meter, 0)
+	src := newCountedReader(body, s.meter, 0)
+	if _, err := io.Copy(dst, src); err != nil {
 		s.abortProxyBody(r, rel, session, err)
 	}
 }
@@ -1680,50 +1690,25 @@ func (s *Server) copyMediaReaderOrAbort(w http.ResponseWriter, r *http.Request, 
 	sessionID := sessionTokenHash(session)
 	device := sessionDevice(session)
 
-	// Telemetry PhaseStart/PhaseEnd for dashboard ActiveTransfers display only.
-	// Reconfigure guard uses mediaInflight, not the async observe path.
-	s.emit(observe.Event{
-		Kind:       observe.KindMediaTransfer,
-		Phase:      observe.PhaseStart,
-		RouteClass: observe.RouteMedia,
-		MediaMode:  mediaMode,
-		Method:     method,
-		UserID:     userID,
-		Username:   username,
-		SessionID:  sessionID,
-		Device:     device,
-	})
+	// Live bandwidth: unique transfer handle + counted I/O (not PhaseEnd events).
+	var transferID uint64
+	var copyErr error
+	if s.meter != nil {
+		transferID = s.meter.BeginTransfer(telemetry.TransferMeta{
+			SessionID: sessionID,
+			UserID:    userID,
+			Username:  username,
+			Device:    device,
+			MediaMode: mediaMode,
+			Method:    method,
+		})
+		defer func() { s.meter.EndTransfer(transferID, copyErr) }()
+	}
+	dst := newCountedWriter(w, s.meter, transferID)
+	src = newCountedReader(src, s.meter, transferID)
 
-	result := copyMediaBody(w, src, expectedLength)
-	outcome := observe.OutcomeOK
-	if result.Err != nil {
-		outcome = observe.OutcomeError
-		if isTimeoutError(result.Err) {
-			outcome = observe.OutcomeTimeout
-		}
-	}
-	direction := result.Direction
-	if direction == mediaDirectionUpstream {
-		direction = observe.DirectionUpstream
-	} else if direction == mediaDirectionDownstream {
-		direction = observe.DirectionDownstream
-	}
-	s.emit(observe.Event{
-		Kind:       observe.KindMediaTransfer,
-		Phase:      observe.PhaseEnd,
-		Outcome:    outcome,
-		RouteClass: observe.RouteMedia,
-		MediaMode:  mediaMode,
-		Method:     method,
-		Direction:  direction,
-		UserID:     userID,
-		Username:   username,
-		SessionID:  sessionID,
-		Device:     device,
-		BytesIn:    result.BytesRead,
-		BytesOut:   result.BytesWritten,
-		DurationMS: result.Duration.Milliseconds(),
-	})
+	result := copyMediaBody(dst, src, expectedLength)
+	copyErr = result.Err
 	if result.Err == nil {
 		return
 	}

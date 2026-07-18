@@ -94,35 +94,16 @@ func TestSessionTTL(t *testing.T) {
 
 func TestMediaTransferOpenAndComplete(t *testing.T) {
 	r := New(nil)
-	base := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
-	r.now = func() time.Time { return base }
-
-	// Legacy open: empty phase, no outcome.
-	r.handle(observe.Event{
-		Kind:      observe.KindMediaTransfer,
-		At:        base,
-		SessionID: "s1",
-		ItemID:    "i1",
-		MediaMode: observe.MediaDirect,
-		BytesOut:  100,
-	})
+	// Active transfers are meter-backed (unique handles), not event-derived keys.
+	id := r.Meter().BeginTransfer(TransferMeta{SessionID: "s1", ItemID: "i1", MediaMode: observe.MediaDirect})
 	if got := len(r.ActiveTransfers()); got != 1 {
 		t.Fatalf("open transfers: %d", got)
 	}
 	if !r.HasActiveMediaLoad() {
 		t.Fatal("expected media load from transfer")
 	}
-
-	// Legacy complete: empty phase with terminal outcome.
-	r.handle(observe.Event{
-		Kind:      observe.KindMediaTransfer,
-		At:        base.Add(time.Second),
-		SessionID: "s1",
-		ItemID:    "i1",
-		MediaMode: observe.MediaDirect,
-		BytesOut:  5000,
-		Outcome:   observe.OutcomeOK,
-	})
+	r.Meter().AddTransferEgress(id, 5000)
+	r.Meter().EndTransfer(id, nil)
 	if got := len(r.ActiveTransfers()); got != 0 {
 		t.Fatalf("completed transfers: %d", got)
 	}
@@ -133,66 +114,38 @@ func TestMediaTransferPhaseStartEnd(t *testing.T) {
 	base := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
 	r.now = func() time.Time { return base }
 
-	// PhaseStart opens the transfer even if Outcome is accidentally set.
-	r.handle(observe.Event{
-		Kind:      observe.KindMediaTransfer,
-		At:        base,
-		Phase:     observe.PhaseStart,
-		SessionID: "s1",
-		ItemID:    "i1",
-		MediaMode: observe.MediaDirect,
-		Method:    "GET",
-		Outcome:   observe.OutcomeOK, // must not close on start
-	})
+	id := r.Meter().BeginTransfer(TransferMeta{SessionID: "s1", ItemID: "i1", MediaMode: observe.MediaDirect, Method: "GET"})
 	if got := len(r.ActiveTransfers()); got != 1 {
 		t.Fatalf("active during transfer: got %d want 1", got)
 	}
 	if !r.HasActiveMediaLoad() {
 		t.Fatal("HasActiveMediaLoad should be true while transfer is open")
 	}
-	// PhaseStart must not count a request (RPS stays 0).
-	if snap := r.Snapshot(); snap.Traffic.RPS != 0 {
-		t.Fatalf("PhaseStart must not increment Requests: rps=%v", snap.Traffic.RPS)
+	r.Meter().AddTransferEgress(id, 9000)
+	// Live bytes visible before end.
+	if _, out := r.Meter().Totals(); out != 9000 {
+		t.Fatalf("live egress=%d", out)
 	}
 
-	// Mid-stream: still active.
-	r.now = func() time.Time { return base.Add(30 * time.Second) }
-	if got := len(r.ActiveTransfers()); got != 1 {
-		t.Fatalf("still active mid-transfer: got %d", got)
-	}
-	if !r.HasActiveMediaLoad() {
-		t.Fatal("expected media load mid-transfer")
-	}
-
-	// PhaseEnd closes and counts bytes only (not Requests — KindRequest owns RPS).
-	endAt := base.Add(30 * time.Second)
+	// PhaseEnd events must not inflate RPS or Mbps rings.
 	r.handle(observe.Event{
-		Kind:       observe.KindMediaTransfer,
-		At:         endAt,
-		Phase:      observe.PhaseEnd,
-		SessionID:  "s1",
-		ItemID:     "i1",
-		MediaMode:  observe.MediaDirect,
-		Method:     "GET",
-		Outcome:    observe.OutcomeOK,
-		BytesOut:   9000,
-		DurationMS: 30000,
+		Kind:      observe.KindMediaTransfer,
+		At:        base,
+		Phase:     observe.PhaseEnd,
+		SessionID: "s1",
+		ItemID:    "i1",
+		MediaMode: observe.MediaDirect,
+		Method:    "GET",
+		Outcome:   observe.OutcomeOK,
+		BytesOut:  9000,
 	})
-	if got := len(r.ActiveTransfers()); got != 0 {
-		t.Fatalf("empty after end: got %d want 0", got)
-	}
-	if r.HasActiveMediaLoad() {
-		t.Fatal("HasActiveMediaLoad should be false after transfer ends")
-	}
-	// Media transfer events must not contribute to RPS, but still count bytes.
-	r.now = func() time.Time { return endAt }
 	snap := r.Snapshot()
-	if snap.Traffic.RPS != 0 {
-		t.Fatalf("start+end must not count Requests: rps=%v want 0", snap.Traffic.RPS)
+	if snap.Traffic.RPS != 0 || snap.Traffic.MbpsOut != 0 {
+		t.Fatalf("PhaseEnd must not affect RPS/Mbps: rps=%v mbps=%v", snap.Traffic.RPS, snap.Traffic.MbpsOut)
 	}
-	// 9000 bytes over 10s window → MbpsOut > 0
-	if snap.Traffic.MbpsOut <= 0 {
-		t.Fatalf("PhaseEnd should still count bytes: mbpsOut=%v", snap.Traffic.MbpsOut)
+	r.Meter().EndTransfer(id, nil)
+	if r.HasActiveMediaLoad() {
+		t.Fatal("expected no media load after end")
 	}
 }
 
@@ -221,48 +174,34 @@ func TestMediaTransferStartEndDoesNotCountRequests(t *testing.T) {
 		Outcome:   observe.OutcomeOK,
 		BytesOut:  100,
 	})
-	// Transfer events alone must not inflate RPS (KindRequest already counts the HTTP request).
+	// Transfer events alone must not inflate RPS or Mbps (live meter owns bandwidth).
 	snap := r.Snapshot()
 	if snap.Traffic.RPS != 0 {
 		t.Fatalf("rps=%v want 0 (media transfer must not increment Requests)", snap.Traffic.RPS)
 	}
-	if snap.Traffic.MbpsOut <= 0 {
-		t.Fatalf("bytes still counted: mbpsOut=%v", snap.Traffic.MbpsOut)
+	if snap.Traffic.MbpsOut != 0 {
+		t.Fatalf("PhaseEnd must not count bytes into Mbps: mbpsOut=%v", snap.Traffic.MbpsOut)
 	}
 }
 
-func TestMediaTransferKeyWithoutItemID(t *testing.T) {
+func TestMediaTransferUniqueHandlesWithoutItemID(t *testing.T) {
 	r := New(nil)
-	base := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
-	r.now = func() time.Time { return base }
-
-	// Start/end without ItemID must share a stable key (session+mode+method).
-	r.handle(observe.Event{
-		Kind:      observe.KindMediaTransfer,
-		At:        base,
-		Phase:     observe.PhaseStart,
-		SessionID: "sess-a",
-		MediaMode: observe.MediaHLS,
-		Method:    "GET",
-	})
+	// Concurrent HLS segments get unique handles (no session+mode collapse).
+	id1 := r.Meter().BeginTransfer(TransferMeta{SessionID: "sess-a", MediaMode: observe.MediaHLS, Method: "GET"})
+	id2 := r.Meter().BeginTransfer(TransferMeta{SessionID: "sess-a", MediaMode: observe.MediaHLS, Method: "GET"})
+	if id1 == id2 {
+		t.Fatal("expected unique transfer ids")
+	}
+	if got := len(r.ActiveTransfers()); got != 2 {
+		t.Fatalf("open concurrent: %d", got)
+	}
+	r.Meter().EndTransfer(id1, nil)
 	if got := len(r.ActiveTransfers()); got != 1 {
-		t.Fatalf("open without item: %d", got)
+		t.Fatalf("after one end: %d", got)
 	}
-	if !r.HasActiveMediaLoad() {
-		t.Fatal("expected active media load")
-	}
-	r.handle(observe.Event{
-		Kind:      observe.KindMediaTransfer,
-		At:        base.Add(time.Second),
-		Phase:     observe.PhaseEnd,
-		SessionID: "sess-a",
-		MediaMode: observe.MediaHLS,
-		Method:    "GET",
-		Outcome:   observe.OutcomeOK,
-		BytesOut:  100,
-	})
+	r.Meter().EndTransfer(id2, nil)
 	if got := len(r.ActiveTransfers()); got != 0 {
-		t.Fatalf("end without item should close: %d", got)
+		t.Fatalf("after both end: %d", got)
 	}
 }
 

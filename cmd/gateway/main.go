@@ -191,6 +191,7 @@ func newGatewayApp() *pocketbase.PocketBase {
 			MaxResumePct:             envFloatDefault("GATEWAY_MAX_RESUME_PCT", 0),
 			MinResumeDurationSeconds: envFloatDefault("GATEWAY_MIN_RESUME_DURATION_SECONDS", 0),
 			Emitter:                  emitter,
+			Meter:                    registry.Meter(),
 		}, pbstore.New(e.App))
 		web, err := newEmbyWebServer(webAssetsDirFromEnv(), os.Getenv("GATEWAY_PUBLIC_URL"))
 		if err != nil {

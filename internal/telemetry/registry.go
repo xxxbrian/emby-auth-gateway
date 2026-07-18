@@ -33,8 +33,11 @@ const (
 )
 
 // Registry consumes observe events and maintains in-memory metrics.
+// Live forwarded bandwidth is driven by ByteMeter (atomic totals + 1s sampler),
+// not by end-of-transfer observe events.
 type Registry struct {
 	emitter *observe.Emitter
+	meter   *ByteMeter
 	bootID  string
 	started time.Time
 	now     func() time.Time
@@ -43,7 +46,7 @@ type Registry struct {
 
 	sessions  map[string]*sessionState
 	playbacks map[string]*playbackState
-	transfers map[string]*transferState
+	transfers map[string]*transferState // legacy event-based; prefer meter handles
 	upstream  upstreamState
 
 	sec *timeRing
@@ -52,10 +55,12 @@ type Registry struct {
 	startOnce sync.Once
 }
 
-// New creates a Registry bound to emitter. A nil emitter is allowed (no-op Start).
+// New creates a Registry bound to emitter. A nil emitter is allowed.
+// ByteMeter is always created for live bandwidth sampling.
 func New(emitter *observe.Emitter) *Registry {
 	return &Registry{
 		emitter:   emitter,
+		meter:     NewByteMeter(),
 		bootID:    newBootID(),
 		started:   time.Now().UTC(),
 		now:       func() time.Time { return time.Now().UTC() },
@@ -67,6 +72,14 @@ func New(emitter *observe.Emitter) *Registry {
 	}
 }
 
+// Meter returns the live byte meter (never nil for a non-nil Registry).
+func (r *Registry) Meter() *ByteMeter {
+	if r == nil {
+		return nil
+	}
+	return r.meter
+}
+
 func newBootID() string {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -75,13 +88,14 @@ func newBootID() string {
 	return hex.EncodeToString(b[:])
 }
 
-// Start runs the single consumer loop until ctx is done or the emitter closes.
+// Start runs the live-byte sampler and optional observe consumer until ctx is done.
 // Safe to call once; subsequent calls are no-ops.
 func (r *Registry) Start(ctx context.Context) {
 	if r == nil {
 		return
 	}
 	r.startOnce.Do(func() {
+		go r.sampleLiveBytes(ctx)
 		if r.emitter == nil {
 			return
 		}
@@ -101,6 +115,51 @@ func (r *Registry) Start(ctx context.Context) {
 			}
 		}
 	})
+}
+
+// sampleLiveBytes moves cumulative ByteMeter totals into 1s/1m rings once per second.
+// This is the sole source of Traffic.Mbps* / series bandwidth (not PhaseEnd events).
+func (r *Registry) sampleLiveBytes(ctx context.Context) {
+	if r == nil || r.meter == nil {
+		return
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	var prevIn, prevOut uint64
+	// Seed previous so the first tick only records the last second of activity.
+	prevIn, prevOut = r.meter.Totals()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			in, out := r.meter.Totals()
+			dIn := int64(in - prevIn)
+			dOut := int64(out - prevOut)
+			prevIn, prevOut = in, out
+			if dIn < 0 {
+				dIn = 0
+			}
+			if dOut < 0 {
+				dOut = 0
+			}
+			if dIn == 0 && dOut == 0 {
+				continue
+			}
+			at := now.UTC()
+			if r.now != nil {
+				at = r.now()
+			}
+			r.mu.Lock()
+			fn := func(c *counters) {
+				c.BytesIn += dIn
+				c.BytesOut += dOut
+			}
+			r.sec.add(at, fn)
+			r.min.add(at, fn)
+			r.mu.Unlock()
+		}
+	}
 }
 
 // NoteSessionActivity records request activity for session liveness (5m TTL).
@@ -152,10 +211,14 @@ func (r *Registry) ActivePlaybacks() []Playback {
 	return out
 }
 
-// ActiveTransfers returns open media transfers.
+// ActiveTransfers returns open media transfers from the live byte meter
+// (authoritative). Falls back to legacy event-based map if meter is nil.
 func (r *Registry) ActiveTransfers() []Transfer {
 	if r == nil {
 		return nil
+	}
+	if r.meter != nil {
+		return r.meter.ActiveTransfers()
 	}
 	now := r.now()
 	r.mu.Lock()
@@ -168,10 +231,13 @@ func (r *Registry) ActiveTransfers() []Transfer {
 	return out
 }
 
-// HasActiveMediaLoad reports whether any playbacks or transfers are active.
+// HasActiveMediaLoad reports whether any playbacks or live transfers are active.
 func (r *Registry) HasActiveMediaLoad() bool {
 	if r == nil {
 		return false
+	}
+	if r.meter != nil && r.meter.ActiveTransferCount() > 0 {
+		return true
 	}
 	now := r.now()
 	r.mu.Lock()
@@ -238,11 +304,13 @@ func (r *Registry) SnapshotWindow(window SeriesWindow) Snapshot {
 		Upstream:  r.upstreamSnapshotLocked(),
 		Capacity: CapacityStatus{
 			ActivePlaybacks:      len(r.playbacks),
-			ActiveMediaTransfers: len(r.transfers),
+			ActiveMediaTransfers: r.activeTransferCountLocked(),
 			ActiveSessions:       len(r.sessions),
 			Rejects5m:            min5.Rejects,
 			RejectRate5m:         rate(min5.Rejects, min5.Requests),
 		},
+		// Traffic Mbps* is a rolling ~10s average of live-sampled downstream/upstream
+		// body bytes (from ByteMeter), not end-of-transfer totals.
 		Traffic: TrafficStatus{
 			RPS:          float64(sec10.Requests) / float64(rpsWindowSec),
 			MbpsIn:       bitsPerSec(sec10.BytesIn, trafficWindowSec),
@@ -548,24 +616,29 @@ func (r *Registry) recordPlaybackLocked(at time.Time, ev observe.Event) {
 	}
 }
 
+// activeTransferCountLocked returns live meter transfer count (preferred) or
+// legacy event-map size. Caller may hold r.mu; meter uses its own lock.
+func (r *Registry) activeTransferCountLocked() int {
+	if r.meter != nil {
+		return r.meter.ActiveTransferCount()
+	}
+	return len(r.transfers)
+}
+
 func (r *Registry) recordTransferLocked(at time.Time, ev observe.Event) {
 	key := transferKey(ev)
 	if key == "" {
 		return
 	}
-	// Completion (PhaseEnd or legacy terminal outcome) closes the transfer and
-	// counts bytes/errors only. KindRequest/KindUpstreamRequest already count
-	// the HTTP request for RPS — never increment Requests on media transfer events.
+	// Completion closes legacy event-based transfer tracking only.
+	// Bytes for Mbps come exclusively from ByteMeter live sampling — never
+	// add PhaseEnd BytesIn/BytesOut to traffic rings (would double-count).
 	if isTransferComplete(ev) {
-		fn := func(c *counters) {
-			c.BytesIn += ev.BytesIn
-			c.BytesOut += ev.BytesOut
-			if isErrorOutcome(ev) {
-				c.Errors++
-			}
+		if isErrorOutcome(ev) {
+			fn := func(c *counters) { c.Errors++ }
+			r.sec.add(at, fn)
+			r.min.add(at, fn)
 		}
-		r.sec.add(at, fn)
-		r.min.add(at, fn)
 		delete(r.transfers, key)
 		return
 	}

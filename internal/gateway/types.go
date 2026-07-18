@@ -23,6 +23,7 @@ type Config struct {
 	MaxResumePct             float64
 	MinResumeDurationSeconds float64
 	Emitter                  *observe.Emitter // optional; nil = no-op
+	Meter                    TrafficMeter     // optional live bandwidth meter; nil = no-op
 }
 
 type Store interface {
