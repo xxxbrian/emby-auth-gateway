@@ -549,8 +549,140 @@ func TestSeriesPrivacyNoRawIdentity(t *testing.T) {
 	}
 	// Active playbacks may include item name for ops UI current-state, but series must not.
 	// Ensure series points don't embed names (struct has only T,V).
-	if len(snap.Series.RPS) != seriesPoints {
-		t.Fatalf("rps series len: %d", len(snap.Series.RPS))
+	if len(snap.Series.RPS) != series15mSec {
+		t.Fatalf("rps series len: %d want %d", len(snap.Series.RPS), series15mSec)
+	}
+	if snap.Series.Window != string(Window15m) {
+		t.Fatalf("default window: %q", snap.Series.Window)
+	}
+}
+
+func TestParseSeriesWindow(t *testing.T) {
+	cases := []struct {
+		in   string
+		want SeriesWindow
+	}{
+		{"", Window15m},
+		{"15m", Window15m},
+		{"1h", Window1h},
+		{"6h", Window6h},
+		{"24h", Window24h},
+		{"1H", Window1h},
+		{" bogus ", Window15m},
+	}
+	for _, tc := range cases {
+		if got := ParseSeriesWindow(tc.in); got != tc.want {
+			t.Fatalf("ParseSeriesWindow(%q)=%q want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestSnapshotWindowSeries(t *testing.T) {
+	r := New(nil)
+	base := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+
+	// 3 requests in the same second (one error), plus a playback sample.
+	r.now = func() time.Time { return base }
+	r.handle(observe.Event{
+		Kind:        observe.KindRequest,
+		At:          base,
+		Outcome:     observe.OutcomeOK,
+		StatusClass: observe.Status2xx,
+		BytesIn:     1_000_000,
+		BytesOut:    2_000_000,
+	})
+	r.handle(observe.Event{
+		Kind:          observe.KindPlayback,
+		At:            base,
+		SessionID:     "s1",
+		ItemID:        "i1",
+		PlaybackEvent: observe.PlaybackPlaying,
+	})
+	r.handle(observe.Event{Kind: observe.KindRequest, At: base, Outcome: observe.OutcomeOK, StatusClass: observe.Status2xx})
+	r.handle(observe.Event{Kind: observe.KindRequest, At: base, Outcome: observe.OutcomeError, StatusClass: observe.Status5xx})
+
+	// Later minute: 60 MB out → 8 Mbps average over the 1m bucket.
+	later := base.Add(5 * time.Minute)
+	r.now = func() time.Time { return later }
+	r.handle(observe.Event{
+		Kind:        observe.KindRequest,
+		At:          later,
+		Outcome:     observe.OutcomeOK,
+		StatusClass: observe.Status2xx,
+		BytesOut:    60_000_000,
+	})
+
+	type want struct {
+		window   SeriesWindow
+		interval string
+		points   int
+	}
+	for _, w := range []want{
+		{Window15m, "1s", series15mSec},
+		{Window1h, "1m", series1hMin},
+		{Window6h, "1m", series6hMin},
+		{Window24h, "1m", series24hMin},
+	} {
+		snap := r.SnapshotWindow(w.window)
+		if snap.Series.Window != string(w.window) {
+			t.Fatalf("%s: window=%q", w.window, snap.Series.Window)
+		}
+		if snap.Series.Interval != w.interval {
+			t.Fatalf("%s: interval=%q want %q", w.window, snap.Series.Interval, w.interval)
+		}
+		if len(snap.Series.RPS) != w.points ||
+			len(snap.Series.MbpsIn) != w.points ||
+			len(snap.Series.MbpsOut) != w.points ||
+			len(snap.Series.Errors) != w.points ||
+			len(snap.Series.Playbacks) != w.points {
+			t.Fatalf("%s: series lengths rps=%d mbps_in=%d mbps_out=%d errors=%d playbacks=%d want %d",
+				w.window,
+				len(snap.Series.RPS), len(snap.Series.MbpsIn), len(snap.Series.MbpsOut),
+				len(snap.Series.Errors), len(snap.Series.Playbacks), w.points)
+		}
+		if !snap.Series.RPS[0].T.Before(snap.Series.RPS[len(snap.Series.RPS)-1].T) {
+			t.Fatalf("%s: series not oldest-first", w.window)
+		}
+	}
+
+	// 15m @ 1s: base second has 3 requests → rps=3; 1 error count; playbacks max >= 1.
+	snap15 := r.SnapshotWindow(Window15m)
+	lastRPS := snap15.Series.RPS[len(snap15.Series.RPS)-1].V
+	if lastRPS < 0.9 || lastRPS > 1.1 {
+		t.Fatalf("15m last rps: got %v want ~1", lastRPS)
+	}
+	foundRPS, foundErr, foundPB := false, false, false
+	for i, pt := range snap15.Series.RPS {
+		if pt.V > 2.5 && pt.V < 3.5 {
+			foundRPS = true
+		}
+		if snap15.Series.Errors[i].V >= 1 {
+			foundErr = true
+		}
+		if snap15.Series.Playbacks[i].V >= 1 {
+			foundPB = true
+		}
+	}
+	if !foundRPS {
+		t.Fatal("15m series missing ~3 rps bucket")
+	}
+	if !foundErr {
+		t.Fatal("15m series missing error count >= 1")
+	}
+	if !foundPB {
+		t.Fatal("15m series missing playbacks max >= 1")
+	}
+
+	// 1h @ 1m: last minute has 1 request → rps=1/60; 60MB → 8 Mbps.
+	snap1h := r.SnapshotWindow(Window1h)
+	lastMinRPS := snap1h.Series.RPS[len(snap1h.Series.RPS)-1].V
+	wantRPS := 1.0 / 60.0
+	if lastMinRPS < wantRPS*0.9 || lastMinRPS > wantRPS*1.1 {
+		t.Fatalf("1h last rps: got %v want ~%v", lastMinRPS, wantRPS)
+	}
+	lastMbps := snap1h.Series.MbpsOut[len(snap1h.Series.MbpsOut)-1].V
+	if lastMbps < 7.5 || lastMbps > 8.5 {
+		t.Fatalf("1h last mbps_out: got %v want ~8", lastMbps)
 	}
 }
 

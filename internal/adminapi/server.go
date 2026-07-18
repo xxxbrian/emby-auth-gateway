@@ -345,12 +345,14 @@ func (s *Server) handleOverview(e *core.RequestEvent) error {
 	if s.cfg.Telemetry == nil {
 		return e.JSON(http.StatusOK, telemetry.Snapshot{})
 	}
-	return e.JSON(http.StatusOK, s.cfg.Telemetry.Snapshot())
+	window := telemetry.ParseSeriesWindow(e.Request.URL.Query().Get("window"))
+	return e.JSON(http.StatusOK, s.cfg.Telemetry.SnapshotWindow(window))
 }
 
 func (s *Server) handleMetricsStream(e *core.RequestEvent) error {
 	w := e.Response
 	r := e.Request
+	window := telemetry.ParseSeriesWindow(r.URL.Query().Get("window"))
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "private, no-store")
 	w.Header().Set("Connection", "keep-alive")
@@ -364,7 +366,7 @@ func (s *Server) handleMetricsStream(e *core.RequestEvent) error {
 	writeSnap := func() bool {
 		var snap telemetry.Snapshot
 		if s.cfg.Telemetry != nil {
-			snap = s.cfg.Telemetry.Snapshot()
+			snap = s.cfg.Telemetry.SnapshotWindow(window)
 		}
 		b, err := json.Marshal(snap)
 		if err != nil {

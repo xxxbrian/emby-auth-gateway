@@ -15,6 +15,7 @@ import (
 	"github.com/xxxbrian/emby-auth-gateway/internal/adminauth"
 	"github.com/xxxbrian/emby-auth-gateway/internal/adminquery"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pbschema"
+	"github.com/xxxbrian/emby-auth-gateway/internal/telemetry"
 )
 
 const testOrigin = "https://admin.example.test"
@@ -291,5 +292,102 @@ func TestCreateUserReturnsUserDTO(t *testing.T) {
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusConflict {
 		t.Fatalf("duplicate code=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestOverviewWindowQuery(t *testing.T) {
+	app := newTestApp(t)
+	su := createSuperuser(t, app, "window@example.test", "SuperSecret1!")
+	token, err := su.NewAuthToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions := adminauth.NewStore(10)
+	reg := telemetry.New(nil)
+	srv, err := New(Config{
+		App:       app,
+		Origin:    testOrigin,
+		Sessions:  sessions,
+		Query:     adminquery.New(app, 2),
+		Telemetry: reg,
+		StartedAt: time.Now().UTC(),
+		BootID:    "test-boot",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := apis.NewRouter(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Bind(apis.CORS(apis.CORSConfig{AllowOrigins: []string{"*"}}))
+	srv.Mount(r)
+	h, err := r.BuildMux()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create session cookie.
+	body, _ := json.Marshal(map[string]string{"token": token})
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/v1/session", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", testOrigin)
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("create session code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var sessionCookie *http.Cookie
+	for _, c := range rr.Result().Cookies() {
+		if c.Name == adminauth.CookieDev || c.Name == adminauth.CookieSecure {
+			sessionCookie = c
+			break
+		}
+	}
+	if sessionCookie == nil {
+		t.Fatal("missing session cookie")
+	}
+
+	cases := []struct {
+		q        string
+		window   string
+		interval string
+		points   int
+	}{
+		{"", "15m", "1s", 900},
+		{"15m", "15m", "1s", 900},
+		{"1h", "1h", "1m", 60},
+		{"6h", "6h", "1m", 360},
+		{"24h", "24h", "1m", 1440},
+		{"nope", "15m", "1s", 900},
+	}
+	for _, tc := range cases {
+		path := "/admin/api/v1/overview"
+		if tc.q != "" {
+			path += "?window=" + tc.q
+		}
+		rr = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodGet, path, nil)
+		req.AddCookie(sessionCookie)
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("%s: code=%d body=%s", path, rr.Code, rr.Body.String())
+		}
+		var snap telemetry.Snapshot
+		if err := json.Unmarshal(rr.Body.Bytes(), &snap); err != nil {
+			t.Fatalf("%s: decode: %v", path, err)
+		}
+		if snap.Series.Window != tc.window {
+			t.Fatalf("%s: window=%q want %q", path, snap.Series.Window, tc.window)
+		}
+		if snap.Series.Interval != tc.interval {
+			t.Fatalf("%s: interval=%q want %q", path, snap.Series.Interval, tc.interval)
+		}
+		if len(snap.Series.RPS) != tc.points {
+			t.Fatalf("%s: rps points=%d want %d", path, len(snap.Series.RPS), tc.points)
+		}
+		if len(snap.Series.MbpsIn) != tc.points {
+			t.Fatalf("%s: mbps_in points=%d want %d", path, len(snap.Series.MbpsIn), tc.points)
+		}
 	}
 }

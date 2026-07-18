@@ -100,114 +100,124 @@
     }
 </script>
 
-<div class="flex justify-between items-center mb-4">
-    <h1 class="page-title" style="margin: 0">Users</h1>
-    <button onclick={() => showCreate = !showCreate}>{showCreate ? 'Cancel' : 'Create User'}</button>
+<div class="page-header">
+    <h1 class="page-title">Users</h1>
+    <button onclick={() => showCreate = true}>Create User</button>
 </div>
 
-{#if error}
-    <div class="error-message">{error}</div>
-{/if}
+<div class="page-body">
+    {#if error}
+        <div class="error-message">{error}</div>
+    {/if}
+
+    {#if loading}
+        <div class="text-secondary">Loading…</div>
+    {:else if users.length === 0}
+        <div class="text-secondary">No users found.</div>
+    {:else}
+        <div class="table-container panel" style="padding: 0;">
+            <table style="min-width: 800px;">
+                <thead>
+                    <tr>
+                        <th style="width: 15%">Username</th>
+                        <th style="width: 10%">Status</th>
+                        <th style="width: 20%">ID</th>
+                        <th style="width: 25%">Synthetic ID</th>
+                        <th style="width: 15%">Created</th>
+                        <th style="width: 15%; text-align: right;">Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {#each users as user}
+                        <tr>
+                            <td><strong>{user.username}</strong></td>
+                            <td>
+                                <span class={user.enabled ? 'status-ok' : 'status-err'}>
+                                    {user.enabled ? 'Enabled' : 'Disabled'}
+                                </span>
+                            </td>
+                            <td>
+                                <div class="mono truncate" style="max-width: 120px;" title={user.id}>{user.id}</div>
+                            </td>
+                            <td>
+                                <div class="mono text-secondary truncate" style="max-width: 160px;" title={user.synthetic_user_id || '-'}>{user.synthetic_user_id || '-'}</div>
+                            </td>
+                            <td>{fmtTime(user.created)}</td>
+                            <td>
+                                <div class="flex gap-2 justify-end">
+                                    <button class="secondary text-xs" onclick={() => toggleEnable(user)}>
+                                        {user.enabled ? 'Disable' : 'Enable'}
+                                    </button>
+                                    <button class="secondary text-xs" onclick={() => resetUserId = user.id}>Pwd</button>
+                                    <button class="secondary text-xs" onclick={() => revokeSessions(user.id)}>Kick</button>
+                                </div>
+                            </td>
+                        </tr>
+                    {/each}
+                </tbody>
+            </table>
+        </div>
+    {/if}
+</div>
 
 {#if showCreate}
-    <div class="panel">
-        <h3 style="margin-top:0">Create User</h3>
-        {#if createError}
-            <div class="error-message">{createError}</div>
-        {/if}
-        <form onsubmit={handleCreate} class="form-grid">
-            <div>
-                <label class="text-sm text-secondary" for="username">Username</label>
-                <input type="text" id="username" bind:value={newUsername} required class="mt-2" />
+    <div class="overlay" onclick={() => showCreate = false}>
+        <div class="drawer" onclick={(e) => e.stopPropagation()}>
+            <div class="drawer-header">
+                <h3 class="drawer-title">Create User</h3>
+                <button class="icon" onclick={() => showCreate = false}>✕</button>
             </div>
-            <div>
-                <label class="text-sm text-secondary" for="password">Password</label>
-                <input type="password" id="password" bind:value={newPassword} required class="mt-2" />
+            <div class="drawer-body">
+                {#if createError}
+                    <div class="error-message">{createError}</div>
+                {/if}
+                <form id="create-user-form" onsubmit={handleCreate}>
+                    <div class="mb-4">
+                        <label class="text-sm text-secondary block mb-2" for="username">Username</label>
+                        <input type="text" id="username" bind:value={newUsername} required />
+                    </div>
+                    <div class="mb-4">
+                        <label class="text-sm text-secondary block mb-2" for="password">Password</label>
+                        <input type="password" id="password" bind:value={newPassword} required />
+                    </div>
+                    <div class="mb-4">
+                        <label class="text-sm text-secondary block mb-2" for="syn_id">Synthetic User ID</label>
+                        <input type="text" id="syn_id" bind:value={newSyntheticId} required />
+                    </div>
+                </form>
             </div>
-            <div>
-                <label class="text-sm text-secondary" for="syn_id">Synthetic User ID</label>
-                <input type="text" id="syn_id" bind:value={newSyntheticId} required class="mt-2" />
+            <div class="drawer-footer">
+                <button class="secondary" onclick={() => showCreate = false}>Cancel</button>
+                <button type="submit" form="create-user-form" disabled={createLoading}>{createLoading ? 'Saving…' : 'Save User'}</button>
             </div>
-            <div class="actions">
-                <button type="submit" disabled={createLoading}>{createLoading ? 'Saving…' : 'Save'}</button>
-            </div>
-        </form>
+        </div>
     </div>
 {/if}
 
 {#if resetUserId}
-    <div class="panel">
-        <h3 style="margin-top:0">Reset Password</h3>
-        <form onsubmit={handleResetPassword} class="flex gap-4 items-center">
-            <input type="password" placeholder="New password" bind:value={resetPasswordValue} required />
-            <button type="submit">Reset</button>
-            <button type="button" class="secondary" onclick={() => resetUserId = null}>Cancel</button>
-        </form>
+    <div class="overlay" onclick={() => resetUserId = null}>
+        <div class="drawer" style="width: 350px;" onclick={(e) => e.stopPropagation()}>
+            <div class="drawer-header">
+                <h3 class="drawer-title">Reset Password</h3>
+                <button class="icon" onclick={() => resetUserId = null}>✕</button>
+            </div>
+            <div class="drawer-body">
+                <form id="reset-pwd-form" onsubmit={handleResetPassword}>
+                    <div class="mb-4">
+                        <label class="text-sm text-secondary block mb-2" for="new_pwd">New Password</label>
+                        <input type="password" id="new_pwd" placeholder="New password" bind:value={resetPasswordValue} required />
+                    </div>
+                </form>
+            </div>
+            <div class="drawer-footer">
+                <button class="secondary" onclick={() => resetUserId = null}>Cancel</button>
+                <button type="submit" form="reset-pwd-form">Reset Password</button>
+            </div>
+        </div>
     </div>
 {/if}
 
-<div class="panel" style="padding: 0; overflow-x: auto;">
-    {#if loading}
-        <div style="padding: 1.5rem" class="text-secondary">Loading…</div>
-    {:else if users.length === 0}
-        <div style="padding: 1.5rem" class="text-secondary">No users found.</div>
-    {:else}
-        <table class="mobile-cards">
-            <thead>
-                <tr>
-                    <th>Username</th>
-                    <th>Status</th>
-                    <th>Synthetic ID</th>
-                    <th>Created</th>
-                    <th>Actions</th>
-                </tr>
-            </thead>
-            <tbody>
-                {#each users as user}
-                    <tr>
-                        <td data-label="Username"><strong>{user.username}</strong></td>
-                        <td data-label="Status">
-                            <span class={user.enabled ? 'status-ok' : 'status-err'}>
-                                {user.enabled ? 'Enabled' : 'Disabled'}
-                            </span>
-                        </td>
-                        <td data-label="Synthetic ID" class="text-secondary mono">{user.synthetic_user_id || '-'}</td>
-                        <td data-label="Created">{fmtTime(user.created)}</td>
-                        <td data-label="Actions">
-                            <div class="flex gap-2 action-row">
-                                <button class="secondary text-xs" onclick={() => toggleEnable(user)}>
-                                    {user.enabled ? 'Disable' : 'Enable'}
-                                </button>
-                                <button class="secondary text-xs" onclick={() => resetUserId = user.id}>Password</button>
-                                <button class="secondary text-xs" onclick={() => revokeSessions(user.id)}>Kick</button>
-                            </div>
-                        </td>
-                    </tr>
-                {/each}
-            </tbody>
-        </table>
-    {/if}
-</div>
-
 <style>
-    .form-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-        gap: 1rem;
-        align-items: end;
-    }
-    .actions { padding-bottom: 0.1rem; }
-    .text-xs { font-size: 0.75rem; padding: 0.35rem 0.65rem; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; }
-    .action-row { justify-content: flex-end; flex-wrap: wrap; gap: 0.5rem; }
-    @media (max-width: 768px) {
-        .action-row {
-            justify-content: stretch;
-            width: 100%;
-        }
-        .action-row button {
-            flex: 1 1 calc(50% - 0.25rem);
-            min-width: 0;
-        }
-    }
+    .justify-end { justify-content: flex-end; }
+    .block { display: block; }
 </style>

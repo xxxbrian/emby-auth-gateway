@@ -2,7 +2,6 @@
     import { onMount } from 'svelte';
     import { apiRequest, session, reauth } from '../lib/api';
     import type {
-        InstallDefaultsResponse,
         ItemsResponse,
         Policy,
         PolicyBody,
@@ -11,19 +10,41 @@
         UpstreamBody,
         UpstreamDTO,
         UpstreamProbeResult,
+        InstallDefaultsResponse,
     } from '../lib/types';
 
     let sysInfo = $state<SystemInfo | null>(null);
     let upstream = $state<UpstreamDTO | null>(null);
-    let policies = $state<PolicyForm[]>([]);
+    let policies = $state<Policy[]>([]);
 
     let loading = $state(true);
     let error = $state<string | null>(null);
 
-    let showPolicyForm = $state(false);
-    let policyForm = $state<PolicyForm>(emptyPolicyForm());
+    let probeResult = $state<UpstreamProbeResult | null>(null);
+    let probing = $state(false);
+    let probeError = $state<string | null>(null);
+    let showProbeModal = $state(false);
 
-    let upstreamForm = $state<UpstreamBody>({
+    let showPolicyModal = $state(false);
+    let policyError = $state<string | null>(null);
+    let policySaving = $state(false);
+    
+    // Using explicit object structure instead of Partial<PolicyForm> 
+    // because Svelte 5 state needs to know all property keys upfront sometimes.
+    let currentPolicy = $state<PolicyForm>({
+        id: '',
+        method: '',
+        path: '',
+        action: 'block',
+        reason: '',
+        priority: 100,
+        enabled: true
+    });
+    let isEditingPolicy = $state(false);
+
+    let activeTab = $state<'runtime' | 'upstream' | 'policies'>('runtime');
+
+    let probeForm = $state({
         emby_base_url: '',
         backend_username: '',
         backend_password: '',
@@ -34,92 +55,33 @@
         force: false,
     });
 
-    let showProbeModal = $state(false);
-    let probeResult = $state<UpstreamProbeResult | null>(null);
-    let probeError = $state<string | null>(null);
-    let probing = $state(false);
-
     let showReauthModal = $state(false);
     let reauthPassword = $state('');
-    let reauthError = $state('');
+    let reauthError = $state<string | null>(null);
     let reauthLoading = $state(false);
-
-    function emptyPolicyForm(): PolicyForm {
-        return {
-            id: '',
-            method: '*',
-            path: '',
-            action: 'allow',
-            reason: '',
-            priority: 0,
-            enabled: true,
-        };
-    }
-
-    function normalizePolicy(p: Policy | null | undefined): PolicyForm {
-        if (!p) return emptyPolicyForm();
-        return {
-            id: p.id || p.ID || '',
-            method: p.method || p.Method || '*',
-            path: p.path || p.Path || '',
-            action: (p.action || p.Action || 'allow').toLowerCase(),
-            reason: p.reason || p.Reason || '',
-            priority: p.priority ?? p.Priority ?? 0,
-            enabled: p.enabled ?? p.Enabled ?? true,
-        };
-    }
-
-    function applyUpstreamToForm(up: UpstreamDTO | null) {
-        if (!up) return;
-        upstreamForm.emby_base_url = up.base_url || '';
-        upstreamForm.backend_username = up.backend_username || '';
-        if (up.backend_user_agent) {
-            upstreamForm.backend_user_agent = up.backend_user_agent;
-        }
-        if (up.backend_authorization_client) {
-            upstreamForm.backend_authorization_client = up.backend_authorization_client;
-        }
-        if (up.backend_authorization_device) {
-            upstreamForm.backend_authorization_device = up.backend_authorization_device;
-        }
-        if (up.backend_authorization_version) {
-            upstreamForm.backend_authorization_version = up.backend_authorization_version;
-        }
-    }
-
-    function yesNo(v: boolean | undefined): string {
-        return v ? 'Yes' : 'No';
-    }
-
-    function formatBytes(n: number | undefined): string {
-        const bytes = Number(n) || 0;
-        if (bytes < 1024) return `${bytes} B`;
-        if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-        return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-    }
-
-    function formatUptime(sec: number | undefined): string {
-        const s = Math.max(0, Number(sec) || 0);
-        if (s < 60) return `${s}s`;
-        const m = Math.floor(s / 60);
-        const rs = s % 60;
-        if (m < 60) return `${m}m ${rs}s`;
-        const h = Math.floor(m / 60);
-        const rm = m % 60;
-        if (h < 48) return `${h}h ${rm}m`;
-        const d = Math.floor(h / 24);
-        const rh = h % 24;
-        return `${d}d ${rh}h`;
-    }
+    let pendingAction: (() => Promise<void>) | null = null;
 
     async function loadData() {
+        loading = true;
         try {
+            const [si, up, pol] = await Promise.all([
+                apiRequest<SystemInfo>('/system'),
+                apiRequest<UpstreamDTO>('/upstream'),
+                apiRequest<ItemsResponse<Policy>>('/pathpolicies'),
+            ]);
+            sysInfo = si;
+            upstream = up;
+            policies = pol.items || [];
+            
+            if (up) {
+                probeForm.emby_base_url = up.base_url || '';
+                probeForm.backend_username = up.backend_username || '';
+                probeForm.backend_user_agent = up.backend_user_agent || 'SenPlayer/6.1.3';
+                probeForm.backend_authorization_client = up.backend_authorization_client || 'SenPlayer';
+                probeForm.backend_authorization_device = up.backend_authorization_device || 'Mac';
+                probeForm.backend_authorization_version = up.backend_authorization_version || '6.1.3';
+            }
             error = null;
-            sysInfo = await apiRequest<SystemInfo>('/system');
-            upstream = await apiRequest<UpstreamDTO>('/upstream');
-            const polRes = await apiRequest<ItemsResponse<Policy>>('/path-policies');
-            policies = (polRes.items || []).map(normalizePolicy);
-            applyUpstreamToForm(upstream);
         } catch (err) {
             error = err instanceof Error ? err.message : String(err);
         } finally {
@@ -129,88 +91,28 @@
 
     onMount(loadData);
 
-    async function handleInstallDefaults() {
-        if (!confirm('Install default policies? Existing matching policies are preserved.')) return;
-        try {
-            const res = await apiRequest<InstallDefaultsResponse>('/path-policies/install-defaults', { method: 'POST' });
-            alert(`Installed ${res.created ?? 0} defaults, preserved ${res.preserved ?? 0}`);
-            await loadData();
-        } catch (err) {
-            alert('Error: ' + (err instanceof Error ? err.message : String(err)));
-        }
+    function fmtTime(v: string | undefined): string {
+        if (!v) return '-';
+        try { return new Date(v).toLocaleString(); } catch { return String(v); }
     }
 
-    async function savePolicy(e: Event) {
-        e.preventDefault();
-        try {
-            const payload: PolicyBody = {
-                method: policyForm.method,
-                path: policyForm.path,
-                action: policyForm.action,
-                reason: policyForm.reason,
-                priority: Number(policyForm.priority) || 0,
-                enabled: !!policyForm.enabled,
-            };
-            if (policyForm.id) {
-                await apiRequest(`/path-policies/${policyForm.id}`, {
-                    method: 'PUT',
-                    body: JSON.stringify(payload),
-                });
-            } else {
-                await apiRequest('/path-policies', {
-                    method: 'POST',
-                    body: JSON.stringify(payload),
-                });
-            }
-            showPolicyForm = false;
-            policyForm = emptyPolicyForm();
-            await loadData();
-        } catch (err) {
-            alert('Error: ' + (err instanceof Error ? err.message : String(err)));
-        }
-    }
-
-    async function deletePolicy(id: string) {
-        if (!id) return;
-        if (!confirm('Delete this policy?')) return;
-        try {
-            await apiRequest(`/path-policies/${id}`, { method: 'DELETE' });
-            await loadData();
-        } catch (err) {
-            alert('Error: ' + (err instanceof Error ? err.message : String(err)));
-        }
-    }
-
-    function editPolicy(p: PolicyForm) {
-        policyForm = { ...p };
-        showPolicyForm = true;
-    }
-
-    function openNewPolicy() {
-        policyForm = emptyPolicyForm();
-        showPolicyForm = true;
+    function yesNo(v: boolean | undefined): string {
+        return v ? 'Yes' : 'No';
     }
 
     async function handleProbe(e: Event) {
         e.preventDefault();
-        probing = true;
         probeError = null;
         probeResult = null;
+        probing = true;
         showProbeModal = true;
         try {
-            const body: Omit<UpstreamBody, 'force'> = {
-                emby_base_url: upstreamForm.emby_base_url,
-                backend_username: upstreamForm.backend_username,
-                backend_password: upstreamForm.backend_password,
-                backend_user_agent: upstreamForm.backend_user_agent,
-                backend_authorization_client: upstreamForm.backend_authorization_client,
-                backend_authorization_device: upstreamForm.backend_authorization_device,
-                backend_authorization_version: upstreamForm.backend_authorization_version,
-            };
-            probeResult = await apiRequest<UpstreamProbeResult>('/upstream/probe', {
+            const body: UpstreamBody = { ...probeForm, force: false };
+            const res = await apiRequest<UpstreamProbeResult>('/upstream/probe', {
                 method: 'POST',
                 body: JSON.stringify(body),
             });
+            probeResult = res;
         } catch (err) {
             probeError = err instanceof Error ? err.message : String(err);
         } finally {
@@ -218,469 +120,494 @@
         }
     }
 
-    function requestReconfigure() {
-        showProbeModal = false;
-        reauthError = '';
+    function askForReauth(action: () => Promise<void>) {
+        pendingAction = action;
+        reauthError = null;
         reauthPassword = '';
         showReauthModal = true;
     }
 
-    async function handleReauthAndReconfigure(e: Event) {
-        e.preventDefault();
-        reauthError = '';
-        reauthLoading = true;
+    async function performApply() {
         try {
-            const identity = $session?.email;
-            if (!identity) {
-                throw new Error('Admin email not available in session');
-            }
-            const ticket = await reauth(identity, reauthPassword);
-
-            await apiRequest('/upstream/reconfigure', {
-                method: 'POST',
-                headers: {
-                    'X-Admin-Reauth': ticket,
-                },
-                body: JSON.stringify(upstreamForm),
+            const body: UpstreamBody = { ...probeForm, force: true };
+            await apiRequest('/upstream', {
+                method: 'PUT',
+                body: JSON.stringify(body),
             });
-
-            showReauthModal = false;
-            reauthPassword = '';
-            alert('Upstream reconfigured successfully');
+            showProbeModal = false;
             await loadData();
         } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            reauthError = msg;
-            if (/active.?media|force/i.test(msg || '')) {
-                reauthError = 'Active media load detected. Check "Force" to proceed anyway.';
+            probeError = err instanceof Error ? err.message : String(err);
+        }
+    }
+
+    function requestApply() {
+        askForReauth(performApply);
+    }
+
+    async function toggleEndpoint(active: boolean) {
+        askForReauth(async () => {
+            await apiRequest(`/upstream/endpoint/${active ? 'enable' : 'disable'}`, { method: 'POST' });
+            await loadData();
+        });
+    }
+
+    function openNewPolicy() {
+        currentPolicy = {
+            id: '',
+            method: '*',
+            path: '',
+            action: 'block',
+            reason: '',
+            priority: 100,
+            enabled: true,
+        };
+        isEditingPolicy = false;
+        policyError = null;
+        showPolicyModal = true;
+    }
+
+    function openEditPolicy(p: Policy) {
+        currentPolicy = {
+            id: p.ID || p.id || '',
+            method: p.Method || p.method || '*',
+            path: p.Path || p.path || '',
+            action: p.Action || p.action || 'block',
+            reason: p.Reason || p.reason || '',
+            priority: p.Priority ?? p.priority ?? 100,
+            enabled: p.Enabled ?? p.enabled ?? true,
+        };
+        isEditingPolicy = true;
+        policyError = null;
+        showPolicyModal = true;
+    }
+
+    async function handleSavePolicy(e: Event) {
+        e.preventDefault();
+        policyError = null;
+        policySaving = true;
+        try {
+            const body: PolicyBody = {
+                method: currentPolicy.method,
+                path: currentPolicy.path,
+                action: currentPolicy.action,
+                reason: currentPolicy.reason,
+                priority: currentPolicy.priority,
+                enabled: currentPolicy.enabled,
+            };
+            
+            if (isEditingPolicy && currentPolicy.id) {
+                await apiRequest(`/pathpolicies/${currentPolicy.id}`, {
+                    method: 'PUT',
+                    body: JSON.stringify(body),
+                });
+            } else {
+                await apiRequest('/pathpolicies', {
+                    method: 'POST',
+                    body: JSON.stringify(body),
+                });
             }
+            showPolicyModal = false;
+            await loadData();
+        } catch (err) {
+            policyError = err instanceof Error ? err.message : String(err);
+        } finally {
+            policySaving = false;
+        }
+    }
+
+    async function handleDeletePolicy(id: string) {
+        if (!confirm('Delete this policy?')) return;
+        try {
+            await apiRequest(`/pathpolicies/${id}`, { method: 'DELETE' });
+            await loadData();
+        } catch (err) {
+            alert(err instanceof Error ? err.message : String(err));
+        }
+    }
+
+    async function handleInstallDefaults() {
+        if (!confirm('Install default path policies? Existing default policies will be updated or preserved.')) return;
+        try {
+            const res = await apiRequest<InstallDefaultsResponse>('/pathpolicies/defaults', { method: 'POST' });
+            alert(`Installed defaults. Created: ${res.created}, Preserved: ${res.preserved}`);
+            await loadData();
+        } catch (err) {
+            alert(err instanceof Error ? err.message : String(err));
+        }
+    }
+
+    async function handleReauthSubmit(e: Event) {
+        e.preventDefault();
+        if (!pendingAction) {
+            showReauthModal = false;
+            return;
+        }
+        reauthError = null;
+        reauthLoading = true;
+        try {
+            const identity = $session?.email || $session?.superuser_id;
+            if (!identity) throw new Error('No active session identity found');
+            
+            await reauth(identity, reauthPassword);
+            showReauthModal = false;
+            await pendingAction();
+            pendingAction = null;
+        } catch (err) {
+            reauthError = err instanceof Error ? err.message : String(err);
         } finally {
             reauthLoading = false;
         }
     }
 </script>
 
-<h1 class="page-title">System & Upstream</h1>
+<div class="page-header">
+    <h1 class="page-title">System</h1>
+</div>
 
-{#if error}
-    <div class="error-message">{error}</div>
-{/if}
+<div class="page-body">
+    {#if error}
+        <div class="error-message">{error}</div>
+    {/if}
 
-{#if loading}
-    <div>Loading...</div>
-{:else}
-    <div class="panel">
-        <h3 style="margin-top:0">System Info</h3>
-        <div class="flex gap-4" style="flex-wrap: wrap">
-            <div class="text-sm">
-                <div class="text-secondary">Version</div>
-                <div>{sysInfo?.version || '-'}</div>
-            </div>
-            <div class="text-sm">
-                <div class="text-secondary">Boot ID</div>
-                <div class="mono">{sysInfo?.boot_id || '-'}</div>
-            </div>
-            <div class="text-sm">
-                <div class="text-secondary">Started</div>
-                <div>{sysInfo?.started_at ? new Date(sysInfo.started_at).toLocaleString() : '-'}</div>
-            </div>
-            <div class="text-sm">
-                <div class="text-secondary">Uptime</div>
-                <div title="{sysInfo?.uptime_sec ?? 0}s">{formatUptime(sysInfo?.uptime_sec)}</div>
-            </div>
-            <div class="text-sm">
-                <div class="text-secondary">Goroutines</div>
-                <div>{sysInfo?.goroutines ?? '-'}</div>
-            </div>
-            <div class="text-sm">
-                <div class="text-secondary">Heap</div>
-                <div>{formatBytes(sysInfo?.heap_bytes)}</div>
-            </div>
-            <div class="text-sm">
-                <div class="text-secondary">Go</div>
-                <div class="mono">{sysInfo?.go_version || '-'}</div>
-            </div>
-        </div>
+    <div class="sub-nav">
+        <div class="sub-nav-item {activeTab === 'runtime' ? 'active' : ''}" onclick={() => activeTab = 'runtime'} role="tab" tabindex="0" onkeydown={(e) => e.key === 'Enter' && (activeTab = 'runtime')}>Runtime Info</div>
+        <div class="sub-nav-item {activeTab === 'upstream' ? 'active' : ''}" onclick={() => activeTab = 'upstream'} role="tab" tabindex="0" onkeydown={(e) => e.key === 'Enter' && (activeTab = 'upstream')}>Upstream</div>
+        <div class="sub-nav-item {activeTab === 'policies' ? 'active' : ''}" onclick={() => activeTab = 'policies'} role="tab" tabindex="0" onkeydown={(e) => e.key === 'Enter' && (activeTab = 'policies')}>Path Policies</div>
     </div>
 
-    <div class="panel">
-        <h3 style="margin-top:0">Upstream Status</h3>
-        <div class="flex gap-4 mb-4" style="flex-wrap: wrap">
-            <div class="text-sm">
-                <div class="text-secondary">Configured</div>
-                <div class={upstream?.configured ? 'status-ok' : 'status-warn'}>
-                    {yesNo(upstream?.configured)}
+    {#if loading}
+        <div class="text-secondary">Loading...</div>
+    {:else}
+        {#if activeTab === 'runtime'}
+            <div class="panel">
+                <div class="metric-label mb-4">System Information</div>
+                <div class="data-grid">
+                    <div class="metric-box">
+                        <div class="metric-label">Version</div>
+                        <div class="metric-value mono" style="font-size: 16px;">{sysInfo?.version || '-'}</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-label">Go Version</div>
+                        <div class="metric-value mono" style="font-size: 16px;">{sysInfo?.go_version || '-'}</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-label">Boot ID</div>
+                        <div class="metric-value mono truncate" style="font-size: 16px;">{sysInfo?.boot_id || '-'}</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-label">Started</div>
+                        <div class="metric-value mono" style="font-size: 16px;">{fmtTime(sysInfo?.started_at)}</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-label">Uptime</div>
+                        <div class="metric-value mono" style="font-size: 16px;">{sysInfo?.uptime_sec || 0}s</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-label">Goroutines</div>
+                        <div class="metric-value mono" style="font-size: 16px;">{sysInfo?.goroutines || 0}</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-label">Heap memory</div>
+                        <div class="metric-value mono" style="font-size: 16px;">{((sysInfo?.heap_bytes || 0) / 1024 / 1024).toFixed(2)} MB</div>
+                    </div>
                 </div>
-            </div>
-            <div class="text-sm">
-                <div class="text-secondary">Base URL</div>
-                <div class="mono text-sm">{upstream?.base_url || '-'}</div>
-            </div>
-            <div class="text-sm">
-                <div class="text-secondary">Server</div>
-                <div>
-                    {upstream?.server_name || '-'}
-                    {#if upstream?.server_version}
-                        <span class="text-secondary">· {upstream.server_version}</span>
-                    {/if}
-                </div>
-            </div>
-            <div class="text-sm">
-                <div class="text-secondary">Server ID</div>
-                <div class="mono text-sm">{upstream?.server_id || '-'}</div>
-            </div>
-            <div class="text-sm">
-                <div class="text-secondary">Backend User</div>
-                <div>{upstream?.backend_username || '-'}</div>
-            </div>
-            <div class="text-sm">
-                <div class="text-secondary">Password Set</div>
-                <div>{yesNo(upstream?.password_set)}</div>
-            </div>
-            <div class="text-sm">
-                <div class="text-secondary">Token Set</div>
-                <div>{yesNo(upstream?.token_set)}</div>
-            </div>
-            <div class="text-sm">
-                <div class="text-secondary">Endpoint Active</div>
-                <div class={upstream?.endpoint_active ? 'status-ok' : 'status-warn'}>
-                    {yesNo(upstream?.endpoint_active)}
-                </div>
-            </div>
-            <div class="text-sm">
-                <div class="text-secondary">Last Login</div>
-                <div>
-                    {upstream?.last_login_at ? new Date(upstream.last_login_at).toLocaleString() : '-'}
-                </div>
-            </div>
-        </div>
-        {#if upstream?.last_login_error}
-            <div class="error-message" style="margin-bottom: 0">
-                Last login error: {upstream.last_login_error}
             </div>
         {/if}
-    </div>
 
-    <div class="panel">
-        <h3 style="margin-top:0">Upstream Configuration</h3>
-        <form onsubmit={handleProbe}>
-            <div class="flex gap-4 mb-4" style="flex-wrap: wrap">
-                <div style="flex: 1; min-width: 250px;">
-                    <label class="text-sm text-secondary" for="emby_base_url">Emby Base URL</label>
-                    <input
-                        type="url"
-                        id="emby_base_url"
-                        bind:value={upstreamForm.emby_base_url}
-                        required
-                        class="mt-2"
-                        autocomplete="off"
-                    />
-                </div>
-                <div style="flex: 1; min-width: 200px;">
-                    <label class="text-sm text-secondary" for="backend_username">Backend Username</label>
-                    <input
-                        type="text"
-                        id="backend_username"
-                        bind:value={upstreamForm.backend_username}
-                        required
-                        class="mt-2"
-                        autocomplete="username"
-                    />
-                </div>
-                <div style="flex: 1; min-width: 200px;">
-                    <label class="text-sm text-secondary" for="backend_password">Backend Password (if changing)</label>
-                    <input
-                        type="password"
-                        id="backend_password"
-                        bind:value={upstreamForm.backend_password}
-                        class="mt-2"
-                        autocomplete="new-password"
-                    />
-                </div>
-            </div>
-
-            <details class="mb-4">
-                <summary class="text-sm text-secondary" style="cursor: pointer;">Advanced Device Info</summary>
-                <div class="flex gap-4 mt-2" style="flex-wrap: wrap; padding: 1rem; background: rgba(255,255,255,0.02); border-radius: 4px;">
-                    <div style="flex: 1; min-width: 150px;">
-                        <label class="text-xs text-secondary" for="backend_authorization_client">Client</label>
-                        <input
-                            type="text"
-                            id="backend_authorization_client"
-                            bind:value={upstreamForm.backend_authorization_client}
-                            class="mt-2 text-sm"
-                        />
-                    </div>
-                    <div style="flex: 1; min-width: 150px;">
-                        <label class="text-xs text-secondary" for="backend_authorization_device">Device</label>
-                        <input
-                            type="text"
-                            id="backend_authorization_device"
-                            bind:value={upstreamForm.backend_authorization_device}
-                            class="mt-2 text-sm"
-                        />
-                    </div>
-                    <div style="flex: 1; min-width: 150px;">
-                        <label class="text-xs text-secondary" for="backend_authorization_version">Version</label>
-                        <input
-                            type="text"
-                            id="backend_authorization_version"
-                            bind:value={upstreamForm.backend_authorization_version}
-                            class="mt-2 text-sm"
-                        />
-                    </div>
-                    <div style="flex: 1; min-width: 150px;">
-                        <label class="text-xs text-secondary" for="backend_user_agent">User Agent</label>
-                        <input
-                            type="text"
-                            id="backend_user_agent"
-                            bind:value={upstreamForm.backend_user_agent}
-                            class="mt-2 text-sm"
-                        />
-                    </div>
-                </div>
-            </details>
-
-            <div class="flex items-center gap-4">
-                <label class="flex items-center gap-2 text-sm" for="upstream_force">
-                    <input type="checkbox" id="upstream_force" bind:checked={upstreamForm.force} style="width: auto;" />
-                    Force reconfigure (ignore active playbacks)
-                </label>
-            </div>
-
-            <div class="mt-4">
-                <button type="submit">Probe & Configure</button>
-            </div>
-        </form>
-    </div>
-
-    <div class="panel" style="padding: 0;">
-        <div class="flex justify-between items-center" style="padding: 1.5rem">
-            <h3 style="margin: 0">Path Policies</h3>
-            <div class="flex gap-2">
-                <button type="button" class="secondary" onclick={handleInstallDefaults}>Install Defaults</button>
-                <button type="button" onclick={openNewPolicy}>Add Policy</button>
-            </div>
-        </div>
-
-        {#if showPolicyForm}
-            <div style="padding: 0 1.5rem 1.5rem; border-bottom: 1px solid var(--border-color);">
-                <form onsubmit={savePolicy} class="flex gap-4 items-end" style="flex-wrap: wrap">
+        {#if activeTab === 'upstream'}
+            <div class="panel">
+                <div class="flex justify-between items-center mb-4">
+                    <div class="metric-label" style="margin:0">Upstream Status</div>
                     <div>
-                        <label class="text-xs text-secondary" for="policy_method">Method (* or GET/POST)</label>
-                        <input
-                            type="text"
-                            id="policy_method"
-                            bind:value={policyForm.method}
-                            required
-                            class="mt-2 text-sm"
-                        />
+                        <button class="secondary text-xs" onclick={() => toggleEndpoint(!upstream?.endpoint_active)}>
+                            {upstream?.endpoint_active ? 'Disable Endpoint' : 'Enable Endpoint'}
+                        </button>
                     </div>
-                    <div style="flex: 1; min-width: 180px;">
-                        <label class="text-xs text-secondary" for="policy_path">Path pattern</label>
-                        <input
-                            type="text"
-                            id="policy_path"
-                            bind:value={policyForm.path}
-                            required
-                            class="mt-2 text-sm"
-                            placeholder="/Items/*"
-                        />
+                </div>
+                <div class="data-grid mb-4">
+                    <div class="metric-box">
+                        <div class="metric-label">Configured</div>
+                        <div class="metric-value {upstream?.configured ? 'status-ok' : 'status-warn'}">
+                            {yesNo(upstream?.configured)}
+                        </div>
                     </div>
-                    <div>
-                        <label class="text-xs text-secondary" for="policy_action">Action</label>
-                        <select id="policy_action" bind:value={policyForm.action} required class="mt-2 text-sm">
-                            <option value="allow">Allow</option>
-                            <option value="deny">Deny</option>
-                        </select>
+                    <div class="metric-box">
+                        <div class="metric-label">Endpoint Active</div>
+                        <div class="metric-value {upstream?.endpoint_active ? 'status-ok' : 'status-warn'}">
+                            {yesNo(upstream?.endpoint_active)}
+                        </div>
                     </div>
-                    <div>
-                        <label class="text-xs text-secondary" for="policy_priority">Priority</label>
-                        <input
-                            type="number"
-                            id="policy_priority"
-                            bind:value={policyForm.priority}
-                            class="mt-2 text-sm"
-                            style="width: 6rem;"
-                        />
+                    <div class="metric-box">
+                        <div class="metric-label">Password Set</div>
+                        <div class="metric-value {upstream?.password_set ? 'status-ok' : 'status-err'}">
+                            {yesNo(upstream?.password_set)}
+                        </div>
                     </div>
-                    <div style="flex: 1; min-width: 140px;">
-                        <label class="text-xs text-secondary" for="policy_reason">Reason</label>
-                        <input
-                            type="text"
-                            id="policy_reason"
-                            bind:value={policyForm.reason}
-                            class="mt-2 text-sm"
-                        />
+                    <div class="metric-box">
+                        <div class="metric-label">Token Set</div>
+                        <div class="metric-value {upstream?.token_set ? 'status-ok' : 'status-err'}">
+                            {yesNo(upstream?.token_set)}
+                        </div>
                     </div>
-                    <label class="flex items-center gap-2 text-sm" for="policy_enabled" style="margin-bottom: 0.35rem;">
-                        <input type="checkbox" id="policy_enabled" bind:checked={policyForm.enabled} style="width: auto;" />
-                        Enabled
-                    </label>
-                    <div class="flex gap-2" style="margin-bottom: 0.15rem;">
-                        <button type="submit">Save</button>
-                        <button type="button" class="secondary" onclick={() => (showPolicyForm = false)}>Cancel</button>
+                    <div class="metric-box">
+                        <div class="metric-label">Version Checked</div>
+                        <div class="metric-value mono" style="font-size: 14px;">{fmtTime(upstream?.version_checked_at)}</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="metric-label">Last Login</div>
+                        <div class="metric-value mono" style="font-size: 14px;">{fmtTime(upstream?.last_login_at)}</div>
+                    </div>
+                </div>
+
+                {#if upstream?.last_login_error}
+                    <div class="error-message">
+                        Last login error: {upstream.last_login_error}
+                    </div>
+                {/if}
+            </div>
+
+            <div class="panel">
+                <div class="metric-label mb-4">Upstream Configuration</div>
+                <form onsubmit={handleProbe}>
+                    <div class="form-grid">
+                        <div style="grid-column: 1 / -1;">
+                            <label class="text-sm text-secondary block mb-1" for="emby_base_url">Emby Base URL</label>
+                            <input type="url" id="emby_base_url" bind:value={probeForm.emby_base_url} required placeholder="https://emby.example.com" />
+                        </div>
+                        <div>
+                            <label class="text-sm text-secondary block mb-1" for="backend_username">Backend Username</label>
+                            <input type="text" id="backend_username" bind:value={probeForm.backend_username} required />
+                        </div>
+                        <div>
+                            <label class="text-sm text-secondary block mb-1" for="backend_password">Backend Password</label>
+                            <input type="password" id="backend_password" bind:value={probeForm.backend_password} placeholder={upstream?.password_set ? '(unchanged)' : ''} />
+                        </div>
+                        <div style="grid-column: 1 / -1;">
+                            <label class="text-sm text-secondary block mb-1" for="backend_user_agent">User-Agent</label>
+                            <input type="text" id="backend_user_agent" bind:value={probeForm.backend_user_agent} />
+                        </div>
+                        <div>
+                            <label class="text-sm text-secondary block mb-1" for="backend_authorization_client">Auth Client</label>
+                            <input type="text" id="backend_authorization_client" bind:value={probeForm.backend_authorization_client} />
+                        </div>
+                        <div>
+                            <label class="text-sm text-secondary block mb-1" for="backend_authorization_device">Auth Device</label>
+                            <input type="text" id="backend_authorization_device" bind:value={probeForm.backend_authorization_device} />
+                        </div>
+                        <div>
+                            <label class="text-sm text-secondary block mb-1" for="backend_authorization_version">Auth Version</label>
+                            <input type="text" id="backend_authorization_version" bind:value={probeForm.backend_authorization_version} />
+                        </div>
+                    </div>
+                    <div class="mt-4 flex justify-end">
+                        <button type="submit" disabled={probing}>{probing ? 'Probing...' : 'Probe & Setup'}</button>
                     </div>
                 </form>
             </div>
         {/if}
 
-        <div style="overflow-x: auto;">
-            <table class="mobile-cards">
-                <thead>
-                    <tr>
-                        <th>Method</th>
-                        <th>Path pattern</th>
-                        <th>Action</th>
-                        <th>Priority</th>
-                        <th>Reason</th>
-                        <th>Status</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {#each policies as p (p.id)}
-                        <tr>
-                            <td data-label="Method"><strong>{p.method}</strong></td>
-                            <td data-label="Path pattern" class="text-sm"><code>{p.path}</code></td>
-                            <td data-label="Action">
-                                <span class={p.action === 'allow' ? 'status-ok' : 'status-err'}>
-                                    {p.action}
-                                </span>
-                            </td>
-                            <td data-label="Priority">{p.priority}</td>
-                            <td data-label="Reason" class="text-sm text-secondary">{p.reason || '-'}</td>
-                            <td data-label="Status">{p.enabled ? 'Enabled' : 'Disabled'}</td>
-                            <td data-label="Actions">
-                                <div class="flex gap-2" style="justify-content: flex-end;">
-                                    <button type="button" class="secondary text-xs" onclick={() => editPolicy(p)}>Edit</button>
-                                    <button type="button" class="secondary text-xs" onclick={() => deletePolicy(p.id)}>Delete</button>
-                                </div>
-                            </td>
-                        </tr>
-                    {:else}
-                        <tr>
-                            <td colspan="7" class="text-sm text-secondary" style="text-align: center; padding: 1.5rem;">
-                                No path policies configured.
-                            </td>
-                        </tr>
-                    {/each}
-                </tbody>
-            </table>
+        {#if activeTab === 'policies'}
+            <div class="panel" style="padding: 0;">
+                <div class="flex justify-between items-center" style="padding: 1rem 1.5rem; border-bottom: 1px solid var(--border-color);">
+                    <div class="metric-label" style="margin:0">Path Policies</div>
+                    <div class="flex gap-2">
+                        <button type="button" class="secondary" onclick={handleInstallDefaults}>Install Defaults</button>
+                        <button type="button" onclick={openNewPolicy}>Add Policy</button>
+                    </div>
+                </div>
+                
+                <div class="table-container" style="max-height: calc(100vh - 250px);">
+                    <table style="min-width: 800px;">
+                        <thead>
+                            <tr>
+                                <th style="width: 5%">Pri</th>
+                                <th style="width: 10%">Method</th>
+                                <th style="width: 35%">Path</th>
+                                <th style="width: 10%">Action</th>
+                                <th style="width: 20%">Reason</th>
+                                <th style="width: 5%">Enabled</th>
+                                <th style="width: 15%; text-align: right;">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {#if policies.length === 0}
+                                <tr>
+                                    <td colspan="7" class="text-secondary text-center" style="padding: 2rem;">No path policies configured.</td>
+                                </tr>
+                            {/if}
+                            {#each policies as p}
+                                <tr>
+                                    <td>{p.Priority ?? p.priority}</td>
+                                    <td><strong class="mono">{p.Method || p.method}</strong></td>
+                                    <td><span class="mono">{p.Path || p.path}</span></td>
+                                    <td>
+                                        <span class={(p.Action || p.action) === 'allow' ? 'status-ok' : 'status-err'}>
+                                            {(p.Action || p.action)?.toUpperCase()}
+                                        </span>
+                                    </td>
+                                    <td class="text-secondary">{p.Reason || p.reason || '-'}</td>
+                                    <td>{(p.Enabled ?? p.enabled) ? 'Yes' : 'No'}</td>
+                                    <td>
+                                        <div class="flex gap-2 justify-end">
+                                            <button class="secondary text-xs" onclick={() => openEditPolicy(p)}>Edit</button>
+                                            <button class="danger text-xs" onclick={() => handleDeletePolicy(p.ID || p.id || '')}>Del</button>
+                                        </div>
+                                    </td>
+                                </tr>
+                            {/each}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        {/if}
+    {/if}
+</div>
+
+{#if showProbeModal}
+    <div class="overlay" onclick={() => showProbeModal = false}>
+        <div class="drawer" style="width: 400px;" onclick={(e) => e.stopPropagation()}>
+            <div class="drawer-header">
+                <h3 class="drawer-title">Upstream Probe Result</h3>
+                <button class="icon" onclick={() => showProbeModal = false}>✕</button>
+            </div>
+            
+            <div class="drawer-body">
+                {#if probing}
+                    <div class="text-secondary">Probing upstream server...</div>
+                {:else if probeError}
+                    <div class="error-message">{probeError}</div>
+                {:else if probeResult}
+                    <div class="mb-4">
+                        <div class="metric-label mb-2">Probe Successful</div>
+                        <div class="data-grid" style="grid-template-columns: 1fr;">
+                            <div class="metric-box">
+                                <div class="metric-label">Server Name</div>
+                                <div class="metric-value" style="font-size: 16px;">{probeResult.server_name}</div>
+                            </div>
+                            <div class="metric-box">
+                                <div class="metric-label">Server Version</div>
+                                <div class="metric-value mono" style="font-size: 16px;">{probeResult.server_version}</div>
+                            </div>
+                            <div class="metric-box">
+                                <div class="metric-label">Latency</div>
+                                <div class="metric-value mono" style="font-size: 16px;">{probeResult.latency_ms} ms</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="text-sm text-secondary">
+                        <span class="status-warn font-bold">WARNING:</span> Applying this configuration will forcefully replace backend tokens and immediately disconnect all currently active gateway sessions.
+                    </div>
+                {/if}
+            </div>
+
+            <div class="drawer-footer">
+                <button class="secondary" onclick={() => showProbeModal = false}>Cancel</button>
+                {#if !probing && probeResult}
+                    <button class="danger" onclick={requestApply}>Apply & Disconnect Sessions</button>
+                {/if}
+            </div>
         </div>
     </div>
 {/if}
 
-{#if showProbeModal}
-    <div class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="probe-modal-title">
-        <div class="panel modal-content" style="max-width: 500px; width: 100%;">
-            <h3 id="probe-modal-title" style="margin-top:0">Upstream Probe Result</h3>
+{#if showPolicyModal}
+    <div class="overlay" onclick={() => showPolicyModal = false}>
+        <div class="drawer" style="width: 450px;" onclick={(e) => e.stopPropagation()}>
+            <div class="drawer-header">
+                <h3 class="drawer-title">{isEditingPolicy ? 'Edit Policy' : 'Add Policy'}</h3>
+                <button class="icon" onclick={() => showPolicyModal = false}>✕</button>
+            </div>
 
-            {#if probing}
-                <div>Probing upstream server...</div>
-            {:else if probeError}
-                <div class="error-message">{probeError}</div>
-                <div class="mt-4 flex gap-2">
-                    <button type="button" class="secondary" onclick={() => (showProbeModal = false)}>Close</button>
-                </div>
-            {:else if probeResult}
-                <div class="flex flex-col gap-2 mt-4 text-sm">
-                    <div class="flex justify-between">
-                        <span class="text-secondary">Server Name:</span>
-                        <span>{probeResult.server_name || '-'}</span>
+            <div class="drawer-body">
+                {#if policyError}
+                    <div class="error-message">{policyError}</div>
+                {/if}
+                <form id="policy-form" onsubmit={handleSavePolicy}>
+                    <div class="mb-4">
+                        <label class="text-sm text-secondary block mb-1" for="p_method">Method</label>
+                        <select id="p_method" bind:value={currentPolicy.method}>
+                            <option value="*">* (Any)</option>
+                            <option value="GET">GET</option>
+                            <option value="POST">POST</option>
+                            <option value="PUT">PUT</option>
+                            <option value="DELETE">DELETE</option>
+                        </select>
                     </div>
-                    <div class="flex justify-between">
-                        <span class="text-secondary">Server Version:</span>
-                        <span>{probeResult.server_version || '-'}</span>
+                    <div class="mb-4">
+                        <label class="text-sm text-secondary block mb-1" for="p_path">Path (Regex)</label>
+                        <input type="text" id="p_path" bind:value={currentPolicy.path} required placeholder="^/emby/users" class="mono" />
                     </div>
-                    <div class="flex justify-between">
-                        <span class="text-secondary">Server ID:</span>
-                        <span class="mono">{probeResult.server_id || '-'}</span>
+                    <div class="mb-4">
+                        <label class="text-sm text-secondary block mb-1" for="p_action">Action</label>
+                        <select id="p_action" bind:value={currentPolicy.action}>
+                            <option value="allow">Allow</option>
+                            <option value="block">Block</option>
+                        </select>
                     </div>
-                    <div class="flex justify-between">
-                        <span class="text-secondary">Latency:</span>
-                        <span>{probeResult.latency_ms ?? 0} ms</span>
+                    <div class="mb-4">
+                        <label class="text-sm text-secondary block mb-1" for="p_reason">Reason</label>
+                        <input type="text" id="p_reason" bind:value={currentPolicy.reason} />
                     </div>
-                </div>
+                    <div class="mb-4">
+                        <label class="text-sm text-secondary block mb-1" for="p_priority">Priority (lower runs first)</label>
+                        <input type="number" id="p_priority" bind:value={currentPolicy.priority} />
+                    </div>
+                    <div class="mb-4 flex items-center gap-2">
+                        <input type="checkbox" id="p_enabled" bind:checked={currentPolicy.enabled} style="width:auto" />
+                        <label class="text-sm text-secondary" for="p_enabled">Enabled</label>
+                    </div>
+                </form>
+            </div>
 
-                <div class="mt-4 pt-4 flex gap-2 justify-end" style="border-top: 1px solid var(--border-color)">
-                    <button type="button" class="secondary" onclick={() => (showProbeModal = false)}>Cancel</button>
-                    <button type="button" class="danger" onclick={requestReconfigure}>Apply Configuration</button>
-                </div>
-            {/if}
+            <div class="drawer-footer">
+                <button class="secondary" onclick={() => showPolicyModal = false}>Cancel</button>
+                <button type="submit" form="policy-form" disabled={policySaving}>{policySaving ? 'Saving...' : 'Save Policy'}</button>
+            </div>
         </div>
     </div>
 {/if}
 
 {#if showReauthModal}
-    <div class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="reauth-modal-title">
-        <div class="panel modal-content" style="max-width: 400px; width: 100%;">
-            <h3 id="reauth-modal-title" style="margin-top:0">Confirm Configuration Change</h3>
-            <p class="text-sm text-secondary mb-4">
-                Re-enter your admin password to apply this dangerous change.
-                {#if $session?.email}
-                    <br />Identity: <span class="mono">{$session.email}</span>
+    <div class="overlay" style="z-index: 100;" onclick={() => showReauthModal = false}>
+        <div class="drawer" style="width: 350px; justify-content: center; max-height: 350px; border-radius: 4px; margin: auto; height: auto;" onclick={(e) => e.stopPropagation()}>
+            <div class="drawer-header">
+                <h3 class="drawer-title">Confirm Change</h3>
+                <button class="icon" onclick={() => showReauthModal = false}>✕</button>
+            </div>
+            
+            <div class="drawer-body">
+                <p class="text-sm text-secondary mb-4">
+                    Re-enter your admin password to apply this change.
+                    {#if $session?.email}
+                        <br />Identity: <span class="mono">{$session.email}</span>
+                    {/if}
+                </p>
+                {#if reauthError}
+                    <div class="error-message">{reauthError}</div>
                 {/if}
-            </p>
+                <form id="reauth-form" onsubmit={handleReauthSubmit}>
+                    <input type="password" placeholder="Admin Password" bind:value={reauthPassword} required autofocus />
+                </form>
+            </div>
 
-            {#if reauthError}
-                <div class="error-message">{reauthError}</div>
-            {/if}
-
-            <form onsubmit={handleReauthAndReconfigure}>
-                <label class="text-sm text-secondary" for="reauth_password">Admin Password</label>
-                <input
-                    type="password"
-                    id="reauth_password"
-                    bind:value={reauthPassword}
-                    required
-                    class="mt-2 mb-4"
-                    autocomplete="current-password"
-                />
-                <div class="flex gap-2 justify-end">
-                    <button
-                        type="button"
-                        class="secondary"
-                        onclick={() => (showReauthModal = false)}
-                        disabled={reauthLoading}
-                    >
-                        Cancel
-                    </button>
-                    <button type="submit" class="danger" disabled={reauthLoading}>
-                        {reauthLoading ? 'Applying...' : 'Confirm & Apply'}
-                    </button>
-                </div>
-            </form>
+            <div class="drawer-footer">
+                <button class="secondary" onclick={() => showReauthModal = false}>Cancel</button>
+                <button type="submit" form="reauth-form" disabled={reauthLoading} class="danger">
+                    {reauthLoading ? 'Verifying...' : 'Confirm'}
+                </button>
+            </div>
         </div>
     </div>
 {/if}
 
 <style>
-    .modal-backdrop {
-        position: fixed;
-        top: 0;
-        left: 0;
-        right: 0;
-        bottom: 0;
-        background: rgba(0, 0, 0, 0.7);
-        display: flex;
-        justify-content: center;
-        align-items: center;
-        z-index: 100;
-        padding: 1rem;
+    .form-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 1rem;
     }
-    .modal-content {
-        margin-bottom: 0;
-        box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5);
-    }
-    .flex-col {
-        flex-direction: column;
-    }
-    .justify-end {
-        justify-content: flex-end;
-    }
-    .mono {
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-        word-break: break-all;
-    }
+    .block { display: block; }
+    .justify-end { justify-content: flex-end; }
+    .text-xs { font-size: 11px; padding: 4px 8px; }
 </style>

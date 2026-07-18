@@ -58,9 +58,28 @@ type RuntimeStatus struct {
 	HeapBytes  uint64 `json:"heap_bytes"`
 }
 
+// SeriesWindow selects historical chart coverage for Snapshot.Series.
+type SeriesWindow string
+
+const (
+	Window15m SeriesWindow = "15m"
+	Window1h  SeriesWindow = "1h"
+	Window6h  SeriesWindow = "6h"
+	Window24h SeriesWindow = "24h"
+)
+
 // SeriesData holds recent chart points (low-cardinality values only).
+//
+// Metric semantics per bucket:
+//   - rps: average requests per second over the bucket
+//   - mbps_in / mbps_out: average megabits per second over the bucket
+//   - errors: error count in the bucket (not a rate)
+//   - playbacks: max active playbacks observed in the bucket
 type SeriesData struct {
+	Window    string        `json:"window"`              // 15m|1h|6h|24h
+	Interval  string        `json:"interval,omitempty"`  // 1s|1m bucket size
 	RPS       []SeriesPoint `json:"rps"`
+	MbpsIn    []SeriesPoint `json:"mbps_in"`
 	MbpsOut   []SeriesPoint `json:"mbps_out"`
 	Errors    []SeriesPoint `json:"errors"`
 	Playbacks []SeriesPoint `json:"playbacks"`

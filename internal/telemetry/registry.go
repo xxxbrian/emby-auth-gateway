@@ -13,11 +13,16 @@ import (
 )
 
 const (
-	sessionTTL   = 5 * time.Minute
-	playbackTTL  = 90 * time.Second
-	secBuckets   = 3600
-	minBuckets   = 1440
-	seriesPoints = 60
+	sessionTTL  = 5 * time.Minute
+	playbackTTL = 90 * time.Second
+	secBuckets  = 3600
+	minBuckets  = 1440
+
+	// Series point counts by window.
+	series15mSec = 900  // 15m @ 1s
+	series1hMin  = 60   // 1h @ 1m
+	series6hMin  = 360  // 6h @ 1m
+	series24hMin = 1440 // 24h @ 1m
 
 	// Rate windows.
 	rpsWindowSec       = 10
@@ -175,11 +180,32 @@ func (r *Registry) HasActiveMediaLoad() bool {
 	return len(r.playbacks) > 0 || len(r.transfers) > 0
 }
 
-// Snapshot returns a race-safe metrics snapshot.
+// ParseSeriesWindow maps a query value to a supported series window.
+// Unknown or empty values default to 15m.
+func ParseSeriesWindow(s string) SeriesWindow {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case string(Window1h):
+		return Window1h
+	case string(Window6h):
+		return Window6h
+	case string(Window24h):
+		return Window24h
+	default:
+		return Window15m
+	}
+}
+
+// Snapshot returns a race-safe metrics snapshot with the default 15m series window.
 func (r *Registry) Snapshot() Snapshot {
+	return r.SnapshotWindow(Window15m)
+}
+
+// SnapshotWindow returns a race-safe metrics snapshot with series for the given window.
+func (r *Registry) SnapshotWindow(window SeriesWindow) Snapshot {
 	if r == nil {
 		return Snapshot{}
 	}
+	window = ParseSeriesWindow(string(window))
 	now := r.now()
 
 	var ms runtime.MemStats
@@ -232,23 +258,55 @@ func (r *Registry) Snapshot() Snapshot {
 			Goroutines: goroutines,
 			HeapBytes:  ms.HeapAlloc,
 		},
-		Series: SeriesData{
-			RPS: r.sec.series(now, seriesPoints, func(c counters) float64 {
-				return float64(c.Requests)
-			}),
-			MbpsOut: r.sec.series(now, seriesPoints, func(c counters) float64 {
-				// bytes in this 1s bucket → Mbps
-				return float64(c.BytesOut) * 8 / 1_000_000
-			}),
-			Errors: r.sec.series(now, seriesPoints, func(c counters) float64 {
-				return float64(c.Errors)
-			}),
-			Playbacks: r.sec.series(now, seriesPoints, func(c counters) float64 {
-				return float64(c.PlaybacksMax)
-			}),
-		},
+		Series: r.buildSeriesLocked(now, window),
 	}
 	return snap
+}
+
+// buildSeriesLocked selects ring resolution and point count for the window.
+// Caller must hold r.mu.
+func (r *Registry) buildSeriesLocked(now time.Time, window SeriesWindow) SeriesData {
+	switch window {
+	case Window1h:
+		return seriesFromRing(r.min, now, series1hMin, time.Minute, window)
+	case Window6h:
+		return seriesFromRing(r.min, now, series6hMin, time.Minute, window)
+	case Window24h:
+		return seriesFromRing(r.min, now, series24hMin, time.Minute, window)
+	default:
+		// 15m: prefer 1s buckets for smoothness (900 points).
+		return seriesFromRing(r.sec, now, series15mSec, time.Second, Window15m)
+	}
+}
+
+func seriesFromRing(ring *timeRing, now time.Time, n int, bucket time.Duration, window SeriesWindow) SeriesData {
+	bucketSec := bucket.Seconds()
+	if bucketSec <= 0 {
+		bucketSec = 1
+	}
+	interval := "1s"
+	if bucket >= time.Minute {
+		interval = "1m"
+	}
+	return SeriesData{
+		Window:   string(window),
+		Interval: interval,
+		RPS: ring.series(now, n, func(c counters) float64 {
+			return float64(c.Requests) / bucketSec
+		}),
+		MbpsIn: ring.series(now, n, func(c counters) float64 {
+			return float64(c.BytesIn) * 8 / 1_000_000 / bucketSec
+		}),
+		MbpsOut: ring.series(now, n, func(c counters) float64 {
+			return float64(c.BytesOut) * 8 / 1_000_000 / bucketSec
+		}),
+		Errors: ring.series(now, n, func(c counters) float64 {
+			return float64(c.Errors) // count per bucket
+		}),
+		Playbacks: ring.series(now, n, func(c counters) float64 {
+			return float64(c.PlaybacksMax)
+		}),
+	}
 }
 
 func (r *Registry) upstreamSnapshotLocked() UpstreamStatus {

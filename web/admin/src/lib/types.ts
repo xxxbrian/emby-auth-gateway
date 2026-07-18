@@ -64,7 +64,10 @@ export interface SeriesPoint {
 }
 
 export interface SeriesData {
+  window?: string; // 15m|1h|6h|24h
+  interval?: string; // 1s|1m
   rps: SeriesPoint[];
+  mbps_in?: SeriesPoint[];
   mbps_out: SeriesPoint[];
   errors: SeriesPoint[];
   playbacks: SeriesPoint[];
