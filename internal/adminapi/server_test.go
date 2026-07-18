@@ -18,7 +18,9 @@ import (
 	"github.com/xxxbrian/emby-auth-gateway/internal/telemetry"
 )
 
-const testOrigin = "https://admin.example.test"
+// testHost is used with httptest; Origin must match requestOrigin (http://Host).
+const testHost = "admin.example.test"
+const testOrigin = "http://" + testHost
 
 func newTestApp(t *testing.T) *tests.TestApp {
 	t.Helper()
@@ -55,7 +57,6 @@ func buildHandler(t *testing.T, app core.App, sessions *adminauth.Store) http.Ha
 	t.Helper()
 	srv, err := New(Config{
 		App:       app,
-		Origin:    testOrigin,
 		Sessions:  sessions,
 		Query:     adminquery.New(app, 2),
 		StartedAt: time.Now().UTC(),
@@ -78,6 +79,13 @@ func buildHandler(t *testing.T, app core.App, sessions *adminauth.Store) http.Ha
 	return mux
 }
 
+// withSameOrigin sets Host + Origin so CSRF same-origin checks pass.
+func withSameOrigin(req *http.Request) *http.Request {
+	req.Host = testHost
+	req.Header.Set("Origin", testOrigin)
+	return req
+}
+
 func TestAuthzMatrixNoCookie(t *testing.T) {
 	app := newTestApp(t)
 	h := buildHandler(t, app, adminauth.NewStore(10))
@@ -90,8 +98,7 @@ func TestAuthzMatrixNoCookie(t *testing.T) {
 	}
 	for _, path := range paths {
 		rr := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, path, nil)
-		req.Header.Set("Origin", testOrigin)
+		req := withSameOrigin(httptest.NewRequest(http.MethodGet, path, nil))
 		h.ServeHTTP(rr, req)
 		if rr.Code != http.StatusUnauthorized {
 			t.Fatalf("%s: code=%d body=%s", path, rr.Code, rr.Body.String())
@@ -104,8 +111,7 @@ func TestAuthzMatrixBadCookie(t *testing.T) {
 	h := buildHandler(t, app, adminauth.NewStore(10))
 
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/admin/api/v1/overview", nil)
-	req.Header.Set("Origin", testOrigin)
+	req := withSameOrigin(httptest.NewRequest(http.MethodGet, "/admin/api/v1/overview", nil))
 	req.AddCookie(&http.Cookie{Name: adminauth.CookieDev, Value: "not-a-real-session", Path: "/admin"})
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusUnauthorized {
@@ -125,9 +131,8 @@ func TestSessionCreateAndGet(t *testing.T) {
 
 	body, _ := json.Marshal(map[string]string{"token": token})
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/admin/api/v1/session", bytes.NewReader(body))
+	req := withSameOrigin(httptest.NewRequest(http.MethodPost, "/admin/api/v1/session", bytes.NewReader(body)))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Origin", testOrigin)
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("create code=%d body=%s", rr.Code, rr.Body.String())
@@ -174,9 +179,8 @@ func TestSessionCreateAndGet(t *testing.T) {
 
 	// Write without CSRF fails.
 	rr = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/admin/api/v1/users", bytes.NewReader([]byte(`{"username":"u","password":"p","synthetic_user_id":"s"}`)))
+	req = withSameOrigin(httptest.NewRequest(http.MethodPost, "/admin/api/v1/users", bytes.NewReader([]byte(`{"username":"u","password":"p","synthetic_user_id":"s"}`))))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Origin", testOrigin)
 	req.AddCookie(sessionCookie)
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusForbidden {
@@ -184,7 +188,7 @@ func TestSessionCreateAndGet(t *testing.T) {
 	}
 }
 
-func TestSessionCreateOriginRequired(t *testing.T) {
+func TestSessionCreateEvilOriginRejected(t *testing.T) {
 	app := newTestApp(t)
 	su := createSuperuser(t, app, "admin2@example.test", "SuperSecret1!")
 	token, err := su.NewAuthToken()
@@ -195,8 +199,8 @@ func TestSessionCreateOriginRequired(t *testing.T) {
 	body, _ := json.Marshal(map[string]string{"token": token})
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/admin/api/v1/session", bytes.NewReader(body))
+	req.Host = testHost
 	req.Header.Set("Content-Type", "application/json")
-	// wrong origin
 	req.Header.Set("Origin", "https://evil.example")
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusForbidden {
@@ -204,10 +208,82 @@ func TestSessionCreateOriginRequired(t *testing.T) {
 	}
 }
 
-func TestNewRequiresOrigin(t *testing.T) {
+func TestSessionCreateMatchingOriginOK(t *testing.T) {
 	app := newTestApp(t)
-	if _, err := New(Config{App: app, Origin: ""}); err == nil {
-		t.Fatal("expected error")
+	su := createSuperuser(t, app, "match@example.test", "SuperSecret1!")
+	token, err := su.NewAuthToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := buildHandler(t, app, adminauth.NewStore(10))
+	body, _ := json.Marshal(map[string]string{"token": token})
+	rr := httptest.NewRecorder()
+	req := withSameOrigin(httptest.NewRequest(http.MethodPost, "/admin/api/v1/session", bytes.NewReader(body)))
+	req.Header.Set("Content-Type", "application/json")
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestSessionCreateSecFetchSiteSameOrigin(t *testing.T) {
+	app := newTestApp(t)
+	su := createSuperuser(t, app, "sfs@example.test", "SuperSecret1!")
+	token, err := su.NewAuthToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := buildHandler(t, app, adminauth.NewStore(10))
+	body, _ := json.Marshal(map[string]string{"token": token})
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/v1/session", bytes.NewReader(body))
+	req.Host = testHost
+	req.Header.Set("Content-Type", "application/json")
+	// No Origin header; Sec-Fetch-Site same-origin is enough.
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestSessionCreateMissingOriginRejected(t *testing.T) {
+	app := newTestApp(t)
+	su := createSuperuser(t, app, "noorigin@example.test", "SuperSecret1!")
+	token, err := su.NewAuthToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := buildHandler(t, app, adminauth.NewStore(10))
+	body, _ := json.Marshal(map[string]string{"token": token})
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/v1/session", bytes.NewReader(body))
+	req.Host = testHost
+	req.Header.Set("Content-Type", "application/json")
+	// No Origin, no Sec-Fetch-Site.
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestNewAllowsEmptyOrigin(t *testing.T) {
+	app := newTestApp(t)
+	if _, err := New(Config{App: app, Origin: ""}); err != nil {
+		t.Fatalf("empty Origin must be allowed: %v", err)
+	}
+}
+
+func TestRequestOrigin(t *testing.T) {
+	t.Parallel()
+	req := httptest.NewRequest(http.MethodGet, "http://example.test:8090/admin", nil)
+	req.Host = "example.test:8090"
+	if got := requestOrigin(req); got != "http://example.test:8090" {
+		t.Fatalf("got=%q", got)
+	}
+	req.Header.Set("X-Forwarded-Proto", "https, http")
+	if got := requestOrigin(req); got != "https://example.test:8090" {
+		t.Fatalf("forwarded got=%q", got)
 	}
 }
 
@@ -224,9 +300,8 @@ func TestCreateUserReturnsUserDTO(t *testing.T) {
 	// Establish admin session.
 	body, _ := json.Marshal(map[string]string{"token": token})
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/admin/api/v1/session", bytes.NewReader(body))
+	req := withSameOrigin(httptest.NewRequest(http.MethodPost, "/admin/api/v1/session", bytes.NewReader(body)))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Origin", testOrigin)
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("session create code=%d body=%s", rr.Code, rr.Body.String())
@@ -253,9 +328,8 @@ func TestCreateUserReturnsUserDTO(t *testing.T) {
 		"synthetic_user_id": "syn-dto-1",
 	})
 	rr = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/admin/api/v1/users", bytes.NewReader(userBody))
+	req = withSameOrigin(httptest.NewRequest(http.MethodPost, "/admin/api/v1/users", bytes.NewReader(userBody)))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Origin", testOrigin)
 	req.Header.Set(adminauth.CSRFHeader, csrf)
 	req.AddCookie(sessionCookie)
 	h.ServeHTTP(rr, req)
@@ -300,9 +374,8 @@ func TestCreateUserReturnsUserDTO(t *testing.T) {
 
 	// Duplicate must be 409, not password overwrite.
 	rr = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/admin/api/v1/users", bytes.NewReader(userBody))
+	req = withSameOrigin(httptest.NewRequest(http.MethodPost, "/admin/api/v1/users", bytes.NewReader(userBody)))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Origin", testOrigin)
 	req.Header.Set(adminauth.CSRFHeader, csrf)
 	req.AddCookie(sessionCookie)
 	h.ServeHTTP(rr, req)
@@ -324,9 +397,8 @@ func TestUpstreamProbeFailsOnBadPassword(t *testing.T) {
 	// Session + CSRF.
 	body, _ := json.Marshal(map[string]string{"token": token})
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/admin/api/v1/session", bytes.NewReader(body))
+	req := withSameOrigin(httptest.NewRequest(http.MethodPost, "/admin/api/v1/session", bytes.NewReader(body)))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Origin", testOrigin)
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("session create code=%d body=%s", rr.Code, rr.Body.String())
@@ -361,18 +433,17 @@ func TestUpstreamProbeFailsOnBadPassword(t *testing.T) {
 	defer backend.Close()
 
 	probeBody, _ := json.Marshal(map[string]any{
-		"emby_base_url":     backend.URL,
-		"backend_username":  "u",
-		"backend_password":  "bad",
-		"backend_user_agent": "ua",
-		"backend_authorization_client": "c",
-		"backend_authorization_device": "d",
+		"emby_base_url":                 backend.URL,
+		"backend_username":              "u",
+		"backend_password":              "bad",
+		"backend_user_agent":            "ua",
+		"backend_authorization_client":  "c",
+		"backend_authorization_device":  "d",
 		"backend_authorization_version": "v",
 	})
 	rr = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/admin/api/v1/upstream/probe", bytes.NewReader(probeBody))
+	req = withSameOrigin(httptest.NewRequest(http.MethodPost, "/admin/api/v1/upstream/probe", bytes.NewReader(probeBody)))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Origin", testOrigin)
 	req.Header.Set(adminauth.CSRFHeader, csrf)
 	req.AddCookie(sessionCookie)
 	h.ServeHTTP(rr, req)
@@ -395,7 +466,6 @@ func TestOverviewWindowQuery(t *testing.T) {
 	reg := telemetry.New(nil)
 	srv, err := New(Config{
 		App:       app,
-		Origin:    testOrigin,
 		Sessions:  sessions,
 		Query:     adminquery.New(app, 2),
 		Telemetry: reg,
@@ -419,9 +489,8 @@ func TestOverviewWindowQuery(t *testing.T) {
 	// Create session cookie.
 	body, _ := json.Marshal(map[string]string{"token": token})
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/admin/api/v1/session", bytes.NewReader(body))
+	req := withSameOrigin(httptest.NewRequest(http.MethodPost, "/admin/api/v1/session", bytes.NewReader(body)))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Origin", testOrigin)
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("create session code=%d body=%s", rr.Code, rr.Body.String())

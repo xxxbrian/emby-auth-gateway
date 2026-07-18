@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -22,14 +21,13 @@ import (
 )
 
 // adminConfig is loaded from environment for the public admin control plane.
-// Admin is always mounted; Origin is required for CSRF (exact trusted origin).
+// Admin is always mounted. CSRF uses same-origin checks (request Origin vs Host),
+// so no fixed GATEWAY_ADMIN_ORIGIN is required at startup.
 type adminConfig struct {
-	Origin             string
 	AuditRetentionDays int
 }
 
 func adminConfigFromEnv() adminConfig {
-	origin := resolveAdminOriginFromEnv()
 	days := 30
 	if v := strings.TrimSpace(os.Getenv("GATEWAY_ADMIN_AUDIT_RETENTION_DAYS")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -37,45 +35,8 @@ func adminConfigFromEnv() adminConfig {
 		}
 	}
 	return adminConfig{
-		Origin:             origin,
 		AuditRetentionDays: days,
 	}
-}
-
-// resolveAdminOriginFromEnv prefers GATEWAY_ADMIN_ORIGIN; otherwise derives
-// scheme://host from GATEWAY_PUBLIC_URL (path like /emby is stripped).
-// Returns empty string when neither yields a usable candidate; mountAdmin
-// validates and fails startup closed.
-func resolveAdminOriginFromEnv() string {
-	if raw := strings.TrimSpace(os.Getenv("GATEWAY_ADMIN_ORIGIN")); raw != "" {
-		return strings.TrimRight(raw, "/")
-	}
-	if derived, err := originFromPublicURL(os.Getenv("GATEWAY_PUBLIC_URL")); err == nil {
-		return derived
-	}
-	return ""
-}
-
-// originFromPublicURL derives scheme://host from a public base URL, stripping any path.
-func originFromPublicURL(raw string) (string, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return "", fmt.Errorf("GATEWAY_PUBLIC_URL is empty")
-	}
-	if !strings.Contains(raw, "://") {
-		return "", fmt.Errorf("GATEWAY_PUBLIC_URL must be an absolute http or https URL")
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "", fmt.Errorf("GATEWAY_PUBLIC_URL is invalid: %w", err)
-	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return "", fmt.Errorf("GATEWAY_PUBLIC_URL must use http or https scheme")
-	}
-	if u.Host == "" {
-		return "", fmt.Errorf("GATEWAY_PUBLIC_URL must include a host")
-	}
-	return u.Scheme + "://" + u.Host, nil
 }
 
 // mountAdmin always mounts the admin API and SPA.
@@ -83,7 +44,7 @@ func originFromPublicURL(raw string) (string, error) {
 // registration handler when webReady, deliberate 404 otherwise.
 // acquireReconfigure is the preferred reconfigure exclusion gate; activeMediaLoad
 // is the fallback when acquireReconfigure is nil.
-// Origin must be a valid trusted origin (CSRF); invalid config fails startup closed.
+// Does not require GATEWAY_ADMIN_ORIGIN or GATEWAY_PUBLIC_URL.
 func mountAdmin(
 	r *router.Router[*core.RequestEvent],
 	app core.App,
@@ -109,19 +70,12 @@ func mountAdmin(
 		})
 	}
 
-	origin, err := validateAdminOrigin(cfg.Origin)
-	if err != nil {
-		return fmt.Errorf("admin control plane requires a trusted origin (set GATEWAY_ADMIN_ORIGIN or a valid GATEWAY_PUBLIC_URL): %w", err)
-	}
-	cfg.Origin = origin
-
 	// SPA posts to PB superuser auth directly; rate-limit before session exchange.
 	// Match both collection name and resolved id (clients may use either).
 	bindSuperuserAuthRateLimit(r, adminauth.NewRateLimiter(superuserAuthRateLimit, superuserAuthRateWindow), superuserAuthCollectionIDs(app)...)
 
 	api, err := adminapi.New(adminapi.Config{
 		App:                app,
-		Origin:             cfg.Origin,
 		Sessions:           adminauth.NewStore(adminauth.DefaultMaxSessions),
 		Query:              adminquery.New(app, adminquery.DefaultConcurrency),
 		Telemetry:          registry,

@@ -1,10 +1,7 @@
 package main
 
 import (
-	"fmt"
-	"net"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -27,56 +24,6 @@ const (
 	// Run with other early rate-limit middleware (before default PB rate limit).
 	superuserAuthRateMiddlewarePriority = apis.DefaultRateLimitMiddlewarePriority - 1
 )
-
-// validateAdminOrigin normalizes and validates GATEWAY_ADMIN_ORIGIN.
-// Requires an absolute http/https URL with a host. http is allowed only for
-// loopback hosts (localhost, 127.0.0.1, ::1); non-loopback http fails closed.
-func validateAdminOrigin(raw string) (string, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return "", fmt.Errorf("GATEWAY_ADMIN_ORIGIN is empty")
-	}
-	// Reject path-only or scheme-less values before parse edge cases.
-	if !strings.Contains(raw, "://") {
-		return "", fmt.Errorf("GATEWAY_ADMIN_ORIGIN must be an absolute http or https URL")
-	}
-
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "", fmt.Errorf("GATEWAY_ADMIN_ORIGIN is invalid: %w", err)
-	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return "", fmt.Errorf("GATEWAY_ADMIN_ORIGIN must use http or https scheme")
-	}
-	if u.Host == "" {
-		return "", fmt.Errorf("GATEWAY_ADMIN_ORIGIN must include a host")
-	}
-	if u.User != nil {
-		return "", fmt.Errorf("GATEWAY_ADMIN_ORIGIN must not include userinfo")
-	}
-	if u.RawQuery != "" || u.Fragment != "" {
-		return "", fmt.Errorf("GATEWAY_ADMIN_ORIGIN must not include query or fragment")
-	}
-	// Origins never include a path; reject path-only leftovers and accidental paths.
-	if path := strings.TrimRight(u.Path, "/"); path != "" {
-		return "", fmt.Errorf("GATEWAY_ADMIN_ORIGIN must not include a path")
-	}
-	if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
-		return "", fmt.Errorf("GATEWAY_ADMIN_ORIGIN http is only allowed for loopback hosts")
-	}
-
-	// Canonical origin: scheme://host (no trailing slash, no path).
-	return u.Scheme + "://" + u.Host, nil
-}
-
-func isLoopbackHost(host string) bool {
-	host = strings.ToLower(strings.TrimSpace(host))
-	if host == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
-}
 
 // superuserAuthCollectionIDs returns identities used in PB auth paths:
 // the collection name plus the resolved collection id when available.

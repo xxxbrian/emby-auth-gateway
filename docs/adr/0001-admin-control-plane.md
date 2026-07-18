@@ -36,15 +36,16 @@ ops surface. Schema is 0.7 canonical/exact-validate with no application migratio
 - Cookie: `__Secure-eag_admin_session`, `Secure`, `HttpOnly`, `SameSite=Strict`,
   `Path=/admin`, absolute 8h, idle 30m.
 - Early path-scoped middleware injects `Authorization` before PB auth loading.
-- Writes require CSRF token + exact Origin match + same-origin fetch metadata.
+- Writes require CSRF token + same-origin checks: `Origin` must equal the
+  current request origin (`scheme://Host`, with `X-Forwarded-Proto` when set),
+  or when `Origin` is absent `Sec-Fetch-Site: same-origin` is required.
 - Strict CSP; HTML/JSON/SSE are `Cache-Control: private, no-store`.
 
 ### Enablement
 
 - Admin control plane is always mounted (no feature flag).
-- Trusted origin for CSRF: prefer `GATEWAY_ADMIN_ORIGIN`; else derive
-  `scheme://host` from `GATEWAY_PUBLIC_URL` (path such as `/emby` is stripped).
-- Missing or invalid origin fails startup closed (origin is required for CSRF).
+- No fixed `GATEWAY_ADMIN_ORIGIN` / `GATEWAY_PUBLIC_URL` is required to mount
+  admin; CSRF is evaluated per request against the inbound Host.
 - Telemetry may run independently; telemetry failure never blocks gateway start.
 
 ### Isolation

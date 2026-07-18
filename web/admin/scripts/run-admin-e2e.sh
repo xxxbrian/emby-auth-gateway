@@ -117,15 +117,11 @@ start_gateway() {
 
   "${GATEWAY_BIN}" --dir "${TMP_PB_DIR}" superuser create "${EMAIL}" "${PASSWORD}"
 
-  # Admin UI is always on for this closure runner; public URL includes /emby base path.
-  export GATEWAY_ADMIN_ENABLED=1
-  export GATEWAY_ADMIN_ORIGIN="${BASE}"
+  # Admin is always mounted; CSRF is same-origin (browser Origin matches Host).
+  # PUBLIC_URL is optional (Emby rewrite); set for realistic local Emby URLs.
   export GATEWAY_PUBLIC_URL="${BASE}/emby"
 
-  # Explicit env for child process (document required pair).
   env \
-    GATEWAY_ADMIN_ENABLED=1 \
-    GATEWAY_ADMIN_ORIGIN="${BASE}" \
     GATEWAY_PUBLIC_URL="${BASE}/emby" \
     "${GATEWAY_BIN}" --dir "${TMP_PB_DIR}" serve --http="127.0.0.1:${PORT}" &
   GATEWAY_PID=$!

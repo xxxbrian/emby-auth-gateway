@@ -29,10 +29,12 @@ const (
 
 // Config configures the admin API.
 type Config struct {
-	App         core.App
-	Origin      string // exact trusted origin, required
-	Sessions    *adminauth.Store
-	Query       *adminquery.Querier
+	App      core.App
+	// Origin is deprecated/unused for CSRF. Writes use same-origin checks against
+	// the current request (Origin header vs scheme://Host, or Sec-Fetch-Site).
+	Origin   string
+	Sessions *adminauth.Store
+	Query    *adminquery.Querier
 	Telemetry *telemetry.Registry // optional
 	// AcquireReconfigure, when set, is the preferred reconfigure exclusion gate
 	// (holds exclusive lock over media copies for the duration of reconfigure).
@@ -57,10 +59,6 @@ func New(cfg Config) (*Server, error) {
 	if cfg.App == nil {
 		return nil, errors.New("adminapi: app is required")
 	}
-	origin := strings.TrimRight(strings.TrimSpace(cfg.Origin), "/")
-	if origin == "" {
-		return nil, errors.New("adminapi: origin is required")
-	}
 	if cfg.Sessions == nil {
 		cfg.Sessions = adminauth.NewStore(adminauth.DefaultMaxSessions)
 	}
@@ -76,7 +74,8 @@ func New(cfg Config) (*Server, error) {
 	if cfg.StartedAt.IsZero() {
 		cfg.StartedAt = time.Now().UTC()
 	}
-	cfg.Origin = origin
+	// Origin is ignored for CSRF (same-origin only); keep trimmed if set for diagnostics.
+	cfg.Origin = strings.TrimRight(strings.TrimSpace(cfg.Origin), "/")
 	return &Server{cfg: cfg}, nil
 }
 
@@ -204,27 +203,56 @@ func sessionFromEvent(e *core.RequestEvent) *adminauth.Session {
 	return sess
 }
 
+// requireOrigin enforces same-origin CSRF for writes and session create:
+// Origin must equal the current request origin (scheme://Host), or when Origin
+// is absent Sec-Fetch-Site must be same-origin.
 func (s *Server) requireOrigin(e *core.RequestEvent) error {
-	origin := strings.TrimRight(strings.TrimSpace(e.Request.Header.Get("Origin")), "/")
+	if e == nil || e.Request == nil {
+		return e.ForbiddenError("origin required", nil)
+	}
+	req := e.Request
+	origin := strings.TrimRight(strings.TrimSpace(req.Header.Get("Origin")), "/")
 	if origin == "" {
-		// Same-origin navigations may omit Origin; require Sec-Fetch-Site=same-origin
-		// or matching Referer host for defense in depth.
-		if site := e.Request.Header.Get("Sec-Fetch-Site"); site == "same-origin" || site == "" {
-			if ref := e.Request.Header.Get("Referer"); ref != "" {
-				if strings.HasPrefix(ref, s.cfg.Origin+"/") || ref == s.cfg.Origin {
-					return nil
-				}
-			}
-			if site == "same-origin" {
-				return nil
-			}
+		if site := req.Header.Get("Sec-Fetch-Site"); site == "same-origin" {
+			return nil
 		}
 		return e.ForbiddenError("origin required", nil)
 	}
-	if origin != s.cfg.Origin {
+	expected := requestOrigin(req)
+	if expected == "" || origin != expected {
 		return e.ForbiddenError("origin mismatch", nil)
 	}
 	return nil
+}
+
+// requestOrigin returns scheme://Host for the inbound request.
+// Scheme is https when TLS is present, else X-Forwarded-Proto when http/https, else http.
+func requestOrigin(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	} else if p := firstForwardedProto(r.Header.Get("X-Forwarded-Proto")); p == "http" || p == "https" {
+		scheme = p
+	}
+	host := strings.TrimSpace(r.Host)
+	if host == "" {
+		return ""
+	}
+	return scheme + "://" + host
+}
+
+func firstForwardedProto(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if i := strings.IndexByte(raw, ','); i >= 0 {
+		raw = raw[:i]
+	}
+	return strings.ToLower(strings.TrimSpace(raw))
 }
 
 // --- session handlers ---
