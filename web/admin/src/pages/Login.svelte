@@ -21,7 +21,7 @@
 </script>
 
 <div class="login-container">
-    <form class="login-box panel" on:submit={handleSubmit}>
+    <form class="login-box panel" onsubmit={handleSubmit}>
         <h2 class="mb-4" style="margin-top: 0;">Emby Auth Gateway</h2>
         
         {#if error}

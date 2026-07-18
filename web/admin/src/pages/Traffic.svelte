@@ -30,7 +30,7 @@
 
 <div class="flex justify-between items-center mb-4">
     <h1 class="page-title" style="margin: 0">Traffic & Audit</h1>
-    <button class="secondary" on:click={loadData} disabled={loading}>Refresh</button>
+    <button class="secondary" onclick={loadData} disabled={loading}>Refresh</button>
 </div>
 
 {#if error}

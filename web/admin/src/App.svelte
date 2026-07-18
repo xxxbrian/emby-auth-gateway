@@ -35,7 +35,7 @@
     });
 </script>
 
-<svelte:window on:hashchange={updatePath} />
+<svelte:window onhashchange={updatePath} />
 
 {#if !$initialized}
     <div style="display: flex; justify-content: center; align-items: center; height: 100vh;">
@@ -56,7 +56,7 @@
             </nav>
             <div class="sidebar-footer">
                 <div class="text-sm text-secondary" style="word-break: break-all;">{$session.email || $session.superuser_id || 'superuser'}</div>
-                <button class="secondary sidebar-logout" on:click={logout}>Logout</button>
+                <button class="secondary sidebar-logout" onclick={logout}>Logout</button>
             </div>
         </aside>
 

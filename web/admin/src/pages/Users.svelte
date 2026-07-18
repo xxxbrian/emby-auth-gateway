@@ -102,7 +102,7 @@
 
 <div class="flex justify-between items-center mb-4">
     <h1 class="page-title" style="margin: 0">Users</h1>
-    <button on:click={() => showCreate = !showCreate}>{showCreate ? 'Cancel' : 'Create User'}</button>
+    <button onclick={() => showCreate = !showCreate}>{showCreate ? 'Cancel' : 'Create User'}</button>
 </div>
 
 {#if error}
@@ -115,7 +115,7 @@
         {#if createError}
             <div class="error-message">{createError}</div>
         {/if}
-        <form on:submit={handleCreate} class="form-grid">
+        <form onsubmit={handleCreate} class="form-grid">
             <div>
                 <label class="text-sm text-secondary" for="username">Username</label>
                 <input type="text" id="username" bind:value={newUsername} required class="mt-2" />
@@ -138,10 +138,10 @@
 {#if resetUserId}
     <div class="panel">
         <h3 style="margin-top:0">Reset Password</h3>
-        <form on:submit={handleResetPassword} class="flex gap-4 items-center">
+        <form onsubmit={handleResetPassword} class="flex gap-4 items-center">
             <input type="password" placeholder="New password" bind:value={resetPasswordValue} required />
             <button type="submit">Reset</button>
-            <button type="button" class="secondary" on:click={() => resetUserId = null}>Cancel</button>
+            <button type="button" class="secondary" onclick={() => resetUserId = null}>Cancel</button>
         </form>
     </div>
 {/if}
@@ -175,11 +175,11 @@
                         <td data-label="Created">{fmtTime(user.created)}</td>
                         <td data-label="Actions">
                             <div class="flex gap-2 action-row">
-                                <button class="secondary text-xs" on:click={() => toggleEnable(user)}>
+                                <button class="secondary text-xs" onclick={() => toggleEnable(user)}>
                                     {user.enabled ? 'Disable' : 'Enable'}
                                 </button>
-                                <button class="secondary text-xs" on:click={() => resetUserId = user.id}>Password</button>
-                                <button class="secondary text-xs" on:click={() => revokeSessions(user.id)}>Kick</button>
+                                <button class="secondary text-xs" onclick={() => resetUserId = user.id}>Password</button>
+                                <button class="secondary text-xs" onclick={() => revokeSessions(user.id)}>Kick</button>
                             </div>
                         </td>
                     </tr>

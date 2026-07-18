@@ -363,7 +363,7 @@
 
     <div class="panel">
         <h3 style="margin-top:0">Upstream Configuration</h3>
-        <form on:submit={handleProbe}>
+        <form onsubmit={handleProbe}>
             <div class="flex gap-4 mb-4" style="flex-wrap: wrap">
                 <div style="flex: 1; min-width: 250px;">
                     <label class="text-sm text-secondary" for="emby_base_url">Emby Base URL</label>
@@ -458,14 +458,14 @@
         <div class="flex justify-between items-center" style="padding: 1.5rem">
             <h3 style="margin: 0">Path Policies</h3>
             <div class="flex gap-2">
-                <button type="button" class="secondary" on:click={handleInstallDefaults}>Install Defaults</button>
-                <button type="button" on:click={openNewPolicy}>Add Policy</button>
+                <button type="button" class="secondary" onclick={handleInstallDefaults}>Install Defaults</button>
+                <button type="button" onclick={openNewPolicy}>Add Policy</button>
             </div>
         </div>
 
         {#if showPolicyForm}
             <div style="padding: 0 1.5rem 1.5rem; border-bottom: 1px solid var(--border-color);">
-                <form on:submit={savePolicy} class="flex gap-4 items-end" style="flex-wrap: wrap">
+                <form onsubmit={savePolicy} class="flex gap-4 items-end" style="flex-wrap: wrap">
                     <div>
                         <label class="text-xs text-secondary" for="policy_method">Method (* or GET/POST)</label>
                         <input
@@ -519,7 +519,7 @@
                     </label>
                     <div class="flex gap-2" style="margin-bottom: 0.15rem;">
                         <button type="submit">Save</button>
-                        <button type="button" class="secondary" on:click={() => (showPolicyForm = false)}>Cancel</button>
+                        <button type="button" class="secondary" onclick={() => (showPolicyForm = false)}>Cancel</button>
                     </div>
                 </form>
             </div>
@@ -553,8 +553,8 @@
                             <td data-label="Status">{p.enabled ? 'Enabled' : 'Disabled'}</td>
                             <td data-label="Actions">
                                 <div class="flex gap-2" style="justify-content: flex-end;">
-                                    <button type="button" class="secondary text-xs" on:click={() => editPolicy(p)}>Edit</button>
-                                    <button type="button" class="secondary text-xs" on:click={() => deletePolicy(p.id)}>Delete</button>
+                                    <button type="button" class="secondary text-xs" onclick={() => editPolicy(p)}>Edit</button>
+                                    <button type="button" class="secondary text-xs" onclick={() => deletePolicy(p.id)}>Delete</button>
                                 </div>
                             </td>
                         </tr>
@@ -581,7 +581,7 @@
             {:else if probeError}
                 <div class="error-message">{probeError}</div>
                 <div class="mt-4 flex gap-2">
-                    <button type="button" class="secondary" on:click={() => (showProbeModal = false)}>Close</button>
+                    <button type="button" class="secondary" onclick={() => (showProbeModal = false)}>Close</button>
                 </div>
             {:else if probeResult}
                 <div class="flex flex-col gap-2 mt-4 text-sm">
@@ -604,8 +604,8 @@
                 </div>
 
                 <div class="mt-4 pt-4 flex gap-2 justify-end" style="border-top: 1px solid var(--border-color)">
-                    <button type="button" class="secondary" on:click={() => (showProbeModal = false)}>Cancel</button>
-                    <button type="button" class="danger" on:click={requestReconfigure}>Apply Configuration</button>
+                    <button type="button" class="secondary" onclick={() => (showProbeModal = false)}>Cancel</button>
+                    <button type="button" class="danger" onclick={requestReconfigure}>Apply Configuration</button>
                 </div>
             {/if}
         </div>
@@ -627,7 +627,7 @@
                 <div class="error-message">{reauthError}</div>
             {/if}
 
-            <form on:submit={handleReauthAndReconfigure}>
+            <form onsubmit={handleReauthAndReconfigure}>
                 <label class="text-sm text-secondary" for="reauth_password">Admin Password</label>
                 <input
                     type="password"
@@ -641,7 +641,7 @@
                     <button
                         type="button"
                         class="secondary"
-                        on:click={() => (showReauthModal = false)}
+                        onclick={() => (showReauthModal = false)}
                         disabled={reauthLoading}
                     >
                         Cancel

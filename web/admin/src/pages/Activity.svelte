@@ -63,9 +63,9 @@
 <h1 class="page-title">Activity</h1>
 
 <div class="tabs" role="tablist">
-    <button type="button" class="tab {activeTab === 'playbacks' ? 'active' : ''}" role="tab" aria-selected={activeTab === 'playbacks'} on:click={() => switchTab('playbacks')}>Playbacks</button>
-    <button type="button" class="tab {activeTab === 'transfers' ? 'active' : ''}" role="tab" aria-selected={activeTab === 'transfers'} on:click={() => switchTab('transfers')}>Transfers</button>
-    <button type="button" class="tab {activeTab === 'sessions' ? 'active' : ''}" role="tab" aria-selected={activeTab === 'sessions'} on:click={() => switchTab('sessions')}>Sessions</button>
+    <button type="button" class="tab {activeTab === 'playbacks' ? 'active' : ''}" role="tab" aria-selected={activeTab === 'playbacks'} onclick={() => switchTab('playbacks')}>Playbacks</button>
+    <button type="button" class="tab {activeTab === 'transfers' ? 'active' : ''}" role="tab" aria-selected={activeTab === 'transfers'} onclick={() => switchTab('transfers')}>Transfers</button>
+    <button type="button" class="tab {activeTab === 'sessions' ? 'active' : ''}" role="tab" aria-selected={activeTab === 'sessions'} onclick={() => switchTab('sessions')}>Sessions</button>
 </div>
 
 {#if error}
@@ -157,7 +157,7 @@
                         <td data-label="Expires">{fmtTime(s.expires_at)}</td>
                         <td data-label="Actions">
                             {#if s.active}
-                                <button class="secondary text-xs" on:click={async () => {
+                                <button class="secondary text-xs" onclick={async () => {
                                     if (!confirm('Revoke this session?')) return;
                                     try {
                                         await apiRequest(`/sessions/${s.id}/revoke`, { method: 'POST' });
