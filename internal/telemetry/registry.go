@@ -119,47 +119,68 @@ func (r *Registry) Start(ctx context.Context) {
 
 // sampleLiveBytes moves cumulative ByteMeter totals into 1s/1m rings once per second.
 // This is the sole source of Traffic.Mbps* / series bandwidth (not PhaseEnd events).
+// prev starts at 0 so bytes written before the sampler goroutine starts are not lost.
 func (r *Registry) sampleLiveBytes(ctx context.Context) {
 	if r == nil || r.meter == nil {
 		return
 	}
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	var prevIn, prevOut uint64
-	// Seed previous so the first tick only records the last second of activity.
-	prevIn, prevOut = r.meter.Totals()
+	var prevIn, prevOut, prevErr uint64
+	// First sample immediately so early traffic is not discarded until the first tick.
+	r.SampleLiveBytesOnce(r.sampleTime(time.Now()), &prevIn, &prevOut, &prevErr)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			in, out := r.meter.Totals()
-			dIn := int64(in - prevIn)
-			dOut := int64(out - prevOut)
-			prevIn, prevOut = in, out
-			if dIn < 0 {
-				dIn = 0
-			}
-			if dOut < 0 {
-				dOut = 0
-			}
-			if dIn == 0 && dOut == 0 {
-				continue
-			}
-			at := now.UTC()
-			if r.now != nil {
-				at = r.now()
-			}
-			r.mu.Lock()
-			fn := func(c *counters) {
-				c.BytesIn += dIn
-				c.BytesOut += dOut
-			}
-			r.sec.add(at, fn)
-			r.min.add(at, fn)
-			r.mu.Unlock()
+			r.SampleLiveBytesOnce(r.sampleTime(now), &prevIn, &prevOut, &prevErr)
 		}
 	}
+}
+
+func (r *Registry) sampleTime(fallback time.Time) time.Time {
+	if r != nil && r.now != nil {
+		return r.now()
+	}
+	return fallback.UTC()
+}
+
+// SampleLiveBytesOnce applies one meter→ring sample. Used by the sampler and tests.
+// prev* are updated in place. Delayed ticks attribute the full multi-second delta
+// to the sample timestamp (documented trade-off vs splitting buckets).
+func (r *Registry) SampleLiveBytesOnce(at time.Time, prevIn, prevOut, prevErr *uint64) {
+	if r == nil || r.meter == nil || prevIn == nil || prevOut == nil || prevErr == nil {
+		return
+	}
+	in, out := r.meter.Totals()
+	errs := r.meter.ErrorTotal()
+	dIn := int64(in - *prevIn)
+	dOut := int64(out - *prevOut)
+	dErr := int64(errs - *prevErr)
+	*prevIn, *prevOut, *prevErr = in, out, errs
+	if dIn < 0 {
+		dIn = 0
+	}
+	if dOut < 0 {
+		dOut = 0
+	}
+	if dErr < 0 {
+		dErr = 0
+	}
+	if dIn == 0 && dOut == 0 && dErr == 0 {
+		return
+	}
+	at = at.UTC()
+	r.mu.Lock()
+	fn := func(c *counters) {
+		c.BytesIn += dIn
+		c.BytesOut += dOut
+		c.Errors += dErr
+	}
+	r.sec.add(at, fn)
+	r.min.add(at, fn)
+	r.mu.Unlock()
 }
 
 // NoteSessionActivity records request activity for session liveness (5m TTL).
@@ -232,6 +253,7 @@ func (r *Registry) ActiveTransfers() []Transfer {
 }
 
 // HasActiveMediaLoad reports whether any playbacks or live transfers are active.
+// Transfer activity is meter-only (legacy event map is not consulted).
 func (r *Registry) HasActiveMediaLoad() bool {
 	if r == nil {
 		return false
@@ -243,7 +265,7 @@ func (r *Registry) HasActiveMediaLoad() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.expireLocked(now)
-	return len(r.playbacks) > 0 || len(r.transfers) > 0
+	return len(r.playbacks) > 0
 }
 
 // ParseSeriesWindow maps a query value to a supported series window.

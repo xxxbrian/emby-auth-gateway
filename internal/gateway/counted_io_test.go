@@ -2,7 +2,9 @@ package gateway
 
 import (
 	"bytes"
+	"errors"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -13,7 +15,7 @@ import (
 
 func TestCountedWriterRecordsEgressBeforeCopyCompletes(t *testing.T) {
 	meter := telemetry.NewByteMeter()
-	id := meter.BeginTransfer(telemetry.TransferMeta{SessionID: "s", Method: "GET", MediaMode: "direct"})
+	handle := meter.BeginTransfer(telemetry.TransferMeta{SessionID: "s", Method: "GET", MediaMode: "direct"})
 
 	pr, pw := io.Pipe()
 	go func() {
@@ -24,8 +26,8 @@ func TestCountedWriterRecordsEgressBeforeCopyCompletes(t *testing.T) {
 	}()
 
 	rec := httptest.NewRecorder()
-	dst := newCountedWriter(rec, meter, id)
-	src := newCountedReader(pr, meter, id)
+	dst := newCountedWriter(rec, meter, handle)
+	src := newCountedReader(pr, meter, handle)
 
 	done := make(chan mediaCopyResult, 1)
 	go func() {
@@ -53,7 +55,7 @@ func TestCountedWriterRecordsEgressBeforeCopyCompletes(t *testing.T) {
 	if result.Err != nil {
 		t.Fatalf("copy: %v", result.Err)
 	}
-	meter.EndTransfer(id, result.Err)
+	handle.End(result.Err)
 	if _, total := meter.Totals(); total < 64*1024 {
 		t.Fatalf("total egress=%d", total)
 	}
@@ -61,7 +63,7 @@ func TestCountedWriterRecordsEgressBeforeCopyCompletes(t *testing.T) {
 
 func TestCountedWriterNilMeterPassthrough(t *testing.T) {
 	rec := httptest.NewRecorder()
-	w := newCountedWriter(rec, nil, 0)
+	w := newCountedWriter(rec, nil, nil)
 	n, err := w.Write([]byte("hello"))
 	if err != nil || n != 5 {
 		t.Fatalf("write n=%d err=%v", n, err)
@@ -69,7 +71,7 @@ func TestCountedWriterNilMeterPassthrough(t *testing.T) {
 	if rec.Body.String() != "hello" {
 		t.Fatalf("body=%q", rec.Body.String())
 	}
-	r := newCountedReader(bytes.NewReader([]byte("abc")), nil, 0)
+	r := newCountedReader(bytes.NewReader([]byte("abc")), nil, nil)
 	buf := make([]byte, 8)
 	n, err = r.Read(buf)
 	if err != nil && err != io.EOF {
@@ -78,4 +80,54 @@ func TestCountedWriterNilMeterPassthrough(t *testing.T) {
 	if n != 3 {
 		t.Fatalf("n=%d", n)
 	}
+}
+
+func TestCountEgressWriteFailureCountsOneError(t *testing.T) {
+	meter := telemetry.NewByteMeter()
+	w := &countedFailureWriter{err: errors.New("write failed")}
+
+	if _, err := countEgressWrite(w, meter, nil, []byte("payload")); err == nil {
+		t.Fatal("expected write error")
+	}
+	if got := meter.ErrorTotal(); got != 1 {
+		t.Fatalf("errors=%d want 1", got)
+	}
+}
+
+func TestCopyProxyBodyFailureCountsOneError(t *testing.T) {
+	meter := telemetry.NewByteMeter()
+	s := NewServer(Config{Meter: meter}, testStore("http://backend.invalid/emby"))
+	r := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/test", nil)
+	w := &countedFailureWriter{err: errors.New("write failed")}
+
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != http.ErrAbortHandler {
+				t.Fatalf("panic=%v want http.ErrAbortHandler", recovered)
+			}
+		}()
+		s.copyProxyBodyOrAbort(w, r, "/test", strings.NewReader("payload"), nil)
+	}()
+
+	if got := meter.ErrorTotal(); got != 1 {
+		t.Fatalf("errors=%d want 1", got)
+	}
+}
+
+type countedFailureWriter struct {
+	header http.Header
+	err    error
+}
+
+func (w *countedFailureWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (*countedFailureWriter) WriteHeader(int) {}
+
+func (w *countedFailureWriter) Write([]byte) (int, error) {
+	return 0, w.err
 }

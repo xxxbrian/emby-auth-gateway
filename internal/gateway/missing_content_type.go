@@ -27,8 +27,20 @@ func (s *Server) writeMissingContentTypeResponse(w http.ResponseWriter, r *http.
 		}
 		var value any
 		if json.Unmarshal(data, &value) == nil {
+			if s.meter != nil && len(data) > 0 {
+				s.meter.AddIngress(int64(len(data)))
+			}
+			rewritten := s.rewriteProxyJSONValueForRequestWithSnapshot(r.Context(), r, value, session, upstream, gatewayToken, publicGatewayBase)
+			payload, encErr := json.Marshal(rewritten)
+			if encErr != nil {
+				s.handlePreHeaderProxyFailure(w, r, rel, session, encErr, proxyFailureDetails{Event: "proxy_rewrite_failed", AuditMessage: "proxy json encode failed", ClientBody: "response encode failed", FallbackKind: "upstream_read_error", Duration: time.Since(started), UpstreamStatus: resp.StatusCode})
+				return
+			}
+			payload = append(payload, '\n')
 			w.Header().Del("Content-Length")
-			writeJSON(w, resp.StatusCode, s.rewriteProxyJSONValueForRequestWithSnapshot(r.Context(), r, value, session, upstream, gatewayToken, publicGatewayBase))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(resp.StatusCode)
+			_, _ = countEgressWrite(w, s.meter, nil, payload)
 			return
 		}
 		reader = bufio.NewReader(bytes.NewReader(data))

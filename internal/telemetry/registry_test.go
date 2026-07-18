@@ -95,15 +95,15 @@ func TestSessionTTL(t *testing.T) {
 func TestMediaTransferOpenAndComplete(t *testing.T) {
 	r := New(nil)
 	// Active transfers are meter-backed (unique handles), not event-derived keys.
-	id := r.Meter().BeginTransfer(TransferMeta{SessionID: "s1", ItemID: "i1", MediaMode: observe.MediaDirect})
+	h := r.Meter().BeginTransfer(TransferMeta{SessionID: "s1", ItemID: "i1", MediaMode: observe.MediaDirect})
 	if got := len(r.ActiveTransfers()); got != 1 {
 		t.Fatalf("open transfers: %d", got)
 	}
 	if !r.HasActiveMediaLoad() {
 		t.Fatal("expected media load from transfer")
 	}
-	r.Meter().AddTransferEgress(id, 5000)
-	r.Meter().EndTransfer(id, nil)
+	h.AddEgress(5000)
+	h.End(nil)
 	if got := len(r.ActiveTransfers()); got != 0 {
 		t.Fatalf("completed transfers: %d", got)
 	}
@@ -114,14 +114,14 @@ func TestMediaTransferPhaseStartEnd(t *testing.T) {
 	base := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
 	r.now = func() time.Time { return base }
 
-	id := r.Meter().BeginTransfer(TransferMeta{SessionID: "s1", ItemID: "i1", MediaMode: observe.MediaDirect, Method: "GET"})
+	h := r.Meter().BeginTransfer(TransferMeta{SessionID: "s1", ItemID: "i1", MediaMode: observe.MediaDirect, Method: "GET"})
 	if got := len(r.ActiveTransfers()); got != 1 {
 		t.Fatalf("active during transfer: got %d want 1", got)
 	}
 	if !r.HasActiveMediaLoad() {
 		t.Fatal("HasActiveMediaLoad should be true while transfer is open")
 	}
-	r.Meter().AddTransferEgress(id, 9000)
+	h.AddEgress(9000)
 	// Live bytes visible before end.
 	if _, out := r.Meter().Totals(); out != 9000 {
 		t.Fatalf("live egress=%d", out)
@@ -143,7 +143,7 @@ func TestMediaTransferPhaseStartEnd(t *testing.T) {
 	if snap.Traffic.RPS != 0 || snap.Traffic.MbpsOut != 0 {
 		t.Fatalf("PhaseEnd must not affect RPS/Mbps: rps=%v mbps=%v", snap.Traffic.RPS, snap.Traffic.MbpsOut)
 	}
-	r.Meter().EndTransfer(id, nil)
+	h.End(nil)
 	if r.HasActiveMediaLoad() {
 		t.Fatal("expected no media load after end")
 	}
@@ -187,19 +187,19 @@ func TestMediaTransferStartEndDoesNotCountRequests(t *testing.T) {
 func TestMediaTransferUniqueHandlesWithoutItemID(t *testing.T) {
 	r := New(nil)
 	// Concurrent HLS segments get unique handles (no session+mode collapse).
-	id1 := r.Meter().BeginTransfer(TransferMeta{SessionID: "sess-a", MediaMode: observe.MediaHLS, Method: "GET"})
-	id2 := r.Meter().BeginTransfer(TransferMeta{SessionID: "sess-a", MediaMode: observe.MediaHLS, Method: "GET"})
-	if id1 == id2 {
+	h1 := r.Meter().BeginTransfer(TransferMeta{SessionID: "sess-a", MediaMode: observe.MediaHLS, Method: "GET"})
+	h2 := r.Meter().BeginTransfer(TransferMeta{SessionID: "sess-a", MediaMode: observe.MediaHLS, Method: "GET"})
+	if h1.ID() == h2.ID() {
 		t.Fatal("expected unique transfer ids")
 	}
 	if got := len(r.ActiveTransfers()); got != 2 {
 		t.Fatalf("open concurrent: %d", got)
 	}
-	r.Meter().EndTransfer(id1, nil)
+	h1.End(nil)
 	if got := len(r.ActiveTransfers()); got != 1 {
 		t.Fatalf("after one end: %d", got)
 	}
-	r.Meter().EndTransfer(id2, nil)
+	h2.End(nil)
 	if got := len(r.ActiveTransfers()); got != 0 {
 		t.Fatalf("after both end: %d", got)
 	}

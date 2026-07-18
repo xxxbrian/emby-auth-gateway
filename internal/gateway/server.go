@@ -1481,8 +1481,7 @@ func (s *Server) writeProxyResponseWithSnapshot(w http.ResponseWriter, r *http.R
 		rewritten := rewriteM3U8WithSnapshot(data, rel, session, upstream, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
 		w.Header().Del("Content-Length")
 		w.WriteHeader(resp.StatusCode)
-		dst := newCountedWriter(w, s.meter, 0)
-		_, _ = dst.Write(rewritten)
+		_, _ = countEgressWrite(w, s.meter, nil, rewritten)
 		return
 	}
 
@@ -1517,12 +1516,29 @@ func (s *Server) writeProxyResponseWithSnapshot(w http.ResponseWriter, r *http.R
 		}
 		var value any
 		if looksLikeJSON(data) && json.Unmarshal(data, &value) == nil {
+			if s.meter != nil && len(data) > 0 {
+				s.meter.AddIngress(int64(len(data)))
+			}
+			rewritten := s.rewriteProxyJSONValueForRequestWithSnapshot(r.Context(), r, value, session, upstream, gatewayToken, publicGatewayBase)
+			payload, err := json.Marshal(rewritten)
+			if err != nil {
+				s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_rewrite_failed", AuditMessage: "proxy json encode failed", ClientBody: "response encode failed", FallbackKind: "upstream_read_error", Duration: time.Since(readStarted), UpstreamStatus: resp.StatusCode})
+				return
+			}
+			// Encode matches writeJSON trailing newline for Emby clients.
+			payload = append(payload, '\n')
 			w.Header().Del("Content-Length")
-			writeJSON(w, resp.StatusCode, s.rewriteProxyJSONValueForRequestWithSnapshot(r.Context(), r, value, session, upstream, gatewayToken, publicGatewayBase))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(resp.StatusCode)
+			_, _ = countEgressWrite(w, s.meter, nil, payload)
 			return
 		}
+		if s.meter != nil && len(data) > 0 {
+			s.meter.AddIngress(int64(len(data)))
+		}
+		out := rewriteBytesWithSnapshot(data, session, upstream, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
 		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(rewriteBytesWithSnapshot(data, session, upstream, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID))
+		_, _ = countEgressWrite(w, s.meter, nil, out)
 		return
 	}
 
@@ -1550,12 +1566,15 @@ func (s *Server) writeImageProxyResponse(w http.ResponseWriter, r *http.Request,
 		s.rejectInvalidImageResponse(w, r, rel, session, "backend returned an invalid image response")
 		return
 	}
+	if s.meter != nil && n > 0 {
+		s.meter.AddIngress(int64(n))
+	}
 
 	setContentLength(w.Header(), resp.ContentLength)
 	w.WriteHeader(resp.StatusCode)
 	fullImage := resp.StatusCode == http.StatusOK && strings.TrimSpace(r.Header.Get("Range")) == "" && strings.TrimSpace(resp.Header.Get("Content-Range")) == ""
 	if !fullImage {
-		if _, writeErr := w.Write(first[:n]); writeErr != nil {
+		if _, writeErr := countEgressWrite(w, s.meter, nil, first[:n]); writeErr != nil {
 			return
 		}
 		if err != nil && err != io.EOF {
@@ -1567,15 +1586,17 @@ func (s *Server) writeImageProxyResponse(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	validator := newImageStreamValidator(w, resp.Header.Get("Content-Type"))
+	dst := newCountedWriter(w, s.meter, nil)
+	validator := newImageStreamValidator(dst, resp.Header.Get("Content-Type"))
 	if _, writeErr := validator.Write(first[:n]); writeErr != nil {
-		return
+		s.abortProxyBody(r, rel, session, writeErr)
 	}
 	if err != nil && err != io.EOF {
 		s.abortProxyBody(r, rel, session, err)
 	}
 	if err != io.EOF {
-		if _, copyErr := io.Copy(validator, resp.Body); copyErr != nil {
+		src := newCountedReader(resp.Body, s.meter, nil)
+		if _, copyErr := io.Copy(validator, src); copyErr != nil {
 			s.abortProxyBody(r, rel, session, copyErr)
 		}
 	}
@@ -1664,8 +1685,8 @@ func (v *imageStreamValidator) validate() error {
 
 func (s *Server) copyProxyBodyOrAbort(w http.ResponseWriter, r *http.Request, rel string, body io.Reader, session *Session) {
 	// Count generic proxied body bytes as live forwarded traffic.
-	dst := newCountedWriter(w, s.meter, 0)
-	src := newCountedReader(body, s.meter, 0)
+	dst := newCountedWriter(w, s.meter, nil)
+	src := newCountedReader(body, s.meter, nil)
 	if _, err := io.Copy(dst, src); err != nil {
 		s.abortProxyBody(r, rel, session, err)
 	}
@@ -1690,11 +1711,11 @@ func (s *Server) copyMediaReaderOrAbort(w http.ResponseWriter, r *http.Request, 
 	sessionID := sessionTokenHash(session)
 	device := sessionDevice(session)
 
-	// Live bandwidth: unique transfer handle + counted I/O (not PhaseEnd events).
-	var transferID uint64
+	// Live bandwidth: handle with atomics-only I/O (not PhaseEnd ring accounting).
+	var handle *telemetry.TransferHandle
 	var copyErr error
 	if s.meter != nil {
-		transferID = s.meter.BeginTransfer(telemetry.TransferMeta{
+		handle = s.meter.BeginTransfer(telemetry.TransferMeta{
 			SessionID: sessionID,
 			UserID:    userID,
 			Username:  username,
@@ -1702,10 +1723,10 @@ func (s *Server) copyMediaReaderOrAbort(w http.ResponseWriter, r *http.Request, 
 			MediaMode: mediaMode,
 			Method:    method,
 		})
-		defer func() { s.meter.EndTransfer(transferID, copyErr) }()
+		defer func() { handle.End(copyErr) }()
 	}
-	dst := newCountedWriter(w, s.meter, transferID)
-	src = newCountedReader(src, s.meter, transferID)
+	dst := newCountedWriter(w, s.meter, handle)
+	src = newCountedReader(src, s.meter, handle)
 
 	result := copyMediaBody(dst, src, expectedLength)
 	copyErr = result.Err
@@ -1719,6 +1740,9 @@ func (s *Server) copyMediaReaderOrAbort(w http.ResponseWriter, r *http.Request, 
 }
 
 func (s *Server) abortProxyBody(r *http.Request, rel string, session *Session, err error) {
+	if s.meter != nil {
+		s.meter.NoteError()
+	}
 	s.audit(r.Context(), AuditLog{GatewayUserID: sessionGatewayUserID(session), SyntheticUserID: sessionSyntheticUserID(session), Event: "proxy_read_failed", Message: err.Error(), RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
 	panic(http.ErrAbortHandler)
 }

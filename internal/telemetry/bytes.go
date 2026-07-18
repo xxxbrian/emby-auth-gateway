@@ -25,20 +25,28 @@ type liveTransfer struct {
 	startedAt time.Time
 	ingress   atomic.Int64
 	egress    atomic.Int64
+	lastSeen  atomic.Int64 // unix nano
+}
+
+// TransferHandle is returned by BeginTransfer. Hot-path Add* methods use only
+// atomics on the handle and meter — no map lock.
+type TransferHandle struct {
+	meter *ByteMeter
+	tr    *liveTransfer
+	ended atomic.Bool
 }
 
 // ByteMeter holds monotonic ingress/egress totals and active transfer handles.
-// Hot path Add* methods use only atomics (no map lock on the common path after
-// the handle pointer is obtained). Begin/End take a mutex.
 type ByteMeter struct {
 	ingress          atomic.Uint64
 	egress           atomic.Uint64
 	completedEgress  atomic.Uint64
 	completedIngress atomic.Uint64
+	errors           atomic.Uint64 // media/proxy body errors for sampler
 
 	nextID atomic.Uint64
 
-	mu        sync.RWMutex
+	mu        sync.Mutex
 	transfers map[uint64]*liveTransfer
 }
 
@@ -63,6 +71,14 @@ func (m *ByteMeter) AddIngress(n int64) {
 	m.ingress.Add(uint64(n))
 }
 
+// NoteError increments the live error counter (sampled into traffic error rings).
+func (m *ByteMeter) NoteError() {
+	if m == nil {
+		return
+	}
+	m.errors.Add(1)
+}
+
 // Totals returns monotonic cumulative ingress and egress byte counts.
 func (m *ByteMeter) Totals() (ingress, egress uint64) {
 	if m == nil {
@@ -71,7 +87,15 @@ func (m *ByteMeter) Totals() (ingress, egress uint64) {
 	return m.ingress.Load(), m.egress.Load()
 }
 
-// CompletedEgress returns bytes from transfers that have ended (for diagnostics).
+// ErrorTotal returns monotonic proxy/media body error count.
+func (m *ByteMeter) ErrorTotal() uint64 {
+	if m == nil {
+		return 0
+	}
+	return m.errors.Load()
+}
+
+// CompletedEgress returns bytes from transfers that have ended.
 func (m *ByteMeter) CompletedEgress() uint64 {
 	if m == nil {
 		return 0
@@ -79,79 +103,80 @@ func (m *ByteMeter) CompletedEgress() uint64 {
 	return m.completedEgress.Load()
 }
 
-// BeginTransfer registers an active transfer and returns a unique id.
-// id 0 is reserved as "no transfer".
-func (m *ByteMeter) BeginTransfer(meta TransferMeta) uint64 {
+// BeginTransfer registers an active transfer and returns a handle for atomics-only I/O.
+func (m *ByteMeter) BeginTransfer(meta TransferMeta) *TransferHandle {
 	if m == nil {
-		return 0
+		return nil
 	}
 	id := m.nextID.Add(1)
 	if id == 0 {
 		id = m.nextID.Add(1)
 	}
+	now := time.Now().UTC()
 	tr := &liveTransfer{
 		id:        id,
 		meta:      meta,
-		startedAt: time.Now().UTC(),
+		startedAt: now,
 	}
+	tr.lastSeen.Store(now.UnixNano())
 	m.mu.Lock()
 	m.transfers[id] = tr
 	m.mu.Unlock()
-	return id
+	return &TransferHandle{meter: m, tr: tr}
 }
 
-// AddTransferEgress adds to both the transfer handle and global egress.
-func (m *ByteMeter) AddTransferEgress(id uint64, n int64) {
-	if m == nil || n <= 0 {
+// AddEgress records successful client write bytes (atomics only).
+func (h *TransferHandle) AddEgress(n int64) {
+	if h == nil || h.meter == nil || h.tr == nil || n <= 0 || h.ended.Load() {
 		return
 	}
-	m.egress.Add(uint64(n))
-	if id == 0 {
-		return
-	}
-	m.mu.RLock()
-	tr := m.transfers[id]
-	m.mu.RUnlock()
-	if tr != nil {
-		tr.egress.Add(n)
-	}
+	h.meter.egress.Add(uint64(n))
+	h.tr.egress.Add(n)
+	h.tr.lastSeen.Store(time.Now().UnixNano())
 }
 
-// AddTransferIngress adds to both the transfer handle and global ingress.
-func (m *ByteMeter) AddTransferIngress(id uint64, n int64) {
-	if m == nil || n <= 0 {
+// AddIngress records successful upstream read bytes (atomics only).
+func (h *TransferHandle) AddIngress(n int64) {
+	if h == nil || h.meter == nil || h.tr == nil || n <= 0 || h.ended.Load() {
 		return
 	}
-	m.ingress.Add(uint64(n))
-	if id == 0 {
-		return
-	}
-	m.mu.RLock()
-	tr := m.transfers[id]
-	m.mu.RUnlock()
-	if tr != nil {
-		tr.ingress.Add(n)
-	}
+	h.meter.ingress.Add(uint64(n))
+	h.tr.ingress.Add(n)
+	h.tr.lastSeen.Store(time.Now().UnixNano())
 }
 
-// EndTransfer removes an active transfer. err is reserved for future outcome tagging.
-func (m *ByteMeter) EndTransfer(id uint64, err error) {
-	if m == nil || id == 0 {
+// ID returns the transfer id (0 if nil).
+func (h *TransferHandle) ID() uint64 {
+	if h == nil || h.tr == nil {
+		return 0
+	}
+	return h.tr.id
+}
+
+// End removes the transfer from the active set. Idempotent.
+func (h *TransferHandle) End(err error) {
+	if h == nil || h.meter == nil || h.tr == nil {
 		return
 	}
-	_ = err
-	m.mu.Lock()
-	tr := m.transfers[id]
-	delete(m.transfers, id)
-	m.mu.Unlock()
+	if !h.ended.CompareAndSwap(false, true) {
+		return
+	}
+	if err != nil {
+		h.meter.errors.Add(1)
+	}
+	id := h.tr.id
+	h.meter.mu.Lock()
+	tr := h.meter.transfers[id]
+	delete(h.meter.transfers, id)
+	h.meter.mu.Unlock()
 	if tr == nil {
 		return
 	}
 	if e := tr.egress.Load(); e > 0 {
-		m.completedEgress.Add(uint64(e))
+		h.meter.completedEgress.Add(uint64(e))
 	}
 	if i := tr.ingress.Load(); i > 0 {
-		m.completedIngress.Add(uint64(i))
+		h.meter.completedIngress.Add(uint64(i))
 	}
 }
 
@@ -160,9 +185,9 @@ func (m *ByteMeter) ActiveTransferCount() int {
 	if m == nil {
 		return 0
 	}
-	m.mu.RLock()
+	m.mu.Lock()
 	n := len(m.transfers)
-	m.mu.RUnlock()
+	m.mu.Unlock()
 	return n
 }
 
@@ -171,9 +196,13 @@ func (m *ByteMeter) ActiveTransfers() []Transfer {
 	if m == nil {
 		return nil
 	}
-	m.mu.RLock()
+	m.mu.Lock()
 	out := make([]Transfer, 0, len(m.transfers))
 	for _, tr := range m.transfers {
+		last := tr.startedAt
+		if ns := tr.lastSeen.Load(); ns > 0 {
+			last = time.Unix(0, ns).UTC()
+		}
 		out = append(out, Transfer{
 			SessionID: tr.meta.SessionID,
 			UserID:    tr.meta.UserID,
@@ -184,10 +213,10 @@ func (m *ByteMeter) ActiveTransfers() []Transfer {
 			BytesIn:   tr.ingress.Load(),
 			BytesOut:  tr.egress.Load(),
 			StartedAt: tr.startedAt,
-			LastSeen:  time.Now().UTC(),
+			LastSeen:  last,
 		})
 	}
-	m.mu.RUnlock()
+	m.mu.Unlock()
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].StartedAt.Equal(out[j].StartedAt) {
 			return out[i].SessionID < out[j].SessionID

@@ -8,36 +8,37 @@ import (
 )
 
 // TrafficMeter records live forwarded body bytes. Implemented by *telemetry.ByteMeter.
-// Nil-safe: all methods no-op on a nil receiver implementation check at call sites.
 type TrafficMeter interface {
 	AddEgress(n int64)
 	AddIngress(n int64)
-	BeginTransfer(meta telemetry.TransferMeta) uint64
-	AddTransferEgress(id uint64, n int64)
-	AddTransferIngress(id uint64, n int64)
-	EndTransfer(id uint64, err error)
+	NoteError()
+	BeginTransfer(meta telemetry.TransferMeta) *telemetry.TransferHandle
 }
 
-// countedWriter counts successful downstream body writes into a TrafficMeter.
+// countedWriter counts successful downstream body writes.
+// Prefer handle (atomics-only); fall back to meter global AddEgress.
 type countedWriter struct {
 	http.ResponseWriter
-	meter      TrafficMeter
-	transferID uint64
+	meter  TrafficMeter
+	handle *telemetry.TransferHandle
 }
 
-func newCountedWriter(w http.ResponseWriter, meter TrafficMeter, transferID uint64) http.ResponseWriter {
-	if w == nil || meter == nil {
+func newCountedWriter(w http.ResponseWriter, meter TrafficMeter, handle *telemetry.TransferHandle) http.ResponseWriter {
+	if w == nil {
 		return w
 	}
-	return &countedWriter{ResponseWriter: w, meter: meter, transferID: transferID}
+	if meter == nil && handle == nil {
+		return w
+	}
+	return &countedWriter{ResponseWriter: w, meter: meter, handle: handle}
 }
 
 func (w *countedWriter) Write(p []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(p)
-	if n > 0 && w.meter != nil {
-		if w.transferID != 0 {
-			w.meter.AddTransferEgress(w.transferID, int64(n))
-		} else {
+	if n > 0 {
+		if w.handle != nil {
+			w.handle.AddEgress(int64(n))
+		} else if w.meter != nil {
 			w.meter.AddEgress(int64(n))
 		}
 	}
@@ -49,28 +50,48 @@ func (w *countedWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
 
-// countedReader counts successful upstream body reads into a TrafficMeter.
+// countedReader counts successful upstream body reads.
 type countedReader struct {
-	r          io.Reader
-	meter      TrafficMeter
-	transferID uint64
+	r      io.Reader
+	meter  TrafficMeter
+	handle *telemetry.TransferHandle
 }
 
-func newCountedReader(r io.Reader, meter TrafficMeter, transferID uint64) io.Reader {
-	if r == nil || meter == nil {
+func newCountedReader(r io.Reader, meter TrafficMeter, handle *telemetry.TransferHandle) io.Reader {
+	if r == nil {
 		return r
 	}
-	return &countedReader{r: r, meter: meter, transferID: transferID}
+	if meter == nil && handle == nil {
+		return r
+	}
+	return &countedReader{r: r, meter: meter, handle: handle}
 }
 
 func (r *countedReader) Read(p []byte) (int, error) {
 	n, err := r.r.Read(p)
-	if n > 0 && r.meter != nil {
-		if r.transferID != 0 {
-			r.meter.AddTransferIngress(r.transferID, int64(n))
-		} else {
+	if n > 0 {
+		if r.handle != nil {
+			r.handle.AddIngress(int64(n))
+		} else if r.meter != nil {
 			r.meter.AddIngress(int64(n))
 		}
+	}
+	return n, err
+}
+
+// countEgressWrite writes p through w and records successful bytes.
+func countEgressWrite(w http.ResponseWriter, meter TrafficMeter, handle *telemetry.TransferHandle, p []byte) (int, error) {
+	if w == nil {
+		return 0, io.ErrShortWrite
+	}
+	cw := newCountedWriter(w, meter, handle)
+	n, err := cw.Write(p)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+	// Direct buffered writes have no transfer End hook to account for failure.
+	if err != nil && meter != nil && handle == nil {
+		meter.NoteError()
 	}
 	return n, err
 }

@@ -192,10 +192,13 @@ func (s *Server) writeAnonymousFullImage(w http.ResponseWriter, r *http.Request,
 		writeAnonymousImageError(w, http.StatusBadGateway)
 		return
 	}
+	if s.meter != nil && len(data) > 0 {
+		s.meter.AddIngress(int64(len(data)))
+	}
 	copyAnonymousImageResponseHeaders(w.Header(), resp.Header)
 	setContentLength(w.Header(), int64(len(data)))
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
+	_, _ = countEgressWrite(w, s.meter, nil, data)
 }
 
 func (s *Server) writeAnonymousPartialImage(w http.ResponseWriter, r *http.Request, resp *http.Response) {
@@ -215,6 +218,7 @@ func (s *Server) writeAnonymousPartialImage(w http.ResponseWriter, r *http.Reque
 		writeAnonymousImageError(w, http.StatusBadGateway)
 		return
 	}
+	// First byte is re-fed into copyMediaReaderOrAbort (counted there as ingress/egress).
 	copyAnonymousImageResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(http.StatusPartialContent)
 	s.copyMediaReaderOrAbort(w, r, r.URL.Path, io.MultiReader(bytes.NewReader(first[:]), resp.Body), expectedLength, http.StatusPartialContent, nil)
