@@ -95,6 +95,7 @@ func (s *Server) tryDownloadDirectStreamFallback(r *http.Request, rel string, se
 
 	attemptStarted := time.Now()
 	response, err := s.proxyClient.Do(request)
+	wrapResponseBodyOnce(response)
 	if err != nil {
 		s.emitUpstreamAttempt(attemptStarted, 0, err)
 		closeResponseOnError(response)
@@ -138,6 +139,7 @@ func (s *Server) fetchDownloadPlaybackInfo(ctx context.Context, itemID, mediaSou
 
 	attemptStarted := time.Now()
 	response, err := s.proxyClient.Do(request)
+	wrapResponseBodyOnce(response)
 	if err != nil {
 		s.emitUpstreamAttempt(attemptStarted, 0, err)
 		closeResponseOnError(response)

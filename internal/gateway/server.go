@@ -577,6 +577,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 
 	attemptStarted := time.Now()
 	resp, err := s.proxyClient.Do(req)
+	wrapResponseBodyOnce(resp)
 	if err != nil {
 		s.emitUpstreamAttempt(attemptStarted, 0, err)
 		upstreamStatus := closeResponseOnError(resp)
@@ -617,6 +618,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 			retryReq.Host = retryURL.Host
 			attemptStarted = time.Now()
 			resp, err = s.proxyClient.Do(retryReq)
+			wrapResponseBodyOnce(resp)
 			if err != nil {
 				s.emitUpstreamAttempt(attemptStarted, 0, err)
 				upstreamStatus := closeResponseOnError(resp)
@@ -637,6 +639,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 		if fallback, fallbackErr := s.tryDownloadDirectStreamFallback(r, rel, session, upstream, gatewayToken); fallbackErr == nil {
 			_ = resp.Body.Close()
 			resp = fallback
+			wrapResponseBodyOnce(resp)
 			defer resp.Body.Close()
 		}
 	}
@@ -664,22 +667,14 @@ func playbackInfoItemID(method, rel string) (string, bool) {
 	return parts[1], true
 }
 
-type delegatedReadCloser struct {
-	io.Reader
-	closer io.Closer
-}
-
-func (r delegatedReadCloser) Close() error { return r.closer.Close() }
-
-type replayReadErrorCloser struct {
+type replayReadErrorReader struct {
 	prefix       []byte
 	err          error
 	errorPending bool
 	remainder    io.Reader
-	closer       io.Closer
 }
 
-func (r *replayReadErrorCloser) Read(p []byte) (int, error) {
+func (r *replayReadErrorReader) Read(p []byte) (int, error) {
 	if len(r.prefix) > 0 {
 		n := copy(p, r.prefix)
 		r.prefix = r.prefix[n:]
@@ -696,17 +691,19 @@ func (r *replayReadErrorCloser) Read(p []byte) (int, error) {
 	return r.remainder.Read(p)
 }
 
-func (r *replayReadErrorCloser) Close() error { return r.closer.Close() }
-
 func isConcurrentPlaybackDenial(resp *http.Response) bool {
 	const limit = 48 << 10
-	original := resp.Body
+	owner := wrapResponseBodyOnce(resp)
+	if owner == nil {
+		return false
+	}
+	original := owner.reader
 	data, err := io.ReadAll(io.LimitReader(original, limit+1))
 	restore := func() {
-		resp.Body = delegatedReadCloser{Reader: io.MultiReader(bytes.NewReader(data), original), closer: original}
+		owner.replaceReader(io.MultiReader(bytes.NewReader(data), original))
 	}
 	if err != nil {
-		resp.Body = &replayReadErrorCloser{prefix: data, err: err, errorPending: true, remainder: original, closer: original}
+		owner.replaceReader(&replayReadErrorReader{prefix: data, err: err, errorPending: true, remainder: original})
 		return false
 	}
 	if len(data) > limit {
@@ -851,6 +848,7 @@ func (s *Server) upstreamSnapshotUnauthorized(ctx context.Context, upstream upst
 	}
 	s.rewriteRequestHeaders(req.Header, upstream)
 	resp, err := s.upstreamAuth.client.Do(req)
+	wrapResponseBodyOnce(resp)
 	if err != nil {
 		return false, err
 	}
