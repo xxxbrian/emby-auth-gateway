@@ -20,6 +20,8 @@ type MemoryStore struct {
 	UpstreamEndpoints  map[string]UpstreamEndpoint
 }
 
+var _ SessionRepository = (*MemoryStore)(nil)
+
 type MemoryUser struct {
 	GatewayUser
 	Password string

@@ -6,16 +6,12 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/spf13/cobra"
 	"github.com/xxxbrian/emby-auth-gateway/internal/controlplane"
-	"github.com/xxxbrian/emby-auth-gateway/internal/pbschema"
 )
 
 func newPoliciesCommand(app core.App) *cobra.Command {
 	cmd := &cobra.Command{Use: "policies", Args: cobra.NoArgs}
 	cmd.AddCommand(&cobra.Command{Use: "install-defaults", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
 		if err := app.Bootstrap(); err != nil {
-			return err
-		}
-		if err := pbschema.Ensure(app); err != nil {
 			return err
 		}
 		created, preserved, err := installDefaults(app)

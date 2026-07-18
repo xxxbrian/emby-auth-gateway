@@ -11,6 +11,7 @@ import (
 
 	"github.com/xxxbrian/emby-auth-gateway/internal/gateway"
 	"github.com/xxxbrian/emby-auth-gateway/internal/observe"
+	"github.com/xxxbrian/emby-auth-gateway/internal/pbmigrations"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pbschema"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pbsetup"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pbstore"
@@ -221,7 +222,10 @@ func newGatewayApp() *pocketbase.PocketBase {
 		if err := e.Next(); err != nil {
 			return err
 		}
-		return pbschema.Ensure(e.App)
+		if err := pbschema.Ensure(e.App); err != nil {
+			return err
+		}
+		return pbmigrations.Apply(e.App)
 	})
 
 	app.OnServe().BindFunc(func(e *core.ServeEvent) error {

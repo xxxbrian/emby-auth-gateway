@@ -35,6 +35,7 @@ var ErrActiveMedia = errors.New("active media copies in progress")
 type Server struct {
 	cfg                  Config
 	store                Store
+	sessions             SessionRepository
 	client               *http.Client
 	proxyClient          *http.Client
 	emitter              *observe.Emitter
@@ -144,7 +145,7 @@ func NewServer(cfg Config, store Store) *Server {
 		client = &http.Client{Timeout: backendAuthTimeout}
 	}
 	proxyClient := newProxyClient(cfg.HTTPClient)
-	return &Server{cfg: cfg, store: store, client: client, proxyClient: proxyClient, emitter: cfg.Emitter, meter: cfg.Meter, upstreamAuth: newUpstreamAuthenticator(store, client), logins: newLoginFailureLimiter(), playbackGuards: newPlaybackGuardTracker(), mediaBuffer: configuredMediaBuffer(cfg.MediaBuffer), mediaBufferLive: cfg.MediaBufferLive, anonymousImageNow: time.Now, anonymousImageSlots: make(chan struct{}, anonymousImageValidationConcurrency)}
+	return &Server{cfg: cfg, store: store, sessions: store, client: client, proxyClient: proxyClient, emitter: cfg.Emitter, meter: cfg.Meter, upstreamAuth: newUpstreamAuthenticator(store, client), logins: newLoginFailureLimiter(), playbackGuards: newPlaybackGuardTracker(), mediaBuffer: configuredMediaBuffer(cfg.MediaBuffer), mediaBufferLive: cfg.MediaBufferLive, anonymousImageNow: time.Now, anonymousImageSlots: make(chan struct{}, anonymousImageValidationConcurrency)}
 }
 
 // Emitter returns the optional non-blocking observe emitter (nil if unset).
@@ -380,7 +381,7 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:        now,
 		ExpiresAt:        now.Add(defaultSessionTTL),
 	}
-	if err := s.store.SaveSession(ctx, session); err != nil {
+	if err := s.sessions.SaveSession(ctx, session); err != nil {
 		s.audit(ctx, AuditLog{GatewayUserID: user.ID, SyntheticUserID: user.SyntheticUserID, Event: "session_save_failure", Message: "session save failed", RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusInternalServerError})
 		s.emit(observe.Event{
 			Kind:       observe.KindAuthLogin,
@@ -443,7 +444,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, rel string
 		return
 	}
 	s.noteSession(session, decision)
-	if err := s.store.RevokeSession(r.Context(), HashToken(token)); err != nil {
+	if err := s.sessions.RevokeSession(r.Context(), HashToken(token)); err != nil {
 		s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "logout_failure", Message: "session revoke failed", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusInternalServerError})
 		http.Error(w, "session revoke failed", http.StatusInternalServerError)
 		return
@@ -947,7 +948,7 @@ func (s *Server) lookupActiveSession(w http.ResponseWriter, r *http.Request, tok
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return nil, false
 	}
-	session, err := s.store.FindSessionByTokenHash(r.Context(), HashToken(token))
+	session, err := s.sessions.FindSessionByTokenHash(r.Context(), HashToken(token))
 	if err != nil || session == nil || !session.Active(time.Now().UTC()) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return nil, false
@@ -1100,7 +1101,7 @@ func pathHex(c byte) bool {
 func (s *Server) auditForRequest(r *http.Request, rel, event, message string, status int) AuditLog {
 	entry := AuditLog{Event: event, Message: message, RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: status}
 	if token := ExtractToken(r); token != "" {
-		if session, err := s.store.FindSessionByTokenHash(r.Context(), HashToken(token)); err == nil && session != nil {
+		if session, err := s.sessions.FindSessionByTokenHash(r.Context(), HashToken(token)); err == nil && session != nil {
 			entry.GatewayUserID = session.GatewayUserID
 			entry.SyntheticUserID = session.SyntheticUserID
 		}

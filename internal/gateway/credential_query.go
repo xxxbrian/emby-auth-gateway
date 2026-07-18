@@ -109,7 +109,7 @@ func (s *Server) guardGenericQueryTokens(ctx context.Context, values []string, g
 		return nil
 	}
 
-	exists, err := s.store.SessionTokenExists(ctx, HashToken(shaped[0]))
+	exists, err := s.sessions.SessionTokenExists(ctx, HashToken(shaped[0]))
 	if err != nil {
 		return errCredentialStore
 	}

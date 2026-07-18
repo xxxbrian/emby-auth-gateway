@@ -30,6 +30,7 @@ type Config struct {
 }
 
 type Store interface {
+	SessionRepository
 	LoadDefaultUpstreamRuntime(ctx context.Context) (*UpstreamRuntime, error)
 	CompareAndSwapUpstreamAuth(ctx context.Context, update UpstreamAuthUpdate) error
 	UpdateUpstreamServerInfo(ctx context.Context, update UpstreamServerInfoUpdate) error
@@ -56,13 +57,6 @@ type Store interface {
 	SavePlaybackResolution(ctx context.Context, state PlaybackState) error
 	FindDisplayPreference(ctx context.Context, gatewayUserID, preferenceID, client string) (*DisplayPreference, error)
 	SaveDisplayPreference(ctx context.Context, preference DisplayPreference) error
-	SaveSession(ctx context.Context, session *Session) error
-	FindSessionByTokenHash(ctx context.Context, tokenHash string) (*Session, error)
-	// SessionTokenExists reports whether any session row exists for tokenHash
-	// (active, revoked, or expired) without hydrating account/session details.
-	// false,nil means not found; non-nil error is an operational/store failure.
-	SessionTokenExists(ctx context.Context, tokenHash string) (bool, error)
-	RevokeSession(ctx context.Context, tokenHash string) error
 }
 
 // UpstreamSource is the singleton upstream authentication and identity configuration.
