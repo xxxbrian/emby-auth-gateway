@@ -6,6 +6,9 @@ pb_data/
 tmp/
 bin/
 dist/
+# Keep embedded admin SPA assets trackable.
+!internal/adminui/dist/
+!internal/adminui/dist/**
 *.db
 *.sqlite
 *.sqlite3

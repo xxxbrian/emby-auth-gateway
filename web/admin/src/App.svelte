@@ -47,15 +47,16 @@
     <div class="app-container">
         <aside class="sidebar">
             <div class="sidebar-title">Admin</div>
-            <a href="#/" class="nav-link {currentPath === '/' ? 'active' : ''}">Overview</a>
-            <a href="#/users" class="nav-link {currentPath === '/users' ? 'active' : ''}">Users</a>
-            <a href="#/activity" class="nav-link {currentPath === '/activity' ? 'active' : ''}">Activity</a>
-            <a href="#/traffic" class="nav-link {currentPath === '/traffic' ? 'active' : ''}">Traffic</a>
-            <a href="#/system" class="nav-link {currentPath === '/system' ? 'active' : ''}">System</a>
-            
-            <div style="margin-top: auto; padding: 1.5rem;">
-                <div class="text-sm text-secondary mb-2">{$session.username || $session.id}</div>
-                <button class="secondary" style="width: 100%" on:click={logout}>Logout</button>
+            <nav class="sidebar-nav">
+                <a href="#/" class="nav-link {currentPath === '/' ? 'active' : ''}">Overview</a>
+                <a href="#/users" class="nav-link {currentPath === '/users' ? 'active' : ''}">Users</a>
+                <a href="#/activity" class="nav-link {currentPath === '/activity' ? 'active' : ''}">Activity</a>
+                <a href="#/traffic" class="nav-link {currentPath === '/traffic' ? 'active' : ''}">Traffic</a>
+                <a href="#/system" class="nav-link {currentPath === '/system' ? 'active' : ''}">System</a>
+            </nav>
+            <div class="sidebar-footer">
+                <div class="text-sm text-secondary" style="word-break: break-all;">{$session.email || $session.superuser_id || 'superuser'}</div>
+                <button class="secondary sidebar-logout" on:click={logout}>Logout</button>
             </div>
         </aside>
 

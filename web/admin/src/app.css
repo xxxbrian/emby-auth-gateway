@@ -182,6 +182,16 @@ th {
   border-right: 2px solid var(--primary);
 }
 
+.sidebar-footer {
+  margin-top: auto;
+  padding: 1.5rem;
+  border-top: 1px solid var(--border-color);
+}
+
+.sidebar-logout {
+  width: 100%;
+}
+
 .main-content {
   flex: 1;
   padding: 2rem;
@@ -225,50 +235,87 @@ th {
   border-bottom-color: var(--primary);
 }
 
-/* Mobile cards */
+/* Mobile layout */
 @media (max-width: 768px) {
   .app-container {
     flex-direction: column;
   }
-  
+
   .sidebar {
     width: 100%;
     border-right: none;
     border-bottom: 1px solid var(--border-color);
-    padding: 1rem 0;
+    padding: 0.75rem 0 0;
   }
-  
+
+  .sidebar-title {
+    padding: 0 1rem 0.75rem;
+    margin-bottom: 0.5rem;
+    font-size: 1.1rem;
+  }
+
+  .sidebar-nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+    padding: 0 0.5rem 0.5rem;
+  }
+
   .nav-link {
     display: inline-block;
-    padding: 0.5rem 1rem;
+    padding: 0.45rem 0.75rem;
+    border-radius: 999px;
   }
-  
-  table.mobile-cards, 
-  table.mobile-cards tbody, 
-  table.mobile-cards tr, 
+
+  .nav-link.active {
+    border-right: none;
+    background-color: rgba(59, 130, 246, 0.18);
+  }
+
+  .sidebar-footer {
+    margin-top: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+  }
+
+  .sidebar-logout {
+    width: auto;
+    flex-shrink: 0;
+  }
+
+  .main-content {
+    padding: 1rem;
+  }
+
+  table.mobile-cards,
+  table.mobile-cards tbody,
+  table.mobile-cards tr,
   table.mobile-cards td {
     display: block;
     width: 100%;
   }
-  
+
   table.mobile-cards thead {
     display: none;
   }
-  
+
   table.mobile-cards tr {
     margin-bottom: 1rem;
     border: 1px solid var(--border-color);
     border-radius: 6px;
     padding: 0.5rem;
   }
-  
+
   table.mobile-cards td {
     border-bottom: none;
     position: relative;
     padding-left: 40%;
     text-align: right;
   }
-  
+
   table.mobile-cards td::before {
     content: attr(data-label);
     position: absolute;

@@ -40,7 +40,7 @@
                 body: JSON.stringify({
                     username: newUsername,
                     password: newPassword,
-                    synthetic_user_id: newSyntheticId || undefined
+                    synthetic_user_id: newSyntheticId
                 })
             });
             showCreate = false;
@@ -56,12 +56,12 @@
     }
 
     async function toggleEnable(user) {
-        if (!confirm(`Are you sure you want to ${user.enabled ? 'disable' : 'enable'} ${user.username}?`)) return;
+        if (!confirm(`${user.enabled ? 'Disable' : 'Enable'} user ${user.username}?`)) return;
         try {
             await apiRequest(`/users/${user.id}/${user.enabled ? 'disable' : 'enable'}`, { method: 'POST' });
             await loadUsers();
         } catch (err) {
-            alert('Error: ' + err.message);
+            alert(err.message);
         }
     }
 
@@ -75,28 +75,31 @@
             });
             resetUserId = null;
             resetPasswordValue = '';
-            alert('Password reset successful');
+            alert('Password reset.');
         } catch (err) {
-            alert('Error: ' + err.message);
+            alert(err.message);
         }
     }
 
     async function revokeSessions(id) {
         if (!confirm('Revoke all sessions for this user?')) return;
         try {
-            const res = await apiRequest(`/users/${id}/sessions/revoke`, { method: 'POST' });
+            const res = await apiRequest(`/users/${id}/sessions/revoke-all`, { method: 'POST' });
             alert(`Revoked ${res.revoked || 0} sessions`);
         } catch (err) {
-            alert('Error: ' + err.message);
+            alert(err.message);
         }
+    }
+
+    function fmtTime(v) {
+        if (!v) return '-';
+        try { return new Date(v).toLocaleString(); } catch { return String(v); }
     }
 </script>
 
 <div class="flex justify-between items-center mb-4">
     <h1 class="page-title" style="margin: 0">Users</h1>
-    <button on:click={() => showCreate = !showCreate}>
-        {showCreate ? 'Cancel' : 'Create User'}
-    </button>
+    <button on:click={() => showCreate = !showCreate}>{showCreate ? 'Cancel' : 'Create User'}</button>
 </div>
 
 {#if error}
@@ -109,7 +112,7 @@
         {#if createError}
             <div class="error-message">{createError}</div>
         {/if}
-        <form on:submit={handleCreate} class="flex gap-4 items-center" style="flex-wrap: wrap">
+        <form on:submit={handleCreate} class="form-grid">
             <div>
                 <label class="text-sm text-secondary" for="username">Username</label>
                 <input type="text" id="username" bind:value={newUsername} required class="mt-2" />
@@ -119,13 +122,11 @@
                 <input type="password" id="password" bind:value={newPassword} required class="mt-2" />
             </div>
             <div>
-                <label class="text-sm text-secondary" for="syn_id">Synthetic User ID (optional)</label>
-                <input type="text" id="syn_id" bind:value={newSyntheticId} class="mt-2" />
+                <label class="text-sm text-secondary" for="syn_id">Synthetic User ID</label>
+                <input type="text" id="syn_id" bind:value={newSyntheticId} required class="mt-2" />
             </div>
-            <div style="margin-top: 1.5rem;">
-                <button type="submit" disabled={createLoading}>
-                    {createLoading ? 'Saving...' : 'Save'}
-                </button>
+            <div class="actions">
+                <button type="submit" disabled={createLoading}>{createLoading ? 'Saving…' : 'Save'}</button>
             </div>
         </form>
     </div>
@@ -135,9 +136,7 @@
     <div class="panel">
         <h3 style="margin-top:0">Reset Password</h3>
         <form on:submit={handleResetPassword} class="flex gap-4 items-center">
-            <div>
-                <input type="password" placeholder="New Password" bind:value={resetPasswordValue} required />
-            </div>
+            <input type="password" placeholder="New password" bind:value={resetPasswordValue} required />
             <button type="submit">Reset</button>
             <button type="button" class="secondary" on:click={() => resetUserId = null}>Cancel</button>
         </form>
@@ -146,14 +145,13 @@
 
 <div class="panel" style="padding: 0; overflow-x: auto;">
     {#if loading}
-        <div style="padding: 1.5rem">Loading...</div>
+        <div style="padding: 1.5rem" class="text-secondary">Loading…</div>
     {:else if users.length === 0}
-        <div style="padding: 1.5rem">No users found.</div>
+        <div style="padding: 1.5rem" class="text-secondary">No users found.</div>
     {:else}
         <table class="mobile-cards">
             <thead>
                 <tr>
-                    <th>ID</th>
                     <th>Username</th>
                     <th>Status</th>
                     <th>Synthetic ID</th>
@@ -164,26 +162,21 @@
             <tbody>
                 {#each users as user}
                     <tr>
-                        <td data-label="ID">{user.id}</td>
                         <td data-label="Username"><strong>{user.username}</strong></td>
                         <td data-label="Status">
                             <span class={user.enabled ? 'status-ok' : 'status-err'}>
                                 {user.enabled ? 'Enabled' : 'Disabled'}
                             </span>
                         </td>
-                        <td data-label="Synthetic ID" class="text-secondary">{user.synthetic_user_id || '-'}</td>
-                        <td data-label="Created">{new Date(user.created).toLocaleString()}</td>
+                        <td data-label="Synthetic ID" class="text-secondary mono">{user.synthetic_user_id || '-'}</td>
+                        <td data-label="Created">{fmtTime(user.created)}</td>
                         <td data-label="Actions">
-                            <div class="flex gap-2" style="justify-content: flex-end;">
+                            <div class="flex gap-2 action-row">
                                 <button class="secondary text-xs" on:click={() => toggleEnable(user)}>
                                     {user.enabled ? 'Disable' : 'Enable'}
                                 </button>
-                                <button class="secondary text-xs" on:click={() => resetUserId = user.id}>
-                                    Password
-                                </button>
-                                <button class="secondary text-xs" on:click={() => revokeSessions(user.id)}>
-                                    Revoke Sessions
-                                </button>
+                                <button class="secondary text-xs" on:click={() => resetUserId = user.id}>Password</button>
+                                <button class="secondary text-xs" on:click={() => revokeSessions(user.id)}>Kick</button>
                             </div>
                         </td>
                     </tr>
@@ -192,3 +185,16 @@
         </table>
     {/if}
 </div>
+
+<style>
+    .form-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 1rem;
+        align-items: end;
+    }
+    .actions { padding-bottom: 0.1rem; }
+    .text-xs { font-size: 0.75rem; padding: 0.25rem 0.55rem; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; }
+    .action-row { justify-content: flex-end; flex-wrap: wrap; }
+</style>

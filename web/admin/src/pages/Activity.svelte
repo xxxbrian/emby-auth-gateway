@@ -2,14 +2,20 @@
     import { onMount, onDestroy } from 'svelte';
     import { apiRequest } from '../lib/api.js';
 
-    let activeTab = 'playbacks'; // playbacks, transfers, sessions
+    let activeTab = 'playbacks';
     let data = [];
     let error = null;
     let timer;
 
+    const endpoints = {
+        playbacks: '/activity/playbacks',
+        transfers: '/activity/transfers',
+        sessions: '/sessions'
+    };
+
     async function loadData() {
         try {
-            const res = await apiRequest(`/${activeTab}`);
+            const res = await apiRequest(endpoints[activeTab]);
             data = res.items || [];
             error = null;
         } catch (err) {
@@ -23,25 +29,25 @@
         loadData();
     }
 
+    function fmtTime(v) {
+        if (!v) return '-';
+        try { return new Date(v).toLocaleString(); } catch { return String(v); }
+    }
+
     onMount(() => {
         loadData();
         timer = setInterval(loadData, 3000);
     });
 
-    onDestroy(() => {
-        clearInterval(timer);
-    });
+    onDestroy(() => clearInterval(timer));
 </script>
 
 <h1 class="page-title">Activity</h1>
 
-<div class="tabs">
-    <!-- svelte-ignore a11y-click-events-have-key-events -->
-    <div class="tab {activeTab === 'playbacks' ? 'active' : ''}" on:click={() => switchTab('playbacks')}>Playbacks</div>
-    <!-- svelte-ignore a11y-click-events-have-key-events -->
-    <div class="tab {activeTab === 'transfers' ? 'active' : ''}" on:click={() => switchTab('transfers')}>Transfers</div>
-    <!-- svelte-ignore a11y-click-events-have-key-events -->
-    <div class="tab {activeTab === 'sessions' ? 'active' : ''}" on:click={() => switchTab('sessions')}>Sessions</div>
+<div class="tabs" role="tablist">
+    <button type="button" class="tab {activeTab === 'playbacks' ? 'active' : ''}" role="tab" aria-selected={activeTab === 'playbacks'} on:click={() => switchTab('playbacks')}>Playbacks</button>
+    <button type="button" class="tab {activeTab === 'transfers' ? 'active' : ''}" role="tab" aria-selected={activeTab === 'transfers'} on:click={() => switchTab('transfers')}>Transfers</button>
+    <button type="button" class="tab {activeTab === 'sessions' ? 'active' : ''}" role="tab" aria-selected={activeTab === 'sessions'} on:click={() => switchTab('sessions')}>Sessions</button>
 </div>
 
 {#if error}
@@ -53,77 +59,115 @@
         {#if activeTab === 'playbacks'}
             <thead>
                 <tr>
-                    <th>User ID</th>
-                    <th>Item ID</th>
-                    <th>Client</th>
-                    <th>Started At</th>
-                    <th>Last Active</th>
+                    <th>User</th>
+                    <th>Item</th>
+                    <th>Device</th>
+                    <th>Paused</th>
+                    <th>Started</th>
+                    <th>Last Seen</th>
                 </tr>
             </thead>
             <tbody>
                 {#if data.length === 0}
-                    <tr><td colspan="5" style="text-align: center; padding: 1.5rem">No active playbacks.</td></tr>
+                    <tr><td colspan="6" class="empty">No active playbacks.</td></tr>
                 {/if}
                 {#each data as item}
                     <tr>
-                        <td data-label="User ID">{item.user_id}</td>
-                        <td data-label="Item ID">{item.item_id}</td>
-                        <td data-label="Client">{item.client}</td>
-                        <td data-label="Started At">{new Date(item.started_at).toLocaleString()}</td>
-                        <td data-label="Last Active">{new Date(item.last_active).toLocaleString()}</td>
+                        <td data-label="User">{item.username || item.user_id || '-'}</td>
+                        <td data-label="Item">{item.item_name || item.item_id || '-'}</td>
+                        <td data-label="Device">{item.device || '-'}</td>
+                        <td data-label="Paused">{item.is_paused ? 'Yes' : 'No'}</td>
+                        <td data-label="Started">{fmtTime(item.started_at)}</td>
+                        <td data-label="Last Seen">{fmtTime(item.last_seen)}</td>
                     </tr>
                 {/each}
             </tbody>
         {:else if activeTab === 'transfers'}
             <thead>
                 <tr>
-                    <th>ID</th>
-                    <th>User ID</th>
-                    <th>Path</th>
-                    <th>Bytes</th>
-                    <th>Started At</th>
+                    <th>User</th>
+                    <th>Item</th>
+                    <th>Mode</th>
+                    <th>Bytes Out</th>
+                    <th>Started</th>
+                    <th>Last Seen</th>
                 </tr>
             </thead>
             <tbody>
                 {#if data.length === 0}
-                    <tr><td colspan="5" style="text-align: center; padding: 1.5rem">No active transfers.</td></tr>
+                    <tr><td colspan="6" class="empty">No active transfers.</td></tr>
                 {/if}
                 {#each data as item}
                     <tr>
-                        <td data-label="ID">{item.id}</td>
-                        <td data-label="User ID">{item.user_id}</td>
-                        <td data-label="Path" class="text-sm">{item.path}</td>
-                        <td data-label="Bytes">{item.bytes_transferred}</td>
-                        <td data-label="Started At">{new Date(item.started_at).toLocaleString()}</td>
+                        <td data-label="User">{item.username || item.user_id || '-'}</td>
+                        <td data-label="Item">{item.item_id || '-'}</td>
+                        <td data-label="Mode">{item.media_mode || '-'}</td>
+                        <td data-label="Bytes Out">{item.bytes_out ?? 0}</td>
+                        <td data-label="Started">{fmtTime(item.started_at)}</td>
+                        <td data-label="Last Seen">{fmtTime(item.last_seen)}</td>
                     </tr>
                 {/each}
             </tbody>
         {:else}
             <thead>
                 <tr>
-                    <th>ID</th>
-                    <th>User ID</th>
-                    <th>Device</th>
+                    <th>User</th>
                     <th>Client</th>
+                    <th>Device</th>
                     <th>IP</th>
-                    <th>Created</th>
+                    <th>Active</th>
+                    <th>Expires</th>
+                    <th></th>
                 </tr>
             </thead>
             <tbody>
                 {#if data.length === 0}
-                    <tr><td colspan="6" style="text-align: center; padding: 1.5rem">No sessions found.</td></tr>
+                    <tr><td colspan="7" class="empty">No sessions.</td></tr>
                 {/if}
                 {#each data as item}
                     <tr>
-                        <td data-label="ID">{item.id}</td>
-                        <td data-label="User ID">{item.user_id}</td>
-                        <td data-label="Device">{item.device_name || '-'}</td>
-                        <td data-label="Client">{item.client_name || '-'} {item.client_version || ''}</td>
-                        <td data-label="IP">{item.ip || '-'}</td>
-                        <td data-label="Created">{new Date(item.created).toLocaleString()}</td>
+                        <td data-label="User">{item.gateway_username || item.gateway_user_id || '-'}</td>
+                        <td data-label="Client">{item.client || '-'}</td>
+                        <td data-label="Device">{item.device || '-'}</td>
+                        <td data-label="IP">{item.remote_ip || '-'}</td>
+                        <td data-label="Active">
+                            <span class={item.active ? 'status-ok' : 'status-err'}>{item.active ? 'Active' : 'Inactive'}</span>
+                        </td>
+                        <td data-label="Expires">{fmtTime(item.expires_at)}</td>
+                        <td data-label="Actions">
+                            {#if item.active}
+                                <button class="secondary text-xs" on:click={async () => {
+                                    if (!confirm('Revoke this session?')) return;
+                                    try {
+                                        await apiRequest(`/sessions/${item.id}/revoke`, { method: 'POST' });
+                                        await loadData();
+                                    } catch (err) {
+                                        alert(err.message);
+                                    }
+                                }}>Revoke</button>
+                            {/if}
+                        </td>
                     </tr>
                 {/each}
             </tbody>
         {/if}
     </table>
 </div>
+
+<style>
+    .empty { text-align: center; padding: 1.5rem; color: var(--text-secondary); }
+    .tabs { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
+    .tab {
+        background: transparent;
+        border: 1px solid var(--border-color);
+        color: var(--text-secondary);
+        padding: 0.4rem 0.9rem;
+        border-radius: 999px;
+    }
+    .tab.active {
+        background: var(--primary);
+        border-color: var(--primary);
+        color: #fff;
+    }
+    .text-xs { font-size: 0.75rem; padding: 0.25rem 0.5rem; }
+</style>
