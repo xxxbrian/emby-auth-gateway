@@ -54,6 +54,52 @@
         return 'status-warn';
     }
 
+    /** Compact relative age; null for missing/invalid/future timestamps. */
+    function formatRelativeAge(iso?: string): string | null {
+        if (!iso) return null;
+        const t = Date.parse(iso);
+        if (Number.isNaN(t)) return null;
+        const sec = Math.floor((Date.now() - t) / 1000);
+        if (sec < 0) return null;
+        if (sec < 60) return `${sec}s ago`;
+        const min = Math.floor(sec / 60);
+        if (min < 60) return `${min}m ago`;
+        const hr = Math.floor(min / 60);
+        if (hr < 24) return `${hr}h ago`;
+        return `${Math.floor(hr / 24)}d ago`;
+    }
+
+    function authErrorLabel(err?: string): string {
+        if (err === 'refresh_failed') return 'Refresh failed';
+        if (err === 'auth_unavailable') return 'Unavailable';
+        return 'Failed';
+    }
+
+    function authState(u: UpstreamStatus | null | undefined): 'unknown' | 'healthy' | 'failing' {
+        const s = u?.auth_state;
+        if (s === 'healthy' || s === 'failing' || s === 'unknown') return s;
+        return 'unknown';
+    }
+
+    function authLabel(u: UpstreamStatus | null | undefined): string {
+        const state = authState(u);
+        if (state === 'healthy') {
+            const age = formatRelativeAge(u?.last_auth_at);
+            return age ? `Accepted · ${age}` : 'Accepted';
+        }
+        if (state === 'failing') {
+            return `Auth failed · ${authErrorLabel(u?.last_auth_error)}`;
+        }
+        return 'Not observed';
+    }
+
+    function authClass(u: UpstreamStatus | null | undefined): string {
+        const state = authState(u);
+        if (state === 'healthy') return 'status-ok';
+        if (state === 'failing') return 'status-err';
+        return 'text-secondary';
+    }
+
     onMount(() => {
         fetchData();
         timer = setInterval(fetchData, 2000);
@@ -87,10 +133,8 @@
                     <div class="metric-value {upstreamClass(data.upstream)}">{upstreamLabel(data.upstream)}</div>
                 </div>
                 <div class="metric-box">
-                    <div class="metric-label">Auth</div>
-                    <div class="metric-value {data.upstream?.auth_ok ? 'status-ok' : 'status-warn'}">
-                        {data.upstream?.auth_ok ? 'OK' : (data.upstream?.last_auth_error || 'Unknown')}
-                    </div>
+                    <div class="metric-label">Backend Auth</div>
+                    <div class="metric-value {authClass(data.upstream)}">{authLabel(data.upstream)}</div>
                 </div>
                 <div class="metric-box">
                     <div class="metric-label">Uptime</div>

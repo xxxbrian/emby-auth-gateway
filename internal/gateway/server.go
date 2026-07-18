@@ -531,6 +531,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 		if r.Context().Err() != nil || errors.Is(err, context.Canceled) {
 			panic(http.ErrAbortHandler)
 		}
+		s.emitAuthUnavailable(session)
 		s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "backend_auth_failure", Message: "backend authentication failed", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
 		http.Error(w, "backend authentication failed", http.StatusBadGateway)
 		return
@@ -628,8 +629,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 				s.writeConcurrentPlaybackDenied(w, r, rel, session, guardKey)
 				return
 			}
-		} else if confirmed && !errors.Is(refreshErr, ErrUnauthorized) {
-			s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh_failure", refreshErr.Error(), http.StatusUnauthorized)
+		} else {
+			s.auditBackendTokenRefreshFailure(r.Context(), r, rel, session, confirmed, refreshErr, "backend token refresh failed after unauthorized response")
 		}
 	}
 	if resp.StatusCode == http.StatusForbidden {
@@ -810,8 +811,8 @@ func (s *Server) prepareBackendUpgrade(ctx context.Context, r *http.Request, rel
 	if refreshed, confirmed, err := s.refreshAfterUnauthorized(ctx, upstream); confirmed && err == nil {
 		s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh", "backend token refreshed before upgrade", http.StatusOK)
 		return refreshed
-	} else if confirmed && !errors.Is(err, ErrUnauthorized) {
-		s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh_failure", "backend token refresh failed before upgrade", http.StatusUnauthorized)
+	} else {
+		s.auditBackendTokenRefreshFailure(ctx, r, rel, session, confirmed, err, "backend token refresh failed before upgrade")
 	}
 	return upstream
 }
@@ -962,17 +963,59 @@ func (s *Server) audit(ctx context.Context, entry AuditLog) {
 
 func (s *Server) auditBackendTokenRefresh(r *http.Request, rel string, session *Session, event, message string, status int) {
 	s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: event, Message: message, RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: status})
-	if event == "backend_token_refresh" {
-		s.emit(observe.Event{
-			Kind:        observe.KindUpstreamAuthRefresh,
-			Outcome:     observe.OutcomeOK,
-			StatusClass: observe.StatusClassOf(status),
-			UserID:      sessionGatewayUserID(session),
-			Username:    sessionUsername(session),
-			SessionID:   sessionTokenHash(session),
-			Device:      sessionDevice(session),
-		})
+	s.emitBackendAuthRefresh(session, event, status)
+}
+
+// auditBackendTokenRefreshFailure records only confirmed refresh failures from
+// a live parent request. Caller cancellation is not evidence of auth failure.
+func (s *Server) auditBackendTokenRefreshFailure(ctx context.Context, r *http.Request, rel string, session *Session, confirmed bool, err error, message string) {
+	if !shouldReportBackendAuthRefreshFailure(ctx, confirmed, err) {
+		return
 	}
+	s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh_failure", message, http.StatusUnauthorized)
+}
+
+func shouldReportBackendAuthRefreshFailure(ctx context.Context, confirmed bool, err error) bool {
+	if !confirmed || err == nil || errors.Is(err, ErrUnauthorized) {
+		return false
+	}
+	return ctx == nil || ctx.Err() == nil
+}
+
+// emitBackendAuthRefresh observes explicit managed-backend token refresh outcomes.
+// Success marks telemetry auth healthy; confirmed failure marks failing with refresh_failed.
+func (s *Server) emitBackendAuthRefresh(session *Session, event string, status int) {
+	ev := observe.Event{
+		Kind:        observe.KindUpstreamAuthRefresh,
+		StatusClass: observe.StatusClassOf(status),
+		UserID:      sessionGatewayUserID(session),
+		Username:    sessionUsername(session),
+		SessionID:   sessionTokenHash(session),
+		Device:      sessionDevice(session),
+	}
+	switch event {
+	case "backend_token_refresh":
+		ev.Outcome = observe.OutcomeOK
+	case "backend_token_refresh_failure":
+		ev.Outcome = observe.OutcomeError
+		ev.ErrorKind = telemetry.AuthErrorRefreshFailed
+	default:
+		return
+	}
+	s.emit(ev)
+}
+
+// emitAuthUnavailable records a confirmed Ensure failure (not request cancellation).
+func (s *Server) emitAuthUnavailable(session *Session) {
+	s.emit(observe.Event{
+		Kind:      observe.KindUpstreamAuthRefresh,
+		Outcome:   observe.OutcomeError,
+		ErrorKind: telemetry.AuthErrorAuthUnavailable,
+		UserID:    sessionGatewayUserID(session),
+		Username:  sessionUsername(session),
+		SessionID: sessionTokenHash(session),
+		Device:    sessionDevice(session),
+	})
 }
 
 func (s *Server) proxyURL(upstream upstreamRequestSnapshot, session *Session, rel, rawQuery, gatewayToken string) (*url.URL, error) {

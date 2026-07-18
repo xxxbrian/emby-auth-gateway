@@ -21,14 +21,18 @@ export interface ReauthResponse {
 
 // --- Telemetry Snapshot (nested) ---
 
+/** Three-state backend auth observation from telemetry snapshot. */
+export type UpstreamAuthState = 'unknown' | 'healthy' | 'failing';
+
 export interface UpstreamStatus {
   last_ok_at?: string;
   last_error_at?: string;
   last_status_class?: string;
   last_error_kind?: string;
   last_latency_ms?: number;
-  auth_ok: boolean;
+  auth_state: UpstreamAuthState;
   last_auth_at?: string;
+  /** Known: refresh_failed | auth_unavailable; tolerate unknown future strings. */
   last_auth_error?: string;
 }
 

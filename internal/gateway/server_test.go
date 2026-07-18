@@ -18,7 +18,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xxxbrian/emby-auth-gateway/internal/observe"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pathpolicy"
+	"github.com/xxxbrian/emby-auth-gateway/internal/telemetry"
 )
 
 var testHTTPClient = &http.Client{Timeout: 5 * time.Second}
@@ -748,7 +750,9 @@ func TestProxyRefreshesBackendTokenOnUnauthorized(t *testing.T) {
 	source := store.UpstreamSources["source"]
 	source.BackendToken, source.BackendUserID = "backend-token-1", "backend-user"
 	store.UpstreamSources["source"] = source
-	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby", GatewayServerID: "gateway-server"}, store))
+	em := observe.NewEmitter(32)
+	defer em.Close()
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby", GatewayServerID: "gateway-server", Emitter: em}, store))
 	defer gw.Close()
 
 	loginResp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice","Pw":"alice-pass"}`))
@@ -775,6 +779,9 @@ func TestProxyRefreshesBackendTokenOnUnauthorized(t *testing.T) {
 	}
 	if store.UpstreamSources["source"].BackendToken != "backend-token-2" {
 		t.Fatalf("upstream source token was not refreshed: %#v", store.UpstreamSources["source"])
+	}
+	if !hasObserveEvent(t, em, observe.KindUpstreamAuthRefresh, observe.OutcomeOK, "") {
+		t.Fatal("expected upstream_auth_refresh ok observation on successful token refresh")
 	}
 }
 
@@ -1350,7 +1357,9 @@ func TestAuditLogsForAuthDependencyFailures(t *testing.T) {
 		source.AuthGenerationID, source.BackendToken, source.BackendUserID = "", "", ""
 		source.TokenUpdatedAt, source.LastLoginAt = nil, nil
 		store.UpstreamSources["source"] = source
-		gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+		em := observe.NewEmitter(16)
+		defer em.Close()
+		gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby", Emitter: em}, store))
 		defer gw.Close()
 
 		loginResp := do(t, mustJSONLoginRequest(t, gw.URL+"/emby/Users/AuthenticateByName", `{"Username":"alice","Pw":"alice-pass"}`))
@@ -1372,6 +1381,9 @@ func TestAuditLogsForAuthDependencyFailures(t *testing.T) {
 		}
 		if !hasAuditEvent(store, "backend_auth_failure") {
 			t.Fatalf("missing backend_auth_failure audit in %#v", store.AuditLogs)
+		}
+		if !hasObserveEvent(t, em, observe.KindUpstreamAuthRefresh, observe.OutcomeError, telemetry.AuthErrorAuthUnavailable) {
+			t.Fatal("expected auth_unavailable observation on Ensure failure")
 		}
 	})
 
@@ -4087,6 +4099,139 @@ func hasAuditEvent(store *MemoryStore, event string) bool {
 		}
 	}
 	return false
+}
+
+// hasObserveEvent drains the emitter channel (non-blocking after a short wait)
+// and reports whether a matching event was observed.
+func hasObserveEvent(t *testing.T, em *observe.Emitter, kind observe.Kind, outcome, errorKind string) bool {
+	t.Helper()
+	if em == nil {
+		return false
+	}
+	ch := em.Events()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		select {
+		case ev, ok := <-ch:
+			if !ok {
+				return false
+			}
+			if ev.Kind != kind {
+				continue
+			}
+			if outcome != "" && ev.Outcome != outcome {
+				continue
+			}
+			if errorKind != "" && ev.ErrorKind != errorKind {
+				continue
+			}
+			return true
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	return false
+}
+
+func TestEmitBackendAuthObservations(t *testing.T) {
+	em := observe.NewEmitter(8)
+	defer em.Close()
+	s := NewServer(Config{GatewayBasePath: "/emby", Emitter: em}, NewMemoryStore())
+	session := &Session{GatewayUserID: "u1", GatewayUsername: "alice", GatewayTokenHash: "tok", Device: "dev"}
+
+	s.emitBackendAuthRefresh(session, "backend_token_refresh", http.StatusOK)
+	if !hasObserveEvent(t, em, observe.KindUpstreamAuthRefresh, observe.OutcomeOK, "") {
+		t.Fatal("expected success refresh observation")
+	}
+
+	s.emitBackendAuthRefresh(session, "backend_token_refresh_failure", http.StatusUnauthorized)
+	if !hasObserveEvent(t, em, observe.KindUpstreamAuthRefresh, observe.OutcomeError, telemetry.AuthErrorRefreshFailed) {
+		t.Fatal("expected refresh_failed observation")
+	}
+
+	s.emitAuthUnavailable(session)
+	if !hasObserveEvent(t, em, observe.KindUpstreamAuthRefresh, observe.OutcomeError, telemetry.AuthErrorAuthUnavailable) {
+		t.Fatal("expected auth_unavailable observation")
+	}
+
+	// Unknown audit event names must not emit.
+	s.emitBackendAuthRefresh(session, "unrelated_event", http.StatusOK)
+	select {
+	case ev := <-em.Events():
+		t.Fatalf("unexpected observation for unrelated event: %#v", ev)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestBackendAuthRefreshFailureReportingSkipsParentCancellation(t *testing.T) {
+	em := observe.NewEmitter(8)
+	defer em.Close()
+	store := NewMemoryStore()
+	s := NewServer(Config{GatewayBasePath: "/emby", Emitter: em}, store)
+	session := &Session{GatewayUserID: "u1", GatewayUsername: "alice", GatewayTokenHash: "tok", Device: "dev"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/System/Info", nil).WithContext(ctx)
+	s.auditBackendTokenRefreshFailure(ctx, r, "/System/Info", session, true, context.Canceled, "refresh failed")
+	if hasAuditEvent(store, "backend_token_refresh_failure") {
+		t.Fatalf("canceled refresh must not audit auth failure: %#v", store.AuditLogs)
+	}
+	select {
+	case ev := <-em.Events():
+		t.Fatalf("canceled refresh emitted auth failure: %#v", ev)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	live := context.Background()
+	r = httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/System/Info", nil)
+	s.auditBackendTokenRefreshFailure(live, r, "/System/Info", session, true, errors.New("refresh failed"), "refresh failed")
+	if !hasAuditEvent(store, "backend_token_refresh_failure") {
+		t.Fatalf("confirmed live refresh failure was not audited: %#v", store.AuditLogs)
+	}
+	if !hasObserveEvent(t, em, observe.KindUpstreamAuthRefresh, observe.OutcomeError, telemetry.AuthErrorRefreshFailed) {
+		t.Fatal("expected refresh_failed observation for live request")
+	}
+}
+
+func TestFetchBackendJSONEmitsConfirmedRefreshFailure(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/emby/Users/backend-user/Items", "/emby/System/Info":
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{}`))
+		case "/emby/Users/AuthenticateByName":
+			http.Error(w, "refresh failed", http.StatusInternalServerError)
+		default:
+			t.Fatalf("unexpected backend request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer backend.Close()
+
+	store := testStore(backend.URL + "/emby")
+	source := store.UpstreamSources["source"]
+	source.BackendToken = "backend-token"
+	source.BackendUserID = "backend-user"
+	store.UpstreamSources["source"] = source
+	em := observe.NewEmitter(16)
+	defer em.Close()
+	s := NewServer(Config{HTTPClient: backend.Client(), Emitter: em}, store)
+	session := testSession()
+	r := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Users/gateway-user/Items", nil)
+
+	_, status, _, err := s.fetchBackendJSON(r.Context(), r, "/Users/backend-user/Items", "", session, "gateway-token")
+	if err != nil {
+		t.Fatalf("fetchBackendJSON: %v", err)
+	}
+	if status != http.StatusUnauthorized {
+		t.Fatalf("status=%d want %d", status, http.StatusUnauthorized)
+	}
+	if !hasAuditEvent(store, "backend_token_refresh_failure") {
+		t.Fatalf("missing refresh failure audit: %#v", store.AuditLogs)
+	}
+	if !hasObserveEvent(t, em, observe.KindUpstreamAuthRefresh, observe.OutcomeError, telemetry.AuthErrorRefreshFailed) {
+		t.Fatal("expected refresh_failed observation from fetchBackendJSON")
+	}
 }
 
 func fetchUserData(t *testing.T, url string) map[string]any {

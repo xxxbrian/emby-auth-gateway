@@ -355,8 +355,14 @@ func TestUpstreamAndReliability(t *testing.T) {
 	if snap.Upstream.LastLatencyMS != 42 {
 		t.Fatalf("latency: %d", snap.Upstream.LastLatencyMS)
 	}
-	if !snap.Upstream.AuthOK {
-		t.Fatal("expected auth ok")
+	if snap.Upstream.AuthState != AuthStateHealthy {
+		t.Fatalf("auth_state: %q want %q", snap.Upstream.AuthState, AuthStateHealthy)
+	}
+	if snap.Upstream.LastAuthAt == nil {
+		t.Fatal("expected last_auth_at")
+	}
+	if snap.Upstream.LastAuthError != "" {
+		t.Fatalf("last_auth_error: %q want empty", snap.Upstream.LastAuthError)
 	}
 	if snap.Upstream.LastOKAt == nil {
 		t.Fatal("expected last_ok_at")
@@ -366,6 +372,151 @@ func TestUpstreamAndReliability(t *testing.T) {
 	}
 	if snap.Reliability.OverlayFail5m < 1 {
 		t.Fatalf("overlay fails: %d", snap.Reliability.OverlayFail5m)
+	}
+}
+
+func TestAuthStateThreeStateTransitions(t *testing.T) {
+	r := New(nil)
+	base := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	r.now = func() time.Time { return base }
+
+	// Startup: unknown, always serialized.
+	snap := r.Snapshot()
+	if snap.Upstream.AuthState != AuthStateUnknown {
+		t.Fatalf("initial auth_state: %q want %q", snap.Upstream.AuthState, AuthStateUnknown)
+	}
+	if snap.Upstream.LastAuthAt != nil || snap.Upstream.LastAuthError != "" {
+		t.Fatalf("initial auth fields: at=%v err=%q", snap.Upstream.LastAuthAt, snap.Upstream.LastAuthError)
+	}
+
+	// 2xx managed upstream request -> healthy + timestamp, clears error.
+	r.handle(observe.Event{
+		Kind:        observe.KindUpstreamRequest,
+		At:          base,
+		Outcome:     observe.OutcomeOK,
+		StatusClass: observe.Status2xx,
+		DurationMS:  10,
+	})
+	snap = r.Snapshot()
+	if snap.Upstream.AuthState != AuthStateHealthy {
+		t.Fatalf("after 2xx: auth_state=%q", snap.Upstream.AuthState)
+	}
+	if snap.Upstream.LastAuthAt == nil || !snap.Upstream.LastAuthAt.Equal(base) {
+		t.Fatalf("after 2xx: last_auth_at=%v want %v", snap.Upstream.LastAuthAt, base)
+	}
+	if snap.Upstream.LastAuthError != "" {
+		t.Fatalf("after 2xx: last_auth_error=%q", snap.Upstream.LastAuthError)
+	}
+
+	// 4xx / 5xx / network (status0) must not change auth state.
+	prevAuthAt := *snap.Upstream.LastAuthAt
+	for i, class := range []string{observe.Status4xx, observe.Status5xx, observe.Status0} {
+		at := base.Add(time.Duration(i+1) * time.Second)
+		outcome := observe.OutcomeOK
+		if class != observe.Status4xx {
+			outcome = observe.OutcomeError
+		}
+		r.handle(observe.Event{
+			Kind:        observe.KindUpstreamRequest,
+			At:          at,
+			Outcome:     outcome,
+			StatusClass: class,
+		})
+		snap = r.Snapshot()
+		if snap.Upstream.AuthState != AuthStateHealthy {
+			t.Fatalf("after %s: auth_state=%q want healthy", class, snap.Upstream.AuthState)
+		}
+		if snap.Upstream.LastAuthAt == nil || !snap.Upstream.LastAuthAt.Equal(prevAuthAt) {
+			t.Fatalf("after %s: last_auth_at changed to %v", class, snap.Upstream.LastAuthAt)
+		}
+		if snap.Upstream.LastAuthError != "" {
+			t.Fatalf("after %s: last_auth_error=%q", class, snap.Upstream.LastAuthError)
+		}
+	}
+
+	// Explicit refresh failure -> failing with stable code.
+	failAt := base.Add(10 * time.Second)
+	r.handle(observe.Event{
+		Kind:      observe.KindUpstreamAuthRefresh,
+		At:        failAt,
+		Outcome:   observe.OutcomeError,
+		ErrorKind: AuthErrorRefreshFailed,
+	})
+	snap = r.Snapshot()
+	if snap.Upstream.AuthState != AuthStateFailing {
+		t.Fatalf("after refresh fail: auth_state=%q", snap.Upstream.AuthState)
+	}
+	if snap.Upstream.LastAuthError != AuthErrorRefreshFailed {
+		t.Fatalf("after refresh fail: last_auth_error=%q", snap.Upstream.LastAuthError)
+	}
+	// last_auth_at remains last successful auth evidence.
+	if snap.Upstream.LastAuthAt == nil || !snap.Upstream.LastAuthAt.Equal(prevAuthAt) {
+		t.Fatalf("after refresh fail: last_auth_at=%v want %v", snap.Upstream.LastAuthAt, prevAuthAt)
+	}
+
+	// auth_unavailable is also a stable failing code.
+	r.handle(observe.Event{
+		Kind:      observe.KindUpstreamAuthRefresh,
+		At:        failAt.Add(time.Second),
+		Outcome:   observe.OutcomeError,
+		ErrorKind: AuthErrorAuthUnavailable,
+	})
+	snap = r.Snapshot()
+	if snap.Upstream.AuthState != AuthStateFailing || snap.Upstream.LastAuthError != AuthErrorAuthUnavailable {
+		t.Fatalf("auth_unavailable: state=%q err=%q", snap.Upstream.AuthState, snap.Upstream.LastAuthError)
+	}
+
+	// Non-stable ErrorKind is bounded to refresh_failed.
+	r.handle(observe.Event{
+		Kind:      observe.KindUpstreamAuthRefresh,
+		At:        failAt.Add(2 * time.Second),
+		Outcome:   observe.OutcomeError,
+		ErrorKind: "connection reset by peer and a very long raw string",
+	})
+	snap = r.Snapshot()
+	if snap.Upstream.LastAuthError != AuthErrorRefreshFailed {
+		t.Fatalf("raw error kind: last_auth_error=%q want %q", snap.Upstream.LastAuthError, AuthErrorRefreshFailed)
+	}
+
+	// Recovery via successful refresh: healthy, clears error, updates timestamp.
+	okAt := base.Add(20 * time.Second)
+	r.handle(observe.Event{
+		Kind:        observe.KindUpstreamAuthRefresh,
+		At:          okAt,
+		Outcome:     observe.OutcomeOK,
+		StatusClass: observe.Status2xx,
+	})
+	snap = r.Snapshot()
+	if snap.Upstream.AuthState != AuthStateHealthy {
+		t.Fatalf("after refresh ok: auth_state=%q", snap.Upstream.AuthState)
+	}
+	if snap.Upstream.LastAuthError != "" {
+		t.Fatalf("after refresh ok: last_auth_error=%q", snap.Upstream.LastAuthError)
+	}
+	if snap.Upstream.LastAuthAt == nil || !snap.Upstream.LastAuthAt.Equal(okAt) {
+		t.Fatalf("after refresh ok: last_auth_at=%v want %v", snap.Upstream.LastAuthAt, okAt)
+	}
+
+	// Fail again then recover via managed 2xx request.
+	r.handle(observe.Event{
+		Kind:      observe.KindUpstreamAuthRefresh,
+		At:        okAt.Add(time.Second),
+		Outcome:   observe.OutcomeError,
+		ErrorKind: AuthErrorRefreshFailed,
+	})
+	recoverAt := okAt.Add(2 * time.Second)
+	r.handle(observe.Event{
+		Kind:        observe.KindUpstreamRequest,
+		At:          recoverAt,
+		Outcome:     observe.OutcomeOK,
+		StatusClass: observe.Status2xx,
+	})
+	snap = r.Snapshot()
+	if snap.Upstream.AuthState != AuthStateHealthy || snap.Upstream.LastAuthError != "" {
+		t.Fatalf("2xx recovery: state=%q err=%q", snap.Upstream.AuthState, snap.Upstream.LastAuthError)
+	}
+	if snap.Upstream.LastAuthAt == nil || !snap.Upstream.LastAuthAt.Equal(recoverAt) {
+		t.Fatalf("2xx recovery: last_auth_at=%v want %v", snap.Upstream.LastAuthAt, recoverAt)
 	}
 }
 

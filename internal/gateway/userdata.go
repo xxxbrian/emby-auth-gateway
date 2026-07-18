@@ -610,6 +610,10 @@ func lowerSet(values []string) map[string]bool {
 func (s *Server) fetchBackendJSON(ctx context.Context, r *http.Request, rel, rawQuery string, session *Session, gatewayToken string) (any, int, upstreamRequestSnapshot, error) {
 	runtime, err := s.upstreamAuth.Ensure(ctx)
 	if err != nil {
+		// Confirmed Ensure failure only; cancellation/deadline must not flip auth state.
+		if ctx.Err() == nil {
+			s.emitAuthUnavailable(session)
+		}
 		return nil, 0, upstreamRequestSnapshot{}, err
 	}
 	upstream, err := upstreamRequestSnapshotFromRuntime(runtime)
@@ -659,6 +663,8 @@ func (s *Server) fetchBackendJSON(ctx context.Context, r *http.Request, rel, raw
 			}
 			s.emitUpstreamAttempt(attemptStarted, resp.StatusCode, nil)
 			defer resp.Body.Close()
+		} else {
+			s.auditBackendTokenRefreshFailure(ctx, r, rel, session, confirmed, refreshErr, "backend token refresh failed after unauthorized response")
 		}
 	}
 	data, err := readLimited(resp.Body, proxyJSONLimit)

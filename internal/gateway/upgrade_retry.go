@@ -1,9 +1,6 @@
 package gateway
 
-import (
-	"errors"
-	"net/http"
-)
+import "net/http"
 
 // upgradeRetryTransport retries exactly one definitive backend 401 before the
 // ReverseProxy takes ownership of a successful upgraded connection.
@@ -30,9 +27,7 @@ func (t *upgradeRetryTransport) RoundTrip(req *http.Request) (*http.Response, er
 	// itself keeps req.Context so its cancellation/tracing remains intact.
 	refreshed, confirmed, refreshErr := t.server.refreshAfterUnauthorized(t.original.Context(), t.upstream)
 	if refreshErr != nil || !confirmed {
-		if confirmed && !errors.Is(refreshErr, ErrUnauthorized) {
-			t.server.auditBackendTokenRefresh(t.original, t.rel, t.session, "backend_token_refresh_failure", "backend token refresh failed after upgrade unauthorized response", http.StatusUnauthorized)
-		}
+		t.server.auditBackendTokenRefreshFailure(t.original.Context(), t.original, t.rel, t.session, confirmed, refreshErr, "backend token refresh failed after upgrade unauthorized response")
 		return resp, nil
 	}
 	t.upstream = refreshed

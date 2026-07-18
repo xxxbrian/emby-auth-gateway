@@ -400,11 +400,15 @@ func seriesFromRing(ring *timeRing, now time.Time, n int, bucket time.Duration, 
 }
 
 func (r *Registry) upstreamSnapshotLocked() UpstreamStatus {
+	authState := r.upstream.AuthState
+	if authState == "" {
+		authState = AuthStateUnknown
+	}
 	u := UpstreamStatus{
 		LastStatusClass: r.upstream.LastStatusClass,
 		LastErrorKind:   r.upstream.LastErrorKind,
 		LastLatencyMS:   r.upstream.LastLatencyMS,
-		AuthOK:          r.upstream.AuthOK,
+		AuthState:       authState,
 		LastAuthError:   r.upstream.LastAuthError,
 	}
 	if r.upstream.HasLastOK {
@@ -565,20 +569,24 @@ func (r *Registry) recordUpstreamLocked(at time.Time, ev observe.Event) {
 		r.upstream.HasLastOK = true
 		r.upstream.LastErrorKind = ""
 	}
+	// Managed backend requests after Ensure/header rewrite: 2xx means the
+	// configured identity was accepted. Network errors, 5xx, and ordinary 4xx
+	// do not change auth state.
+	if ev.StatusClass == observe.Status2xx {
+		r.markAuthHealthyLocked(at)
+	}
 }
 
 func (r *Registry) recordUpstreamAuthLocked(at time.Time, ev observe.Event) {
-	r.upstream.LastAuthAt = at
-	r.upstream.HasLastAuth = true
 	if isErrorOutcome(ev) || isErrorStatus(ev.StatusClass) {
-		r.upstream.AuthOK = false
-		r.upstream.LastAuthError = firstNonEmpty(ev.ErrorKind, ev.Outcome, "auth_failed")
+		// Explicit confirmed auth/refresh failure only.
+		r.upstream.AuthState = AuthStateFailing
+		r.upstream.LastAuthError = stableAuthError(ev.ErrorKind)
 		r.upstream.LastErrorAt = at
 		r.upstream.HasLastError = true
 		r.upstream.LastErrorKind = r.upstream.LastAuthError
 	} else {
-		r.upstream.AuthOK = true
-		r.upstream.LastAuthError = ""
+		r.markAuthHealthyLocked(at)
 		r.upstream.LastOKAt = at
 		r.upstream.HasLastOK = true
 	}
@@ -587,6 +595,25 @@ func (r *Registry) recordUpstreamAuthLocked(at time.Time, ev observe.Event) {
 	}
 	if ev.StatusClass != "" {
 		r.upstream.LastStatusClass = ev.StatusClass
+	}
+}
+
+// markAuthHealthyLocked records confirmed managed-backend auth acceptance.
+// Caller must hold r.mu.
+func (r *Registry) markAuthHealthyLocked(at time.Time) {
+	r.upstream.AuthState = AuthStateHealthy
+	r.upstream.LastAuthAt = at
+	r.upstream.HasLastAuth = true
+	r.upstream.LastAuthError = ""
+}
+
+// stableAuthError maps an observation ErrorKind to a bounded wire code.
+func stableAuthError(kind string) string {
+	switch kind {
+	case AuthErrorAuthUnavailable:
+		return AuthErrorAuthUnavailable
+	default:
+		return AuthErrorRefreshFailed
 	}
 }
 

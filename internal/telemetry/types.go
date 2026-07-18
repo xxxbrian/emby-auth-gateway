@@ -16,6 +16,24 @@ type Snapshot struct {
 	Series      SeriesData        `json:"series"`
 }
 
+// Backend auth wire values for UpstreamStatus.AuthState.
+//
+// Meaning: current best-known runtime evidence that the configured managed
+// backend identity was accepted by the active Emby upstream.
+// Startup/restart is unknown; only confirmed auth success/2xx or confirmed
+// auth failure transitions the state (no stale timer).
+const (
+	AuthStateUnknown = "unknown"
+	AuthStateHealthy = "healthy"
+	AuthStateFailing = "failing"
+)
+
+// Stable last_auth_error codes (bounded; never raw error strings).
+const (
+	AuthErrorRefreshFailed   = "refresh_failed"
+	AuthErrorAuthUnavailable = "auth_unavailable"
+)
+
 // UpstreamStatus summarizes recent upstream health.
 type UpstreamStatus struct {
 	LastOKAt        *time.Time `json:"last_ok_at,omitempty"`
@@ -23,7 +41,7 @@ type UpstreamStatus struct {
 	LastStatusClass string     `json:"last_status_class,omitempty"`
 	LastErrorKind   string     `json:"last_error_kind,omitempty"`
 	LastLatencyMS   int64      `json:"last_latency_ms,omitempty"`
-	AuthOK          bool       `json:"auth_ok"`
+	AuthState       string     `json:"auth_state"`
 	LastAuthAt      *time.Time `json:"last_auth_at,omitempty"`
 	LastAuthError   string     `json:"last_auth_error,omitempty"`
 }
@@ -76,8 +94,8 @@ const (
 //   - errors: error count in the bucket (not a rate)
 //   - playbacks: max active playbacks observed in the bucket
 type SeriesData struct {
-	Window    string        `json:"window"`              // 15m|1h|6h|24h
-	Interval  string        `json:"interval,omitempty"`  // 1s|1m bucket size
+	Window    string        `json:"window"`             // 15m|1h|6h|24h
+	Interval  string        `json:"interval,omitempty"` // 1s|1m bucket size
 	RPS       []SeriesPoint `json:"rps"`
 	MbpsIn    []SeriesPoint `json:"mbps_in"`
 	MbpsOut   []SeriesPoint `json:"mbps_out"`
@@ -144,8 +162,9 @@ type upstreamState struct {
 	LastStatusClass string
 	LastErrorKind   string
 	LastLatencyMS   int64
-	AuthOK          bool
-	LastAuthAt      time.Time
-	HasLastAuth     bool
-	LastAuthError   string
+	// AuthState is one of AuthStateUnknown/Healthy/Failing; empty means unknown.
+	AuthState     string
+	LastAuthAt    time.Time
+	HasLastAuth   bool
+	LastAuthError string
 }
