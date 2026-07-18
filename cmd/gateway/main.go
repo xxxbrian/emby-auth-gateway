@@ -10,9 +10,11 @@ import (
 	"time"
 
 	"github.com/xxxbrian/emby-auth-gateway/internal/gateway"
+	"github.com/xxxbrian/emby-auth-gateway/internal/observe"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pbschema"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pbsetup"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pbstore"
+	"github.com/xxxbrian/emby-auth-gateway/internal/telemetry"
 	"github.com/xxxbrian/emby-auth-gateway/internal/version"
 
 	"github.com/pocketbase/pocketbase"
@@ -175,6 +177,12 @@ func newGatewayApp() *pocketbase.PocketBase {
 	})
 
 	app.OnServe().BindFunc(func(e *core.ServeEvent) error {
+		startedAt := time.Now().UTC()
+		emitter := observe.NewEmitter(1024)
+		registry := telemetry.New(emitter)
+		// Telemetry consumer is best-effort; never block gateway start.
+		go registry.Start(context.Background())
+
 		gw := gateway.NewServer(gateway.Config{
 			PublicBaseURL:            strings.TrimRight(os.Getenv("GATEWAY_PUBLIC_URL"), "/"),
 			GatewayBasePath:          fixedGatewayBasePath,
@@ -182,13 +190,20 @@ func newGatewayApp() *pocketbase.PocketBase {
 			MinResumePct:             envFloatDefault("GATEWAY_MIN_RESUME_PCT", 0),
 			MaxResumePct:             envFloatDefault("GATEWAY_MAX_RESUME_PCT", 0),
 			MinResumeDurationSeconds: envFloatDefault("GATEWAY_MIN_RESUME_DURATION_SECONDS", 0),
+			Emitter:                  emitter,
 		}, pbstore.New(e.App))
 		web, err := newEmbyWebServer(webAssetsDirFromEnv(), os.Getenv("GATEWAY_PUBLIC_URL"))
 		if err != nil {
 			return err
 		}
 
-		mountGatewayRoutes(e.Router, web, gw, webReadyForRootRedirect(web))
+		webReady := webReadyForRootRedirect(web)
+		mountGatewayRoutes(e.Router, web, gw, webReady)
+
+		adminCfg := adminConfigFromEnv()
+		if err := mountAdmin(e.Router, e.App, adminCfg, registry, webReady, startedAt, registry.Snapshot().BootID); err != nil {
+			return err
+		}
 
 		go func() {
 			if err := gw.ValidateAnonymousImageNamespace(context.Background()); err != nil {
@@ -208,6 +223,14 @@ func newGatewayApp() *pocketbase.PocketBase {
 			}
 			if err := gw.RefreshUpstreamServerInfo(context.Background()); err != nil {
 				e.App.Logger().Warn("Failed to refresh backend server info", "error", err)
+			}
+		}); err != nil {
+			return err
+		}
+
+		if err := e.App.Cron().Add("gatewayAuditLogCleanup", "@daily", func() {
+			if err := cleanupAuditLogs(e.App, time.Now().UTC(), adminCfg.AuditRetentionDays); err != nil {
+				e.App.Logger().Warn("Failed to cleanup audit logs", "error", err)
 			}
 		}); err != nil {
 			return err
