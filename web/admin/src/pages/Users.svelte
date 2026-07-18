@@ -1,28 +1,29 @@
-<script>
+<script lang="ts">
     import { onMount } from 'svelte';
-    import { apiRequest } from '../lib/api.js';
+    import { apiRequest } from '../lib/api';
+    import type { CreateUserBody, ItemsResponse, PasswordBody, RevokeResponse, UserDTO } from '../lib/types';
 
-    let users = [];
-    let loading = true;
-    let error = null;
+    let users = $state<UserDTO[]>([]);
+    let loading = $state(true);
+    let error = $state<string | null>(null);
 
-    let showCreate = false;
-    let newUsername = '';
-    let newPassword = '';
-    let newSyntheticId = '';
-    let createError = null;
-    let createLoading = false;
+    let showCreate = $state(false);
+    let newUsername = $state('');
+    let newPassword = $state('');
+    let newSyntheticId = $state('');
+    let createError = $state<string | null>(null);
+    let createLoading = $state(false);
 
-    let resetUserId = null;
-    let resetPasswordValue = '';
+    let resetUserId = $state<string | null>(null);
+    let resetPasswordValue = $state('');
 
     async function loadUsers() {
         try {
-            const data = await apiRequest('/users');
+            const data = await apiRequest<ItemsResponse<UserDTO>>('/users');
             users = data.items || [];
             error = null;
         } catch (err) {
-            error = err.message;
+            error = err instanceof Error ? err.message : String(err);
         } finally {
             loading = false;
         }
@@ -30,18 +31,19 @@
 
     onMount(loadUsers);
 
-    async function handleCreate(e) {
+    async function handleCreate(e: Event) {
         e.preventDefault();
         createError = null;
         createLoading = true;
         try {
-            await apiRequest('/users', {
+            const body: CreateUserBody = {
+                username: newUsername,
+                password: newPassword,
+                synthetic_user_id: newSyntheticId,
+            };
+            await apiRequest<UserDTO>('/users', {
                 method: 'POST',
-                body: JSON.stringify({
-                    username: newUsername,
-                    password: newPassword,
-                    synthetic_user_id: newSyntheticId
-                })
+                body: JSON.stringify(body),
             });
             showCreate = false;
             newUsername = '';
@@ -49,49 +51,50 @@
             newSyntheticId = '';
             await loadUsers();
         } catch (err) {
-            createError = err.message;
+            createError = err instanceof Error ? err.message : String(err);
         } finally {
             createLoading = false;
         }
     }
 
-    async function toggleEnable(user) {
+    async function toggleEnable(user: UserDTO) {
         if (!confirm(`${user.enabled ? 'Disable' : 'Enable'} user ${user.username}?`)) return;
         try {
             await apiRequest(`/users/${user.id}/${user.enabled ? 'disable' : 'enable'}`, { method: 'POST' });
             await loadUsers();
         } catch (err) {
-            alert(err.message);
+            alert(err instanceof Error ? err.message : String(err));
         }
     }
 
-    async function handleResetPassword(e) {
+    async function handleResetPassword(e: Event) {
         e.preventDefault();
-        if (!resetPasswordValue) return;
+        if (!resetPasswordValue || !resetUserId) return;
         try {
+            const body: PasswordBody = { password: resetPasswordValue };
             await apiRequest(`/users/${resetUserId}/password`, {
                 method: 'POST',
-                body: JSON.stringify({ password: resetPasswordValue })
+                body: JSON.stringify(body),
             });
             resetUserId = null;
             resetPasswordValue = '';
             alert('Password reset.');
         } catch (err) {
-            alert(err.message);
+            alert(err instanceof Error ? err.message : String(err));
         }
     }
 
-    async function revokeSessions(id) {
+    async function revokeSessions(id: string) {
         if (!confirm('Revoke all sessions for this user?')) return;
         try {
-            const res = await apiRequest(`/users/${id}/sessions/revoke-all`, { method: 'POST' });
+            const res = await apiRequest<RevokeResponse>(`/users/${id}/sessions/revoke-all`, { method: 'POST' });
             alert(`Revoked ${res.revoked || 0} sessions`);
         } catch (err) {
-            alert(err.message);
+            alert(err instanceof Error ? err.message : String(err));
         }
     }
 
-    function fmtTime(v) {
+    function fmtTime(v: string | undefined): string {
         if (!v) return '-';
         try { return new Date(v).toLocaleString(); } catch { return String(v); }
     }

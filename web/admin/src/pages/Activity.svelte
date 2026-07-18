@@ -1,37 +1,53 @@
-<script>
+<script lang="ts">
     import { onMount, onDestroy } from 'svelte';
-    import { apiRequest } from '../lib/api.js';
+    import { apiRequest } from '../lib/api';
+    import type { ItemsResponse, Playback, SessionDTO, Transfer } from '../lib/types';
 
-    let activeTab = 'playbacks';
-    let data = [];
-    let error = null;
-    let timer;
+    type ActivityTab = 'playbacks' | 'transfers' | 'sessions';
+    type ActivityItem = Playback | Transfer | SessionDTO;
 
-    const endpoints = {
+    let activeTab = $state<ActivityTab>('playbacks');
+    let data = $state<ActivityItem[]>([]);
+    let error = $state<string | null>(null);
+    let timer: ReturnType<typeof setInterval> | undefined;
+
+    const endpoints: Record<ActivityTab, string> = {
         playbacks: '/activity/playbacks',
         transfers: '/activity/transfers',
-        sessions: '/sessions'
+        sessions: '/sessions',
     };
 
     async function loadData() {
         try {
-            const res = await apiRequest(endpoints[activeTab]);
+            const res = await apiRequest<ItemsResponse<ActivityItem>>(endpoints[activeTab]);
             data = res.items || [];
             error = null;
         } catch (err) {
-            error = err.message;
+            error = err instanceof Error ? err.message : String(err);
         }
     }
 
-    function switchTab(tab) {
+    function switchTab(tab: ActivityTab) {
         activeTab = tab;
         data = [];
         loadData();
     }
 
-    function fmtTime(v) {
+    function fmtTime(v: string | undefined): string {
         if (!v) return '-';
         try { return new Date(v).toLocaleString(); } catch { return String(v); }
+    }
+
+    function asPlayback(item: ActivityItem): Playback {
+        return item as Playback;
+    }
+
+    function asTransfer(item: ActivityItem): Transfer {
+        return item as Transfer;
+    }
+
+    function asSession(item: ActivityItem): SessionDTO {
+        return item as SessionDTO;
     }
 
     onMount(() => {
@@ -39,7 +55,9 @@
         timer = setInterval(loadData, 3000);
     });
 
-    onDestroy(() => clearInterval(timer));
+    onDestroy(() => {
+        if (timer) clearInterval(timer);
+    });
 </script>
 
 <h1 class="page-title">Activity</h1>
@@ -72,13 +90,14 @@
                     <tr><td colspan="6" class="empty">No active playbacks.</td></tr>
                 {/if}
                 {#each data as item}
+                    {@const p = asPlayback(item)}
                     <tr>
-                        <td data-label="User">{item.username || item.user_id || '-'}</td>
-                        <td data-label="Item">{item.item_name || item.item_id || '-'}</td>
-                        <td data-label="Device">{item.device || '-'}</td>
-                        <td data-label="Paused">{item.is_paused ? 'Yes' : 'No'}</td>
-                        <td data-label="Started">{fmtTime(item.started_at)}</td>
-                        <td data-label="Last Seen">{fmtTime(item.last_seen)}</td>
+                        <td data-label="User">{p.username || p.user_id || '-'}</td>
+                        <td data-label="Item">{p.item_name || p.item_id || '-'}</td>
+                        <td data-label="Device">{p.device || '-'}</td>
+                        <td data-label="Paused">{p.is_paused ? 'Yes' : 'No'}</td>
+                        <td data-label="Started">{fmtTime(p.started_at)}</td>
+                        <td data-label="Last Seen">{fmtTime(p.last_seen)}</td>
                     </tr>
                 {/each}
             </tbody>
@@ -98,13 +117,14 @@
                     <tr><td colspan="6" class="empty">No active transfers.</td></tr>
                 {/if}
                 {#each data as item}
+                    {@const t = asTransfer(item)}
                     <tr>
-                        <td data-label="User">{item.username || item.user_id || '-'}</td>
-                        <td data-label="Item">{item.item_id || '-'}</td>
-                        <td data-label="Mode">{item.media_mode || '-'}</td>
-                        <td data-label="Bytes Out">{item.bytes_out ?? 0}</td>
-                        <td data-label="Started">{fmtTime(item.started_at)}</td>
-                        <td data-label="Last Seen">{fmtTime(item.last_seen)}</td>
+                        <td data-label="User">{t.username || t.user_id || '-'}</td>
+                        <td data-label="Item">{t.item_id || '-'}</td>
+                        <td data-label="Mode">{t.media_mode || '-'}</td>
+                        <td data-label="Bytes Out">{t.bytes_out ?? 0}</td>
+                        <td data-label="Started">{fmtTime(t.started_at)}</td>
+                        <td data-label="Last Seen">{fmtTime(t.last_seen)}</td>
                     </tr>
                 {/each}
             </tbody>
@@ -125,24 +145,25 @@
                     <tr><td colspan="7" class="empty">No sessions.</td></tr>
                 {/if}
                 {#each data as item}
+                    {@const s = asSession(item)}
                     <tr>
-                        <td data-label="User">{item.gateway_username || item.gateway_user_id || '-'}</td>
-                        <td data-label="Client">{item.client || '-'}</td>
-                        <td data-label="Device">{item.device || '-'}</td>
-                        <td data-label="IP">{item.remote_ip || '-'}</td>
+                        <td data-label="User">{s.gateway_username || s.gateway_user_id || '-'}</td>
+                        <td data-label="Client">{s.client || '-'}</td>
+                        <td data-label="Device">{s.device || '-'}</td>
+                        <td data-label="IP">{s.remote_ip || '-'}</td>
                         <td data-label="Active">
-                            <span class={item.active ? 'status-ok' : 'status-err'}>{item.active ? 'Active' : 'Inactive'}</span>
+                            <span class={s.active ? 'status-ok' : 'status-err'}>{s.active ? 'Active' : 'Inactive'}</span>
                         </td>
-                        <td data-label="Expires">{fmtTime(item.expires_at)}</td>
+                        <td data-label="Expires">{fmtTime(s.expires_at)}</td>
                         <td data-label="Actions">
-                            {#if item.active}
+                            {#if s.active}
                                 <button class="secondary text-xs" on:click={async () => {
                                     if (!confirm('Revoke this session?')) return;
                                     try {
-                                        await apiRequest(`/sessions/${item.id}/revoke`, { method: 'POST' });
+                                        await apiRequest(`/sessions/${s.id}/revoke`, { method: 'POST' });
                                         await loadData();
                                     } catch (err) {
-                                        alert(err.message);
+                                        alert(err instanceof Error ? err.message : String(err));
                                     }
                                 }}>Revoke</button>
                             {/if}

@@ -209,3 +209,87 @@ func TestNewRequiresOrigin(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+func TestCreateUserReturnsUserDTO(t *testing.T) {
+	app := newTestApp(t)
+	su := createSuperuser(t, app, "admin-create@example.test", "SuperSecret1!")
+	token, err := su.NewAuthToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions := adminauth.NewStore(10)
+	h := buildHandler(t, app, sessions)
+
+	// Establish admin session.
+	body, _ := json.Marshal(map[string]string{"token": token})
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/v1/session", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", testOrigin)
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("session create code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var sess map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &sess); err != nil {
+		t.Fatal(err)
+	}
+	csrf, _ := sess["csrf"].(string)
+	var sessionCookie *http.Cookie
+	for _, c := range rr.Result().Cookies() {
+		if c.Name == adminauth.CookieDev || c.Name == adminauth.CookieSecure {
+			sessionCookie = c
+			break
+		}
+	}
+	if sessionCookie == nil || csrf == "" {
+		t.Fatal("missing session cookie or csrf")
+	}
+
+	userBody, _ := json.Marshal(map[string]string{
+		"username":          "dto_user",
+		"password":          "DtoPass123!",
+		"synthetic_user_id": "syn-dto-1",
+	})
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/admin/api/v1/users", bytes.NewReader(userBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", testOrigin)
+	req.Header.Set(adminauth.CSRFHeader, csrf)
+	req.AddCookie(sessionCookie)
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("create user code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var created map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := created["ok"]; ok {
+		t.Fatalf("must not return bare ok payload: %v", created)
+	}
+	if created["id"] == nil || created["id"] == "" {
+		t.Fatalf("missing id: %v", created)
+	}
+	if created["username"] != "dto_user" {
+		t.Fatalf("username=%v", created["username"])
+	}
+	if created["synthetic_user_id"] != "syn-dto-1" {
+		t.Fatalf("synthetic_user_id=%v", created["synthetic_user_id"])
+	}
+	if created["enabled"] != true {
+		t.Fatalf("enabled=%v", created["enabled"])
+	}
+
+	// Duplicate must be 409, not password overwrite.
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/admin/api/v1/users", bytes.NewReader(userBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", testOrigin)
+	req.Header.Set(adminauth.CSRFHeader, csrf)
+	req.AddCookie(sessionCookie)
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("duplicate code=%d body=%s", rr.Code, rr.Body.String())
+	}
+}

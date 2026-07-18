@@ -1,31 +1,32 @@
-<script>
+<script lang="ts">
     import { onMount, onDestroy } from 'svelte';
-    import { apiRequest } from '../lib/api.js';
+    import { apiRequest } from '../lib/api';
+    import type { Snapshot, UpstreamStatus } from '../lib/types';
 
-    let data = null;
-    let error = null;
-    let timer;
+    let data = $state<Snapshot | null>(null);
+    let error = $state<string | null>(null);
+    let timer: ReturnType<typeof setInterval> | undefined;
 
     async function fetchData() {
         try {
-            data = await apiRequest('/overview');
+            data = await apiRequest<Snapshot>('/overview');
             error = null;
         } catch (err) {
-            error = err.message;
+            error = err instanceof Error ? err.message : String(err);
         }
     }
 
-    function fmtMbps(v) {
+    function fmtMbps(v: number | null | undefined): string {
         if (v == null || Number.isNaN(v)) return '0.00';
         return Number(v).toFixed(2);
     }
 
-    function fmtPct(v) {
+    function fmtPct(v: number | null | undefined): string {
         if (v == null || Number.isNaN(v)) return '0.00';
         return (Number(v) * 100).toFixed(2);
     }
 
-    function upstreamLabel(u) {
+    function upstreamLabel(u: UpstreamStatus | null | undefined): string {
         if (!u) return 'Unknown';
         if (u.last_error_at && (!u.last_ok_at || new Date(u.last_error_at) > new Date(u.last_ok_at))) {
             return `Error · ${u.last_error_kind || u.last_status_class || 'failed'}`;
@@ -37,7 +38,7 @@
         return 'Unknown';
     }
 
-    function upstreamClass(u) {
+    function upstreamClass(u: UpstreamStatus | null | undefined): string {
         if (!u) return 'status-warn';
         if (u.last_error_at && (!u.last_ok_at || new Date(u.last_error_at) > new Date(u.last_ok_at))) {
             return 'status-err';
@@ -51,7 +52,9 @@
         timer = setInterval(fetchData, 2000);
     });
 
-    onDestroy(() => clearInterval(timer));
+    onDestroy(() => {
+        if (timer) clearInterval(timer);
+    });
 </script>
 
 <h1 class="page-title">Overview</h1>

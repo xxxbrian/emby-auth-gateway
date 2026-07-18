@@ -1,7 +1,7 @@
-<script>
+<script lang="ts">
     import { onMount } from 'svelte';
     import Router from 'svelte-spa-router';
-    import { session, initialized, checkSession, logout } from './lib/api.js';
+    import { session, initialized, checkSession, logout } from './lib/api';
     import Login from './pages/Login.svelte';
     import Overview from './pages/Overview.svelte';
     import Users from './pages/Users.svelte';
@@ -11,7 +11,7 @@
 
     import './app.css';
 
-    const routes = {
+    const routes: Record<string, typeof Overview> = {
         '/': Overview,
         '/users': Users,
         '/activity': Activity,
@@ -20,7 +20,7 @@
         '*': Overview
     };
 
-    let currentPath = '/';
+    let currentPath = $state('/');
 
     function updatePath() {
         let hash = window.location.hash;

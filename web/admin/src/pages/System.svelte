@@ -1,18 +1,29 @@
-<script>
+<script lang="ts">
     import { onMount } from 'svelte';
-    import { apiRequest, session, reauth } from '../lib/api.js';
+    import { apiRequest, session, reauth } from '../lib/api';
+    import type {
+        InstallDefaultsResponse,
+        ItemsResponse,
+        Policy,
+        PolicyBody,
+        PolicyForm,
+        SystemInfo,
+        UpstreamBody,
+        UpstreamDTO,
+        UpstreamProbeResult,
+    } from '../lib/types';
 
-    let sysInfo = null;
-    let upstream = null;
-    let policies = [];
+    let sysInfo = $state<SystemInfo | null>(null);
+    let upstream = $state<UpstreamDTO | null>(null);
+    let policies = $state<PolicyForm[]>([]);
 
-    let loading = true;
-    let error = null;
+    let loading = $state(true);
+    let error = $state<string | null>(null);
 
-    let showPolicyForm = false;
-    let policyForm = emptyPolicyForm();
+    let showPolicyForm = $state(false);
+    let policyForm = $state<PolicyForm>(emptyPolicyForm());
 
-    let upstreamForm = {
+    let upstreamForm = $state<UpstreamBody>({
         emby_base_url: '',
         backend_username: '',
         backend_password: '',
@@ -20,20 +31,20 @@
         backend_authorization_client: 'SenPlayer',
         backend_authorization_device: 'Mac',
         backend_authorization_version: '6.1.3',
-        force: false
-    };
+        force: false,
+    });
 
-    let showProbeModal = false;
-    let probeResult = null;
-    let probeError = null;
-    let probing = false;
+    let showProbeModal = $state(false);
+    let probeResult = $state<UpstreamProbeResult | null>(null);
+    let probeError = $state<string | null>(null);
+    let probing = $state(false);
 
-    let showReauthModal = false;
-    let reauthPassword = '';
-    let reauthError = '';
-    let reauthLoading = false;
+    let showReauthModal = $state(false);
+    let reauthPassword = $state('');
+    let reauthError = $state('');
+    let reauthLoading = $state(false);
 
-    function emptyPolicyForm() {
+    function emptyPolicyForm(): PolicyForm {
         return {
             id: '',
             method: '*',
@@ -41,11 +52,11 @@
             action: 'allow',
             reason: '',
             priority: 0,
-            enabled: true
+            enabled: true,
         };
     }
 
-    function normalizePolicy(p) {
+    function normalizePolicy(p: Policy | null | undefined): PolicyForm {
         if (!p) return emptyPolicyForm();
         return {
             id: p.id || p.ID || '',
@@ -54,11 +65,11 @@
             action: (p.action || p.Action || 'allow').toLowerCase(),
             reason: p.reason || p.Reason || '',
             priority: p.priority ?? p.Priority ?? 0,
-            enabled: p.enabled ?? p.Enabled ?? true
+            enabled: p.enabled ?? p.Enabled ?? true,
         };
     }
 
-    function applyUpstreamToForm(up) {
+    function applyUpstreamToForm(up: UpstreamDTO | null) {
         if (!up) return;
         upstreamForm.emby_base_url = up.base_url || '';
         upstreamForm.backend_username = up.backend_username || '';
@@ -76,18 +87,18 @@
         }
     }
 
-    function yesNo(v) {
+    function yesNo(v: boolean | undefined): string {
         return v ? 'Yes' : 'No';
     }
 
-    function formatBytes(n) {
+    function formatBytes(n: number | undefined): string {
         const bytes = Number(n) || 0;
         if (bytes < 1024) return `${bytes} B`;
         if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
         return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
     }
 
-    function formatUptime(sec) {
+    function formatUptime(sec: number | undefined): string {
         const s = Math.max(0, Number(sec) || 0);
         if (s < 60) return `${s}s`;
         const m = Math.floor(s / 60);
@@ -104,13 +115,13 @@
     async function loadData() {
         try {
             error = null;
-            sysInfo = await apiRequest('/system');
-            upstream = await apiRequest('/upstream');
-            const polRes = await apiRequest('/path-policies');
+            sysInfo = await apiRequest<SystemInfo>('/system');
+            upstream = await apiRequest<UpstreamDTO>('/upstream');
+            const polRes = await apiRequest<ItemsResponse<Policy>>('/path-policies');
             policies = (polRes.items || []).map(normalizePolicy);
             applyUpstreamToForm(upstream);
         } catch (err) {
-            error = err.message;
+            error = err instanceof Error ? err.message : String(err);
         } finally {
             loading = false;
         }
@@ -121,57 +132,57 @@
     async function handleInstallDefaults() {
         if (!confirm('Install default policies? Existing matching policies are preserved.')) return;
         try {
-            const res = await apiRequest('/path-policies/install-defaults', { method: 'POST' });
+            const res = await apiRequest<InstallDefaultsResponse>('/path-policies/install-defaults', { method: 'POST' });
             alert(`Installed ${res.created ?? 0} defaults, preserved ${res.preserved ?? 0}`);
             await loadData();
         } catch (err) {
-            alert('Error: ' + err.message);
+            alert('Error: ' + (err instanceof Error ? err.message : String(err)));
         }
     }
 
-    async function savePolicy(e) {
+    async function savePolicy(e: Event) {
         e.preventDefault();
         try {
-            const payload = {
+            const payload: PolicyBody = {
                 method: policyForm.method,
                 path: policyForm.path,
                 action: policyForm.action,
                 reason: policyForm.reason,
                 priority: Number(policyForm.priority) || 0,
-                enabled: !!policyForm.enabled
+                enabled: !!policyForm.enabled,
             };
             if (policyForm.id) {
                 await apiRequest(`/path-policies/${policyForm.id}`, {
                     method: 'PUT',
-                    body: JSON.stringify(payload)
+                    body: JSON.stringify(payload),
                 });
             } else {
                 await apiRequest('/path-policies', {
                     method: 'POST',
-                    body: JSON.stringify(payload)
+                    body: JSON.stringify(payload),
                 });
             }
             showPolicyForm = false;
             policyForm = emptyPolicyForm();
             await loadData();
         } catch (err) {
-            alert('Error: ' + err.message);
+            alert('Error: ' + (err instanceof Error ? err.message : String(err)));
         }
     }
 
-    async function deletePolicy(id) {
+    async function deletePolicy(id: string) {
         if (!id) return;
         if (!confirm('Delete this policy?')) return;
         try {
             await apiRequest(`/path-policies/${id}`, { method: 'DELETE' });
             await loadData();
         } catch (err) {
-            alert('Error: ' + err.message);
+            alert('Error: ' + (err instanceof Error ? err.message : String(err)));
         }
     }
 
-    function editPolicy(p) {
-        policyForm = normalizePolicy(p);
+    function editPolicy(p: PolicyForm) {
+        policyForm = { ...p };
         showPolicyForm = true;
     }
 
@@ -180,28 +191,28 @@
         showPolicyForm = true;
     }
 
-    async function handleProbe(e) {
+    async function handleProbe(e: Event) {
         e.preventDefault();
         probing = true;
         probeError = null;
         probeResult = null;
         showProbeModal = true;
         try {
-            const body = {
+            const body: Omit<UpstreamBody, 'force'> = {
                 emby_base_url: upstreamForm.emby_base_url,
                 backend_username: upstreamForm.backend_username,
                 backend_password: upstreamForm.backend_password,
                 backend_user_agent: upstreamForm.backend_user_agent,
                 backend_authorization_client: upstreamForm.backend_authorization_client,
                 backend_authorization_device: upstreamForm.backend_authorization_device,
-                backend_authorization_version: upstreamForm.backend_authorization_version
+                backend_authorization_version: upstreamForm.backend_authorization_version,
             };
-            probeResult = await apiRequest('/upstream/probe', {
+            probeResult = await apiRequest<UpstreamProbeResult>('/upstream/probe', {
                 method: 'POST',
-                body: JSON.stringify(body)
+                body: JSON.stringify(body),
             });
         } catch (err) {
-            probeError = err.message;
+            probeError = err instanceof Error ? err.message : String(err);
         } finally {
             probing = false;
         }
@@ -214,7 +225,7 @@
         showReauthModal = true;
     }
 
-    async function handleReauthAndReconfigure(e) {
+    async function handleReauthAndReconfigure(e: Event) {
         e.preventDefault();
         reauthError = '';
         reauthLoading = true;
@@ -228,9 +239,9 @@
             await apiRequest('/upstream/reconfigure', {
                 method: 'POST',
                 headers: {
-                    'X-Admin-Reauth': ticket
+                    'X-Admin-Reauth': ticket,
                 },
-                body: JSON.stringify(upstreamForm)
+                body: JSON.stringify(upstreamForm),
             });
 
             showReauthModal = false;
@@ -238,8 +249,9 @@
             alert('Upstream reconfigured successfully');
             await loadData();
         } catch (err) {
-            reauthError = err.message;
-            if (/active.?media|force/i.test(err.message || '')) {
+            const msg = err instanceof Error ? err.message : String(err);
+            reauthError = msg;
+            if (/active.?media|force/i.test(msg || '')) {
                 reauthError = 'Active media load detected. Check "Force" to proceed anyway.';
             }
         } finally {

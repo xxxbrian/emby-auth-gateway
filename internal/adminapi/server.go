@@ -545,12 +545,15 @@ func (s *Server) handleCreateUser(e *core.RequestEvent) error {
 		}
 		return e.BadRequestError(err.Error(), err)
 	}
-	// Return created user by username lookup.
+	// Always return UserDTO for the created user (never bare {ok:true}).
 	rec, err := e.App.FindFirstRecordByData("users", "username", strings.TrimSpace(body.Username))
 	if err != nil {
-		return e.JSON(http.StatusOK, map[string]any{"ok": true})
+		return e.InternalServerError("created user lookup failed", err)
 	}
-	user, _ := s.cfg.Query.GetUser(e.Request.Context(), rec.Id)
+	user, err := s.cfg.Query.GetUser(e.Request.Context(), rec.Id)
+	if err != nil {
+		return e.InternalServerError("created user lookup failed", err)
+	}
 	return e.JSON(http.StatusOK, user)
 }
 

@@ -1,19 +1,19 @@
-<script>
-    import { login } from '../lib/api.js';
+<script lang="ts">
+    import { login } from '../lib/api';
 
-    let identity = '';
-    let password = '';
-    let error = '';
-    let loading = false;
+    let identity = $state('');
+    let password = $state('');
+    let error = $state('');
+    let loading = $state(false);
 
-    async function handleSubmit(e) {
+    async function handleSubmit(e: Event) {
         e.preventDefault();
         error = '';
         loading = true;
         try {
             await login(identity, password);
         } catch (err) {
-            error = err.message;
+            error = err instanceof Error ? err.message : String(err);
         } finally {
             loading = false;
         }

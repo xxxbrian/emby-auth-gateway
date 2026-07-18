@@ -1,25 +1,26 @@
-<script>
+<script lang="ts">
     import { onMount } from 'svelte';
-    import { apiRequest } from '../lib/api.js';
+    import { apiRequest } from '../lib/api';
+    import type { AuditDTO, ItemsResponse } from '../lib/types';
 
-    let data = [];
-    let loading = true;
-    let error = null;
+    let data = $state<AuditDTO[]>([]);
+    let loading = $state(true);
+    let error = $state<string | null>(null);
 
     async function loadData() {
         loading = true;
         try {
-            const res = await apiRequest('/audit?limit=50');
+            const res = await apiRequest<ItemsResponse<AuditDTO>>('/audit?limit=50');
             data = res.items || [];
             error = null;
         } catch (err) {
-            error = err.message;
+            error = err instanceof Error ? err.message : String(err);
         } finally {
             loading = false;
         }
     }
 
-    function fmtTime(v) {
+    function fmtTime(v: string | undefined): string {
         if (!v) return '-';
         try { return new Date(v).toLocaleString(); } catch { return String(v); }
     }
@@ -63,7 +64,7 @@
                     <td data-label="Method"><strong>{item.method || '-'}</strong></td>
                     <td data-label="Path" class="path">{item.path || '-'}</td>
                     <td data-label="Status">
-                        <span class={item.status >= 500 ? 'status-err' : item.status >= 400 ? 'status-warn' : 'status-ok'}>
+                        <span class={(item.status ?? 0) >= 500 ? 'status-err' : (item.status ?? 0) >= 400 ? 'status-warn' : 'status-ok'}>
                             {item.status || '-'}
                         </span>
                     </td>
