@@ -10,6 +10,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/xxxbrian/emby-auth-gateway/internal/observe"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pathpolicy"
 )
 
@@ -21,6 +22,7 @@ type Config struct {
 	MinResumePct             float64
 	MaxResumePct             float64
 	MinResumeDurationSeconds float64
+	Emitter                  *observe.Emitter // optional; nil = no-op
 }
 
 type Store interface {

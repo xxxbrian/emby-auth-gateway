@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/xxxbrian/emby-auth-gateway/internal/observe"
 	"github.com/xxxbrian/emby-auth-gateway/internal/version"
 )
 
@@ -30,6 +31,7 @@ type Server struct {
 	store                Store
 	client               *http.Client
 	proxyClient          *http.Client
+	emitter              *observe.Emitter
 	logins               *loginFailureLimiter
 	upstreamAuth         *upstreamAuthenticator
 	playbackGuards       *playbackGuardTracker
@@ -63,7 +65,74 @@ func NewServer(cfg Config, store Store) *Server {
 		client = &http.Client{Timeout: backendAuthTimeout}
 	}
 	proxyClient := newProxyClient(cfg.HTTPClient)
-	return &Server{cfg: cfg, store: store, client: client, proxyClient: proxyClient, upstreamAuth: newUpstreamAuthenticator(store, client), logins: newLoginFailureLimiter(), playbackGuards: newPlaybackGuardTracker(), anonymousImageNow: time.Now, anonymousImageSlots: make(chan struct{}, anonymousImageValidationConcurrency)}
+	return &Server{cfg: cfg, store: store, client: client, proxyClient: proxyClient, emitter: cfg.Emitter, upstreamAuth: newUpstreamAuthenticator(store, client), logins: newLoginFailureLimiter(), playbackGuards: newPlaybackGuardTracker(), anonymousImageNow: time.Now, anonymousImageSlots: make(chan struct{}, anonymousImageValidationConcurrency)}
+}
+
+// Emitter returns the optional non-blocking observe emitter (nil if unset).
+func (s *Server) Emitter() *observe.Emitter {
+	if s == nil {
+		return nil
+	}
+	return s.emitter
+}
+
+// emit enqueues an observation without blocking. Nil emitter is a no-op.
+func (s *Server) emit(ev observe.Event) {
+	if s == nil || s.emitter == nil {
+		return
+	}
+	if ev.At.IsZero() {
+		ev.At = time.Now().UTC()
+	}
+	_ = s.emitter.TryEmit(ev)
+}
+
+// noteSession records lightweight session activity for telemetry.
+func (s *Server) noteSession(session *Session) {
+	if session == nil {
+		return
+	}
+	s.emit(observe.Event{
+		Kind:       observe.KindRequest,
+		Outcome:    observe.OutcomeOK,
+		RouteClass: observe.RouteOther,
+		UserID:     session.GatewayUserID,
+		Username:   session.GatewayUsername,
+		SessionID:  session.GatewayTokenHash,
+		Device:     session.Device,
+	})
+}
+
+func (s *Server) emitUpstreamAttempt(started time.Time, status int, err error) {
+	ev := observe.Event{
+		Kind:       observe.KindUpstreamRequest,
+		DurationMS: time.Since(started).Milliseconds(),
+		Direction:  observe.DirectionUpstream,
+	}
+	if err != nil {
+		ev.Outcome = observe.OutcomeError
+		ev.StatusClass = observe.Status0
+		s.emit(ev)
+		return
+	}
+	ev.StatusClass = observe.StatusClassOf(status)
+	if status >= 500 || status <= 0 {
+		ev.Outcome = observe.OutcomeError
+	} else {
+		ev.Outcome = observe.OutcomeOK
+	}
+	s.emit(ev)
+}
+
+func mediaModeForRequest(r *http.Request, rel string) string {
+	lower := strings.ToLower(rel)
+	if strings.Contains(lower, "/hls/") || strings.HasSuffix(lower, ".m3u8") || strings.HasSuffix(lower, ".ts") {
+		return observe.MediaHLS
+	}
+	if r != nil && strings.TrimSpace(r.Header.Get("Range")) != "" {
+		return observe.MediaRange
+	}
+	return observe.MediaDirect
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -128,6 +197,12 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 	key := loginFailureKey(form.Username, r)
 	if s.logins.blocked(key, time.Now()) {
 		s.auditLoginFailure(r.Context(), r, form.Username, "login blocked", http.StatusUnauthorized)
+		s.emit(observe.Event{
+			Kind:       observe.KindAuthLogin,
+			Outcome:    observe.OutcomeDenied,
+			RouteClass: observe.RouteAuth,
+			Username:   form.Username,
+		})
 		http.Error(w, "failed to authenticate", http.StatusUnauthorized)
 		return
 	}
@@ -138,6 +213,12 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 	}
 	if form.Username == "" || password == "" {
 		s.auditLoginFailure(r.Context(), r, form.Username, "missing credentials", http.StatusBadRequest)
+		s.emit(observe.Event{
+			Kind:       observe.KindAuthLogin,
+			Outcome:    observe.OutcomeError,
+			RouteClass: observe.RouteAuth,
+			Username:   form.Username,
+		})
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -147,6 +228,12 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 	if err != nil || user == nil || !user.Enabled {
 		s.logins.recordFailure(key, time.Now())
 		s.auditLoginFailure(ctx, r, form.Username, "invalid credentials", http.StatusUnauthorized)
+		s.emit(observe.Event{
+			Kind:       observe.KindAuthLogin,
+			Outcome:    observe.OutcomeDenied,
+			RouteClass: observe.RouteAuth,
+			Username:   form.Username,
+		})
 		http.Error(w, "failed to authenticate", http.StatusUnauthorized)
 		return
 	}
@@ -176,10 +263,27 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.store.SaveSession(ctx, session); err != nil {
 		s.audit(ctx, AuditLog{GatewayUserID: user.ID, SyntheticUserID: user.SyntheticUserID, Event: "session_save_failure", Message: "session save failed", RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusInternalServerError})
+		s.emit(observe.Event{
+			Kind:       observe.KindAuthLogin,
+			Outcome:    observe.OutcomeError,
+			RouteClass: observe.RouteAuth,
+			UserID:     user.ID,
+			Username:   user.Username,
+			Device:     identity.Device,
+		})
 		http.Error(w, "session save failed", http.StatusInternalServerError)
 		return
 	}
 	s.audit(ctx, AuditLog{GatewayUserID: user.ID, SyntheticUserID: user.SyntheticUserID, Event: "login_success", Message: "login succeeded", RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusOK})
+	s.emit(observe.Event{
+		Kind:       observe.KindAuthLogin,
+		Outcome:    observe.OutcomeOK,
+		RouteClass: observe.RouteAuth,
+		UserID:     user.ID,
+		Username:   user.Username,
+		SessionID:  tokenHash,
+		Device:     identity.Device,
+	})
 
 	w.Header().Set("Cache-Control", "no-store")
 	s.setResourceCookie(w, token, session.ExpiresAt)
@@ -405,10 +509,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 	attemptStarted := time.Now()
 	resp, err := s.proxyClient.Do(req)
 	if err != nil {
+		s.emitUpstreamAttempt(attemptStarted, 0, err)
 		upstreamStatus := closeResponseOnError(resp)
 		s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_backend_unavailable", AuditMessage: "backend unavailable", ClientBody: "backend unavailable", FallbackKind: "upstream_request_error", Duration: time.Since(attemptStarted), UpstreamStatus: upstreamStatus})
 		return
 	}
+	s.emitUpstreamAttempt(attemptStarted, resp.StatusCode, nil)
 	defer resp.Body.Close()
 	if isPlaybackInfo && resp.StatusCode == http.StatusUnauthorized && isConcurrentPlaybackDenial(resp) {
 		s.writeConcurrentPlaybackDenied(w, r, rel, session, guardKey)
@@ -443,10 +549,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 			attemptStarted = time.Now()
 			resp, err = s.proxyClient.Do(retryReq)
 			if err != nil {
+				s.emitUpstreamAttempt(attemptStarted, 0, err)
 				upstreamStatus := closeResponseOnError(resp)
 				s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_backend_unavailable", AuditMessage: "backend unavailable", ClientBody: "backend unavailable", FallbackKind: "upstream_request_error", Duration: time.Since(attemptStarted), UpstreamStatus: upstreamStatus})
 				return
 			}
+			s.emitUpstreamAttempt(attemptStarted, resp.StatusCode, nil)
 			defer resp.Body.Close()
 			if isPlaybackInfo && resp.StatusCode == http.StatusUnauthorized && isConcurrentPlaybackDenial(resp) {
 				s.writeConcurrentPlaybackDenied(w, r, rel, session, guardKey)
@@ -583,6 +691,16 @@ func (s *Server) writeConcurrentPlaybackDenied(w http.ResponseWriter, r *http.Re
 	if s.playbackGuards.deny(key) {
 		s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "playback_concurrency_denied", Message: "playback denied because the concurrent playback limit was exceeded", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusForbidden})
 	}
+	s.emit(observe.Event{
+		Kind:       observe.KindCapacityReject,
+		Outcome:    observe.OutcomeDenied,
+		RouteClass: observe.RoutePlayback,
+		UserID:     sessionGatewayUserID(session),
+		Username:   sessionUsername(session),
+		SessionID:  sessionTokenHash(session),
+		Device:     sessionDevice(session),
+		ItemID:     key.ItemID,
+	})
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusForbidden)
@@ -674,6 +792,7 @@ func (s *Server) activeSession(w http.ResponseWriter, r *http.Request, token str
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return nil, false
 	}
+	s.noteSession(session)
 	return session, true
 }
 
@@ -768,6 +887,17 @@ func (s *Server) audit(ctx context.Context, entry AuditLog) {
 
 func (s *Server) auditBackendTokenRefresh(r *http.Request, rel string, session *Session, event, message string, status int) {
 	s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: event, Message: message, RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: status})
+	if event == "backend_token_refresh" {
+		s.emit(observe.Event{
+			Kind:        observe.KindUpstreamAuthRefresh,
+			Outcome:     observe.OutcomeOK,
+			StatusClass: observe.StatusClassOf(status),
+			UserID:      sessionGatewayUserID(session),
+			Username:    sessionUsername(session),
+			SessionID:   sessionTokenHash(session),
+			Device:      sessionDevice(session),
+		})
+	}
 }
 
 func (s *Server) proxyURL(upstream upstreamRequestSnapshot, session *Session, rel, rawQuery, gatewayToken string) (*url.URL, error) {
@@ -891,6 +1021,20 @@ func (s *Server) recordPlaybackRequest(r *http.Request, rel string, session *Ses
 	if !ok || details.ItemID == "" {
 		return nil
 	}
+	eventName := playbackEventName(rel)
+	s.emit(observe.Event{
+		Kind:          observe.KindPlayback,
+		Outcome:       observe.OutcomeOK,
+		RouteClass:    observe.RoutePlayback,
+		UserID:        session.GatewayUserID,
+		Username:      session.GatewayUsername,
+		SessionID:     session.GatewayTokenHash,
+		Device:        session.Device,
+		ItemID:        details.ItemID,
+		ItemName:      details.ItemName,
+		PositionTicks: details.PositionTicks,
+		PlaybackEvent: eventName,
+	})
 	key := playbackGuardKey{GatewayTokenHash: session.GatewayTokenHash, ItemID: details.ItemID}
 	if active, auditEligible := s.playbackGuards.suppress(key); active {
 		if auditEligible {
@@ -899,7 +1043,6 @@ func (s *Server) recordPlaybackRequest(r *http.Request, rel string, session *Ses
 		return nil
 	}
 	now := time.Now().UTC()
-	eventName := playbackEventName(rel)
 	if err := s.store.RecordPlaybackEvent(r.Context(), PlaybackEvent{
 		GatewayUserID:    session.GatewayUserID,
 		SyntheticUserID:  session.SyntheticUserID,
@@ -1451,6 +1594,33 @@ func (s *Server) copyMediaBodyOrAbort(w http.ResponseWriter, r *http.Request, re
 
 func (s *Server) copyMediaReaderOrAbort(w http.ResponseWriter, r *http.Request, rel string, src io.Reader, expectedLength int64, upstreamStatus int, session *Session) {
 	result := copyMediaBody(w, src, expectedLength)
+	outcome := observe.OutcomeOK
+	if result.Err != nil {
+		outcome = observe.OutcomeError
+		if isTimeoutError(result.Err) {
+			outcome = observe.OutcomeTimeout
+		}
+	}
+	direction := result.Direction
+	if direction == mediaDirectionUpstream {
+		direction = observe.DirectionUpstream
+	} else if direction == mediaDirectionDownstream {
+		direction = observe.DirectionDownstream
+	}
+	s.emit(observe.Event{
+		Kind:       observe.KindMediaTransfer,
+		Outcome:    outcome,
+		RouteClass: observe.RouteMedia,
+		MediaMode:  mediaModeForRequest(r, rel),
+		Direction:  direction,
+		UserID:     sessionGatewayUserID(session),
+		Username:   sessionUsername(session),
+		SessionID:  sessionTokenHash(session),
+		Device:     sessionDevice(session),
+		BytesIn:    result.BytesRead,
+		BytesOut:   result.BytesWritten,
+		DurationMS: result.Duration.Milliseconds(),
+	})
 	if result.Err == nil {
 		return
 	}
@@ -1503,6 +1673,27 @@ func sessionSyntheticUserID(session *Session) string {
 		return ""
 	}
 	return session.SyntheticUserID
+}
+
+func sessionUsername(session *Session) string {
+	if session == nil {
+		return ""
+	}
+	return session.GatewayUsername
+}
+
+func sessionTokenHash(session *Session) string {
+	if session == nil {
+		return ""
+	}
+	return session.GatewayTokenHash
+}
+
+func sessionDevice(session *Session) string {
+	if session == nil {
+		return ""
+	}
+	return session.Device
 }
 
 func (s *Server) rewriteProxyJSONValueForRequestWithSnapshot(ctx context.Context, r *http.Request, v any, session *Session, upstream upstreamRequestSnapshot, gatewayToken, publicGatewayBase string) any {

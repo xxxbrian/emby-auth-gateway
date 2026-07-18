@@ -627,10 +627,13 @@ func (s *Server) fetchBackendJSON(ctx context.Context, r *http.Request, rel, raw
 	copyRequestHeaders(req.Header, r.Header)
 	s.rewriteRequestHeaders(req.Header, upstream)
 	req.Host = u.Host
+	attemptStarted := time.Now()
 	resp, err := s.proxyClient.Do(req)
 	if err != nil {
+		s.emitUpstreamAttempt(attemptStarted, 0, err)
 		return nil, 0, upstreamRequestSnapshot{}, err
 	}
+	s.emitUpstreamAttempt(attemptStarted, resp.StatusCode, nil)
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusUnauthorized {
 		if refreshed, confirmed, refreshErr := s.refreshAfterUnauthorized(ctx, upstream); confirmed && refreshErr == nil {
@@ -648,10 +651,13 @@ func (s *Server) fetchBackendJSON(ctx context.Context, r *http.Request, rel, raw
 			copyRequestHeaders(req.Header, r.Header)
 			s.rewriteRequestHeaders(req.Header, upstream)
 			req.Host = u.Host
+			attemptStarted = time.Now()
 			resp, err = s.proxyClient.Do(req)
 			if err != nil {
+				s.emitUpstreamAttempt(attemptStarted, 0, err)
 				return nil, 0, upstreamRequestSnapshot{}, err
 			}
+			s.emitUpstreamAttempt(attemptStarted, resp.StatusCode, nil)
 			defer resp.Body.Close()
 		}
 	}
