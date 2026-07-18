@@ -35,7 +35,7 @@
         id: '',
         method: '',
         path: '',
-        action: 'block',
+        action: 'deny',
         reason: '',
         priority: 100,
         enabled: true
@@ -59,6 +59,7 @@
     let reauthPassword = $state('');
     let reauthError = $state<string | null>(null);
     let reauthLoading = $state(false);
+    let reauthTicket = $state<string | null>(null);
     let pendingAction: (() => Promise<void>) | null = null;
 
     async function loadData() {
@@ -67,7 +68,7 @@
             const [si, up, pol] = await Promise.all([
                 apiRequest<SystemInfo>('/system'),
                 apiRequest<UpstreamDTO>('/upstream'),
-                apiRequest<ItemsResponse<Policy>>('/pathpolicies'),
+                apiRequest<ItemsResponse<Policy>>('/path-policies'),
             ]);
             sysInfo = si;
             upstream = up;
@@ -129,15 +130,19 @@
 
     async function performApply() {
         try {
-            const body: UpstreamBody = { ...probeForm, force: true };
-            await apiRequest('/upstream', {
-                method: 'PUT',
+            if (!reauthTicket) throw new Error('Re-authentication required');
+            const body: UpstreamBody = { ...probeForm, force: probeForm.force === true };
+            await apiRequest('/upstream/reconfigure', {
+                method: 'POST',
+                headers: { 'X-Admin-Reauth': reauthTicket },
                 body: JSON.stringify(body),
             });
+            reauthTicket = null;
             showProbeModal = false;
             await loadData();
         } catch (err) {
             probeError = err instanceof Error ? err.message : String(err);
+            throw err;
         }
     }
 
@@ -145,19 +150,12 @@
         askForReauth(performApply);
     }
 
-    async function toggleEndpoint(active: boolean) {
-        askForReauth(async () => {
-            await apiRequest(`/upstream/endpoint/${active ? 'enable' : 'disable'}`, { method: 'POST' });
-            await loadData();
-        });
-    }
-
     function openNewPolicy() {
         currentPolicy = {
             id: '',
             method: '*',
             path: '',
-            action: 'block',
+            action: 'deny',
             reason: '',
             priority: 100,
             enabled: true,
@@ -172,7 +170,7 @@
             id: p.ID || p.id || '',
             method: p.Method || p.method || '*',
             path: p.Path || p.path || '',
-            action: p.Action || p.action || 'block',
+            action: p.Action || p.action || 'deny',
             reason: p.Reason || p.reason || '',
             priority: p.Priority ?? p.priority ?? 100,
             enabled: p.Enabled ?? p.enabled ?? true,
@@ -197,12 +195,12 @@
             };
             
             if (isEditingPolicy && currentPolicy.id) {
-                await apiRequest(`/pathpolicies/${currentPolicy.id}`, {
+                await apiRequest(`/path-policies/${currentPolicy.id}`, {
                     method: 'PUT',
                     body: JSON.stringify(body),
                 });
             } else {
-                await apiRequest('/pathpolicies', {
+                await apiRequest('/path-policies', {
                     method: 'POST',
                     body: JSON.stringify(body),
                 });
@@ -219,7 +217,7 @@
     async function handleDeletePolicy(id: string) {
         if (!confirm('Delete this policy?')) return;
         try {
-            await apiRequest(`/pathpolicies/${id}`, { method: 'DELETE' });
+            await apiRequest(`/path-policies/${id}`, { method: 'DELETE' });
             await loadData();
         } catch (err) {
             alert(err instanceof Error ? err.message : String(err));
@@ -229,7 +227,7 @@
     async function handleInstallDefaults() {
         if (!confirm('Install default path policies? Existing default policies will be updated or preserved.')) return;
         try {
-            const res = await apiRequest<InstallDefaultsResponse>('/pathpolicies/defaults', { method: 'POST' });
+            const res = await apiRequest<InstallDefaultsResponse>('/path-policies/install-defaults', { method: 'POST' });
             alert(`Installed defaults. Created: ${res.created}, Preserved: ${res.preserved}`);
             await loadData();
         } catch (err) {
@@ -249,10 +247,11 @@
             const identity = $session?.email || $session?.superuser_id;
             if (!identity) throw new Error('No active session identity found');
             
-            await reauth(identity, reauthPassword);
+            reauthTicket = await reauth(identity, reauthPassword);
             showReauthModal = false;
             await pendingAction();
             pendingAction = null;
+            reauthTicket = null;
         } catch (err) {
             reauthError = err instanceof Error ? err.message : String(err);
         } finally {
@@ -319,11 +318,6 @@
             <div class="panel">
                 <div class="flex justify-between items-center mb-4">
                     <div class="metric-label" style="margin:0">Upstream Status</div>
-                    <div>
-                        <button class="secondary text-xs" onclick={() => toggleEndpoint(!upstream?.endpoint_active)}>
-                            {upstream?.endpoint_active ? 'Disable Endpoint' : 'Enable Endpoint'}
-                        </button>
-                    </div>
                 </div>
                 <div class="data-grid mb-4">
                     <div class="metric-box">
@@ -373,7 +367,7 @@
                     <div class="form-grid">
                         <div style="grid-column: 1 / -1;">
                             <label class="text-sm text-secondary block mb-1" for="emby_base_url">Emby Base URL</label>
-                            <input type="url" id="emby_base_url" bind:value={probeForm.emby_base_url} required placeholder="https://emby.example.com" />
+                            <input type="url" id="emby_base_url" bind:value={probeForm.emby_base_url} required placeholder="https://emby.example.com/emby" />
                         </div>
                         <div>
                             <label class="text-sm text-secondary block mb-1" for="backend_username">Backend Username</label>
@@ -542,7 +536,7 @@
                         <label class="text-sm text-secondary block mb-1" for="p_action">Action</label>
                         <select id="p_action" bind:value={currentPolicy.action}>
                             <option value="allow">Allow</option>
-                            <option value="block">Block</option>
+                            <option value="deny">Deny</option>
                         </select>
                     </div>
                     <div class="mb-4">

@@ -42,6 +42,9 @@ type upstreamProbeResult struct {
 }
 
 // NewUpstreamHTTPClient is a test hook for injecting HTTP clients.
+// Redirects are not followed automatically: a gateway root often 308s to
+// /emby/web/ (HTML), which is not a valid Emby API base. Callers should use
+// the Emby API base path (e.g. https://host/emby). See probeUpstreamPublic.
 var NewUpstreamHTTPClient = func() *http.Client {
 	return &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }
@@ -58,7 +61,7 @@ func ProbeUpstream(ctx context.Context, in UpstreamReconfigureInput) (serverID, 
 		return "", "", "", 0, err
 	}
 	start := time.Now()
-	public, publicID, err := probeUpstreamPublic(ctx, NewUpstreamHTTPClient(), baseURL, deviceID, "", identity)
+	public, publicID, _, err := probeUpstreamPublic(ctx, NewUpstreamHTTPClient(), baseURL, deviceID, "", identity)
 	latencyMS = time.Since(start).Milliseconds()
 	if err != nil {
 		return "", "", "", latencyMS, err
@@ -83,28 +86,71 @@ func embyAuthorization(identity gateway.BackendClientIdentity, deviceID, userID,
 
 func upstreamURL(baseURL, suffix string) string { return strings.TrimRight(baseURL, "/") + suffix }
 
-func probeUpstream(ctx context.Context, baseURL, username, password, deviceID, expectedServerID string, identity gateway.BackendClientIdentity) (upstreamProbeResult, error) {
+func probeUpstream(ctx context.Context, baseURL, username, password, deviceID, expectedServerID string, identity gateway.BackendClientIdentity) (upstreamProbeResult, string, error) {
 	client := NewUpstreamHTTPClient()
-	public, publicID, err := probeUpstreamPublic(ctx, client, baseURL, deviceID, expectedServerID, identity)
+	public, publicID, effectiveBase, err := probeUpstreamPublic(ctx, client, baseURL, deviceID, expectedServerID, identity)
 	if err != nil {
-		return upstreamProbeResult{}, err
+		return upstreamProbeResult{}, baseURL, err
 	}
-	return authenticateUpstream(ctx, client, baseURL, username, password, deviceID, identity, public, publicID)
+	result, err := authenticateUpstream(ctx, client, effectiveBase, username, password, deviceID, identity, public, publicID)
+	return result, effectiveBase, err
 }
 
-func probeUpstreamPublic(ctx context.Context, client *http.Client, baseURL, deviceID, expectedServerID string, identity gateway.BackendClientIdentity) (upstreamPublicInfo, string, error) {
+// probeUpstreamPublic returns public info, server ID, and the effective base URL
+// (may append /emby after a redirect-style failure on the bare host).
+func probeUpstreamPublic(ctx context.Context, client *http.Client, baseURL, deviceID, expectedServerID string, identity gateway.BackendClientIdentity) (upstreamPublicInfo, string, string, error) {
 	public := upstreamPublicInfo{}
-	if err := UpstreamRequest(ctx, client, http.MethodGet, upstreamURL(baseURL, "/System/Info/Public"), nil, identity, deviceID, "", "", &public, false); err != nil {
-		return public, "", fmt.Errorf("public info probe: %w", err)
+	effective := baseURL
+	err := UpstreamRequest(ctx, client, http.MethodGet, upstreamURL(baseURL, "/System/Info/Public"), nil, identity, deviceID, "", "", &public, false)
+	if err != nil {
+		// Common misconfig: gateway public origin without /emby API base.
+		if alt := embyBaseRetryURL(baseURL, err); alt != "" && alt != baseURL {
+			public = upstreamPublicInfo{}
+			if err2 := UpstreamRequest(ctx, client, http.MethodGet, upstreamURL(alt, "/System/Info/Public"), nil, identity, deviceID, "", "", &public, false); err2 == nil {
+				effective = alt
+				err = nil
+			} else {
+				return public, "", baseURL, fmt.Errorf("public info probe: %w (also tried %s: %v)", err, alt, err2)
+			}
+		} else {
+			return public, "", baseURL, fmt.Errorf("public info probe: %w", err)
+		}
 	}
 	publicID := firstNonEmptyTrimmed(public.ID, public.ServerID)
 	if publicID == "" {
-		return public, "", fmt.Errorf("public info probe: response missing server ID")
+		return public, "", effective, fmt.Errorf("public info probe: response missing server ID")
 	}
 	if expectedServerID != "" && publicID != strings.TrimSpace(expectedServerID) {
-		return public, "", fmt.Errorf("public info probe: server ID differs from the stored source")
+		return public, "", effective, fmt.Errorf("public info probe: server ID differs from the stored source")
 	}
-	return public, publicID, nil
+	return public, publicID, effective, nil
+}
+
+// embyBaseRetryURL suggests an alternate Emby API base when the first probe
+// hits a redirect/HTML gateway root. Returns "" when no retry is warranted.
+func embyBaseRetryURL(baseURL string, probeErr error) string {
+	if probeErr == nil {
+		return ""
+	}
+	msg := probeErr.Error()
+	// Only retry on redirect / non-JSON failures typical of missing /emby.
+	if !strings.Contains(msg, "308") && !strings.Contains(msg, "301") && !strings.Contains(msg, "302") && !strings.Contains(msg, "307") && !strings.Contains(msg, "invalid JSON") && !strings.Contains(msg, "redirect") {
+		return ""
+	}
+	u, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	path := strings.TrimRight(u.Path, "/")
+	if path == "" {
+		u.Path = "/emby"
+		return u.String()
+	}
+	if !strings.HasSuffix(path, "/emby") {
+		u.Path = path + "/emby"
+		return u.String()
+	}
+	return ""
 }
 
 func authenticateUpstream(ctx context.Context, client *http.Client, baseURL, username, password, deviceID string, identity gateway.BackendClientIdentity, public upstreamPublicInfo, publicID string) (upstreamProbeResult, error) {
@@ -176,6 +222,9 @@ func UpstreamRequest(ctx context.Context, client *http.Client, method, endpoint 
 		return fmt.Errorf("response exceeds 1 MiB limit")
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if loc := strings.TrimSpace(resp.Header.Get("Location")); loc != "" && resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			return fmt.Errorf("unexpected HTTP status %d (redirect to %s); if probing a gateway, use the Emby base path (e.g. https://host/emby)", resp.StatusCode, loc)
+		}
 		return fmt.Errorf("unexpected HTTP status %d", resp.StatusCode)
 	}
 	if allowEmptySuccess && len(data) == 0 {

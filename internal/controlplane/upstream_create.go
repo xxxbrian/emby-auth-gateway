@@ -263,7 +263,7 @@ func ReconfigureUpstream(parent context.Context, app core.App, opts UpstreamReco
 		expectedID = state.Source.GetString("server_id")
 	}
 	if exactNoop {
-		_, _, err := probeUpstreamPublic(ctx, NewUpstreamHTTPClient(), baseURL, state.Source.GetString("backend_authorization_device_id"), expectedID, identity)
+		_, _, _, err := probeUpstreamPublic(ctx, NewUpstreamHTTPClient(), baseURL, state.Source.GetString("backend_authorization_device_id"), expectedID, identity)
 		return result, err
 	}
 	deviceID, err = newBackendDeviceID()
@@ -274,7 +274,10 @@ func ReconfigureUpstream(parent context.Context, app core.App, opts UpstreamReco
 	if err != nil {
 		return result, err
 	}
-	probe, err := probeUpstream(ctx, baseURL, opts.BackendUsername, opts.BackendPassword, deviceID, expectedID, identity)
+	probe, effectiveBase, err := probeUpstream(ctx, baseURL, opts.BackendUsername, opts.BackendPassword, deviceID, expectedID, identity)
+	if effectiveBase != "" {
+		baseURL = effectiveBase
+	}
 	if err != nil {
 		if probe.token != "" {
 			if cleanupErr := cleanupInvocationToken(ctx, app, baseURL, identity, deviceID, probe.userID, probe.token); cleanupErr != nil {
