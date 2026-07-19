@@ -139,16 +139,23 @@ type Playback struct {
 
 // Transfer is an open media transfer (current-state map entry).
 type Transfer struct {
-	SessionID string    `json:"session_id"`
-	UserID    string    `json:"user_id"`
-	Username  string    `json:"username"`
-	Device    string    `json:"device"`
-	ItemID    string    `json:"item_id"`
-	MediaMode string    `json:"media_mode"`
-	BytesIn   int64     `json:"bytes_in"`
-	BytesOut  int64     `json:"bytes_out"`
-	StartedAt time.Time `json:"started_at"`
-	LastSeen  time.Time `json:"last_seen"`
+	SessionID   string                `json:"session_id"`
+	UserID      string                `json:"user_id"`
+	Username    string                `json:"username"`
+	Device      string                `json:"device"`
+	ItemID      string                `json:"item_id"`
+	MediaMode   string                `json:"media_mode"`
+	BytesIn     int64                 `json:"bytes_in"`
+	BytesOut    int64                 `json:"bytes_out"`
+	StartedAt   time.Time             `json:"started_at"`
+	LastSeen    time.Time             `json:"last_seen"`
+	MediaBuffer *MediaBufferReference `json:"media_buffer,omitempty"`
+}
+
+// MediaBufferReference is identity-only linkage to an observed buffered stream.
+type MediaBufferReference struct {
+	BootID   string `json:"boot_id"`
+	StreamID uint64 `json:"stream_id,string"`
 }
 
 type sessionState struct {

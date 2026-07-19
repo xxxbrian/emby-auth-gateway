@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+
+	"github.com/xxxbrian/emby-auth-gateway/internal/telemetry"
 )
 
 const (
@@ -19,16 +21,19 @@ var (
 )
 
 type mediaBuffer struct {
-	mu            sync.Mutex
-	hardBudget    int64
-	allocated     int64
-	owned         int64
-	free          []*mediaBufferChunk
-	requests      []*mediaBufferRequest
-	waiters       []*mediaBufferRequest
-	nextRequestID uint64
-	nextChunkID   uint64
-	nextGrant     uint64
+	mu               sync.Mutex
+	hardBudget       int64
+	allocated        int64
+	owned            int64
+	free             []*mediaBufferChunk
+	requests         []*mediaBufferRequest
+	waiters          []*mediaBufferRequest
+	nextRequestID    uint64
+	nextChunkID      uint64
+	nextGrant        uint64
+	baseOnlyRequests int
+	indebtedRequests int
+	requestDebtBytes int64
 }
 
 // MediaBuffer is the opaque adaptive media buffering controller.
@@ -60,6 +65,7 @@ type mediaBufferRequest struct {
 	notify  chan struct{}
 	pending *mediaBufferLease
 	chunks  map[*mediaBufferChunk]uint64
+	live    *mediaBufferLiveState
 }
 
 type mediaBufferSnapshot struct {
@@ -127,6 +133,7 @@ func (b *mediaBuffer) register() *mediaBufferRequest {
 		chunks: make(map[*mediaBufferChunk]uint64),
 	}
 	b.requests = append(b.requests, r)
+	b.addRequestCountersLocked(r)
 	b.recomputeTargetsLocked()
 	b.scheduleLocked()
 	b.assertAccountingLocked()
@@ -138,23 +145,30 @@ func (b *mediaBuffer) Snapshot() mediaBufferSnapshot {
 	defer b.mu.Unlock()
 
 	snapshot := mediaBufferSnapshot{
-		Enabled:        true,
-		HardBudget:     b.hardBudget,
-		Allocated:      b.allocated,
-		Owned:          b.owned,
-		Free:           int64(len(b.free)) * mediaBufferChunkSize,
-		ActiveRequests: len(b.requests),
-	}
-	for _, r := range b.requests {
-		if r.owned == 0 {
-			snapshot.BaseOnlyRequests++
-		}
-		if r.debt > 0 {
-			snapshot.IndebtedRequests++
-			snapshot.RequestDebtBytes += r.debt
-		}
+		Enabled:          true,
+		HardBudget:       b.hardBudget,
+		Allocated:        b.allocated,
+		Owned:            b.owned,
+		Free:             int64(len(b.free)) * mediaBufferChunkSize,
+		ActiveRequests:   len(b.requests),
+		BaseOnlyRequests: b.baseOnlyRequests,
+		IndebtedRequests: b.indebtedRequests,
+		RequestDebtBytes: b.requestDebtBytes,
 	}
 	return snapshot
+}
+
+func (r *mediaBufferRequest) attachLive(state *mediaBufferLiveState) {
+	if r == nil || r.buffer == nil {
+		return
+	}
+	b := r.buffer
+	b.mu.Lock()
+	if !r.closed {
+		r.live = state
+		b.projectRequestLocked(r)
+	}
+	b.mu.Unlock()
 }
 
 func (r *mediaBufferRequest) requestOptional() (<-chan struct{}, error) {
@@ -171,6 +185,7 @@ func (r *mediaBufferRequest) requestOptional() (<-chan struct{}, error) {
 	r.waiting = true
 	b.waiters = append(b.waiters, r)
 	b.scheduleLocked()
+	b.projectRequestLocked(r)
 	b.assertAccountingLocked()
 	return r.notify, nil
 }
@@ -190,6 +205,7 @@ func (r *mediaBufferRequest) acceptOptional() (mediaBufferLease, error) {
 	r.pending = nil
 	drainMediaBufferNotification(r.notify)
 	r.chunks[lease.chunk] = lease.generation
+	b.projectRequestLocked(r)
 	b.assertAccountingLocked()
 	return lease, nil
 }
@@ -211,6 +227,7 @@ func (r *mediaBufferRequest) cancelOptionalRequest() error {
 		drainMediaBufferNotification(r.notify)
 	}
 	b.scheduleLocked()
+	b.projectRequestLocked(r)
 	b.assertAccountingLocked()
 	return nil
 }
@@ -228,6 +245,7 @@ func (r *mediaBufferRequest) releaseOptional(lease mediaBufferLease) error {
 	}
 	b.releaseAcceptedLocked(r, lease.chunk)
 	b.scheduleLocked()
+	b.projectRequestLocked(r)
 	b.assertAccountingLocked()
 	return nil
 }
@@ -252,6 +270,7 @@ func (r *mediaBufferRequest) close() error {
 	for chunk := range r.chunks {
 		b.releaseAcceptedLocked(r, chunk)
 	}
+	b.removeRequestCountersLocked(r)
 	index := b.requestIndexLocked(r)
 	if index < 0 {
 		panic("media buffer request missing during close")
@@ -295,8 +314,11 @@ func (b *mediaBuffer) recomputeTargetsLocked() {
 		target = mediaBufferRequestCap
 	}
 	for _, r := range b.requests {
+		b.removeRequestCountersLocked(r)
 		r.target = target
 		r.recomputeDebtLocked()
+		b.addRequestCountersLocked(r)
+		b.projectRequestLocked(r)
 	}
 }
 
@@ -313,6 +335,7 @@ func (b *mediaBuffer) scheduleLocked() {
 	for _, r := range population {
 		if !b.canGrantLocked(r) {
 			b.waiters = append(b.waiters, r)
+			b.projectRequestLocked(r)
 			continue
 		}
 		chunk := b.takeChunkLocked()
@@ -326,9 +349,12 @@ func (b *mediaBuffer) scheduleLocked() {
 		chunk.ownerID = r.id
 		lease := mediaBufferLease{chunk: chunk, requestID: r.id, generation: chunk.generation}
 		r.pending = &lease
+		b.removeRequestCountersLocked(r)
 		r.owned += mediaBufferChunkSize
 		r.recomputeDebtLocked()
+		b.addRequestCountersLocked(r)
 		b.owned += mediaBufferChunkSize
+		b.projectRequestLocked(r)
 		select {
 		case r.notify <- struct{}{}:
 		default:
@@ -391,10 +417,57 @@ func (b *mediaBuffer) releaseAcceptedLocked(r *mediaBufferRequest, chunk *mediaB
 
 func (b *mediaBuffer) releaseOwnedChunkLocked(r *mediaBufferRequest, chunk *mediaBufferChunk) {
 	chunk.ownerID = 0
+	b.removeRequestCountersLocked(r)
 	r.owned -= mediaBufferChunkSize
 	r.recomputeDebtLocked()
+	b.addRequestCountersLocked(r)
 	b.owned -= mediaBufferChunkSize
 	b.free = append(b.free, chunk)
+	b.projectRequestLocked(r)
+}
+
+func (b *mediaBuffer) addRequestCountersLocked(r *mediaBufferRequest) {
+	if r.owned == 0 {
+		b.baseOnlyRequests++
+	}
+	if r.debt > 0 {
+		b.indebtedRequests++
+		b.requestDebtBytes += r.debt
+	}
+}
+
+func (b *mediaBuffer) removeRequestCountersLocked(r *mediaBufferRequest) {
+	if r.owned == 0 {
+		b.baseOnlyRequests--
+	}
+	if r.debt > 0 {
+		b.indebtedRequests--
+		b.requestDebtBytes -= r.debt
+	}
+}
+
+func (b *mediaBuffer) projectRequestLocked(r *mediaBufferRequest) {
+	if r == nil || r.live == nil {
+		return
+	}
+	r.live.projectAllocation(r.target, r.owned, r.debt)
+	r.live.projectBlocker(b.requestBlockerLocked(r))
+}
+
+func (b *mediaBuffer) requestBlockerLocked(r *mediaBufferRequest) telemetry.MediaBufferAllocationBlocker {
+	if r == nil || !r.waiting || r.pending != nil || r.closed {
+		return telemetry.MediaBufferBlockerNone
+	}
+	if r.debt > 0 {
+		return telemetry.MediaBufferBlockerDebt
+	}
+	if r.owned+mediaBufferChunkSize > r.target {
+		return telemetry.MediaBufferBlockerAtTarget
+	}
+	if len(b.free) == 0 && b.allocated+mediaBufferChunkSize > b.hardBudget {
+		return telemetry.MediaBufferBlockerPoolExhausted
+	}
+	return telemetry.MediaBufferBlockerNone
 }
 
 func (b *mediaBuffer) removeWaiterLocked(request *mediaBufferRequest) {

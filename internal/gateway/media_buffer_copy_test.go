@@ -165,11 +165,38 @@ func TestMediaBufferCopyOwnershipFailuresAreSurfaced(t *testing.T) {
 		if result.Direction != mediaDirectionDownstream || !errors.Is(result.Err, downstreamErr) || !errors.Is(result.Err, errMediaBufferCopyInvariant) || !errors.Is(result.Err, injected) {
 			t.Fatalf("result=%+v", result)
 		}
+		if result.PrimaryDirection != mediaDirectionDownstream || !errors.Is(result.PrimaryErr, downstreamErr) || errors.Is(result.PrimaryErr, injected) || !result.InvariantObserved {
+			t.Fatalf("primary result contaminated by cleanup: %+v", result)
+		}
 		if got := request.snapshot(); got.Owned != 0 || got.Pending || got.Requesting {
 			t.Fatalf("request after simultaneous failure=%+v", got)
 		}
 		closeMediaBufferCopyRequests(t, request)
 	})
+}
+
+func TestMediaBufferCopyDeadlinePrimaryRemainsSeparateFromCleanup(t *testing.T) {
+	for _, withInvariant := range []bool{false, true} {
+		name := "without invariant"
+		var hooks *mediaBufferCopyHooks
+		var injected error
+		if withInvariant {
+			name = "with invariant"
+			injected = errors.New("deadline cleanup invariant")
+			hooks = &mediaBufferCopyHooks{injectCancelErr: injected}
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithDeadline(context.Background(), time.Unix(0, 0))
+			defer cancel()
+			result, _ := runMediaBufferCopy(t, ctx, io.Discard, bytes.NewBufferString("media"), 5, mediaBufferChunkSize, hooks)
+			if !errors.Is(result.PrimaryErr, context.DeadlineExceeded) || result.PrimaryDirection != "" || classifyMediaCopyOutcome(result) != mediaCopyOutcomeCanceled {
+				t.Fatalf("deadline primary=%+v", result)
+			}
+			if withInvariant && (!result.InvariantObserved || !errors.Is(result.Err, injected) || errors.Is(result.PrimaryErr, injected)) {
+				t.Fatalf("deadline cleanup contaminated primary=%+v", result)
+			}
+		})
+	}
 }
 
 func TestMediaBufferCopyQueuePreservesLargeFIFOOrder(t *testing.T) {

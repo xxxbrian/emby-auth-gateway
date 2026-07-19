@@ -30,6 +30,8 @@ func (b *mediaBuffer) assertInvariantsLocked() {
 		}
 	}
 	var requestOwned int64
+	var baseOnlyRequests, indebtedRequests int
+	var requestDebtBytes int64
 	for _, request := range b.requests {
 		if request == nil || request.buffer != b || request.closed {
 			panic("invalid registered media buffer request")
@@ -86,9 +88,19 @@ func (b *mediaBuffer) assertInvariantsLocked() {
 			panic("media buffer notification without pending lease")
 		}
 		requestOwned += request.owned
+		if request.owned == 0 {
+			baseOnlyRequests++
+		}
+		if request.debt > 0 {
+			indebtedRequests++
+			requestDebtBytes += request.debt
+		}
 	}
 	if requestOwned != b.owned || int64(len(seenChunks))*mediaBufferChunkSize != b.allocated {
 		panic("media buffer aggregate ownership mismatch")
+	}
+	if baseOnlyRequests != b.baseOnlyRequests || indebtedRequests != b.indebtedRequests || requestDebtBytes != b.requestDebtBytes {
+		panic("media buffer cached request accounting mismatch")
 	}
 
 	waiterSet := make(map[*mediaBufferRequest]struct{}, len(b.waiters))

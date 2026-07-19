@@ -48,6 +48,8 @@ type Server struct {
 	// mediaInflight counts in-progress media body copies (metrics / ActiveMediaCopies).
 	mediaInflight       atomic.Int64
 	mediaBuffer         *mediaBuffer
+	mediaBufferLive     *telemetry.MediaBufferLiveRegistry
+	mediaBufferLiveMu   sync.Mutex
 	mediaBufferHooks    *mediaBufferServerHooks
 	anonymousImages     anonymousImageNamespaceState
 	anonymousImageNow   func() time.Time
@@ -57,6 +59,7 @@ type Server struct {
 type mediaBufferServerHooks struct {
 	afterHeaderCommit  func()
 	beforeFailureAudit func()
+	beforeLiveRegister func(uint64)
 }
 
 // ActiveMediaCopies returns the number of in-flight media body copies.
@@ -140,7 +143,7 @@ func NewServer(cfg Config, store Store) *Server {
 		client = &http.Client{Timeout: backendAuthTimeout}
 	}
 	proxyClient := newProxyClient(cfg.HTTPClient)
-	return &Server{cfg: cfg, store: store, client: client, proxyClient: proxyClient, emitter: cfg.Emitter, meter: cfg.Meter, upstreamAuth: newUpstreamAuthenticator(store, client), logins: newLoginFailureLimiter(), playbackGuards: newPlaybackGuardTracker(), mediaBuffer: configuredMediaBuffer(cfg.MediaBuffer), anonymousImageNow: time.Now, anonymousImageSlots: make(chan struct{}, anonymousImageValidationConcurrency)}
+	return &Server{cfg: cfg, store: store, client: client, proxyClient: proxyClient, emitter: cfg.Emitter, meter: cfg.Meter, upstreamAuth: newUpstreamAuthenticator(store, client), logins: newLoginFailureLimiter(), playbackGuards: newPlaybackGuardTracker(), mediaBuffer: configuredMediaBuffer(cfg.MediaBuffer), mediaBufferLive: cfg.MediaBufferLive, anonymousImageNow: time.Now, anonymousImageSlots: make(chan struct{}, anonymousImageValidationConcurrency)}
 }
 
 // Emitter returns the optional non-blocking observe emitter (nil if unset).
@@ -208,6 +211,17 @@ func mediaModeForRequest(r *http.Request, rel string) string {
 		return observe.MediaRange
 	}
 	return observe.MediaDirect
+}
+
+func mediaItemIDForRequest(rel string) string {
+	parts := strings.Split(strings.Trim(rel, "/"), "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	if strings.EqualFold(parts[0], "Videos") || strings.EqualFold(parts[0], "Items") {
+		return strings.TrimSpace(parts[1])
+	}
+	return ""
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -1757,8 +1771,8 @@ func (s *Server) copyBufferedMediaResponseOrAbort(w http.ResponseWriter, r *http
 	s.beginMediaCopy()
 	defer s.endMediaCopy()
 
-	request := s.mediaBuffer.register()
 	mediaMode := mediaModeForRequest(r, rel)
+	request, live := s.registerMediaBufferRequest(rel, session, mediaMode)
 	method := ""
 	if r != nil {
 		method = r.Method
@@ -1766,14 +1780,21 @@ func (s *Server) copyBufferedMediaResponseOrAbort(w http.ResponseWriter, r *http
 
 	var handle *telemetry.TransferHandle
 	if s.meter != nil {
-		handle = s.meter.BeginTransfer(telemetry.TransferMeta{
+		meta := telemetry.TransferMeta{
 			SessionID: sessionTokenHash(session),
 			UserID:    sessionGatewayUserID(session),
 			Username:  sessionUsername(session),
 			Device:    sessionDevice(session),
 			MediaMode: mediaMode,
 			Method:    method,
-		})
+		}
+		if live != nil {
+			meta.MediaBuffer = &telemetry.MediaBufferReference{BootID: live.identity.BootID, StreamID: live.identity.StreamID}
+		}
+		handle = s.meter.BeginTransfer(meta)
+		if live != nil && handle != nil {
+			live.bindTransferID(handle.ID())
+		}
 	}
 
 	dst := newCountedWriter(w, s.meter, handle)
@@ -1784,7 +1805,13 @@ func (s *Server) copyBufferedMediaResponseOrAbort(w http.ResponseWriter, r *http
 		s.mediaBufferHooks.afterHeaderCommit()
 	}
 	result := copyBufferedMediaBody(r.Context(), dst, src, owner, base, request, resp.ContentLength)
+	var terminalSnapshot telemetry.MediaBufferLiveSnapshot
+	if live != nil {
+		live.markTerminal()
+		terminalSnapshot = live.MediaBufferLiveSnapshot()
+	}
 	if closeErr := request.close(); closeErr != nil {
+		result.InvariantObserved = true
 		result.Err = errors.Join(result.Err, closeErr)
 		if result.Direction == "" {
 			result.Direction = mediaDirectionUpstream
@@ -1792,6 +1819,15 @@ func (s *Server) copyBufferedMediaResponseOrAbort(w http.ResponseWriter, r *http
 	}
 	if handle != nil {
 		handle.End(result.Err)
+	}
+	if live != nil {
+		s.mediaBufferLive.OfferCompletion(telemetry.MediaBufferCompletion{
+			Terminal:          terminalSnapshot,
+			Outcome:           string(classifyMediaCopyOutcome(result)),
+			InvariantObserved: result.InvariantObserved,
+			BytesRead:         result.BytesRead,
+			BytesWritten:      result.BytesWritten,
+		})
 	}
 	if result.Err == nil {
 		return
@@ -1803,6 +1839,33 @@ func (s *Server) copyBufferedMediaResponseOrAbort(w http.ResponseWriter, r *http
 		s.auditMediaCopyFailure(r, rel, resp.StatusCode, session, result)
 	}
 	panic(http.ErrAbortHandler)
+}
+
+func (s *Server) registerMediaBufferRequest(rel string, session *Session, mediaMode string) (*mediaBufferRequest, *mediaBufferLiveState) {
+	if s.mediaBufferLive == nil {
+		return s.mediaBuffer.register(), nil
+	}
+	s.mediaBufferLiveMu.Lock()
+	defer s.mediaBufferLiveMu.Unlock()
+
+	request := s.mediaBuffer.register()
+	candidate := newMediaBufferLiveState(mediaBufferLiveIdentity{
+		BootID:    s.mediaBufferLive.BootID(),
+		StreamID:  request.id,
+		UserID:    sessionGatewayUserID(session),
+		Username:  sessionUsername(session),
+		Device:    sessionDevice(session),
+		ItemID:    mediaItemIDForRequest(rel),
+		MediaMode: mediaMode,
+	}, nil)
+	if s.mediaBufferHooks != nil && s.mediaBufferHooks.beforeLiveRegister != nil {
+		s.mediaBufferHooks.beforeLiveRegister(request.id)
+	}
+	if !s.mediaBufferLive.Register(candidate) {
+		return request, nil
+	}
+	request.attachLive(candidate)
+	return request, candidate
 }
 
 func (s *Server) copyMediaReaderOrAbort(w http.ResponseWriter, r *http.Request, rel string, src io.Reader, expectedLength int64, upstreamStatus int, session *Session) {

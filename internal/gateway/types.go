@@ -12,6 +12,7 @@ import (
 
 	"github.com/xxxbrian/emby-auth-gateway/internal/observe"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pathpolicy"
+	"github.com/xxxbrian/emby-auth-gateway/internal/telemetry"
 )
 
 type Config struct {
@@ -22,9 +23,10 @@ type Config struct {
 	MinResumePct             float64
 	MaxResumePct             float64
 	MinResumeDurationSeconds float64
-	Emitter                  *observe.Emitter // optional; nil = no-op
-	Meter                    TrafficMeter     // optional live bandwidth meter; nil = no-op
-	MediaBuffer              *MediaBuffer     // optional; nil preserves synchronous media copying
+	Emitter                  *observe.Emitter                   // optional; nil = no-op
+	Meter                    TrafficMeter                       // optional live bandwidth meter; nil = no-op
+	MediaBuffer              *MediaBuffer                       // optional; nil preserves synchronous media copying
+	MediaBufferLive          *telemetry.MediaBufferLiveRegistry // optional Phase 1 injection; nil disables observation
 }
 
 type Store interface {

@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -13,14 +14,36 @@ const (
 	mediaDirectionDownstream = "downstream"
 )
 
-var errMediaLengthMismatch = errors.New("upstream media length mismatch")
+var (
+	errMediaLengthMismatch = errors.New("upstream media length mismatch")
+	ErrInvalidMediaRead    = errors.New("invalid upstream media read")
+	ErrInvalidMediaWrite   = errors.New("invalid downstream media write")
+)
+
+type mediaCopyOutcome string
+
+const (
+	mediaCopyOutcomeSuccess         mediaCopyOutcome = "success"
+	mediaCopyOutcomeCanceled        mediaCopyOutcome = "canceled"
+	mediaCopyOutcomeUpstreamError   mediaCopyOutcome = "upstream_error"
+	mediaCopyOutcomeDownstreamError mediaCopyOutcome = "downstream_error"
+	mediaCopyOutcomeShortWrite      mediaCopyOutcome = "short_write"
+	mediaCopyOutcomeLengthMismatch  mediaCopyOutcome = "length_mismatch"
+	mediaCopyOutcomeInvalidRead     mediaCopyOutcome = "invalid_read"
+	mediaCopyOutcomeInvalidWrite    mediaCopyOutcome = "invalid_write"
+	mediaCopyOutcomeNoProgress      mediaCopyOutcome = "no_progress"
+	mediaCopyOutcomeInvariantError  mediaCopyOutcome = "invariant_error"
+)
 
 type mediaCopyResult struct {
-	BytesRead    int64
-	BytesWritten int64
-	Direction    string
-	Duration     time.Duration
-	Err          error
+	BytesRead         int64
+	BytesWritten      int64
+	Direction         string
+	Duration          time.Duration
+	Err               error
+	PrimaryDirection  string
+	PrimaryErr        error
+	InvariantObserved bool
 }
 
 func copyMediaBody(dst io.Writer, src io.Reader, expectedLength int64) mediaCopyResult {
@@ -30,6 +53,8 @@ func copyMediaBody(dst io.Writer, src io.Reader, expectedLength int64) mediaCopy
 		result.Direction = direction
 		result.Duration = time.Since(started)
 		result.Err = err
+		result.PrimaryDirection = direction
+		result.PrimaryErr = err
 		return result
 	}
 
@@ -38,7 +63,7 @@ func copyMediaBody(dst io.Writer, src io.Reader, expectedLength int64) mediaCopy
 	for {
 		n, readErr := src.Read(buffer)
 		if n < 0 || n > len(buffer) {
-			return finish(mediaDirectionUpstream, errors.New("invalid upstream media read"))
+			return finish(mediaDirectionUpstream, ErrInvalidMediaRead)
 		}
 		if n > 0 {
 			emptyReads = 0
@@ -52,7 +77,7 @@ func copyMediaBody(dst io.Writer, src io.Reader, expectedLength int64) mediaCopy
 			if writeLength > 0 {
 				written, writeErr := dst.Write(buffer[:writeLength])
 				if written < 0 || written > writeLength {
-					return finish(mediaDirectionDownstream, errors.New("invalid downstream media write"))
+					return finish(mediaDirectionDownstream, ErrInvalidMediaWrite)
 				}
 				result.BytesWritten += int64(written)
 				if writeErr != nil {
@@ -83,6 +108,40 @@ func copyMediaBody(dst io.Writer, src io.Reader, expectedLength int64) mediaCopy
 		}
 		return finish("", nil)
 	}
+}
+
+func classifyMediaCopyOutcome(result mediaCopyResult) mediaCopyOutcome {
+	direction := result.PrimaryDirection
+	err := result.PrimaryErr
+	if direction == mediaDirectionDownstream {
+		switch {
+		case errors.Is(err, ErrInvalidMediaWrite):
+			return mediaCopyOutcomeInvalidWrite
+		case errors.Is(err, io.ErrShortWrite):
+			return mediaCopyOutcomeShortWrite
+		default:
+			return mediaCopyOutcomeDownstreamError
+		}
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return mediaCopyOutcomeCanceled
+	}
+	if direction == mediaDirectionUpstream {
+		switch {
+		case errors.Is(err, errMediaLengthMismatch):
+			return mediaCopyOutcomeLengthMismatch
+		case errors.Is(err, ErrInvalidMediaRead):
+			return mediaCopyOutcomeInvalidRead
+		case errors.Is(err, io.ErrNoProgress):
+			return mediaCopyOutcomeNoProgress
+		default:
+			return mediaCopyOutcomeUpstreamError
+		}
+	}
+	if result.InvariantObserved {
+		return mediaCopyOutcomeInvariantError
+	}
+	return mediaCopyOutcomeSuccess
 }
 
 func (s *Server) auditMediaCopyFailure(r *http.Request, rel string, upstreamStatus int, session *Session, result mediaCopyResult) {

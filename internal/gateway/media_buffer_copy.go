@@ -6,6 +6,8 @@ import (
 	"io"
 	"sync"
 	"time"
+
+	"github.com/xxxbrian/emby-auth-gateway/internal/telemetry"
 )
 
 var errMediaBufferCopyState = errors.New("invalid media buffer copy state")
@@ -17,6 +19,8 @@ type mediaBufferCopyHooks struct {
 	onCleanupCanceled  func()
 	onPublished        func(terminal bool)
 	onBeforeDequeue    func(terminal bool)
+	onBeforeQueueWait  func()
+	afterQueueCleanup  func()
 	injectReleaseErr   error
 	injectCancelErr    error
 }
@@ -45,9 +49,11 @@ type mediaBufferProducerResult struct {
 type mediaBufferCopyQueue struct {
 	mu      sync.Mutex
 	events  []mediaBufferCopyEvent
-	head    int
+	head    int32
+	bytes   int32 // bounded by the 512 MiB request cap plus one private base
 	notify  chan struct{}
 	closing bool
+	live    *mediaBufferLiveState
 }
 
 func copyBufferedMediaBody(ctx context.Context, dst io.Writer, src io.Reader, source io.Closer, base []byte, request *mediaBufferRequest, expectedLength int64) mediaCopyResult {
@@ -64,51 +70,75 @@ func copyBufferedMediaBodyWithHooks(ctx context.Context, dst io.Writer, src io.R
 		return result
 	}
 	if ctx == nil || dst == nil || src == nil || source == nil || request == nil || len(base) != mediaCopyBufferSize {
+		result.PrimaryDirection = mediaDirectionUpstream
+		result.PrimaryErr = errMediaBufferCopyState
 		return finish(mediaDirectionUpstream, errMediaBufferCopyState)
 	}
 
 	producerCtx, cancelProducer := context.WithCancel(ctx)
-	queue := &mediaBufferCopyQueue{notify: make(chan struct{}, 1)}
+	live := request.live
+	if live != nil {
+		live.setLifecycle(telemetry.MediaBufferLifecycleActive)
+	}
+	queue := &mediaBufferCopyQueue{notify: make(chan struct{}, 1), live: live}
 	baseReady := make(chan []byte, 1)
 	producerDone := make(chan mediaBufferProducerResult, 1)
 	go produceBufferedMedia(producerCtx, src, request, mediaBufferCopyBuffer{data: base, base: true}, baseReady, queue, producerDone, expectedLength, hooks)
 
 	type selectedResult struct {
-		direction string
-		err       error
+		direction        string
+		err              error
+		primaryDirection string
+		primaryErr       error
+		hasPrimary       bool
 	}
 	selected := selectedResult{}
+	selectPrimary := func(direction string, err error) {
+		selected.direction = direction
+		selected.err = err
+		selected.primaryDirection = direction
+		selected.primaryErr = err
+		selected.hasPrimary = true
+	}
 	for {
 		event, ok := queue.next(ctx, hooks)
 		if !ok {
-			selected.err = ctx.Err()
-			if selected.err == nil {
-				selected.direction = mediaDirectionUpstream
-				selected.err = errMediaBufferCopyState
+			direction := ""
+			err := ctx.Err()
+			if err == nil {
+				direction = mediaDirectionUpstream
+				err = errMediaBufferCopyState
 			}
+			selectPrimary(direction, err)
 			break
 		}
 		if event.terminal {
-			selected.direction = event.direction
-			selected.err = event.err
+			selectPrimary(event.direction, event.err)
 			break
 		}
 
+		var writeStarted int64
+		if live != nil {
+			writeStarted = live.beginConsumerOperation(telemetry.MediaBufferConsumerWriting)
+			live.setWriting(int64(event.length))
+		}
 		written, writeErr := dst.Write(event.buffer.data[:event.length])
+		if live != nil {
+			live.setWriting(0)
+			live.endConsumerOperation(telemetry.MediaBufferConsumerWriting, writeStarted)
+		}
 		if written < 0 || written > event.length {
-			selected.direction = mediaDirectionDownstream
-			selected.err = errors.New("invalid downstream media write")
+			selectPrimary(mediaDirectionDownstream, ErrInvalidMediaWrite)
 		} else {
 			result.BytesWritten += int64(written)
 			if writeErr != nil {
-				selected.direction = mediaDirectionDownstream
-				selected.err = writeErr
+				selectPrimary(mediaDirectionDownstream, writeErr)
 			} else if written < event.length {
-				selected.direction = mediaDirectionDownstream
-				selected.err = io.ErrShortWrite
+				selectPrimary(mediaDirectionDownstream, io.ErrShortWrite)
 			}
 		}
 		if releaseErr := releaseBufferedCopyBuffer(request, baseReady, event.buffer, hooks); releaseErr != nil {
+			result.InvariantObserved = true
 			if selected.err == nil {
 				selected.direction = mediaDirectionUpstream
 				selected.err = releaseErr
@@ -121,6 +151,13 @@ func copyBufferedMediaBodyWithHooks(ctx context.Context, dst io.Writer, src io.R
 		}
 	}
 
+	if selected.hasPrimary {
+		result.PrimaryDirection = selected.primaryDirection
+		result.PrimaryErr = selected.primaryErr
+	}
+	if live != nil {
+		live.setLifecycle(telemetry.MediaBufferLifecycleClosing)
+	}
 	queued := queue.close()
 	cancelProducer()
 	var invariantErr error
@@ -141,8 +178,15 @@ func copyBufferedMediaBodyWithHooks(ctx context.Context, dst io.Writer, src io.R
 			invariantErr = errors.Join(invariantErr, releaseErr)
 		}
 	}
+	if hooks != nil && hooks.afterQueueCleanup != nil {
+		hooks.afterQueueCleanup()
+	}
+	if live != nil {
+		live.setConsumer(telemetry.MediaBufferConsumerDone)
+	}
 	result.BytesRead = producerResult.bytesRead
 	if invariantErr != nil {
+		result.InvariantObserved = true
 		if selected.err == nil {
 			selected.direction = mediaDirectionUpstream
 			selected.err = invariantErr
@@ -159,15 +203,32 @@ func copyBufferedMediaBodyWithHooks(ctx context.Context, dst io.Writer, src io.R
 
 func produceBufferedMedia(ctx context.Context, src io.Reader, request *mediaBufferRequest, current mediaBufferCopyBuffer, baseReady chan []byte, queue *mediaBufferCopyQueue, done chan<- mediaBufferProducerResult, expectedLength int64, hooks *mediaBufferCopyHooks) {
 	result := mediaBufferProducerResult{}
-	defer func() { done <- result }()
+	live := request.live
+	defer func() {
+		if live != nil {
+			live.setProducer(telemetry.MediaBufferProducerDone)
+		}
+		done <- result
+	}()
 	emptyReads := 0
 
 	for {
+		producerState := telemetry.MediaBufferProducerReadingOptional
+		var readStarted int64
+		if live != nil {
+			if current.base {
+				producerState = telemetry.MediaBufferProducerReadingBase
+			}
+			readStarted = live.beginProducerOperation(producerState)
+		}
 		n, readErr := src.Read(current.data[:mediaCopyBufferSize])
+		if live != nil {
+			live.endProducerOperation(producerState, readStarted)
+		}
 		if n < 0 || n > mediaCopyBufferSize {
 			result.invariant = errors.Join(result.invariant, releaseProducerBuffer(request, current, hooks))
 			result.direction = mediaDirectionUpstream
-			result.err = errors.New("invalid upstream media read")
+			result.err = ErrInvalidMediaRead
 			publishBufferedMediaEvent(queue, mediaBufferCopyEvent{terminal: true, direction: result.direction, err: result.err}, hooks)
 			return
 		}
@@ -258,6 +319,7 @@ func classifyBufferedReadTerminal(readErr error, bytesRead, expectedLength int64
 }
 
 func acquireBufferedCopyBuffer(ctx context.Context, request *mediaBufferRequest, baseReady chan []byte, hooks *mediaBufferCopyHooks) (mediaBufferCopyBuffer, error) {
+	live := request.live
 	select {
 	case base := <-baseReady:
 		return mediaBufferCopyBuffer{data: base, base: true}, nil
@@ -286,15 +348,28 @@ func acquireBufferedCopyBuffer(ctx context.Context, request *mediaBufferRequest,
 	if hooks != nil && hooks.onOptionalWait != nil {
 		hooks.onOptionalWait()
 	}
+	var waitStarted int64
+	if live != nil {
+		waitStarted = live.beginProducerOperation(telemetry.MediaBufferProducerWaitingForBuffer)
+	}
 	select {
 	case <-ctx.Done():
+		if live != nil {
+			live.endProducerOperation(telemetry.MediaBufferProducerWaitingForBuffer, waitStarted)
+		}
 		return mediaBufferCopyBuffer{}, errors.Join(ctx.Err(), cancelBufferedOptionalRequest(request, hooks))
 	case base := <-baseReady:
+		if live != nil {
+			live.endProducerOperation(telemetry.MediaBufferProducerWaitingForBuffer, waitStarted)
+		}
 		if cancelErr := cancelBufferedOptionalRequest(request, hooks); cancelErr != nil {
 			return mediaBufferCopyBuffer{}, cancelErr
 		}
 		return mediaBufferCopyBuffer{data: base, base: true}, nil
 	case _, ok := <-notify:
+		if live != nil {
+			live.endProducerOperation(telemetry.MediaBufferProducerWaitingForBuffer, waitStarted)
+		}
 		if !ok {
 			return mediaBufferCopyBuffer{}, mediaBufferCopyInvariantError(errMediaBufferClosed)
 		}
@@ -365,6 +440,10 @@ func (q *mediaBufferCopyQueue) publish(event mediaBufferCopyEvent) bool {
 		return false
 	}
 	q.events = append(q.events, event)
+	if q.live != nil && !event.terminal {
+		q.bytes += int32(event.length)
+		q.live.setQueued(int64(q.bytes))
+	}
 	select {
 	case q.notify <- struct{}{}:
 	default:
@@ -375,7 +454,7 @@ func (q *mediaBufferCopyQueue) publish(event mediaBufferCopyEvent) bool {
 func (q *mediaBufferCopyQueue) next(ctx context.Context, hooks *mediaBufferCopyHooks) (mediaBufferCopyEvent, bool) {
 	for {
 		q.mu.Lock()
-		if q.head < len(q.events) {
+		if q.head < int32(len(q.events)) {
 			event := q.events[q.head]
 			if hooks != nil && hooks.onBeforeDequeue != nil {
 				hooks.onBeforeDequeue(event.terminal)
@@ -386,6 +465,10 @@ func (q *mediaBufferCopyQueue) next(ctx context.Context, hooks *mediaBufferCopyH
 			}
 			q.events[q.head] = mediaBufferCopyEvent{}
 			q.head++
+			if q.live != nil && !event.terminal {
+				q.bytes -= int32(event.length)
+				q.live.setQueued(int64(q.bytes))
+			}
 			q.compactLocked()
 			q.mu.Unlock()
 			return event, true
@@ -394,15 +477,28 @@ func (q *mediaBufferCopyQueue) next(ctx context.Context, hooks *mediaBufferCopyH
 			q.mu.Unlock()
 			return mediaBufferCopyEvent{}, false
 		}
-		closing := q.closing
-		q.mu.Unlock()
-		if closing {
+		if q.closing {
+			q.mu.Unlock()
 			return mediaBufferCopyEvent{}, false
+		}
+		var waitStarted int64
+		if q.live != nil {
+			waitStarted = q.live.beginConsumerOperation(telemetry.MediaBufferConsumerWaitingForData)
+		}
+		q.mu.Unlock()
+		if hooks != nil && hooks.onBeforeQueueWait != nil {
+			hooks.onBeforeQueueWait()
 		}
 		select {
 		case <-ctx.Done():
+			if q.live != nil {
+				q.live.endConsumerOperation(telemetry.MediaBufferConsumerWaitingForData, waitStarted)
+			}
 			return mediaBufferCopyEvent{}, false
 		case <-q.notify:
+			if q.live != nil {
+				q.live.endConsumerOperation(telemetry.MediaBufferConsumerWaitingForData, waitStarted)
+			}
 		}
 	}
 }
@@ -412,6 +508,10 @@ func (q *mediaBufferCopyQueue) close() []mediaBufferCopyEvent {
 	defer q.mu.Unlock()
 	q.closing = true
 	events := q.takeAllLocked()
+	if q.live != nil && q.bytes != 0 {
+		q.bytes = 0
+		q.live.setQueued(0)
+	}
 	select {
 	case q.notify <- struct{}{}:
 	default:
@@ -420,12 +520,12 @@ func (q *mediaBufferCopyQueue) close() []mediaBufferCopyEvent {
 }
 
 func (q *mediaBufferCopyQueue) compactLocked() {
-	if q.head == len(q.events) {
+	if q.head == int32(len(q.events)) {
 		q.events = nil
 		q.head = 0
 		return
 	}
-	if q.head < 64 || q.head*2 < len(q.events) {
+	if q.head < 64 || int(q.head)*2 < len(q.events) {
 		return
 	}
 	remaining := copy(q.events, q.events[q.head:])
@@ -437,13 +537,13 @@ func (q *mediaBufferCopyQueue) compactLocked() {
 }
 
 func (q *mediaBufferCopyQueue) takeAllLocked() []mediaBufferCopyEvent {
-	if q.head >= len(q.events) {
+	if q.head >= int32(len(q.events)) {
 		q.events = nil
 		q.head = 0
 		return nil
 	}
 	events := q.events[q.head:]
-	for index := 0; index < q.head; index++ {
+	for index := int32(0); index < q.head; index++ {
 		q.events[index] = mediaBufferCopyEvent{}
 	}
 	q.events = nil

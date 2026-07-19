@@ -36,11 +36,12 @@ const (
 // Live forwarded bandwidth is driven by ByteMeter (atomic totals + 1s sampler),
 // not by end-of-transfer observe events.
 type Registry struct {
-	emitter *observe.Emitter
-	meter   *ByteMeter
-	bootID  string
-	started time.Time
-	now     func() time.Time
+	emitter         *observe.Emitter
+	meter           *ByteMeter
+	mediaBufferLive *MediaBufferLiveRegistry
+	bootID          string
+	started         time.Time
+	now             func() time.Time
 
 	mu sync.RWMutex
 
@@ -58,18 +59,37 @@ type Registry struct {
 // New creates a Registry bound to emitter. A nil emitter is allowed.
 // ByteMeter is always created for live bandwidth sampling.
 func New(emitter *observe.Emitter) *Registry {
+	bootID := newBootID()
 	return &Registry{
-		emitter:   emitter,
-		meter:     NewByteMeter(),
-		bootID:    newBootID(),
-		started:   time.Now().UTC(),
-		now:       func() time.Time { return time.Now().UTC() },
-		sessions:  make(map[string]*sessionState),
-		playbacks: make(map[string]*playbackState),
-		transfers: make(map[string]*transferState),
-		sec:       newTimeRing(time.Second, secBuckets),
-		min:       newTimeRing(time.Minute, minBuckets),
+		emitter:         emitter,
+		meter:           NewByteMeter(),
+		mediaBufferLive: newMediaBufferLiveRegistry(bootID),
+		bootID:          bootID,
+		started:         time.Now().UTC(),
+		now:             func() time.Time { return time.Now().UTC() },
+		sessions:        make(map[string]*sessionState),
+		playbacks:       make(map[string]*playbackState),
+		transfers:       make(map[string]*transferState),
+		sec:             newTimeRing(time.Second, secBuckets),
+		min:             newTimeRing(time.Minute, minBuckets),
 	}
+}
+
+// BootID returns the immutable process telemetry boot identity.
+func (r *Registry) BootID() string {
+	if r == nil {
+		return ""
+	}
+	return r.bootID
+}
+
+// MediaBufferLive returns the preallocated Phase 1 live registry. Merely
+// constructing it does not enable gateway observation.
+func (r *Registry) MediaBufferLive() *MediaBufferLiveRegistry {
+	if r == nil {
+		return nil
+	}
+	return r.mediaBufferLive
 }
 
 // Meter returns the live byte meter (never nil for a non-nil Registry).

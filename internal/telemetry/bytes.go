@@ -9,13 +9,14 @@ import (
 
 // TransferMeta describes an in-flight proxy body transfer for the admin UI.
 type TransferMeta struct {
-	SessionID string
-	UserID    string
-	Username  string
-	Device    string
-	ItemID    string
-	MediaMode string
-	Method    string
+	SessionID   string
+	UserID      string
+	Username    string
+	Device      string
+	ItemID      string
+	MediaMode   string
+	Method      string
+	MediaBuffer *MediaBufferReference
 }
 
 // liveTransfer is one active request body copy.
@@ -204,16 +205,17 @@ func (m *ByteMeter) ActiveTransfers() []Transfer {
 			last = time.Unix(0, ns).UTC()
 		}
 		out = append(out, Transfer{
-			SessionID: tr.meta.SessionID,
-			UserID:    tr.meta.UserID,
-			Username:  tr.meta.Username,
-			Device:    tr.meta.Device,
-			ItemID:    tr.meta.ItemID,
-			MediaMode: tr.meta.MediaMode,
-			BytesIn:   tr.ingress.Load(),
-			BytesOut:  tr.egress.Load(),
-			StartedAt: tr.startedAt,
-			LastSeen:  last,
+			SessionID:   tr.meta.SessionID,
+			UserID:      tr.meta.UserID,
+			Username:    tr.meta.Username,
+			Device:      tr.meta.Device,
+			ItemID:      tr.meta.ItemID,
+			MediaMode:   tr.meta.MediaMode,
+			BytesIn:     tr.ingress.Load(),
+			BytesOut:    tr.egress.Load(),
+			StartedAt:   tr.startedAt,
+			LastSeen:    last,
+			MediaBuffer: tr.meta.MediaBuffer,
 		})
 	}
 	m.mu.Unlock()
