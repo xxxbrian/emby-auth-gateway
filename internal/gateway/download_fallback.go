@@ -70,7 +70,8 @@ func (s *Server) tryDownloadDirectStreamFallback(r *http.Request, rel string, se
 		return nil, errDownloadFallbackUnavailable
 	}
 	mediaSourceID := strings.TrimSpace(r.URL.Query().Get("MediaSourceId"))
-	playback, leases, err := s.fetchDownloadPlaybackInfo(r.Context(), itemID, mediaSourceID, session, &upstream)
+	refreshResult := s.upstreamRefreshReporter(r.Context(), r, rel, session)
+	playback, leases, err := s.fetchDownloadPlaybackInfo(r.Context(), itemID, mediaSourceID, session, &upstream, refreshResult)
 	if err != nil || playback.ErrorCode != nil {
 		if s.mediaLeases != nil && !leases.empty() {
 			_ = s.mediaLeases.Release(session.GatewayTokenHash, leases.PlaySessionIDs, leases.LiveStreamIDs)
@@ -107,7 +108,7 @@ func (s *Server) tryDownloadDirectStreamFallback(r *http.Request, rel string, se
 		}
 	}
 	response, err := s.mediaUpstream.RoundTripMedia(mediaUpstreamRequest{
-		upstreamHTTPRequest: upstreamHTTPRequest{Request: request, Session: session, Snapshot: upstream},
+		upstreamHTTPRequest: upstreamHTTPRequest{Request: request, Session: session, Snapshot: upstream, refreshResult: refreshResult},
 		Internal:            true,
 		SnapshotRef:         &upstream,
 	})
@@ -131,7 +132,7 @@ func (s *Server) tryDownloadDirectStreamFallback(r *http.Request, rel string, se
 	return response, nil
 }
 
-func (s *Server) fetchDownloadPlaybackInfo(ctx context.Context, itemID, mediaSourceID string, session *Session, upstream *upstreamRequestSnapshot) (embyPlaybackInfoResponseDTO, negotiationSelectorSet, error) {
+func (s *Server) fetchDownloadPlaybackInfo(ctx context.Context, itemID, mediaSourceID string, session *Session, upstream *upstreamRequestSnapshot, refreshResult func(upstreamRefreshResult)) (embyPlaybackInfoResponseDTO, negotiationSelectorSet, error) {
 	payload, err := json.Marshal(embyPlaybackInfoRequestDTO{
 		ID:                 itemID,
 		UserID:             session.SyntheticUserID,
@@ -150,7 +151,7 @@ func (s *Server) fetchDownloadPlaybackInfo(ctx context.Context, itemID, mediaSou
 	}
 	request.Header.Set("Content-Type", "application/json")
 	response, err := s.mediaUpstream.RoundTripNegotiation(negotiationUpstreamRequest{
-		upstreamHTTPRequest: upstreamHTTPRequest{Request: request, Session: session, Snapshot: *upstream},
+		upstreamHTTPRequest: upstreamHTTPRequest{Request: request, Session: session, Snapshot: *upstream, refreshResult: refreshResult},
 		SnapshotRef:         upstream,
 	})
 	if err == nil {
@@ -174,7 +175,7 @@ func (s *Server) fetchDownloadPlaybackInfo(ctx context.Context, itemID, mediaSou
 	}
 	var playback embyPlaybackInfoResponseDTO
 	if err := json.Unmarshal(data, &playback); err != nil {
-		return embyPlaybackInfoResponseDTO{}, negotiationSelectorSet{}, err
+		return embyPlaybackInfoResponseDTO{}, selectors, err
 	}
 	if err := validateNegotiationSelectors(s.mediaLeases, session.GatewayTokenHash, selectors, time.Time{}); err != nil {
 		return embyPlaybackInfoResponseDTO{}, selectors, err

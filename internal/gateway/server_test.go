@@ -3784,6 +3784,104 @@ func TestBackendAuthRefreshFailureReportingSkipsParentCancellation(t *testing.T)
 	}
 }
 
+type refreshReportingMetadataUpstream struct {
+	result upstreamRefreshResult
+	cancel context.CancelFunc
+	status int
+}
+
+func (u refreshReportingMetadataUpstream) RoundTripMetadata(in metadataUpstreamRequest) (*http.Response, error) {
+	if u.cancel != nil {
+		u.cancel()
+	}
+	in.notifyRefreshResult(u.result)
+	status := u.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`)), Request: in.Request}, nil
+}
+
+func waitForAuthState(t *testing.T, registry *telemetry.Registry, want string) telemetry.UpstreamStatus {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		status := registry.Snapshot().Upstream
+		if status.AuthState == want {
+			return status
+		}
+		time.Sleep(time.Millisecond)
+	}
+	status := registry.Snapshot().Upstream
+	t.Fatalf("auth state = %q, want %q", status.AuthState, want)
+	return status
+}
+
+func TestProxyRefreshReportingUsesOriginatingRequestContext(t *testing.T) {
+	t.Run("canceled confirmed failure is suppressed", func(t *testing.T) {
+		store := testStore("http://backend.test/emby")
+		session := testSession()
+		store.Sessions[HashToken("gateway-token")] = session
+		em := observe.NewEmitter(32)
+		defer em.Close()
+		registry := telemetry.New(em)
+		registryCtx, stopRegistry := context.WithCancel(context.Background())
+		defer stopRegistry()
+		go registry.Start(registryCtx)
+		server := NewServer(Config{GatewayBasePath: "/emby", Emitter: em}, store)
+		server.emitBackendAuthRefresh(session, "backend_token_refresh", http.StatusOK)
+		waitForAuthState(t, registry, telemetry.AuthStateHealthy)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		server.metadataUpstream = refreshReportingMetadataUpstream{result: upstreamRefreshResult{Confirmed: true, Err: context.Canceled}, cancel: cancel, status: http.StatusInternalServerError}
+		request := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items/item-1?api_key=gateway-token", nil).WithContext(ctx)
+		response := httptest.NewRecorder()
+		server.ServeHTTP(response, request)
+
+		if hasAuditEvent(store, "backend_token_refresh_failure") {
+			t.Fatalf("canceled adapter refresh was audited: %#v", store.AuditLogs)
+		}
+		status := waitForAuthState(t, registry, telemetry.AuthStateHealthy)
+		if status.LastAuthError != "" {
+			t.Fatalf("canceled adapter refresh changed auth health: %#v", status)
+		}
+	})
+
+	t.Run("live confirmed failure keeps request attribution", func(t *testing.T) {
+		store := testStore("http://backend.test/emby")
+		session := testSession()
+		store.Sessions[HashToken("gateway-token")] = session
+		em := observe.NewEmitter(32)
+		defer em.Close()
+		registry := telemetry.New(em)
+		registryCtx, stopRegistry := context.WithCancel(context.Background())
+		defer stopRegistry()
+		go registry.Start(registryCtx)
+		server := NewServer(Config{GatewayBasePath: "/emby", Emitter: em}, store)
+		server.metadataUpstream = refreshReportingMetadataUpstream{result: upstreamRefreshResult{Confirmed: true, Err: errors.New("refresh failed")}, status: http.StatusInternalServerError}
+		request := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items/item-1?api_key=gateway-token", nil)
+		response := httptest.NewRecorder()
+		server.ServeHTTP(response, request)
+
+		var refreshAudit *AuditLog
+		for i := range store.AuditLogs {
+			if store.AuditLogs[i].Event == "backend_token_refresh_failure" {
+				refreshAudit = &store.AuditLogs[i]
+			}
+		}
+		if refreshAudit == nil {
+			t.Fatalf("missing refresh failure audit: %#v", store.AuditLogs)
+		}
+		if refreshAudit.Method != http.MethodGet || refreshAudit.Path != "/Items/item-1" || refreshAudit.RemoteIP != "192.0.2.1" || refreshAudit.GatewayUserID != session.GatewayUserID || refreshAudit.SyntheticUserID != session.SyntheticUserID {
+			t.Fatalf("refresh audit attribution = %#v", *refreshAudit)
+		}
+		status := waitForAuthState(t, registry, telemetry.AuthStateFailing)
+		if status.LastAuthError != telemetry.AuthErrorRefreshFailed {
+			t.Fatalf("refresh health = %#v", status)
+		}
+	})
+}
+
 func TestFetchBackendJSONEmitsConfirmedRefreshFailure(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -3818,6 +3916,10 @@ func TestFetchBackendJSONEmitsConfirmedRefreshFailure(t *testing.T) {
 	}
 	if !hasAuditEvent(store, "backend_token_refresh_failure") {
 		t.Fatalf("missing refresh failure audit: %#v", store.AuditLogs)
+	}
+	last := store.AuditLogs[len(store.AuditLogs)-1]
+	if last.Event != "backend_token_refresh_failure" || last.Method != http.MethodGet || last.Path != "/Users/gateway-user/Items" || last.GatewayUserID != session.GatewayUserID || last.SyntheticUserID != session.SyntheticUserID {
+		t.Fatalf("refresh failure attribution: %#v", last)
 	}
 	if !hasObserveEvent(t, em, observe.KindUpstreamAuthRefresh, observe.OutcomeError, telemetry.AuthErrorRefreshFailed) {
 		t.Fatal("expected refresh_failed observation from fetchBackendJSON")

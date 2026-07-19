@@ -694,7 +694,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string,
 	adapterURL.Path = rel
 	adapterURL.RawPath = ""
 	adapterRequest.URL = &adapterURL
-	request := upstreamHTTPRequest{Request: adapterRequest, Session: session, Snapshot: upstream, refreshResult: s.reportUpstreamRefreshResult}
+	request := upstreamHTTPRequest{Request: adapterRequest, Session: session, Snapshot: upstream, refreshResult: s.upstreamRefreshReporter(r.Context(), r, rel, session)}
 	var resp *http.Response
 	switch {
 	case decision.Ownership == routeclass.MetadataProxy && decision.Operation == routeclass.OperationMetadataProxy:
@@ -1353,15 +1353,17 @@ func (s *Server) auditBackendTokenRefreshFailure(ctx context.Context, r *http.Re
 	s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh_failure", message, http.StatusUnauthorized)
 }
 
-func (s *Server) reportUpstreamRefreshResult(result upstreamRefreshResult) {
-	if !result.Confirmed {
-		return
+func (s *Server) upstreamRefreshReporter(ctx context.Context, r *http.Request, rel string, session *Session) func(upstreamRefreshResult) {
+	return func(result upstreamRefreshResult) {
+		if !result.Confirmed {
+			return
+		}
+		if result.Err == nil {
+			s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh", "backend token refreshed after unauthorized response", http.StatusOK)
+			return
+		}
+		s.auditBackendTokenRefreshFailure(ctx, r, rel, session, true, result.Err, "backend token refresh failed after unauthorized response")
 	}
-	if result.Err == nil {
-		s.auditBackendTokenRefresh(nil, "", nil, "backend_token_refresh", "backend token refreshed after unauthorized response", http.StatusOK)
-		return
-	}
-	s.auditBackendTokenRefreshFailure(context.Background(), nil, "", nil, true, result.Err, "backend token refresh failed after unauthorized response")
 }
 
 func shouldReportBackendAuthRefreshFailure(ctx context.Context, confirmed bool, err error) bool {

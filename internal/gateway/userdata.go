@@ -369,7 +369,7 @@ func (s *Server) fetchBackendJSON(ctx context.Context, r *http.Request, rel, raw
 	if err != nil {
 		return nil, 0, upstreamRequestSnapshot{}, err
 	}
-	request := metadataUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: req, Session: session, Snapshot: upstream, refreshResult: s.reportUpstreamRefreshResult}, Ownership: routeclass.MetadataProxy, Internal: true, SnapshotRef: &upstream}
+	request := metadataUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: req, Session: session, Snapshot: upstream, refreshResult: s.upstreamRefreshReporter(ctx, r, rel, session)}, Ownership: routeclass.MetadataProxy, Internal: true, SnapshotRef: &upstream}
 	resp, err := s.metadataUpstream.RoundTripMetadata(request)
 	if err != nil {
 		return nil, 0, upstreamRequestSnapshot{}, err
