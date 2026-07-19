@@ -307,15 +307,26 @@ th {
   font-size: 13px;
   border-radius: 2px;
   user-select: none;
+  /* Reset button defaults — inactive tabs must be transparent */
+  background: transparent;
+  border: 1px solid transparent;
+  transition: background-color 0.1s ease, color 0.1s ease;
 }
 
 .segmented-control .tab:hover {
   color: var(--text-primary);
+  background-color: rgba(255, 255, 255, 0.04);
+}
+
+.segmented-control .tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 .segmented-control .tab.active {
   background-color: var(--border-color);
   color: var(--text-primary);
+  border-color: transparent;
 }
 
 /* Data grid styling */
@@ -325,11 +336,32 @@ th {
   gap: 1rem;
 }
 
+/* Named responsive grid for aggregate cards */
+.data-grid-agg {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+@media (max-width: 900px) {
+  .data-grid-agg {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 480px) {
+  .data-grid-agg {
+    grid-template-columns: 1fr;
+  }
+}
+
 .metric-box {
   border: 1px solid var(--border-color);
   background-color: var(--panel-bg);
   padding: 1rem;
   border-radius: 2px;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .metric-label {
@@ -343,6 +375,8 @@ th {
 .metric-value {
   font-size: 20px;
   font-weight: 500;
+  overflow-wrap: break-word;
+  word-break: break-word;
 }
 
 /* Modals / Drawers */
@@ -442,7 +476,10 @@ th {
   .sidebar-nav { display: flex; overflow-x: auto; padding: 0; }
   .nav-link { padding: 12px; white-space: nowrap; }
   .main-content { overflow: auto; }
-  .page-body { overflow: visible; }
+  .page-body { overflow: visible; padding: 1rem; }
+  .page-header { padding: 0.75rem 1rem; flex-wrap: wrap; gap: 0.5rem; }
+  .segmented-control { flex-wrap: nowrap; }
+  .segmented-control .tab { padding: 4px 10px; font-size: 12px; }
   .overlay { justify-content: center; align-items: center; }
   .drawer { width: 90vw; height: auto; max-height: 90vh; border: 1px solid var(--border-color); border-radius: 4px; }
 }

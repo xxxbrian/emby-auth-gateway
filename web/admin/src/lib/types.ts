@@ -65,6 +65,8 @@ export interface RuntimeStatus {
 export interface SeriesPoint {
   t: string;
   v: number;
+  /** When true, this point represents a gap (no committed cycle). Charts break the line here. */
+  gap?: boolean;
 }
 
 export interface SeriesData {
@@ -87,6 +89,7 @@ export interface Snapshot {
   reliability: ReliabilityStatus;
   runtime: RuntimeStatus;
   series?: SeriesData;
+  media_buffer?: BufferAggregate;
 }
 
 // --- adminquery DTOs ---
@@ -308,4 +311,194 @@ export interface ApiErrorBody {
   message?: string;
   error?: string;
   mfaId?: string;
+}
+
+// --- Media Buffer Observability (ADR 0003) ---
+
+/** Aggregate health enum for the buffer pool. */
+export type BufferAggregateHealth = 'disabled' | 'idle' | 'healthy' | 'warning' | 'critical';
+
+/** Per-stream health enum. */
+export type BufferStreamHealth = 'healthy' | 'warning' | 'critical';
+
+/** Observation completeness. */
+export type ObservationCompleteness = 'complete' | 'limited' | 'unavailable';
+
+/** Lifecycle state. */
+export type BufferLifecycle = 'starting' | 'active' | 'closing';
+
+/** Producer state. */
+export type BufferProducerState = 'idle' | 'reading_base' | 'reading_optional' | 'waiting_for_buffer' | 'done';
+
+/** Consumer state. */
+export type BufferConsumerState = 'idle' | 'waiting_for_data' | 'writing' | 'done';
+
+/** Allocation blocker. */
+export type BufferAllocationBlocker = 'none' | 'pool_exhausted' | 'at_target' | 'debt';
+
+/** Media mode. */
+export type BufferMediaMode = 'direct' | 'hls' | 'range' | 'unknown';
+
+/** Wait condition. */
+export type BufferWaitCondition = 'none' | 'buffer_acquire' | 'pool_contention' | 'consumer_starvation' | 'upstream_stall' | 'downstream_stall' | 'close_join_stall';
+
+/** Completion outcome. */
+export type BufferOutcome = 'success' | 'canceled' | 'upstream_error' | 'downstream_error' | 'short_write' | 'length_mismatch' | 'invalid_read' | 'invalid_write' | 'no_progress' | 'invariant_error';
+
+/** Aggregate media-buffer object from /overview or /media-buffer/series. */
+export interface BufferAggregate {
+  enabled: boolean;
+  health: BufferAggregateHealth;
+  health_reasons: string[];
+  hard_budget_bytes: number;
+  allocated_bytes: number;
+  owned_bytes: number;
+  free_bytes: number;
+  unallocated_optional_bytes: number;
+  private_base_bytes: number;
+  queued_bytes: number;
+  writing_bytes: number;
+  active_requests: number;
+  base_only_requests: number;
+  indebted_requests: number;
+  request_debt_bytes: number;
+  buffer_acquire_count: number;
+  pool_contention_count: number;
+  consumer_starvation_count: number;
+  upstream_stall_count: number;
+  downstream_stall_count: number;
+  close_join_stall_count: number;
+  warning_streams: number;
+  critical_streams: number;
+  completion_drops: number;
+  observed_active_requests: number;
+  unobserved_active_requests: number;
+  live_registration_drops: number;
+  observation_completeness: ObservationCompleteness;
+}
+
+/** Live stream DTO from /media-buffer/streams or /media-buffer/streams/:id. */
+export interface BufferStream {
+  boot_id: string;
+  stream_id: string;
+  transfer_id: string | null;
+  user_id: string | null;
+  username: string | null;
+  device: string | null;
+  item_id: string | null;
+  media_mode: BufferMediaMode;
+  state: BufferLifecycle;
+  producer_state: BufferProducerState;
+  consumer_state: BufferConsumerState;
+  allocation_blocker: BufferAllocationBlocker;
+  target_bytes: number;
+  owned_bytes: number;
+  debt_bytes: number;
+  private_base_bytes: number;
+  queued_bytes: number;
+  writing_bytes: number;
+  bytes_read: number;
+  bytes_written: number;
+  wait_condition: BufferWaitCondition;
+  wait_started_at: string | null;
+  wait_duration_ms: number;
+  health: BufferStreamHealth;
+  health_reasons: string[];
+  started_at: string;
+  age_ms: number;
+}
+
+/** Paginated response for /media-buffer/streams. */
+export interface BufferStreamsResponse {
+  boot_id: string;
+  items: BufferStream[];
+  next_cursor: string | null;
+  has_more: boolean;
+  observation_completeness: ObservationCompleteness;
+}
+
+/** Stream detail response from /media-buffer/streams/:id — backend returns {boot_id, item}. */
+export interface BufferStreamDetailResponse {
+  boot_id: string;
+  item: BufferStream | null;
+}
+
+/** Wait duration pair in completion summaries. */
+export interface WaitDuration {
+  total: number;
+  max: number;
+}
+
+/** Completed stream summary from /media-buffer/recent. */
+export interface BufferCompletion {
+  boot_id: string;
+  stream_id: string;
+  transfer_id: string | null;
+  user_id: string | null;
+  username: string | null;
+  device: string | null;
+  item_id: string | null;
+  media_mode: BufferMediaMode;
+  final_state: 'closing';
+  final_producer_state: BufferProducerState;
+  final_consumer_state: BufferConsumerState;
+  final_allocation_blocker: BufferAllocationBlocker;
+  outcome: BufferOutcome;
+  started_at: string;
+  completed_at: string;
+  duration_ms: number;
+  bytes_read: number;
+  bytes_written: number;
+  peak_owned_bytes: number;
+  peak_debt_bytes: number;
+  peak_queued_bytes: number;
+  peak_writing_bytes: number;
+  waits_ms: {
+    buffer_acquire: WaitDuration;
+    pool_contention: WaitDuration;
+    consumer_starvation: WaitDuration;
+    upstream_stall: WaitDuration;
+    downstream_stall: WaitDuration;
+    close_join_stall: WaitDuration;
+  };
+  invariant_observed: boolean;
+}
+
+/** Recent completions response. */
+export interface BufferRecentResponse {
+  boot_id: string;
+  items: BufferCompletion[];
+}
+
+/** Coherence domains descriptor for a series point. */
+export interface BufferSeriesDomains {
+  pool: 'coherent';
+  sidecar: 'eventual';
+}
+
+/** Historical series point with presence. */
+export interface BufferSeriesPoint {
+  t: string;
+  present: boolean;
+  domains: BufferSeriesDomains | null;
+  aggregate: BufferAggregate | null;
+}
+
+/** Series response from /media-buffer/series. */
+export interface BufferSeriesResponse {
+  boot_id: string;
+  window: string;
+  interval: string;
+  points: BufferSeriesPoint[];
+}
+
+/** Transfer with optional buffer linkage for Activity integration. */
+export interface TransferBufferLink {
+  boot_id: string;
+  stream_id: string;
+}
+
+/** Extended transfer DTO with buffer linkage. */
+export interface TransferWithBuffer extends Transfer {
+  media_buffer?: TransferBufferLink | null;
 }

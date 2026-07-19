@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/xxxbrian/emby-auth-gateway/internal/telemetry"
 )
@@ -185,7 +186,6 @@ func (r *mediaBufferRequest) requestOptional() (<-chan struct{}, error) {
 	r.waiting = true
 	b.waiters = append(b.waiters, r)
 	b.scheduleLocked()
-	b.projectRequestLocked(r)
 	b.assertAccountingLocked()
 	return r.notify, nil
 }
@@ -205,7 +205,6 @@ func (r *mediaBufferRequest) acceptOptional() (mediaBufferLease, error) {
 	r.pending = nil
 	drainMediaBufferNotification(r.notify)
 	r.chunks[lease.chunk] = lease.generation
-	b.projectRequestLocked(r)
 	b.assertAccountingLocked()
 	return lease, nil
 }
@@ -218,16 +217,14 @@ func (r *mediaBufferRequest) cancelOptionalRequest() error {
 	if r.closed {
 		return errMediaBufferClosed
 	}
-	if r.waiting {
-		b.removeWaiterLocked(r)
-	}
-	if r.pending != nil {
+	switch {
+	case r.pending != nil:
 		b.reclaimPendingLocked(r)
-	} else {
-		drainMediaBufferNotification(r.notify)
+		b.scheduleLocked()
+	case r.waiting:
+		b.removeWaiterLocked(r)
+		b.projectRequestLocked(r)
 	}
-	b.scheduleLocked()
-	b.projectRequestLocked(r)
 	b.assertAccountingLocked()
 	return nil
 }
@@ -245,18 +242,22 @@ func (r *mediaBufferRequest) releaseOptional(lease mediaBufferLease) error {
 	}
 	b.releaseAcceptedLocked(r, lease.chunk)
 	b.scheduleLocked()
-	b.projectRequestLocked(r)
 	b.assertAccountingLocked()
 	return nil
 }
 
 func (r *mediaBufferRequest) close() error {
+	_, _, err := r.closeAndCaptureTerminal(nil)
+	return err
+}
+
+func (r *mediaBufferRequest) closeAndCaptureTerminal(live *mediaBufferLiveState) (telemetry.MediaBufferLiveSnapshot, time.Time, error) {
 	b := r.buffer
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if r.closed {
-		return nil
+		return telemetry.MediaBufferLiveSnapshot{}, time.Time{}, nil
 	}
 	r.closed = true
 	if r.waiting {
@@ -270,6 +271,14 @@ func (r *mediaBufferRequest) close() error {
 	for chunk := range r.chunks {
 		b.releaseAcceptedLocked(r, chunk)
 	}
+	var terminal telemetry.MediaBufferLiveSnapshot
+	var completedAt time.Time
+	if live != nil {
+		now := live.clock.nowMS()
+		live.markTerminalAt(now)
+		terminal = live.mediaBufferLiveSnapshotAt(now)
+		completedAt = live.completedAtMS(now)
+	}
 	b.removeRequestCountersLocked(r)
 	index := b.requestIndexLocked(r)
 	if index < 0 {
@@ -280,7 +289,7 @@ func (r *mediaBufferRequest) close() error {
 	b.recomputeTargetsLocked()
 	b.scheduleLocked()
 	b.assertAccountingLocked()
-	return nil
+	return terminal, completedAt, nil
 }
 
 func (r *mediaBufferRequest) snapshot() mediaBufferRequestSnapshot {
@@ -450,8 +459,8 @@ func (b *mediaBuffer) projectRequestLocked(r *mediaBufferRequest) {
 	if r == nil || r.live == nil {
 		return
 	}
-	r.live.projectAllocation(r.target, r.owned, r.debt)
-	r.live.projectBlocker(b.requestBlockerLocked(r))
+	r.live.projectAllocationPreTerminal(r.target, r.owned, r.debt)
+	r.live.projectBlockerPreTerminal(b.requestBlockerLocked(r))
 }
 
 func (b *mediaBuffer) requestBlockerLocked(r *mediaBufferRequest) telemetry.MediaBufferAllocationBlocker {

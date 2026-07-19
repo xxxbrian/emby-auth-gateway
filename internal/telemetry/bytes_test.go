@@ -34,6 +34,9 @@ func TestByteMeterLiveTotalsBeforeEnd(t *testing.T) {
 		}
 	}
 	h.End(nil)
+	if in, out := h.Bytes(); in != 1_000_000 || out != 1_000_000 {
+		t.Fatalf("retained bytes in=%d out=%d", in, out)
+	}
 	if m.ActiveTransferCount() != 0 {
 		t.Fatal("expected no active transfers")
 	}

@@ -11,6 +11,7 @@ const (
 	// MediaBufferLiveCapacity is the accepted per-boot observation bound.
 	MediaBufferLiveCapacity       = 4096
 	mediaBufferCompletionCapacity = 256
+	MediaBufferCompletionCapacity = 2048
 )
 
 type MediaBufferLifecycle uint8
@@ -55,8 +56,8 @@ type MediaBufferTimedValue struct {
 }
 
 type MediaBufferWaitStat struct {
-	TotalMS int64
-	MaxMS   int64
+	TotalMS int64 `json:"total"`
+	MaxMS   int64 `json:"max"`
 }
 
 type MediaBufferLiveSnapshot struct {
@@ -98,6 +99,12 @@ type MediaBufferLiveState interface {
 	MediaBufferLiveSnapshot() MediaBufferLiveSnapshot
 }
 
+// MediaBufferLiveByteState is an optional eventual byte domain. It remains
+// separate from the exact allocation/timing snapshot at this checkpoint.
+type MediaBufferLiveByteState interface {
+	MediaBufferLiveBytes() (bytesRead, bytesWritten int64)
+}
+
 type MediaBufferLivePage struct {
 	Items      []MediaBufferLiveState
 	NextCursor uint64
@@ -128,6 +135,7 @@ type MediaBufferCompletion struct {
 	InvariantObserved bool
 	BytesRead         int64
 	BytesWritten      int64
+	CompletedAt       time.Time
 }
 
 // MediaBufferLiveRegistry owns bounded live membership only. History and recent

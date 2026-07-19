@@ -25,6 +25,7 @@ import (
 // so no fixed GATEWAY_ADMIN_ORIGIN is required at startup.
 type adminConfig struct {
 	AuditRetentionDays int
+	MediaBufferEnabled func() bool
 }
 
 var newAdminAPIForMount = adminapi.New
@@ -83,6 +84,7 @@ func mountAdmin(
 		Query:               adminquery.New(app, adminquery.DefaultConcurrency),
 		Telemetry:           registry,
 		MediaBufferSnapshot: mediaBufferSnapshot,
+		MediaBufferEnabled:  cfg.MediaBufferEnabled,
 		AcquireReconfigure:  acquireReconfigure,
 		ActiveMediaLoad:     activeMediaLoad,
 		StartedAt:           startedAt,

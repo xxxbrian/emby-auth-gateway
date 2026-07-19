@@ -54,6 +54,15 @@ type Registry struct {
 	min *timeRing
 
 	startOnce sync.Once
+
+	mediaMu            sync.RWMutex
+	mediaProvider      MediaBufferControllerProvider
+	mediaSec           *mediaBufferGaugeRing
+	mediaMin           *mediaBufferGaugeRing
+	mediaRecent        *mediaBufferCompletionRing
+	mediaTicker        func() (<-chan time.Time, func())
+	mediaLatest        MediaBufferAggregate
+	mediaLatestPresent bool
 }
 
 // New creates a Registry bound to emitter. A nil emitter is allowed.
@@ -72,6 +81,13 @@ func New(emitter *observe.Emitter) *Registry {
 		transfers:       make(map[string]*transferState),
 		sec:             newTimeRing(time.Second, secBuckets),
 		min:             newTimeRing(time.Minute, minBuckets),
+		mediaSec:        newMediaBufferGaugeRing(time.Second, secBuckets),
+		mediaMin:        newMediaBufferGaugeRing(time.Minute, minBuckets),
+		mediaRecent:     newMediaBufferCompletionRing(),
+		mediaTicker: func() (<-chan time.Time, func()) {
+			ticker := time.NewTicker(time.Second)
+			return ticker.C, ticker.Stop
+		},
 	}
 }
 
@@ -116,6 +132,7 @@ func (r *Registry) Start(ctx context.Context) {
 	}
 	r.startOnce.Do(func() {
 		go r.sampleLiveBytes(ctx)
+		go r.sampleMediaBuffer(ctx)
 		if r.emitter == nil {
 			return
 		}

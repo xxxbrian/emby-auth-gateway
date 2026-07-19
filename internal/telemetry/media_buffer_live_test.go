@@ -35,8 +35,9 @@ func (s *blockingTerminalMediaBufferState) MediaBufferLiveSnapshot() MediaBuffer
 func (s *testMediaBufferLiveState) MediaBufferRawStreamID() uint64 { return s.id }
 func (s *testMediaBufferLiveState) MediaBufferTerminal() bool      { return s.snapshot.Terminal }
 func (s *testMediaBufferLiveState) MediaBufferLiveSnapshot() MediaBufferLiveSnapshot {
-	s.snapshot.StreamID = s.id
-	return s.snapshot
+	snapshot := s.snapshot
+	snapshot.StreamID = s.id
+	return snapshot
 }
 
 func TestRegistryBootIDAndLiveRegistryShareIdentity(t *testing.T) {

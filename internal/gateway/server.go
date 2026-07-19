@@ -1772,12 +1772,12 @@ func (s *Server) copyBufferedMediaResponseOrAbort(w http.ResponseWriter, r *http
 	defer s.endMediaCopy()
 
 	mediaMode := mediaModeForRequest(r, rel)
-	request, live := s.registerMediaBufferRequest(rel, session, mediaMode)
 	method := ""
 	if r != nil {
 		method = r.Method
 	}
 
+	request, live := s.registerMediaBufferRequest(rel, session, mediaMode)
 	var handle *telemetry.TransferHandle
 	if s.meter != nil {
 		meta := telemetry.TransferMeta{
@@ -1792,25 +1792,25 @@ func (s *Server) copyBufferedMediaResponseOrAbort(w http.ResponseWriter, r *http
 			meta.MediaBuffer = &telemetry.MediaBufferReference{BootID: live.identity.BootID, StreamID: live.identity.StreamID}
 		}
 		handle = s.meter.BeginTransfer(meta)
-		if live != nil && handle != nil {
-			live.bindTransferID(handle.ID())
+		if live != nil {
+			live.bindTransfer(handle)
 		}
 	}
 
-	dst := newCountedWriter(w, s.meter, handle)
-	src := newCountedReader(owner, s.meter, handle)
+	var liveRead, liveWritten *atomic.Int64
+	if live != nil {
+		liveRead, liveWritten = live.byteFallbacks()
+	}
+	dst := newCountedWriterWithLive(w, s.meter, handle, liveWritten)
+	src := newCountedReaderWithLive(owner, s.meter, handle, liveRead)
 	setContentLength(w.Header(), resp.ContentLength)
 	w.WriteHeader(resp.StatusCode)
 	if s.mediaBufferHooks != nil && s.mediaBufferHooks.afterHeaderCommit != nil {
 		s.mediaBufferHooks.afterHeaderCommit()
 	}
 	result := copyBufferedMediaBody(r.Context(), dst, src, owner, base, request, resp.ContentLength)
-	var terminalSnapshot telemetry.MediaBufferLiveSnapshot
-	if live != nil {
-		live.markTerminal()
-		terminalSnapshot = live.MediaBufferLiveSnapshot()
-	}
-	if closeErr := request.close(); closeErr != nil {
+	terminalSnapshot, completedAt, closeErr := request.closeAndCaptureTerminal(live)
+	if closeErr != nil {
 		result.InvariantObserved = true
 		result.Err = errors.Join(result.Err, closeErr)
 		if result.Direction == "" {
@@ -1827,6 +1827,7 @@ func (s *Server) copyBufferedMediaResponseOrAbort(w http.ResponseWriter, r *http
 			InvariantObserved: result.InvariantObserved,
 			BytesRead:         result.BytesRead,
 			BytesWritten:      result.BytesWritten,
+			CompletedAt:       completedAt,
 		})
 	}
 	if result.Err == nil {
@@ -1846,8 +1847,6 @@ func (s *Server) registerMediaBufferRequest(rel string, session *Session, mediaM
 		return s.mediaBuffer.register(), nil
 	}
 	s.mediaBufferLiveMu.Lock()
-	defer s.mediaBufferLiveMu.Unlock()
-
 	request := s.mediaBuffer.register()
 	candidate := newMediaBufferLiveState(mediaBufferLiveIdentity{
 		BootID:    s.mediaBufferLive.BootID(),
@@ -1861,7 +1860,9 @@ func (s *Server) registerMediaBufferRequest(rel string, session *Session, mediaM
 	if s.mediaBufferHooks != nil && s.mediaBufferHooks.beforeLiveRegister != nil {
 		s.mediaBufferHooks.beforeLiveRegister(request.id)
 	}
-	if !s.mediaBufferLive.Register(candidate) {
+	accepted := s.mediaBufferLive.Register(candidate)
+	s.mediaBufferLiveMu.Unlock()
+	if !accepted {
 		return request, nil
 	}
 	request.attachLive(candidate)

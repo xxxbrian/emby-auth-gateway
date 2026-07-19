@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -186,11 +187,17 @@ func TestMediaBufferLiveProjectionAllocatesNothingAndStopsAtTerminal(t *testing.
 		live.setQueued(0)
 		live.setWriting(1)
 		live.setWriting(0)
+		live.fallbackRead.Add(1)
+		live.fallbackSent.Add(1)
 	})
 	if allocs != 0 {
 		t.Fatalf("projection allocations=%f", allocs)
 	}
 	before := live.MediaBufferLiveSnapshot()
+	bytesRead, bytesWritten := live.MediaBufferLiveBytes()
+	if bytesRead <= 0 || bytesWritten != bytesRead {
+		t.Fatalf("projected bytes=%d/%d", bytesRead, bytesWritten)
+	}
 	live.markTerminal()
 	live.projectAllocation(0, 0, 0)
 	live.setQueued(100)
@@ -199,6 +206,36 @@ func TestMediaBufferLiveProjectionAllocatesNothingAndStopsAtTerminal(t *testing.
 	after := live.MediaBufferLiveSnapshot()
 	if !after.Terminal || after.TargetBytes != before.TargetBytes || after.QueuedBytes != before.QueuedBytes || after.WritingBytes != before.WritingBytes || after.Producer != before.Producer {
 		t.Fatalf("post-terminal publication before=%+v after=%+v", before, after)
+	}
+}
+
+func TestMediaBufferCompletionTimeUsesInjectedClock(t *testing.T) {
+	origin := time.Date(2026, 7, 19, 12, 0, 0, 123000000, time.UTC)
+	clock := newFakeMediaBufferClock(origin, 250)
+	live := newMediaBufferLiveState(mediaBufferLiveIdentity{BootID: "boot", StreamID: 1}, clock)
+	clock.advance(1750 * time.Millisecond)
+	if got, want := live.completedAt(), origin.Add(2*time.Second); !got.Equal(want) {
+		t.Fatalf("completed at=%s want=%s", got, want)
+	}
+}
+
+func TestMediaBufferTerminalCaptureUsesOneClockRead(t *testing.T) {
+	origin := time.Date(2026, 7, 19, 12, 0, 0, 123000000, time.UTC)
+	clock := newFakeMediaBufferClock(origin, 2000)
+	buffer := mustMediaBuffer(t, mediaBufferChunkSize)
+	request := buffer.register()
+	live := newMediaBufferLiveState(mediaBufferLiveIdentity{BootID: "boot", StreamID: request.id}, clock)
+	request.attachLive(live)
+	before := clock.reads.Load()
+	snapshot, completedAt, err := request.closeAndCaptureTerminal(live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := clock.reads.Load() - before; got != 1 {
+		t.Fatalf("terminal clock reads=%d want=1", got)
+	}
+	if snapshot.AgeMS != 2000 || !completedAt.Equal(origin.Add(2*time.Second)) {
+		t.Fatalf("snapshot age=%d completed=%s", snapshot.AgeMS, completedAt)
 	}
 }
 
@@ -220,6 +257,214 @@ func TestMediaBufferCachedAggregateMatchesExhaustiveAccounting(t *testing.T) {
 	assertCachedMediaBufferAccounting(t, buffer)
 	closeMediaBufferRequests(t, second, third, first)
 	assertCachedMediaBufferAccounting(t, buffer)
+}
+
+func TestMediaBufferRequestProjectionTransitionsRemainExact(t *testing.T) {
+	assertProjection := func(t *testing.T, request *mediaBufferRequest, blocker telemetry.MediaBufferAllocationBlocker) {
+		t.Helper()
+		snapshot := request.snapshot()
+		live := request.live.MediaBufferLiveSnapshot()
+		if live.TargetBytes != snapshot.Target || live.OwnedBytes != snapshot.Owned || live.DebtBytes != snapshot.Debt || live.Blocker.Value != uint8(blocker) {
+			t.Fatalf("request=%+v live=%+v blocker=%d", snapshot, live, blocker)
+		}
+	}
+	attach := func(request *mediaBufferRequest) {
+		request.attachLive(newMediaBufferLiveState(mediaBufferLiveIdentity{BootID: "test", StreamID: request.id}, newFakeMediaBufferClock(time.Unix(0, 0), 1)))
+	}
+
+	t.Run("grant accept release", func(t *testing.T) {
+		buffer := mustMediaBuffer(t, mediaBufferChunkSize)
+		request := buffer.register()
+		attach(request)
+		if _, err := request.requestOptional(); err != nil {
+			t.Fatal(err)
+		}
+		assertProjection(t, request, telemetry.MediaBufferBlockerNone)
+		lease, err := request.acceptOptional()
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertProjection(t, request, telemetry.MediaBufferBlockerNone)
+		if err := request.releaseOptional(lease); err != nil {
+			t.Fatal(err)
+		}
+		assertProjection(t, request, telemetry.MediaBufferBlockerNone)
+		closeMediaBufferCopyRequests(t, request)
+	})
+
+	t.Run("pool exhausted", func(t *testing.T) {
+		buffer := mustMediaBuffer(t, 4*mediaBufferChunkSize)
+		holder := buffer.register()
+		leases := make([]mediaBufferLease, 0, 4)
+		for range 4 {
+			if _, err := holder.requestOptional(); err != nil {
+				t.Fatal(err)
+			}
+			lease, err := holder.acceptOptional()
+			if err != nil {
+				t.Fatal(err)
+			}
+			leases = append(leases, lease)
+		}
+		waiter := buffer.register()
+		attach(waiter)
+		if _, err := waiter.requestOptional(); err != nil {
+			t.Fatal(err)
+		}
+		assertProjection(t, waiter, telemetry.MediaBufferBlockerPoolExhausted)
+		if err := holder.releaseOptional(leases[0]); err != nil {
+			t.Fatal(err)
+		}
+		assertProjection(t, waiter, telemetry.MediaBufferBlockerNone)
+		closeMediaBufferCopyRequests(t, waiter, holder)
+	})
+
+	t.Run("at target", func(t *testing.T) {
+		buffer := mustMediaBuffer(t, mediaBufferChunkSize)
+		request := buffer.register()
+		attach(request)
+		if _, err := request.requestOptional(); err != nil {
+			t.Fatal(err)
+		}
+		lease, err := request.acceptOptional()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := request.requestOptional(); err != nil {
+			t.Fatal(err)
+		}
+		assertProjection(t, request, telemetry.MediaBufferBlockerAtTarget)
+		if err := request.cancelOptionalRequest(); err != nil {
+			t.Fatal(err)
+		}
+		if err := request.releaseOptional(lease); err != nil {
+			t.Fatal(err)
+		}
+		closeMediaBufferCopyRequests(t, request)
+	})
+
+	t.Run("debt", func(t *testing.T) {
+		buffer := mustMediaBuffer(t, 2*mediaBufferChunkSize)
+		request := buffer.register()
+		for range 2 {
+			if _, err := request.requestOptional(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := request.acceptOptional(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		attach(request)
+		other := buffer.register()
+		if _, err := request.requestOptional(); err != nil {
+			t.Fatal(err)
+		}
+		assertProjection(t, request, telemetry.MediaBufferBlockerDebt)
+		closeMediaBufferCopyRequests(t, other, request)
+	})
+}
+
+func TestMediaBufferRequestProjectionAllocatesNothing(t *testing.T) {
+	buffer := mustMediaBuffer(t, mediaBufferChunkSize)
+	request := buffer.register()
+	request.attachLive(newMediaBufferLiveState(mediaBufferLiveIdentity{BootID: "test", StreamID: request.id}, nil))
+	allocs := testing.AllocsPerRun(1000, func() {
+		buffer.mu.Lock()
+		buffer.projectRequestLocked(request)
+		buffer.mu.Unlock()
+	})
+	if allocs != 0 {
+		t.Fatalf("request projection allocations=%f", allocs)
+	}
+	closeMediaBufferCopyRequests(t, request)
+}
+
+func TestMediaBufferCancelOptionalProjectionBranches(t *testing.T) {
+	attach := func(request *mediaBufferRequest) *mediaBufferLiveState {
+		live := newMediaBufferLiveState(mediaBufferLiveIdentity{BootID: "cancel", StreamID: request.id}, newFakeMediaBufferClock(time.Unix(0, 0), 1))
+		request.attachLive(live)
+		return live
+	}
+	assertLive := func(t *testing.T, request *mediaBufferRequest, live *mediaBufferLiveState, blocker telemetry.MediaBufferAllocationBlocker) {
+		t.Helper()
+		requestSnapshot := request.snapshot()
+		snapshot := live.MediaBufferLiveSnapshot()
+		if snapshot.TargetBytes != requestSnapshot.Target || snapshot.OwnedBytes != requestSnapshot.Owned || snapshot.DebtBytes != requestSnapshot.Debt || snapshot.Blocker.Value != uint8(blocker) {
+			t.Fatalf("request=%+v live=%+v blocker=%d", requestSnapshot, snapshot, blocker)
+		}
+	}
+
+	t.Run("pending reclaim schedules waiter", func(t *testing.T) {
+		buffer := mustMediaBuffer(t, 4*mediaBufferChunkSize)
+		holder := buffer.register()
+		for range 3 {
+			requireAcceptedMediaBufferLease(t, holder)
+		}
+		requireMediaBufferNotification(t, requireMediaBufferRequest(t, holder))
+		holderLive := attach(holder)
+		waiter := buffer.register()
+		waiterLive := attach(waiter)
+		requireNoMediaBufferNotification(t, requireMediaBufferRequest(t, waiter))
+		assertLive(t, waiter, waiterLive, telemetry.MediaBufferBlockerPoolExhausted)
+		if err := holder.cancelOptionalRequest(); err != nil {
+			t.Fatal(err)
+		}
+		assertLive(t, holder, holderLive, telemetry.MediaBufferBlockerNone)
+		assertLive(t, waiter, waiterLive, telemetry.MediaBufferBlockerNone)
+		if snapshot := waiter.snapshot(); !snapshot.Pending || snapshot.Owned != mediaBufferChunkSize {
+			t.Fatalf("waiter after pending handoff=%+v", snapshot)
+		}
+		controller := buffer.Snapshot()
+		if controller.Allocated != 4*mediaBufferChunkSize || controller.Owned != 4*mediaBufferChunkSize || controller.Free != 0 || controller.ActiveRequests != 2 || controller.IndebtedRequests != 1 || controller.RequestDebtBytes != mediaBufferChunkSize {
+			t.Fatalf("controller after pending cancel=%+v", controller)
+		}
+		closeMediaBufferCopyRequests(t, waiter, holder)
+	})
+
+	t.Run("waiting clears blocker only", func(t *testing.T) {
+		buffer := mustMediaBuffer(t, 4*mediaBufferChunkSize)
+		holder := buffer.register()
+		for range 4 {
+			requireAcceptedMediaBufferLease(t, holder)
+		}
+		waiter := buffer.register()
+		waiterLive := attach(waiter)
+		requireNoMediaBufferNotification(t, requireMediaBufferRequest(t, waiter))
+		assertLive(t, waiter, waiterLive, telemetry.MediaBufferBlockerPoolExhausted)
+		before := buffer.Snapshot()
+		if err := waiter.cancelOptionalRequest(); err != nil {
+			t.Fatal(err)
+		}
+		assertLive(t, waiter, waiterLive, telemetry.MediaBufferBlockerNone)
+		after := buffer.Snapshot()
+		if after != before {
+			t.Fatalf("waiting cancellation changed controller before=%+v after=%+v", before, after)
+		}
+		closeMediaBufferCopyRequests(t, waiter, holder)
+	})
+
+	t.Run("no state is projection and controller no-op", func(t *testing.T) {
+		buffer := mustMediaBuffer(t, mediaBufferChunkSize)
+		request := buffer.register()
+		live := attach(request)
+		beforeLive := live.MediaBufferLiveSnapshot()
+		beforeController := buffer.Snapshot()
+		beforeReads := live.clock.reads.Load()
+		if err := request.cancelOptionalRequest(); err != nil {
+			t.Fatal(err)
+		}
+		afterLive := live.MediaBufferLiveSnapshot()
+		if afterLive.Blocker != beforeLive.Blocker || afterLive.TargetBytes != beforeLive.TargetBytes || afterLive.OwnedBytes != beforeLive.OwnedBytes || afterLive.DebtBytes != beforeLive.DebtBytes {
+			t.Fatalf("no-state live before=%+v after=%+v", beforeLive, afterLive)
+		}
+		if got := live.clock.reads.Load() - beforeReads; got != 1 {
+			t.Fatalf("no-state snapshot clock reads=%d want=1", got)
+		}
+		if afterController := buffer.Snapshot(); afterController != beforeController {
+			t.Fatalf("no-state controller before=%+v after=%+v", beforeController, afterController)
+		}
+		closeMediaBufferCopyRequests(t, request)
+	})
 }
 
 func assertCachedMediaBufferAccounting(t *testing.T, buffer *mediaBuffer) {
@@ -358,6 +603,117 @@ func TestMediaBufferObservedRegistrationPreservesControllerOrder(t *testing.T) {
 		t.Fatalf("ordered page=%+v", page)
 	}
 	closeMediaBufferCopyRequests(t, second.request, first.request)
+}
+
+func TestMediaBufferBeginTransferRunsAfterRegistrationLocksReleased(t *testing.T) {
+	controller := mustMediaBufferCopyController(t, 2*mediaBufferChunkSize)
+	registry := telemetry.New(nil).MediaBufferLive()
+	meter := newBlockingBeginTrafficMeter()
+	server := NewServer(Config{MediaBuffer: &MediaBuffer{controller: controller}, MediaBufferLive: registry, Meter: meter}, NewMemoryStore())
+	headerCommitted := make(chan struct{})
+	server.mediaBufferHooks = &mediaBufferServerHooks{afterHeaderCommit: func() { close(headerCommitted) }}
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Videos/one/stream", nil)
+	body := newMediaBufferServerBody(bytes.NewBufferString("media"))
+	resp := mediaBufferServerResponse(req, http.StatusOK, 5, body)
+	wrapResponseBodyOnce(resp)
+	writer := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		server.writeProxyResponseWithSnapshot(writer, req, "/Videos/one/stream", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
+		close(done)
+	}()
+	meta := <-meter.entered
+	if meta.MediaBuffer == nil || meta.MediaBuffer.StreamID != 1 {
+		t.Fatalf("begin meta=%+v", meta)
+	}
+	select {
+	case <-headerCommitted:
+		t.Fatal("headers committed before transfer binding")
+	default:
+	}
+	page := registry.Page(0, 2)
+	if len(page.Items) != 1 {
+		t.Fatalf("pre-bind page=%+v", page)
+	}
+	first := page.Items[0].(*mediaBufferLiveState)
+	if snapshot := first.MediaBufferLiveSnapshot(); snapshot.TransferID != 0 || first.transfer.Load() != nil {
+		t.Fatalf("pre-bind snapshot=%+v transfer=%p", snapshot, first.transfer.Load())
+	}
+	compacted := make(chan int, 1)
+	go func() { compacted <- registry.CompactTerminal() }()
+	select {
+	case removed := <-compacted:
+		if removed != 0 {
+			t.Fatalf("pre-bind compact removed=%d", removed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("BeginTransfer retained registry lock")
+	}
+	type registration struct {
+		request *mediaBufferRequest
+		live    *mediaBufferLiveState
+	}
+	registered := make(chan registration, 1)
+	go func() {
+		request, live := server.registerMediaBufferRequest("/Videos/two/stream", &Session{}, "direct")
+		registered <- registration{request: request, live: live}
+	}()
+	var second registration
+	select {
+	case second = <-registered:
+	case <-time.After(time.Second):
+		t.Fatal("BeginTransfer retained registration sequencer")
+	}
+	if second.request.id != 2 || second.live == nil {
+		t.Fatalf("second registration=%+v", second)
+	}
+	stopSnapshots := make(chan struct{})
+	snapshotsDone := make(chan struct{})
+	go func() {
+		defer close(snapshotsDone)
+		for {
+			select {
+			case <-stopSnapshots:
+				return
+			default:
+				_ = first.MediaBufferLiveSnapshot()
+				_, _ = first.MediaBufferLiveBytes()
+			}
+		}
+	}()
+	close(meter.release)
+	awaitMediaBufferSignal(t, headerCommitted)
+	awaitMediaBufferSignal(t, done)
+	close(stopSnapshots)
+	awaitMediaBufferSignal(t, snapshotsDone)
+	handle := first.transfer.Load()
+	if handle == nil || first.MediaBufferLiveSnapshot().TransferID != handle.ID() || writer.Body.String() != "media" {
+		t.Fatalf("post-bind transfer=%p snapshot=%+v body=%q", handle, first.MediaBufferLiveSnapshot(), writer.Body.String())
+	}
+	page = registry.Page(0, 2)
+	if len(page.Items) != 1 || page.Items[0].MediaBufferRawStreamID() != 2 {
+		t.Fatalf("post-completion ordered page=%+v", page)
+	}
+	closeMediaBufferCopyRequests(t, second.request)
+}
+
+type blockingBeginTrafficMeter struct {
+	delegate *telemetry.ByteMeter
+	entered  chan telemetry.TransferMeta
+	release  chan struct{}
+}
+
+func newBlockingBeginTrafficMeter() *blockingBeginTrafficMeter {
+	return &blockingBeginTrafficMeter{delegate: telemetry.NewByteMeter(), entered: make(chan telemetry.TransferMeta, 1), release: make(chan struct{})}
+}
+
+func (m *blockingBeginTrafficMeter) AddEgress(n int64)  { m.delegate.AddEgress(n) }
+func (m *blockingBeginTrafficMeter) AddIngress(n int64) { m.delegate.AddIngress(n) }
+func (m *blockingBeginTrafficMeter) NoteError()         { m.delegate.NoteError() }
+func (m *blockingBeginTrafficMeter) BeginTransfer(meta telemetry.TransferMeta) *telemetry.TransferHandle {
+	m.entered <- meta
+	<-m.release
+	return m.delegate.BeginTransfer(meta)
 }
 
 func TestMediaBufferServerRegistrationOverlapsCompaction(t *testing.T) {
@@ -535,7 +891,8 @@ func TestMediaBufferServerIdentityAndCompletionBeforeAudit(t *testing.T) {
 			completionChecked = true
 			completion, ok := registry.TryCompletion()
 			terminal := completion.Terminal
-			if !ok || completion.Outcome != string(mediaCopyOutcomeDownstreamError) || completion.BytesRead != 5 || completion.BytesWritten != 0 || !terminal.Terminal || terminal.TransferID == 0 || terminal.Consumer.Value != uint8(telemetry.MediaBufferConsumerDone) || terminal.Producer.Value != uint8(telemetry.MediaBufferProducerDone) {
+			controllerSnapshot := controller.Snapshot()
+			if !ok || completion.Outcome != string(mediaCopyOutcomeDownstreamError) || completion.BytesRead != 5 || completion.BytesWritten != 0 || completion.CompletedAt.IsZero() || !terminal.Terminal || terminal.TransferID == 0 || terminal.Consumer.Value != uint8(telemetry.MediaBufferConsumerDone) || terminal.Producer.Value != uint8(telemetry.MediaBufferProducerDone) || terminal.OwnedBytes != 0 || terminal.Blocker.Value != uint8(telemetry.MediaBufferBlockerNone) || controllerSnapshot.ActiveRequests != 0 || meter.ActiveTransferCount() != 0 {
 				t.Fatalf("completion before audit=%+v ok=%v", completion, ok)
 			}
 		},
@@ -619,11 +976,150 @@ func TestMediaBufferBytesUseTransferAndCompletionBoundaries(t *testing.T) {
 	if len(active) != 1 || active[0].MediaBuffer == nil || active[0].BytesOut != mediaCopyBufferSize {
 		t.Fatalf("active transfer boundary=%+v", active)
 	}
+	state, ok := registry.Detail(active[0].MediaBuffer.StreamID)
+	if !ok {
+		t.Fatal("live stream missing")
+	}
+	byteState, ok := state.(telemetry.MediaBufferLiveByteState)
+	if !ok {
+		t.Fatal("live stream does not implement byte projection")
+	}
+	bytesRead, bytesWritten := byteState.MediaBufferLiveBytes()
+	if bytesRead != int64(len(payload)) || bytesWritten != mediaCopyBufferSize {
+		t.Fatalf("live bytes=%d/%d", bytesRead, bytesWritten)
+	}
 	close(writer.release)
 	awaitMediaBufferSignal(t, done)
 	completion, ok := registry.TryCompletion()
-	if !ok || completion.BytesRead != int64(len(payload)) || completion.BytesWritten != int64(len(payload)) || meter.ActiveTransferCount() != 0 {
+	if !ok || completion.BytesRead != int64(len(payload)) || completion.BytesWritten != int64(len(payload)) || completion.CompletedAt.IsZero() || meter.ActiveTransferCount() != 0 {
 		t.Fatalf("completion=%+v ok=%v active=%d", completion, ok, meter.ActiveTransferCount())
+	}
+	if finalRead, finalWritten := byteState.MediaBufferLiveBytes(); finalRead != completion.BytesRead || finalWritten != completion.BytesWritten {
+		t.Fatalf("terminal live bytes=%d/%d completion=%d/%d", finalRead, finalWritten, completion.BytesRead, completion.BytesWritten)
+	}
+}
+
+func TestMediaBufferBytesNilMeterFallback(t *testing.T) {
+	registry := telemetry.New(nil).MediaBufferLive()
+	controller := mustMediaBufferCopyController(t, 2*mediaBufferChunkSize)
+	server := NewServer(Config{MediaBuffer: &MediaBuffer{controller: controller}, MediaBufferLive: registry}, NewMemoryStore())
+	payload := bytes.Repeat([]byte("f"), 2*mediaCopyBufferSize)
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Videos/item/stream", nil)
+	body := newMediaBufferServerBody(bytes.NewReader(payload))
+	resp := mediaBufferServerResponse(req, http.StatusOK, int64(len(payload)), body)
+	wrapResponseBodyOnce(resp)
+	writer := newMediaBufferSecondWriteBlockingWriter()
+	done := make(chan struct{})
+	go func() {
+		server.writeProxyResponseWithSnapshot(writer, req, "/Videos/item/stream", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
+		close(done)
+	}()
+	awaitMediaBufferSignal(t, writer.second)
+	page := registry.Page(0, 1)
+	if len(page.Items) != 1 {
+		t.Fatalf("live page=%+v", page)
+	}
+	byteState := page.Items[0].(telemetry.MediaBufferLiveByteState)
+	if read, written := byteState.MediaBufferLiveBytes(); read != int64(len(payload)) || written != mediaCopyBufferSize {
+		t.Fatalf("fallback live bytes=%d/%d", read, written)
+	}
+	close(writer.release)
+	awaitMediaBufferSignal(t, done)
+	completion, ok := registry.TryCompletion()
+	if !ok || completion.BytesRead != int64(len(payload)) || completion.BytesWritten != int64(len(payload)) {
+		t.Fatalf("fallback completion=%+v ok=%v", completion, ok)
+	}
+	if read, written := byteState.MediaBufferLiveBytes(); read != completion.BytesRead || written != completion.BytesWritten {
+		t.Fatalf("retained fallback bytes=%d/%d completion=%d/%d", read, written, completion.BytesRead, completion.BytesWritten)
+	}
+}
+
+func TestMediaBufferNilTransferHandleFallsBackAndDoesNotLeakObservation(t *testing.T) {
+	registry := telemetry.New(nil).MediaBufferLive()
+	controller := mustMediaBufferCopyController(t, 2*mediaBufferChunkSize)
+	meter := &nilHandleTrafficMeter{}
+	server := NewServer(Config{MediaBuffer: &MediaBuffer{controller: controller}, MediaBufferLive: registry, Meter: meter}, NewMemoryStore())
+	payload := bytes.Repeat([]byte("n"), 2*mediaCopyBufferSize)
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Videos/item/stream", nil)
+	body := newMediaBufferServerBody(bytes.NewReader(payload))
+	resp := mediaBufferServerResponse(req, http.StatusOK, int64(len(payload)), body)
+	wrapResponseBodyOnce(resp)
+	writer := newMediaBufferSecondWriteBlockingWriter()
+	done := make(chan struct{})
+	go func() {
+		server.writeProxyResponseWithSnapshot(writer, req, "/Videos/item/stream", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
+		close(done)
+	}()
+	awaitMediaBufferSignal(t, writer.second)
+	page := registry.Page(0, 1)
+	if len(page.Items) != 1 {
+		t.Fatalf("nil-handle page=%+v", page)
+	}
+	live := page.Items[0].(*mediaBufferLiveState)
+	if snapshot := live.MediaBufferLiveSnapshot(); snapshot.TransferID != 0 || live.transfer.Load() != nil {
+		t.Fatalf("nil-handle linkage snapshot=%+v transfer=%p", snapshot, live.transfer.Load())
+	}
+	if read, written := live.MediaBufferLiveBytes(); read != int64(len(payload)) || written != mediaCopyBufferSize {
+		t.Fatalf("nil-handle live bytes=%d/%d", read, written)
+	}
+	close(writer.release)
+	awaitMediaBufferSignal(t, done)
+	completion, ok := registry.TryCompletion()
+	if !ok || completion.Terminal.TransferID != 0 || completion.BytesRead != int64(len(payload)) || completion.BytesWritten != int64(len(payload)) {
+		t.Fatalf("nil-handle completion=%+v ok=%v", completion, ok)
+	}
+	if meter.ingress.Load() != uint64(len(payload)) || meter.egress.Load() != uint64(len(payload)) || meter.begins.Load() != 1 {
+		t.Fatalf("nil-handle meter begins=%d bytes=%d/%d", meter.begins.Load(), meter.ingress.Load(), meter.egress.Load())
+	}
+	if removed := registry.CompactTerminal(); removed != 1 {
+		t.Fatalf("nil-handle compact removed=%d", removed)
+	}
+}
+
+type nilHandleTrafficMeter struct {
+	ingress atomic.Uint64
+	egress  atomic.Uint64
+	errors  atomic.Uint64
+	begins  atomic.Uint64
+}
+
+func (m *nilHandleTrafficMeter) AddEgress(n int64) {
+	if n > 0 {
+		m.egress.Add(uint64(n))
+	}
+}
+func (m *nilHandleTrafficMeter) AddIngress(n int64) {
+	if n > 0 {
+		m.ingress.Add(uint64(n))
+	}
+}
+func (m *nilHandleTrafficMeter) NoteError() { m.errors.Add(1) }
+func (m *nilHandleTrafficMeter) BeginTransfer(telemetry.TransferMeta) *telemetry.TransferHandle {
+	m.begins.Add(1)
+	return nil
+}
+
+func TestMediaBufferCompletionDropDoesNotChangeCopyOrOwnership(t *testing.T) {
+	registry := telemetry.New(nil).MediaBufferLive()
+	for i := 0; i < 256; i++ {
+		if !registry.OfferCompletion(telemetry.MediaBufferCompletion{}) {
+			t.Fatalf("fill completion slot %d", i)
+		}
+	}
+	controller := mustMediaBufferCopyController(t, mediaBufferChunkSize)
+	meter := telemetry.NewByteMeter()
+	server := NewServer(Config{MediaBuffer: &MediaBuffer{controller: controller}, MediaBufferLive: registry, Meter: meter}, NewMemoryStore())
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Videos/item/stream", nil)
+	body := newMediaBufferServerBody(bytes.NewBufferString("media"))
+	resp := mediaBufferServerResponse(req, http.StatusOK, 5, body)
+	wrapResponseBodyOnce(resp)
+	writer := httptest.NewRecorder()
+	server.writeProxyResponseWithSnapshot(writer, req, "/Videos/item/stream", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
+	if writer.Body.String() != "media" || registry.CompletionDrops() != 1 || meter.ActiveTransferCount() != 0 {
+		t.Fatalf("body=%q drops=%d transfers=%d", writer.Body.String(), registry.CompletionDrops(), meter.ActiveTransferCount())
+	}
+	if snapshot := controller.Snapshot(); snapshot.ActiveRequests != 0 || snapshot.Owned != 0 {
+		t.Fatalf("controller after drop=%+v", snapshot)
 	}
 }
 
@@ -775,6 +1271,47 @@ func BenchmarkMediaBufferCopyObservation(b *testing.B) {
 					b.Fatal(result.Err)
 				}
 				_ = request.close()
+			}
+		})
+	}
+}
+
+func BenchmarkMediaBufferResponseObservation(b *testing.B) {
+	payload := bytes.Repeat([]byte("x"), 8*mediaCopyBufferSize)
+	for _, observed := range []bool{false, true} {
+		name := "absent"
+		if observed {
+			name = "present"
+		}
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				controller, _ := newMediaBuffer(4 * mediaBufferChunkSize)
+				config := Config{MediaBuffer: &MediaBuffer{controller: controller}, Meter: telemetry.NewByteMeter()}
+				var registry *telemetry.MediaBufferLiveRegistry
+				if observed {
+					registry = telemetry.New(nil).MediaBufferLive()
+					config.MediaBufferLive = registry
+				}
+				server := NewServer(config, NewMemoryStore())
+				req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Videos/item/stream", nil)
+				body := newMediaBufferServerBody(bytes.NewReader(payload))
+				resp := mediaBufferServerResponse(req, http.StatusOK, int64(len(payload)), body)
+				wrapResponseBodyOnce(resp)
+				writer := httptest.NewRecorder()
+				b.StartTimer()
+				server.writeProxyResponseWithSnapshot(writer, req, "/Videos/item/stream", resp, &Session{}, upstreamRequestSnapshot{}, "", "")
+				b.StopTimer()
+				if writer.Body.Len() != len(payload) || config.Meter.(*telemetry.ByteMeter).ActiveTransferCount() != 0 {
+					b.Fatalf("body=%d active=%d", writer.Body.Len(), config.Meter.(*telemetry.ByteMeter).ActiveTransferCount())
+				}
+				if observed {
+					completion, ok := registry.TryCompletion()
+					if !ok || completion.BytesRead != int64(len(payload)) || completion.BytesWritten != int64(len(payload)) {
+						b.Fatalf("completion=%+v ok=%v", completion, ok)
+					}
+				}
 			}
 		})
 	}

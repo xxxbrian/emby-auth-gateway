@@ -120,11 +120,11 @@ func copyBufferedMediaBodyWithHooks(ctx context.Context, dst io.Writer, src io.R
 		var writeStarted int64
 		if live != nil {
 			writeStarted = live.beginConsumerOperation(telemetry.MediaBufferConsumerWriting)
-			live.setWriting(int64(event.length))
+			live.setWritingPreTerminal(int64(event.length))
 		}
 		written, writeErr := dst.Write(event.buffer.data[:event.length])
 		if live != nil {
-			live.setWriting(0)
+			live.setWritingPreTerminal(0)
 			live.endConsumerOperation(telemetry.MediaBufferConsumerWriting, writeStarted)
 		}
 		if written < 0 || written > event.length {
@@ -442,7 +442,7 @@ func (q *mediaBufferCopyQueue) publish(event mediaBufferCopyEvent) bool {
 	q.events = append(q.events, event)
 	if q.live != nil && !event.terminal {
 		q.bytes += int32(event.length)
-		q.live.setQueued(int64(q.bytes))
+		q.live.setQueuedPreTerminal(int64(q.bytes))
 	}
 	select {
 	case q.notify <- struct{}{}:
@@ -467,7 +467,7 @@ func (q *mediaBufferCopyQueue) next(ctx context.Context, hooks *mediaBufferCopyH
 			q.head++
 			if q.live != nil && !event.terminal {
 				q.bytes -= int32(event.length)
-				q.live.setQueued(int64(q.bytes))
+				q.live.setQueuedPreTerminal(int64(q.bytes))
 			}
 			q.compactLocked()
 			q.mu.Unlock()
@@ -510,7 +510,7 @@ func (q *mediaBufferCopyQueue) close() []mediaBufferCopyEvent {
 	events := q.takeAllLocked()
 	if q.live != nil && q.bytes != 0 {
 		q.bytes = 0
-		q.live.setQueued(0)
+		q.live.setQueuedPreTerminal(0)
 	}
 	select {
 	case q.notify <- struct{}{}:

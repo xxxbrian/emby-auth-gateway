@@ -235,8 +235,6 @@ func newGatewayApp() *pocketbase.PocketBase {
 		startedAt := time.Now().UTC()
 		emitter := observe.NewEmitter(1024)
 		registry := telemetry.New(emitter)
-		// Telemetry consumer is best-effort; never block gateway start.
-		startTelemetryForServe(registry)
 
 		gw := newGatewayServerForServe(gateway.Config{
 			PublicBaseURL:            strings.TrimRight(os.Getenv("GATEWAY_PUBLIC_URL"), "/"),
@@ -248,7 +246,11 @@ func newGatewayApp() *pocketbase.PocketBase {
 			Emitter:                  emitter,
 			Meter:                    registry.Meter(),
 			MediaBuffer:              mediaBuffer,
+			MediaBufferLive:          registry.MediaBufferLive(),
 		}, pbstore.New(e.App))
+		registry.SetMediaBufferProvider(gw.MediaBufferControllerSnapshot)
+		// Telemetry consumer is best-effort; never block gateway start.
+		startTelemetryForServe(registry)
 		web, err := newEmbyWebServer(webAssetsDirFromEnv(), os.Getenv("GATEWAY_PUBLIC_URL"))
 		if err != nil {
 			return err
@@ -258,6 +260,7 @@ func newGatewayApp() *pocketbase.PocketBase {
 		mountGatewayRoutesForServe(e.Router, web, gw, webReady)
 
 		adminCfg := adminConfigFromEnv()
+		adminCfg.MediaBufferEnabled = func() bool { return mediaBuffer != nil }
 		// Exclusive reconfigure gate: media copies (RWMutex) + active playbacks.
 		// force=false fails immediately if copies or playbacks are active;
 		// force=true waits for copies to drain (playbacks are not waited on).

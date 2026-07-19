@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +15,7 @@ import (
 	"github.com/xxxbrian/emby-auth-gateway/internal/telemetry"
 
 	"github.com/pocketbase/pocketbase/apis"
+	"github.com/pocketbase/pocketbase/core"
 )
 
 func TestAdminConfigFromEnv(t *testing.T) {
@@ -52,11 +55,12 @@ func TestMountAdminMediaBufferSnapshotWiring(t *testing.T) {
 	app := newTestApp(t)
 	status := telemetry.MediaBufferStatus{Enabled: true, HardBudgetBytes: 64 << 20, ActiveRequests: 2}
 	callback := func() telemetry.MediaBufferStatus { return status }
+	mediaBufferEnabled := func() bool { return true }
 	r, err := apis.NewRouter(app)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := mountAdmin(r, app, adminConfig{}, nil, callback, nil, nil, false, time.Now(), "boot"); err != nil {
+	if err := mountAdmin(r, app, adminConfig{MediaBufferEnabled: mediaBufferEnabled}, nil, callback, nil, nil, false, time.Now(), "boot"); err != nil {
 		t.Fatal(err)
 	}
 	if captured.MediaBufferSnapshot == nil {
@@ -64,6 +68,9 @@ func TestMountAdminMediaBufferSnapshotWiring(t *testing.T) {
 	}
 	if got := captured.MediaBufferSnapshot(); got != status {
 		t.Fatalf("captured callback status=%+v want %+v", got, status)
+	}
+	if captured.MediaBufferEnabled == nil || !captured.MediaBufferEnabled() {
+		t.Fatal("media buffer enabled callback was not forwarded")
 	}
 
 	r, err = apis.NewRouter(app)
@@ -75,6 +82,85 @@ func TestMountAdminMediaBufferSnapshotWiring(t *testing.T) {
 	}
 	if captured.MediaBufferSnapshot != nil {
 		t.Fatal("nil media buffer callback was not preserved")
+	}
+	if captured.MediaBufferEnabled != nil {
+		t.Fatal("nil media buffer enabled callback was not preserved")
+	}
+}
+
+func TestMountedMediaBufferDisabledVersusMissingProvider(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		enabled bool
+		status  int
+	}{
+		{name: "disabled", enabled: false, status: http.StatusOK},
+		{name: "expected provider missing", enabled: true, status: http.StatusServiceUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app := newTestApp(t)
+			collection, err := app.FindCollectionByNameOrId(core.CollectionNameSuperusers)
+			if err != nil {
+				t.Fatal(err)
+			}
+			superuser := core.NewRecord(collection)
+			superuser.SetEmail("mounted-buffer@example.test")
+			superuser.SetPassword("SuperSecret1!")
+			if err := app.Save(superuser); err != nil {
+				t.Fatal(err)
+			}
+			token, err := superuser.NewAuthToken()
+			if err != nil {
+				t.Fatal(err)
+			}
+			registry := telemetry.New(nil)
+			r, err := apis.NewRouter(app)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := mountAdmin(r, app, adminConfig{MediaBufferEnabled: func() bool { return tc.enabled }}, registry, nil, nil, nil, false, time.Now(), registry.BootID()); err != nil {
+				t.Fatal(err)
+			}
+			h, err := r.BuildMux()
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, _ := json.Marshal(map[string]string{"token": token})
+			sessionResponse := httptest.NewRecorder()
+			sessionRequest := httptest.NewRequest(http.MethodPost, "/admin/api/v1/session", bytes.NewReader(body))
+			sessionRequest.Host = "admin.example.test"
+			sessionRequest.Header.Set("Origin", "http://admin.example.test")
+			sessionRequest.Header.Set("Content-Type", "application/json")
+			h.ServeHTTP(sessionResponse, sessionRequest)
+			if sessionResponse.Code != http.StatusOK {
+				t.Fatalf("session: %d %s", sessionResponse.Code, sessionResponse.Body.String())
+			}
+			var cookie *http.Cookie
+			for _, candidate := range sessionResponse.Result().Cookies() {
+				if candidate.Name == adminauth.CookieDev || candidate.Name == adminauth.CookieSecure {
+					cookie = candidate
+					break
+				}
+			}
+			if cookie == nil {
+				t.Fatal("missing session cookie")
+			}
+			for _, path := range []string{"/admin/api/v1/media-buffer/streams", "/admin/api/v1/media-buffer/streams/1", "/admin/api/v1/media-buffer/series", "/admin/api/v1/media-buffer/recent"} {
+				response := httptest.NewRecorder()
+				request := httptest.NewRequest(http.MethodGet, path, nil)
+				request.AddCookie(cookie)
+				h.ServeHTTP(response, request)
+				if response.Code != tc.status {
+					t.Fatalf("%s: status=%d body=%s", path, response.Code, response.Body.String())
+				}
+				if tc.enabled && !strings.Contains(response.Body.String(), `"error":"provider_unavailable"`) {
+					t.Fatalf("%s: missing bounded provider error: %s", path, response.Body.String())
+				}
+				if !tc.enabled && path == "/admin/api/v1/media-buffer/streams/1" && !strings.Contains(response.Body.String(), `"boot_id":"`+registry.BootID()+`","item":null`) {
+					t.Fatalf("disabled detail wrapper=%s", response.Body.String())
+				}
+			}
+		})
 	}
 }
 

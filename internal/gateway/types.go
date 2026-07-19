@@ -26,7 +26,7 @@ type Config struct {
 	Emitter                  *observe.Emitter                   // optional; nil = no-op
 	Meter                    TrafficMeter                       // optional live bandwidth meter; nil = no-op
 	MediaBuffer              *MediaBuffer                       // optional; nil preserves synchronous media copying
-	MediaBufferLive          *telemetry.MediaBufferLiveRegistry // optional Phase 1 injection; nil disables observation
+	MediaBufferLive          *telemetry.MediaBufferLiveRegistry // optional live observation; nil disables observation
 }
 
 type Store interface {

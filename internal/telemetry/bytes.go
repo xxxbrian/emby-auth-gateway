@@ -154,6 +154,15 @@ func (h *TransferHandle) ID() uint64 {
 	return h.tr.id
 }
 
+// Bytes returns the exact successful ingress and egress byte counts retained by
+// the handle, including after End.
+func (h *TransferHandle) Bytes() (ingress, egress int64) {
+	if h == nil || h.tr == nil {
+		return 0, 0
+	}
+	return h.tr.ingress.Load(), h.tr.egress.Load()
+}
+
 // End removes the transfer from the active set. Idempotent.
 func (h *TransferHandle) End(err error) {
 	if h == nil || h.meter == nil || h.tr == nil {

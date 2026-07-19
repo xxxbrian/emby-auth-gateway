@@ -1,7 +1,7 @@
 <script lang="ts">
     import { onMount, onDestroy } from 'svelte';
     import { apiRequest } from '../lib/api';
-    import type { Snapshot, UpstreamStatus } from '../lib/types';
+    import type { Snapshot, UpstreamStatus, BufferAggregate } from '../lib/types';
     import LineChart from '../lib/LineChart.svelte';
 
     let data = $state<Snapshot | null>(null);
@@ -73,6 +73,44 @@
         if (err === 'refresh_failed') return 'Refresh failed';
         if (err === 'auth_unavailable') return 'Unavailable';
         return 'Failed';
+    }
+
+    function bufferHealthClass(buf: BufferAggregate | null | undefined): string {
+        if (!buf || !buf.enabled) return 'text-secondary';
+        if (buf.health === 'critical') return 'status-err';
+        if (buf.health === 'warning') return 'status-warn';
+        if (buf.health === 'healthy') {
+            if (buf.observation_completeness === 'limited') return 'status-warn';
+            return 'status-ok';
+        }
+        return 'text-secondary';
+    }
+
+    function bufferSentinelLabel(buf: BufferAggregate | null | undefined): string {
+        if (!buf) return 'Unknown';
+        if (!buf.enabled) return 'Disabled';
+        if (buf.health === 'idle') return 'Idle';
+        if (buf.health === 'critical') {
+            const reasons = buf.health_reasons.length > 0 ? buf.health_reasons.join(', ') : 'critical';
+            return `Critical \u00b7 ${reasons}`;
+        }
+        if (buf.health === 'warning') {
+            const reasons = buf.health_reasons.length > 0 ? buf.health_reasons.join(', ') : 'warning';
+            return `Warning \u00b7 ${reasons}`;
+        }
+        // healthy — but show observation coverage
+        const parts: string[] = [];
+        if (buf.observation_completeness === 'limited') {
+            parts.push(`${buf.observed_active_requests} observed / ${buf.active_requests} total`);
+        } else if (buf.active_requests > 0) {
+            parts.push(`${buf.active_requests} active`);
+        }
+        if (buf.allocated_bytes > 0) {
+            const mb = (buf.allocated_bytes / (1024 * 1024)).toFixed(1);
+            parts.push(`${mb} MB`);
+        }
+        const prefix = buf.observation_completeness === 'limited' ? 'OK (limited)' : 'OK';
+        return parts.length > 0 ? `${prefix} \u00b7 ${parts.join(' / ')}` : prefix;
     }
 
     function authState(u: UpstreamStatus | null | undefined): 'unknown' | 'healthy' | 'failing' {
@@ -201,6 +239,13 @@
                     <div class="metric-value mono">
                         {data.runtime?.goroutines ?? 0}
                         <span class="text-secondary text-sm"> / {((data.runtime?.heap_bytes || 0) / 1024 / 1024).toFixed(1)} MB</span>
+                    </div>
+                </div>
+                <div class="metric-box" style="grid-column: 1 / -1;">
+                    <div class="metric-label">Buffer Pool</div>
+                    <div class="flex items-center justify-between">
+                        <div class="metric-value {bufferHealthClass(data.media_buffer)}" style="font-size: 14px;">{bufferSentinelLabel(data.media_buffer)}</div>
+                        <a href="#/buffer" class="text-xs text-secondary" style="text-decoration: none;">&rarr; Buffer</a>
                     </div>
                 </div>
             </div>

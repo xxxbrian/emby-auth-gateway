@@ -58,3 +58,26 @@ func TestServerMediaBufferSnapshot(t *testing.T) {
 	}
 	closeMediaBufferRequests(t, first, second)
 }
+
+func TestServerMediaBufferControllerSnapshotProvider(t *testing.T) {
+	var nilServer *Server
+	if got := nilServer.MediaBufferControllerSnapshot(); got != (telemetry.MediaBufferControllerSnapshot{}) {
+		t.Fatalf("nil provider snapshot=%+v", got)
+	}
+	disabled := NewServer(Config{}, NewMemoryStore())
+	if got := disabled.MediaBufferControllerSnapshot(); got.Available || got.Enabled {
+		t.Fatalf("disabled provider snapshot=%+v", got)
+	}
+
+	controller, err := NewMediaBuffer(2 * mediaBufferChunkSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enabled := NewServer(Config{MediaBuffer: controller}, NewMemoryStore())
+	request := controller.controller.register()
+	got := enabled.MediaBufferControllerSnapshot()
+	if !got.Available || !got.Enabled || got.HardBudgetBytes != 2*mediaBufferChunkSize || got.ActiveRequests != 1 || got.PrivateBaseBytes != mediaBufferChunkSize || got.UnallocatedOptionalBytes != 2*mediaBufferChunkSize {
+		t.Fatalf("enabled provider snapshot=%+v", got)
+	}
+	closeMediaBufferRequests(t, request)
+}

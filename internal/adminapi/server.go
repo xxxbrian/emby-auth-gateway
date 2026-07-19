@@ -37,6 +37,10 @@ type Config struct {
 	Query               *adminquery.Querier
 	Telemetry           *telemetry.Registry // optional
 	MediaBufferSnapshot func() telemetry.MediaBufferStatus
+	// MediaBufferEnabled reports whether media buffering is configured and
+	// expected. False is the intentional disabled mode; true requires a
+	// usable telemetry provider for the media-buffer routes.
+	MediaBufferEnabled func() bool
 	// AcquireReconfigure, when set, is the preferred reconfigure exclusion gate
 	// (holds exclusive lock over media copies for the duration of reconfigure).
 	// force=false fails immediately if media is active; force=true waits.
@@ -103,6 +107,10 @@ func (s *Server) Mount(r *router.Router[*core.RequestEvent]) {
 	g.GET("/sessions", s.withAuth(s.handleListSessions))
 	g.GET("/activity/playbacks", s.withAuth(s.handlePlaybacks))
 	g.GET("/activity/transfers", s.withAuth(s.handleTransfers))
+	g.GET("/media-buffer/streams", s.withAuth(s.handleMediaBufferStreams))
+	g.GET("/media-buffer/streams/{stream_id}", s.withAuth(s.handleMediaBufferStreamDetail))
+	g.GET("/media-buffer/series", s.withAuth(s.handleMediaBufferSeries))
+	g.GET("/media-buffer/recent", s.withAuth(s.handleMediaBufferRecent))
 	g.GET("/audit", s.withAuth(s.handleAudit))
 	g.GET("/system", s.withAuth(s.handleSystem))
 	g.GET("/path-policies", s.withAuth(s.handleListPolicies))
@@ -375,15 +383,12 @@ func (s *Server) handleOverview(e *core.RequestEvent) error {
 	return e.JSON(http.StatusOK, s.snapshot(window))
 }
 
-func (s *Server) snapshot(window telemetry.SeriesWindow) telemetry.Snapshot {
+func (s *Server) snapshot(window telemetry.SeriesWindow) adminSnapshot {
 	var snap telemetry.Snapshot
 	if s != nil && s.cfg.Telemetry != nil {
 		snap = s.cfg.Telemetry.SnapshotWindow(window)
 	}
-	if s != nil && s.cfg.MediaBufferSnapshot != nil {
-		snap.MediaBuffer = s.cfg.MediaBufferSnapshot()
-	}
-	return snap
+	return adminSnapshot{Snapshot: snap, MediaBuffer: s.mediaBufferAggregate()}
 }
 
 func (s *Server) handleMetricsStream(e *core.RequestEvent) error {
@@ -471,7 +476,26 @@ func (s *Server) handleTransfers(e *core.RequestEvent) error {
 	if items == nil {
 		items = []telemetry.Transfer{}
 	}
-	return e.JSON(http.StatusOK, map[string]any{"items": items})
+	// ActiveTransfers and the live registry are copied independently.  Validate
+	// direct linkage only after both source snapshots have released their locks.
+	if s.cfg.Telemetry != nil {
+		boot := s.cfg.Telemetry.BootID()
+		for i := range items {
+			ref := items[i].MediaBuffer
+			if ref == nil || ref.BootID != boot {
+				items[i].MediaBuffer = nil
+				continue
+			}
+			if _, ok := s.cfg.Telemetry.MediaBufferStreamDetail(ref.StreamID); !ok {
+				items[i].MediaBuffer = nil
+			}
+		}
+	}
+	responseItems := make([]adminTransfer, len(items))
+	for i := range items {
+		responseItems[i] = newAdminTransfer(items[i])
+	}
+	return e.JSON(http.StatusOK, map[string]any{"items": responseItems})
 }
 
 func (s *Server) handleAudit(e *core.RequestEvent) error {

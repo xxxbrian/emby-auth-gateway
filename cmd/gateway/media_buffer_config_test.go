@@ -545,23 +545,32 @@ func TestRegisteredOnServeMediaBufferOrdering(t *testing.T) {
 	})
 
 	var stages []string
-	installServeOrderingSeams := func(fake *mediaBufferStartupFake) {
+	installServeOrderingSeams := func(fake *mediaBufferStartupFake, wantProvider bool) {
 		mediaBufferStartupDepsForServe = func() mediaBufferStartupDeps { return fake.deps() }
-		startTelemetryForServe = func(*telemetry.Registry) { stages = append(stages, "telemetry-start") }
+		startTelemetryForServe = func(registry *telemetry.Registry) {
+			stages = append(stages, "telemetry-start")
+			status := registry.MediaBufferAggregateSnapshot()
+			if status.Enabled != wantProvider {
+				t.Fatalf("telemetry started before provider wiring: %+v", status)
+			}
+		}
 		newGatewayServerForServe = func(cfg gateway.Config, _ gateway.Store) *gateway.Server {
 			stages = append(stages, "gateway-construction")
-			if cfg.MediaBuffer == nil {
-				t.Fatal("enabled startup did not inject media buffer")
+			if (cfg.MediaBuffer != nil) != wantProvider || cfg.MediaBufferLive == nil {
+				t.Fatalf("gateway media buffer enabled=%v live=%v want provider=%v", cfg.MediaBuffer != nil, cfg.MediaBufferLive != nil, wantProvider)
 			}
 			return gateway.NewServer(cfg, gateway.NewMemoryStore())
 		}
 		mountGatewayRoutesForServe = func(*router.Router[*core.RequestEvent], http.Handler, http.Handler, bool) {
 			stages = append(stages, "gateway-routes")
 		}
-		mountAdminForServe = func(_ *router.Router[*core.RequestEvent], _ core.App, _ adminConfig, _ *telemetry.Registry, mediaBufferSnapshot func() telemetry.MediaBufferStatus, _ func() bool, _ func(bool) (func(), error), _ bool, _ time.Time, _ string) error {
+		mountAdminForServe = func(_ *router.Router[*core.RequestEvent], _ core.App, cfg adminConfig, _ *telemetry.Registry, mediaBufferSnapshot func() telemetry.MediaBufferStatus, _ func() bool, _ func(bool) (func(), error), _ bool, _ time.Time, _ string) error {
 			stages = append(stages, "admin-routes")
-			if mediaBufferSnapshot == nil || !mediaBufferSnapshot().Enabled {
-				t.Fatal("admin mount did not receive enabled media buffer snapshot callback")
+			if mediaBufferSnapshot == nil || mediaBufferSnapshot().Enabled != wantProvider {
+				t.Fatalf("admin media buffer enabled=%v want=%v", mediaBufferSnapshot != nil && mediaBufferSnapshot().Enabled, wantProvider)
+			}
+			if cfg.MediaBufferEnabled == nil || cfg.MediaBufferEnabled() != wantProvider {
+				t.Fatalf("admin media buffer enabled=%v want=%v", cfg.MediaBufferEnabled != nil && cfg.MediaBufferEnabled(), wantProvider)
 			}
 			return nil
 		}
@@ -569,7 +578,7 @@ func TestRegisteredOnServeMediaBufferOrdering(t *testing.T) {
 	}
 
 	invalid := newMediaBufferStartupFake(map[string]string{mediaBufferEnabledEnv: "invalid"})
-	installServeOrderingSeams(invalid)
+	installServeOrderingSeams(invalid, false)
 	invalidNext := false
 	invalidApp := newGatewayApp()
 	invalidRouter, err := apis.NewRouter(invalidApp)
@@ -586,7 +595,7 @@ func TestRegisteredOnServeMediaBufferOrdering(t *testing.T) {
 
 	stages = nil
 	valid := newMediaBufferStartupFake(map[string]string{mediaBufferEnabledEnv: "true", mediaBufferBudgetEnv: "32KiB"})
-	installServeOrderingSeams(valid)
+	installServeOrderingSeams(valid, true)
 	validApp := newGatewayApp()
 	validRouter, err := apis.NewRouter(validApp)
 	if err != nil {
@@ -596,9 +605,25 @@ func TestRegisteredOnServeMediaBufferOrdering(t *testing.T) {
 		stages = append(stages, "next")
 		return nil
 	})
-	wantStages := []string{"telemetry-start", "gateway-construction", "gateway-routes", "admin-routes", "next"}
+	wantStages := []string{"gateway-construction", "telemetry-start", "gateway-routes", "admin-routes", "next"}
 	if err != nil || !reflect.DeepEqual(stages, wantStages) {
 		t.Fatalf("valid startup error=%v stages=%v want=%v", err, stages, wantStages)
+	}
+
+	stages = nil
+	disabled := newMediaBufferStartupFake(nil)
+	installServeOrderingSeams(disabled, false)
+	disabledApp := newGatewayApp()
+	disabledRouter, err := apis.NewRouter(disabledApp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = disabledApp.OnServe().Trigger(&core.ServeEvent{App: disabledApp, Router: disabledRouter, Server: &http.Server{}}, func(*core.ServeEvent) error {
+		stages = append(stages, "next")
+		return nil
+	})
+	if err != nil || !reflect.DeepEqual(stages, wantStages) {
+		t.Fatalf("disabled startup error=%v stages=%v want=%v", err, stages, wantStages)
 	}
 }
 

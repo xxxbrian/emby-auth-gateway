@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -82,6 +83,45 @@ func TestCountedWriterNilMeterPassthrough(t *testing.T) {
 	}
 }
 
+func TestCountedIONilHandleLiveFallback(t *testing.T) {
+	var read, written atomic.Int64
+	w := newCountedWriterWithLive(httptest.NewRecorder(), nil, nil, &written)
+	r := newCountedReaderWithLive(strings.NewReader("abc"), nil, nil, &read)
+	if n, err := w.Write([]byte("hello")); err != nil || n != 5 {
+		t.Fatalf("write n=%d err=%v", n, err)
+	}
+	buf := make([]byte, 8)
+	if n, err := r.Read(buf); err != nil && err != io.EOF || n != 3 {
+		t.Fatalf("read n=%d err=%v", n, err)
+	}
+	if read.Load() != 3 || written.Load() != 5 {
+		t.Fatalf("fallback bytes=%d/%d", read.Load(), written.Load())
+	}
+}
+
+func TestCountedIOInvalidAndShortWriteParity(t *testing.T) {
+	meter := telemetry.NewByteMeter()
+	handle := meter.BeginTransfer(telemetry.TransferMeta{SessionID: "parity"})
+	invalidWrite := newCountedWriter(countedResultWriter{n: 4}, meter, handle)
+	if n, _ := invalidWrite.Write([]byte("abc")); n != 4 {
+		t.Fatalf("invalid write n=%d", n)
+	}
+	invalidRead := newCountedReader(countedResultReader{n: 4}, meter, handle)
+	if n, _ := invalidRead.Read(make([]byte, 3)); n != 4 {
+		t.Fatalf("invalid read n=%d", n)
+	}
+	if in, out := handle.Bytes(); in != 0 || out != 0 {
+		t.Fatalf("invalid counts in=%d out=%d", in, out)
+	}
+	shortWrite := newCountedWriter(countedResultWriter{n: 2}, meter, handle)
+	if n, _ := shortWrite.Write([]byte("abc")); n != 2 {
+		t.Fatalf("short write n=%d", n)
+	}
+	if in, out := handle.Bytes(); in != 0 || out != 2 {
+		t.Fatalf("short counts in=%d out=%d", in, out)
+	}
+}
+
 func TestCountEgressWriteFailureCountsOneError(t *testing.T) {
 	meter := telemetry.NewByteMeter()
 	w := &countedFailureWriter{err: errors.New("write failed")}
@@ -118,6 +158,16 @@ type countedFailureWriter struct {
 	header http.Header
 	err    error
 }
+
+type countedResultWriter struct{ n int }
+
+func (countedResultWriter) Header() http.Header         { return make(http.Header) }
+func (countedResultWriter) WriteHeader(int)             {}
+func (w countedResultWriter) Write([]byte) (int, error) { return w.n, nil }
+
+type countedResultReader struct{ n int }
+
+func (r countedResultReader) Read([]byte) (int, error) { return r.n, nil }
 
 func (w *countedFailureWriter) Header() http.Header {
 	if w.header == nil {

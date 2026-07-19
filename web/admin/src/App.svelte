@@ -6,6 +6,7 @@
     import Overview from './pages/Overview.svelte';
     import Users from './pages/Users.svelte';
     import Activity from './pages/Activity.svelte';
+    import Buffer from './pages/Buffer.svelte';
     import Traffic from './pages/Traffic.svelte';
     import System from './pages/System.svelte';
 
@@ -15,6 +16,7 @@
         '/': Overview,
         '/users': Users,
         '/activity': Activity,
+        '/buffer': Buffer,
         '/traffic': Traffic,
         '/system': System,
         '*': Overview
@@ -51,6 +53,7 @@
                 <a href="#/" class="nav-link {currentPath === '/' ? 'active' : ''}">Overview</a>
                 <a href="#/users" class="nav-link {currentPath === '/users' ? 'active' : ''}">Users</a>
                 <a href="#/activity" class="nav-link {currentPath === '/activity' ? 'active' : ''}">Activity</a>
+                <a href="#/buffer" class="nav-link {currentPath === '/buffer' ? 'active' : ''}">Buffer</a>
                 <a href="#/traffic" class="nav-link {currentPath === '/traffic' ? 'active' : ''}">Traffic</a>
                 <a href="#/system" class="nav-link {currentPath === '/system' ? 'active' : ''}">System</a>
             </nav>

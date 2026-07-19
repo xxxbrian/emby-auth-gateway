@@ -228,6 +228,19 @@ export async function checkSession(): Promise<void> {
   }
 }
 
+/** Structured API error with HTTP status and optional backend error code. */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code: string | undefined;
+
+  constructor(status: number, message: string, code?: string) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.code = code;
+  }
+}
+
 export async function apiRequest<T = unknown>(
   endpoint: string,
   options: RequestInit = {},
@@ -257,7 +270,7 @@ export async function apiRequest<T = unknown>(
   if (res.status === 401) {
     session.set(null);
     csrfToken = null;
-    throw new Error('Unauthorized');
+    throw new ApiError(401, 'Unauthorized', 'unauthorized');
   }
 
   let data: (ApiErrorBody & T) | null = null;
@@ -270,7 +283,9 @@ export async function apiRequest<T = unknown>(
   }
 
   if (!res.ok) {
-    throw new Error(errorMessage(data, `API error: ${res.status}`));
+    const msg = errorMessage(data, `API error: ${res.status}`);
+    const code = (data as ApiErrorBody | null)?.error;
+    throw new ApiError(res.status, msg, code);
   }
 
   return data as T;

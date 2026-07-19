@@ -85,8 +85,11 @@ type mediaBufferLiveState struct {
 	producer   atomic.Uint64
 	consumer   atomic.Uint64
 
-	queued  atomic.Int64
-	writing atomic.Int64
+	queued       atomic.Int64
+	writing      atomic.Int64
+	fallbackRead atomic.Int64
+	fallbackSent atomic.Int64
+	transfer     atomic.Pointer[telemetry.TransferHandle]
 
 	peakOwned   atomic.Int64
 	peakDebt    atomic.Int64
@@ -203,8 +206,11 @@ func (s *mediaBufferLiveState) MediaBufferLiveSnapshot() telemetry.MediaBufferLi
 	if s == nil {
 		return telemetry.MediaBufferLiveSnapshot{}
 	}
+	return s.mediaBufferLiveSnapshotAt(s.clock.nowMS())
+}
+
+func (s *mediaBufferLiveState) mediaBufferLiveSnapshotAt(age int64) telemetry.MediaBufferLiveSnapshot {
 	target, owned, debt := unpackMediaBufferAllocation(s.allocation.Load())
-	age := s.clock.nowMS()
 	snapshot := telemetry.MediaBufferLiveSnapshot{
 		BootID:           s.identity.BootID,
 		StreamID:         s.identity.StreamID,
@@ -238,16 +244,56 @@ func (s *mediaBufferLiveState) MediaBufferLiveSnapshot() telemetry.MediaBufferLi
 	return snapshot
 }
 
+func (s *mediaBufferLiveState) MediaBufferLiveBytes() (bytesRead, bytesWritten int64) {
+	if s == nil {
+		return 0, 0
+	}
+	if transfer := s.transfer.Load(); transfer != nil {
+		return transfer.Bytes()
+	}
+	return s.fallbackRead.Load(), s.fallbackSent.Load()
+}
+
+func (s *mediaBufferLiveState) completedAt() time.Time {
+	if s == nil || s.clock == nil {
+		return time.Time{}
+	}
+	return s.completedAtMS(s.clock.nowMS())
+}
+
+func (s *mediaBufferLiveState) completedAtMS(now int64) time.Time {
+	return s.clock.origin.Add(time.Duration(now) * time.Millisecond).UTC()
+}
+
 func (s *mediaBufferLiveState) bindTransferID(id uint64) {
 	if s != nil && id != 0 {
 		s.transferID.CompareAndSwap(0, id)
 	}
 }
 
+func (s *mediaBufferLiveState) bindTransfer(handle *telemetry.TransferHandle) {
+	if s == nil || handle == nil {
+		return
+	}
+	s.bindTransferID(handle.ID())
+	s.transfer.CompareAndSwap(nil, handle)
+}
+
+func (s *mediaBufferLiveState) byteFallbacks() (read, written *atomic.Int64) {
+	if s == nil || s.transfer.Load() != nil {
+		return nil, nil
+	}
+	return &s.fallbackRead, &s.fallbackSent
+}
+
 func (s *mediaBufferLiveState) projectAllocation(target, owned, debt int64) {
 	if s == nil || s.terminal.Load() {
 		return
 	}
+	s.projectAllocationPreTerminal(target, owned, debt)
+}
+
+func (s *mediaBufferLiveState) projectAllocationPreTerminal(target, owned, debt int64) {
 	word := packMediaBufferAllocation(target, owned, debt)
 	if s.allocation.Load() == word {
 		return
@@ -261,6 +307,10 @@ func (s *mediaBufferLiveState) projectBlocker(blocker telemetry.MediaBufferAlloc
 	if s == nil || s.terminal.Load() {
 		return
 	}
+	s.projectBlockerPreTerminal(blocker)
+}
+
+func (s *mediaBufferLiveState) projectBlockerPreTerminal(blocker telemetry.MediaBufferAllocationBlocker) {
 	old := unpackMediaBufferTimed(s.blocker.Load())
 	if old.Value == uint8(blocker) {
 		return
@@ -386,6 +436,10 @@ func (s *mediaBufferLiveState) setQueued(bytes int64) {
 	if s == nil || s.terminal.Load() {
 		return
 	}
+	s.setQueuedPreTerminal(bytes)
+}
+
+func (s *mediaBufferLiveState) setQueuedPreTerminal(bytes int64) {
 	s.queued.Store(bytes)
 	if bytes > 0 {
 		updateMediaBufferPeak(&s.peakQueued, bytes)
@@ -396,6 +450,10 @@ func (s *mediaBufferLiveState) setWriting(bytes int64) {
 	if s == nil || s.terminal.Load() {
 		return
 	}
+	s.setWritingPreTerminal(bytes)
+}
+
+func (s *mediaBufferLiveState) setWritingPreTerminal(bytes int64) {
 	s.writing.Store(bytes)
 	if bytes > 0 {
 		updateMediaBufferPeak(&s.peakWriting, bytes)
@@ -403,10 +461,16 @@ func (s *mediaBufferLiveState) setWriting(bytes int64) {
 }
 
 func (s *mediaBufferLiveState) markTerminal() {
+	if s == nil {
+		return
+	}
+	s.markTerminalAt(s.clock.nowMS())
+}
+
+func (s *mediaBufferLiveState) markTerminalAt(now int64) {
 	if s == nil || !s.terminal.CompareAndSwap(false, true) {
 		return
 	}
-	now := s.clock.nowMS()
 	lifecycle := unpackMediaBufferTimed(s.lifecycle.Load())
 	if lifecycle.Value == uint8(telemetry.MediaBufferLifecycleClosing) {
 		s.finishWait(mediaBufferWaitClose, now-lifecycle.TransitionMS)
