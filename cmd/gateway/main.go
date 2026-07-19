@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/xxxbrian/emby-auth-gateway/internal/gateway"
@@ -210,6 +211,8 @@ func terminateAndReset(app *pocketbase.PocketBase) error {
 
 func newGatewayApp() *pocketbase.PocketBase {
 	app := pocketbase.New()
+	lifecycle := &gatewayServerLifecycle{}
+	bindGatewayLifecycle(app, lifecycle)
 	app.RootCmd.Version = version.Version
 	app.RootCmd.AddCommand(pbsetup.NewCommand(app))
 	versionCommand := newVersionCommand()
@@ -227,7 +230,6 @@ func newGatewayApp() *pocketbase.PocketBase {
 		}
 		return pbmigrations.Apply(e.App)
 	})
-
 	app.OnServe().BindFunc(func(e *core.ServeEvent) error {
 		var mediaBuffer *gateway.MediaBuffer
 		if err := injectMediaBufferStartup(mediaBufferStartupDepsForServe(), func(controller *gateway.MediaBuffer) {
@@ -252,6 +254,7 @@ func newGatewayApp() *pocketbase.PocketBase {
 			MediaBuffer:              mediaBuffer,
 			MediaBufferLive:          registry.MediaBufferLive(),
 		}, pbstore.New(e.App))
+		lifecycle.Replace(gw)
 		registry.SetMediaBufferProvider(gw.MediaBufferControllerSnapshot)
 		// Telemetry consumer is best-effort; never block gateway start.
 		startTelemetryForServe(registry)
@@ -278,7 +281,7 @@ func newGatewayApp() *pocketbase.PocketBase {
 			return err
 		}
 
-		startGatewayBackgroundForServe(e, gw)
+		startGatewayBackgroundForServe(e, lifecycle)
 
 		if err := e.App.Cron().Add("gatewayPlaybackEventCleanup", "@hourly", func() {
 			if err := cleanupPlaybackEvents(e.App, time.Now().UTC()); err != nil {
@@ -287,9 +290,11 @@ func newGatewayApp() *pocketbase.PocketBase {
 			if err := cleanupGatewaySessions(e.App, time.Now().UTC()); err != nil {
 				e.App.Logger().Warn("Failed to cleanup gateway sessions", "error", err)
 			}
-			if err := gw.RefreshUpstreamServerInfo(context.Background()); err != nil {
-				e.App.Logger().Warn("Failed to refresh backend server info", "error", err)
-			}
+			lifecycle.UseCurrent(func(current gatewayLifecycleServer) {
+				if err := current.RefreshUpstreamServerInfo(context.Background()); err != nil {
+					e.App.Logger().Warn("Failed to refresh backend server info", "error", err)
+				}
+			})
 		}); err != nil {
 			return err
 		}
@@ -314,15 +319,81 @@ func newGatewayApp() *pocketbase.PocketBase {
 	return app
 }
 
-func startGatewayBackground(e *core.ServeEvent, gw *gateway.Server) {
+func startGatewayBackground(e *core.ServeEvent, lifecycle *gatewayServerLifecycle) {
 	go func() {
-		if err := gw.ValidateAnonymousImageNamespace(context.Background()); err != nil {
-			e.App.Logger().Warn("Anonymous image namespace unavailable", "error", err)
-		}
-		if err := gw.RefreshUpstreamServerInfo(context.Background()); err != nil {
-			e.App.Logger().Warn("Failed to refresh backend server info", "error", err)
-		}
+		lifecycle.UseCurrent(func(current gatewayLifecycleServer) {
+			if err := current.ValidateAnonymousImageNamespace(context.Background()); err != nil {
+				e.App.Logger().Warn("Anonymous image namespace unavailable", "error", err)
+			}
+			if err := current.RefreshUpstreamServerInfo(context.Background()); err != nil {
+				e.App.Logger().Warn("Failed to refresh backend server info", "error", err)
+			}
+		})
 	}()
+}
+
+func bindGatewayLifecycle(app *pocketbase.PocketBase, lifecycle *gatewayServerLifecycle) {
+	app.OnTerminate().BindFunc(func(e *core.TerminateEvent) error {
+		lifecycle.CloseCurrent()
+		return e.Next()
+	})
+}
+
+type gatewayLifecycleServer interface {
+	Close()
+	ValidateAnonymousImageNamespace(context.Context) error
+	RefreshUpstreamServerInfo(context.Context) error
+}
+
+type gatewayServerLifecycle struct {
+	mu      sync.Mutex
+	current gatewayLifecycleServer
+}
+
+func (l *gatewayServerLifecycle) Replace(next gatewayLifecycleServer) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	previous := l.current
+	l.current = next
+	l.mu.Unlock()
+	if previous != nil && previous != next {
+		previous.Close()
+	}
+}
+
+func (l *gatewayServerLifecycle) CloseCurrent() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	current := l.current
+	l.current = nil
+	l.mu.Unlock()
+	if current != nil {
+		current.Close()
+	}
+}
+
+func (l *gatewayServerLifecycle) Current() gatewayLifecycleServer {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.current
+}
+
+func (l *gatewayServerLifecycle) UseCurrent(fn func(gatewayLifecycleServer)) {
+	if l == nil || fn == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.current != nil {
+		fn(l.current)
+	}
 }
 
 func cleanupPlaybackEvents(app core.App, now time.Time) error {

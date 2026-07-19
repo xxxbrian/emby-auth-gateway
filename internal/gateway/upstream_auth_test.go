@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -12,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/xxxbrian/emby-auth-gateway/internal/observe"
 )
 
 func TestUpstreamAuthenticatorEnsureManagedSkipsHTTPAndCAS(t *testing.T) {
@@ -283,7 +286,7 @@ func TestUpstreamAuthenticatorRedirectDoesNotLeakLocation(t *testing.T) {
 	store.runtime.Endpoint.BaseURL = server.URL
 	auth := configuredAuth(store, server.Client())
 	_, err := auth.Ensure(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "302") {
+	if !errors.Is(err, ErrUpstreamRedirectRejected) {
 		t.Fatalf("redirect error = %v", err)
 	}
 	for _, secret := range []string{"sentinel-user", "sentinel-password", "sentinel-token", "/next"} {
@@ -291,6 +294,180 @@ func TestUpstreamAuthenticatorRedirectDoesNotLeakLocation(t *testing.T) {
 			t.Fatalf("redirect error leaked %q: %v", secret, err)
 		}
 	}
+}
+
+func TestManagedAuthUpstreamExactOperationsAndTelemetry(t *testing.T) {
+	runtime := preContractRuntime()
+	runtime.Source.AuthGenerationID = "old-generation"
+	runtime.Source.BackendUserID = "backend-user"
+	runtime.Source.BackendToken = "sentinel-token"
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		switch r.URL.Path {
+		case "/Users/AuthenticateByName":
+			_, _ = w.Write([]byte(`{"AccessToken":"generated-token","ServerId":"server","User":{"Id":"generated-user"}}`))
+		case "/System/Info":
+			if r.Header.Get("X-Emby-Token") != "sentinel-token" {
+				t.Fatalf("probe token = %q", r.Header.Get("X-Emby-Token"))
+			}
+			_, _ = w.Write([]byte(`{"Id":"server","ServerName":"name","Version":"1.2.3"}`))
+		case "/Sessions/Logout":
+			if r.Header.Get("X-Emby-Token") != "generated-token" {
+				t.Fatalf("logout token = %q", r.Header.Get("X-Emby-Token"))
+			}
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	runtime.Endpoint.BaseURL = server.URL
+	var events []observe.Event
+	auth := newUpstreamAuthenticator(&fakeUpstreamAuthStore{runtime: runtime}, server.Client(), func(event observe.Event) { events = append(events, event) })
+	auth.deviceID = func() (string, error) { return "NEW-DEVICE", nil }
+	auth.generation = func() (string, error) { return "new-generation", nil }
+	auth.clock = func() time.Time { return time.Date(2026, 7, 19, 1, 2, 3, 0, time.UTC) }
+
+	login, err := auth.Login(managedAuthLoginRequest{Context: context.Background(), Runtime: *runtime})
+	if err != nil || login.BackendToken != "generated-token" || login.DeviceID != "NEW-DEVICE" {
+		t.Fatalf("Login = %#v, %v", login, err)
+	}
+	probe, err := auth.Probe(managedAuthProbeRequest{Context: context.Background(), Snapshot: *runtime})
+	if err != nil || probe.ServerID != "server" || probe.ServerName != "name" || probe.ServerVersion != "1.2.3" {
+		t.Fatalf("Probe = %#v, %v", probe, err)
+	}
+	logoutSnapshot := upstreamRequestSnapshot{baseURL: server.URL, userID: login.BackendUserID, token: login.BackendToken, identity: runtime.Source.ClientIdentity}
+	logoutSnapshot.identity.DeviceID = login.DeviceID
+	if err := auth.Logout(managedAuthLogoutRequest{Context: context.Background(), Snapshot: logoutSnapshot}); err != nil {
+		t.Fatalf("Logout: %v", err)
+	}
+
+	wantRequests := []string{"POST /Users/AuthenticateByName", "GET /System/Info", "POST /Sessions/Logout"}
+	if strings.Join(requests, "|") != strings.Join(wantRequests, "|") {
+		t.Fatalf("requests = %#v", requests)
+	}
+	wantPurposes := []string{"managed_auth_login", "managed_auth_probe", "managed_auth_logout"}
+	if len(events) != len(wantPurposes) {
+		t.Fatalf("events = %#v", events)
+	}
+	for i, event := range events {
+		if event.Kind != observe.KindUpstreamRequest || event.RouteClass != observe.RouteAuth || event.Direction != observe.DirectionUpstream || event.Outcome != observe.OutcomeOK || event.ErrorKind != wantPurposes[i] {
+			t.Fatalf("event[%d] = %#v", i, event)
+		}
+		serialized := fmt.Sprintf("%#v", event)
+		for _, secret := range []string{"backend", "password", "sentinel-token", "generated-token", "generated-user"} {
+			if strings.Contains(serialized, secret) {
+				t.Fatalf("telemetry leaked %q: %s", secret, serialized)
+			}
+		}
+	}
+}
+
+func TestManagedAuthUpstreamRejectsRedirectsForEveryOperation(t *testing.T) {
+	redirected := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/redirected" {
+			redirected = true
+			return
+		}
+		http.Redirect(w, r, "/redirected?token=sentinel", http.StatusFound)
+	}))
+	defer server.Close()
+	runtime := managedRuntime("token")
+	runtime.Endpoint.BaseURL = server.URL
+	auth := configuredAuth(&fakeUpstreamAuthStore{runtime: runtime}, server.Client())
+
+	operations := []struct {
+		name string
+		run  func() error
+	}{
+		{"login", func() error {
+			_, err := auth.Login(managedAuthLoginRequest{Context: context.Background(), Runtime: *runtime})
+			return err
+		}},
+		{"probe", func() error {
+			_, err := auth.Probe(managedAuthProbeRequest{Context: context.Background(), Snapshot: *runtime})
+			return err
+		}},
+		{"logout", func() error {
+			return auth.Logout(managedAuthLogoutRequest{Context: context.Background(), Snapshot: upstreamRequestSnapshot{baseURL: server.URL, token: "generated", identity: runtime.Source.ClientIdentity}})
+		}},
+	}
+	for _, operation := range operations {
+		t.Run(operation.name, func(t *testing.T) {
+			if err := operation.run(); !errors.Is(err, ErrUpstreamRedirectRejected) {
+				t.Fatalf("redirect error = %v", err)
+			}
+		})
+	}
+	if redirected {
+		t.Fatal("managed authentication followed a redirect")
+	}
+}
+
+func TestManagedAuthProbeBoundsBodyAndHonorsCancellation(t *testing.T) {
+	runtime := managedRuntime("token")
+	runtime.Endpoint.BaseURL = "http://upstream.test"
+	closed := false
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Request: r, Body: &closeTrackingReader{Reader: strings.NewReader(strings.Repeat("x", upstreamAuthBodyLimit+1)), closed: &closed}}, nil
+	})}
+	auth := newUpstreamAuthenticator(&fakeUpstreamAuthStore{runtime: runtime}, client)
+	if _, err := auth.Probe(managedAuthProbeRequest{Context: context.Background(), Snapshot: *runtime}); err == nil || !strings.Contains(err.Error(), "too large") || !closed {
+		t.Fatalf("oversized probe error=%v closed=%v", err, closed)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := auth.Probe(managedAuthProbeRequest{Context: ctx, Snapshot: *runtime}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled probe error = %v", err)
+	}
+}
+
+func TestManagedAuthProbeReportsLiteralUnauthorized(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/System/Info" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	runtime := managedRuntime("failed-token")
+	runtime.Endpoint.BaseURL = server.URL
+	auth := newUpstreamAuthenticator(&fakeUpstreamAuthStore{runtime: runtime}, server.Client())
+	if _, err := auth.Probe(managedAuthProbeRequest{Context: context.Background(), Snapshot: *runtime}); !errors.Is(err, errManagedAuthUnauthorized) {
+		t.Fatalf("probe error = %v", err)
+	}
+}
+
+func TestManagedAuthWrapsSuccessfulResponseBodyOnce(t *testing.T) {
+	body := &adapterCloseCountingBody{Reader: strings.NewReader("ok")}
+	auth := newUpstreamAuthenticator(nil, &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: body, Request: req}, nil
+	})})
+	req, err := http.NewRequest(http.MethodGet, "http://backend.test/System/Info", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := auth.doManagedAuth(req, "probe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	_ = resp.Body.Close()
+	if body.closes != 1 {
+		t.Fatalf("managed auth response closes=%d, want 1", body.closes)
+	}
+}
+
+type closeTrackingReader struct {
+	io.Reader
+	closed *bool
+}
+
+func (r *closeTrackingReader) Close() error {
+	*r.closed = true
+	return nil
 }
 
 func TestUpstreamAuthenticatorFailureTokensAreGuardedlyLoggedOut(t *testing.T) {

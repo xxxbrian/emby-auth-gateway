@@ -77,11 +77,11 @@ func TestSessionDeniedTargetedControlCorpus(t *testing.T) {
 		wantAudit  string
 	}
 	cases := []tc{
-		// Official targeted Session control families (authenticated -> 403).
-		{name: "playing", method: http.MethodPost, path: "/Sessions/session-1/Playing", wantStatus: http.StatusForbidden, wantAudit: "session_access_denied"},
-		{name: "playing_pause", method: http.MethodPost, path: "/Sessions/session-1/Playing/Pause", wantStatus: http.StatusForbidden, wantAudit: "session_access_denied"},
-		{name: "command", method: http.MethodPost, path: "/Sessions/session-1/Command", wantStatus: http.StatusForbidden, wantAudit: "session_access_denied"},
-		{name: "command_name", method: http.MethodPost, path: "/Sessions/session-1/Command/Mute", wantStatus: http.StatusForbidden, wantAudit: "session_access_denied"},
+		// Recognized command families reject malformed public session IDs locally.
+		{name: "playing", method: http.MethodPost, path: "/Sessions/session-1/Playing", wantStatus: http.StatusBadRequest, wantAudit: "session_command_denied"},
+		{name: "playing_pause", method: http.MethodPost, path: "/Sessions/session-1/Playing/Pause", wantStatus: http.StatusBadRequest, wantAudit: "session_command_denied"},
+		{name: "command", method: http.MethodPost, path: "/Sessions/session-1/Command", wantStatus: http.StatusBadRequest, wantAudit: "session_command_denied"},
+		{name: "command_name", method: http.MethodPost, path: "/Sessions/session-1/Command/Mute", wantStatus: http.StatusBadRequest, wantAudit: "session_command_denied"},
 		{name: "system", method: http.MethodPost, path: "/Sessions/session-1/System/Restart", wantStatus: http.StatusForbidden, wantAudit: "session_access_denied"},
 		{name: "message", method: http.MethodPost, path: "/Sessions/session-1/Message", wantStatus: http.StatusForbidden, wantAudit: "session_access_denied"},
 		{name: "viewing", method: http.MethodPost, path: "/Sessions/session-1/Viewing", wantStatus: http.StatusForbidden, wantAudit: "session_access_denied"},
@@ -90,8 +90,8 @@ func TestSessionDeniedTargetedControlCorpus(t *testing.T) {
 		{name: "users_delete_suffix", method: http.MethodPost, path: "/Sessions/session-1/Users/user-2/Delete", wantStatus: http.StatusForbidden, wantAudit: "session_access_denied"},
 		// Ambiguous / no-id control variants and unknown descendants.
 		{name: "playing_pause_no_id", method: http.MethodPost, path: "/Sessions/Playing/Pause", wantStatus: http.StatusForbidden, wantAudit: "session_access_denied"},
-		{name: "mixed_case", method: http.MethodPost, path: "/sessions/SESSION-1/playing/pause", wantStatus: http.StatusForbidden, wantAudit: "session_access_denied"},
-		{name: "trailing_slash", method: http.MethodPost, path: "/Sessions/session-1/Playing/Pause/", wantStatus: http.StatusForbidden, wantAudit: "session_access_denied"},
+		{name: "mixed_case", method: http.MethodPost, path: "/sessions/SESSION-1/playing/pause", wantStatus: http.StatusBadRequest, wantAudit: "session_command_denied"},
+		{name: "trailing_slash", method: http.MethodPost, path: "/Sessions/session-1/Playing/Pause/", wantStatus: http.StatusBadRequest, wantAudit: "session_command_denied"},
 		{name: "unknown_descendant", method: http.MethodGet, path: "/Sessions/session-1/Unknown/Descendant", wantStatus: http.StatusForbidden, wantAudit: "session_access_denied"},
 		// PlayQueue: GET denied 403; POST wrong method 405 Allow GET.
 		{name: "playqueue_get", method: http.MethodGet, path: "/Sessions/PlayQueue", wantStatus: http.StatusForbidden, wantAudit: "session_access_denied"},

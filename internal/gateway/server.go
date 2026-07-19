@@ -11,7 +11,6 @@ import (
 	"mime"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"path"
 	"strconv"
@@ -37,12 +36,27 @@ type Server struct {
 	store                Store
 	sessions             SessionRepository
 	playback             PlaybackRepository // required; obtained from store (no legacy fallback)
-	client               *http.Client
-	proxyClient          *http.Client
+	sessionHub           SessionHub
+	sessionCommands      *SessionCommandService
+	websocketTiming      websocketTransportTiming
+	websocketNewTicker   func(time.Duration) websocketTicker
+	websocketNewTimer    func(time.Duration) websocketTimer
+	websocketOnMessage   websocketMessageHandler
+	websocketSessions    *websocketSubscriptionRegistry
+	metadataUpstream     MetadataUpstream
+	mediaUpstream        MediaUpstream
+	managedAuthUpstream  ManagedAuthUpstream
+	legacyHTTPUpstream   LegacyHTTPUpstream
+	mediaLeases          MediaLeaseRegistry
+	leaseCleanupOnce     sync.Once
+	leaseCleanupStarted  atomic.Bool
+	leaseCleanupStop     chan struct{}
+	leaseCleanupDone     chan struct{}
+	leaseCleanupInterval time.Duration
+	closeOnce            sync.Once
 	emitter              *observe.Emitter
 	meter                TrafficMeter
 	logins               *loginFailureLimiter
-	upstreamAuth         *upstreamAuthenticator
 	playbackGuards       *playbackGuardTracker
 	mediaDeadlineWarning atomic.Bool
 	// mediaGate excludes reconfigure from concurrent media body copies.
@@ -123,6 +137,10 @@ func (s *Server) TryAcquireReconfigure(force bool) (release func(), err error) {
 }
 
 func NewServer(cfg Config, store Store) *Server {
+	return newServerWithSessionHub(cfg, store, NewProcessLocalSessionHub())
+}
+
+func newServerWithSessionHub(cfg Config, store Store, sessionHub SessionHub) *Server {
 	if cfg.GatewayBasePath == "" {
 		cfg.GatewayBasePath = "/emby"
 	}
@@ -145,8 +163,16 @@ func NewServer(cfg Config, store Store) *Server {
 	if client == nil {
 		client = &http.Client{Timeout: backendAuthTimeout}
 	}
-	proxyClient := newProxyClient(cfg.HTTPClient)
-	s := &Server{cfg: cfg, store: store, sessions: store, client: client, proxyClient: proxyClient, emitter: cfg.Emitter, meter: cfg.Meter, upstreamAuth: newUpstreamAuthenticator(store, client), logins: newLoginFailureLimiter(), playbackGuards: newPlaybackGuardTracker(), mediaBuffer: configuredMediaBuffer(cfg.MediaBuffer), mediaBufferLive: cfg.MediaBufferLive, anonymousImageNow: time.Now, anonymousImageSlots: make(chan struct{}, anonymousImageValidationConcurrency)}
+	if sessionHub == nil {
+		sessionHub = NewProcessLocalSessionHub()
+	}
+	s := &Server{cfg: cfg, store: store, sessions: store, sessionHub: sessionHub, sessionCommands: NewSessionCommandService(store, sessionHub), websocketTiming: defaultWebSocketTransportTiming(), websocketNewTicker: newWebSocketTicker, websocketNewTimer: newWebSocketTimer, websocketSessions: newWebSocketSubscriptionRegistry(), emitter: cfg.Emitter, meter: cfg.Meter, logins: newLoginFailureLimiter(), playbackGuards: newPlaybackGuardTracker(), mediaBuffer: configuredMediaBuffer(cfg.MediaBuffer), mediaBufferLive: cfg.MediaBufferLive, anonymousImageNow: time.Now, anonymousImageSlots: make(chan struct{}, anonymousImageValidationConcurrency), mediaLeases: NewMediaLeaseRegistry(nil), leaseCleanupStop: make(chan struct{}), leaseCleanupDone: make(chan struct{}), leaseCleanupInterval: time.Minute}
+	s.managedAuthUpstream = newUpstreamAuthenticator(store, client, func(event observe.Event) { s.emit(event) })
+	s.metadataUpstream = newMetadataUpstream(client, s.refreshAfterUnauthorized, func(event observe.Event) { s.emit(event) })
+	media := newMediaUpstream(client, s.refreshAfterUnauthorized, s.mediaLeases, func(event observe.Event) { s.emit(event) })
+	media.closeStream = media.closeNegotiatedStream
+	s.mediaUpstream = media
+	s.legacyHTTPUpstream = newLegacyHTTPUpstream(client, func(ctx context.Context, entry AuditLog) { s.audit(ctx, entry) }, s.refreshAfterUnauthorized, func(event observe.Event) { s.emit(event) })
 	// Playback reports require PlaybackRepository; MemoryStore implements it.
 	// Missing implementation fails closed at request time (no silent legacy path).
 	if pr, ok := store.(PlaybackRepository); ok {
@@ -203,27 +229,6 @@ func (s *Server) noteSession(session *Session, decision routeclass.Decision) {
 		SessionID:  session.GatewayTokenHash,
 		Device:     session.Device,
 	})
-}
-
-func (s *Server) emitUpstreamAttempt(started time.Time, status int, err error) {
-	ev := observe.Event{
-		Kind:       observe.KindUpstreamRequest,
-		DurationMS: time.Since(started).Milliseconds(),
-		Direction:  observe.DirectionUpstream,
-	}
-	if err != nil {
-		ev.Outcome = observe.OutcomeError
-		ev.StatusClass = observe.Status0
-		s.emit(ev)
-		return
-	}
-	ev.StatusClass = observe.StatusClassOf(status)
-	if status >= 500 || status <= 0 {
-		ev.Outcome = observe.OutcomeError
-	} else {
-		ev.Outcome = observe.OutcomeOK
-	}
-	s.emit(ev)
 }
 
 func mediaModeForRequest(r *http.Request, rel string) string {
@@ -418,6 +423,7 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(ctx, AuditLog{GatewayUserID: user.ID, SyntheticUserID: user.SyntheticUserID, Event: "login_success", Message: "login succeeded", RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusOK})
+	s.publishSessionsForUser(user.ID)
 	s.emit(observe.Event{
 		Kind:       observe.KindAuthLogin,
 		Outcome:    observe.OutcomeOK,
@@ -472,9 +478,14 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, rel string
 		http.Error(w, "session revoke failed", http.StatusInternalServerError)
 		return
 	}
+	s.mediaLeases.RemoveSession(session.GatewayTokenHash)
 	if resourceCookieMatches(r, token) {
 		s.clearResourceCookie(w)
 	}
+	if s.sessionHub != nil {
+		s.sessionHub.CloseByToken(session.GatewayTokenHash)
+	}
+	s.publishSessionsForUser(session.GatewayUserID)
 	s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "logout_success", Message: "logout succeeded", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusOK})
 	w.WriteHeader(http.StatusOK)
 }
@@ -609,6 +620,22 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string,
 			return
 		}
 	}
+	if !decision.MethodAllowed && methodEnforcedBeforeUpstream(decision) {
+		s.writeUpstreamRequestDenied(w, r, rel, session, decision, ErrForbidden)
+		return
+	}
+	if decision.Operation == routeclass.OperationWebSocket {
+		s.handleLocalWebSocket(w, r, rel, session, decision)
+		return
+	}
+	if isUpgradeRequest(r) {
+		s.writeUpgradeRouteNotFound(w, r, rel, session, decision)
+		return
+	}
+	if isSessionCommandOperation(decision.Operation) {
+		s.handleSessionCommandRequest(w, r, rel, session, decision)
+		return
+	}
 	playbackItemID, isPlaybackInfo := playbackInfoItemID(r.Method, rel)
 	guardKey := playbackGuardKey{GatewayTokenHash: session.GatewayTokenHash, ItemID: playbackItemID}
 	guardGeneration := uint64(0)
@@ -625,18 +652,34 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string,
 		return
 	}
 	// Fail closed: LocalSession must be consumed by a local handler, never proxied.
-	if decision.Ownership == routeclass.LocalSession {
+	if decision.Ownership == routeclass.LocalPersonal || decision.Ownership == routeclass.LocalSession {
 		s.writeSessionRouteUnhandled(w, r, rel, session, decision)
 		return
 	}
 	s.noteSession(session, decision)
 	s.touchSessionActivityBestEffort(r.Context(), session, r)
-	runtime, err := s.upstreamAuth.Ensure(r.Context())
+	if decision.Ownership == routeclass.MetadataProxy {
+		if err := validateExternalMetadataSelector(r, session); err != nil {
+			s.writeUpstreamRequestDenied(w, r, rel, session, decision, err)
+			return
+		}
+	}
+	if decision.Ownership == routeclass.MediaProxy {
+		if err := s.preflightMediaLeaseSelectors(r, session, decision.Operation); err != nil {
+			s.writeUpstreamRequestDenied(w, r, rel, session, decision, err)
+			return
+		}
+	}
+	runtime, err := s.managedAuthUpstream.Ensure(r.Context())
 	if err != nil {
 		if r.Context().Err() != nil || errors.Is(err, context.Canceled) {
 			panic(http.ErrAbortHandler)
 		}
 		s.emitAuthUnavailable(session)
+		if isUpstreamRedirectError(err) {
+			s.writeUpstreamRedirectDenied(w, r, rel, session)
+			return
+		}
 		s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "backend_auth_failure", Message: "backend authentication failed", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
 		http.Error(w, "backend authentication failed", http.StatusBadGateway)
 		return
@@ -646,110 +689,63 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string,
 		http.Error(w, "backend authentication failed", http.StatusBadGateway)
 		return
 	}
-	if isUpgradeRequest(r) {
-		upstream = s.prepareBackendUpgrade(r.Context(), r, rel, session, upstream)
+	adapterRequest := r.Clone(r.Context())
+	adapterURL := *r.URL
+	adapterURL.Path = rel
+	adapterURL.RawPath = ""
+	adapterRequest.URL = &adapterURL
+	request := upstreamHTTPRequest{Request: adapterRequest, Session: session, Snapshot: upstream, refreshResult: s.reportUpstreamRefreshResult}
+	var resp *http.Response
+	switch {
+	case decision.Ownership == routeclass.MetadataProxy && decision.Operation == routeclass.OperationMetadataProxy:
+		resp, err = s.metadataUpstream.RoundTripMetadata(metadataUpstreamRequest{upstreamHTTPRequest: request, Ownership: decision.Ownership, SnapshotRef: &upstream})
+	case decision.Ownership == routeclass.MediaProxy && decision.Operation == routeclass.OperationMediaProxy:
+		resp, err = s.mediaUpstream.RoundTripMedia(mediaUpstreamRequest{upstreamHTTPRequest: request, SnapshotRef: &upstream})
+	case decision.Ownership == routeclass.MediaProxy && isNegotiationOperation(decision.Operation):
+		resp, err = s.mediaUpstream.RoundTripNegotiation(negotiationUpstreamRequest{upstreamHTTPRequest: request, SnapshotRef: &upstream})
+	case decision.Ownership == routeclass.LegacyProxy && decision.Operation == routeclass.OperationLegacyProxy:
+		resp, err = s.legacyHTTPUpstream.RoundTripLegacy(legacyUpstreamRequest{upstreamHTTPRequest: request, SnapshotRef: &upstream})
+	default:
+		s.writeUpstreamRequestDenied(w, r, rel, session, decision, ErrForbidden)
+		return
 	}
-	proxyURL, err := s.proxyURL(upstream, session, rel, r.URL.RawQuery, gatewayToken)
+	if err == nil {
+		wrapResponseBodyOnce(resp)
+	}
 	if err != nil {
-		if errors.Is(err, errMalformedQuery) || errors.Is(err, errCredentialConflict) || errors.Is(err, errCredentialStore) {
-			writeCredentialQueryError(w, err)
+		if errors.Is(err, ErrForbidden) || errors.Is(err, ErrNotFound) || errors.Is(err, ErrStoreUnavailable) || errors.Is(err, ErrRequestBodyTooLarge) || errors.Is(err, ErrMediaRequestRejected) || errors.Is(err, ErrNegotiationRequestRejected) {
+			s.writeUpstreamRequestDenied(w, r, rel, session, decision, err)
 			return
 		}
-		s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "proxy_backend_unavailable", Message: "backend url unavailable", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
-		http.Error(w, "bad backend url", http.StatusBadGateway)
-		return
-	}
-	if isUpgradeRequest(r) {
-		s.handleUpgradeProxy(w, r, proxyURL, session, upstream, gatewayToken, rel)
-		return
-	}
-	body, rawBody, replayable, err := s.rewriteRequestBody(r, session, upstream, gatewayToken)
-	if err != nil {
-		http.Error(w, "bad request body", http.StatusBadRequest)
-		return
-	}
-	req, err := http.NewRequestWithContext(withRedirectCredentialTokens(r.Context(), gatewayToken, upstream.token), r.Method, proxyURL.String(), body)
-	if err != nil {
-		http.Error(w, "bad proxy request", http.StatusInternalServerError)
-		return
-	}
-	if body != nil {
-		req.ContentLength = contentLength(body)
-	}
-	copyRequestHeaders(req.Header, r.Header)
-	s.rewriteRequestHeaders(req.Header, upstream)
-	req.Host = proxyURL.Host
-
-	attemptStarted := time.Now()
-	resp, err := s.proxyClient.Do(req)
-	wrapResponseBodyOnce(resp)
-	if err != nil {
-		s.emitUpstreamAttempt(attemptStarted, 0, err)
-		upstreamStatus := closeResponseOnError(resp)
-		s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_backend_unavailable", AuditMessage: "backend unavailable", ClientBody: "backend unavailable", FallbackKind: "upstream_request_error", Duration: time.Since(attemptStarted), UpstreamStatus: upstreamStatus})
-		return
-	}
-	s.emitUpstreamAttempt(attemptStarted, resp.StatusCode, nil)
-	defer resp.Body.Close()
-	if isPlaybackInfo && resp.StatusCode == http.StatusUnauthorized && isConcurrentPlaybackDenial(resp) {
-		s.writeConcurrentPlaybackDenied(w, r, rel, session, guardKey)
-		return
-	}
-	if resp.StatusCode == http.StatusUnauthorized && replayable {
-		if refreshed, confirmed, refreshErr := s.refreshAfterUnauthorized(r.Context(), upstream); confirmed && refreshErr == nil {
-			upstream = refreshed
-			s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh", "backend token refreshed after unauthorized response", http.StatusOK)
-			_ = resp.Body.Close()
-			retryURL, retryErr := s.proxyURL(upstream, session, rel, r.URL.RawQuery, gatewayToken)
-			if retryErr != nil {
-				s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "proxy_backend_unavailable", Message: "backend url unavailable", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
-				http.Error(w, "bad backend url", http.StatusBadGateway)
-				return
-			}
-			var retryBody io.Reader
-			if rawBody != nil {
-				retryBody = s.rewriteRequestBodyData(rawBody, session, upstream, gatewayToken)
-			}
-			retryReq, retryErr := http.NewRequestWithContext(withRedirectCredentialTokens(r.Context(), gatewayToken, upstream.token), r.Method, retryURL.String(), retryBody)
-			if retryErr != nil {
-				http.Error(w, "bad proxy request", http.StatusInternalServerError)
-				return
-			}
-			if retryBody != nil {
-				retryReq.ContentLength = contentLength(retryBody)
-			}
-			copyRequestHeaders(retryReq.Header, r.Header)
-			s.rewriteRequestHeaders(retryReq.Header, upstream)
-			retryReq.Host = retryURL.Host
-			attemptStarted = time.Now()
-			resp, err = s.proxyClient.Do(retryReq)
-			wrapResponseBodyOnce(resp)
-			if err != nil {
-				s.emitUpstreamAttempt(attemptStarted, 0, err)
-				upstreamStatus := closeResponseOnError(resp)
-				s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_backend_unavailable", AuditMessage: "backend unavailable", ClientBody: "backend unavailable", FallbackKind: "upstream_request_error", Duration: time.Since(attemptStarted), UpstreamStatus: upstreamStatus})
-				return
-			}
-			s.emitUpstreamAttempt(attemptStarted, resp.StatusCode, nil)
-			defer resp.Body.Close()
-			if isPlaybackInfo && resp.StatusCode == http.StatusUnauthorized && isConcurrentPlaybackDenial(resp) {
-				s.writeConcurrentPlaybackDenied(w, r, rel, session, guardKey)
-				return
-			}
-		} else {
-			s.auditBackendTokenRefreshFailure(r.Context(), r, rel, session, confirmed, refreshErr, "backend token refresh failed after unauthorized response")
+		if errors.Is(err, ErrBadRequest) || errors.Is(err, errMalformedQuery) {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
 		}
+		if isUpstreamRedirectError(err) {
+			s.writeUpstreamRedirectDenied(w, r, rel, session)
+			return
+		}
+		upstreamStatus := closeResponseOnError(resp)
+		s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_backend_unavailable", AuditMessage: "backend unavailable", ClientBody: "backend unavailable", FallbackKind: "upstream_request_error", UpstreamStatus: upstreamStatus})
+		return
 	}
 	if resp.StatusCode == http.StatusForbidden {
 		if fallback, fallbackErr := s.tryDownloadDirectStreamFallback(r, rel, session, upstream, gatewayToken); fallbackErr == nil {
 			_ = resp.Body.Close()
 			resp = fallback
 			wrapResponseBodyOnce(resp)
-			defer resp.Body.Close()
 		}
+	}
+	defer resp.Body.Close()
+	if isPlaybackInfo && resp.StatusCode == http.StatusUnauthorized && isConcurrentPlaybackDenial(resp) {
+		s.writeConcurrentPlaybackDenied(w, r, rel, session, guardKey)
+		return
 	}
 	if isPlaybackInfo && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
 		s.playbackGuards.clearIfGeneration(guardKey, guardGeneration)
+	}
+	if isNegotiationOperation(decision.Operation) && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		s.startMediaLeaseCleanup()
 	}
 
 	rewriteToken := gatewayToken
@@ -819,6 +815,7 @@ func isConcurrentPlaybackDenial(resp *http.Response) bool {
 		restore()
 		return false
 	}
+	restore()
 	return true
 }
 
@@ -885,40 +882,6 @@ func (s *Server) writeConcurrentPlaybackDenied(w http.ResponseWriter, r *http.Re
 	_, _ = io.WriteString(w, concurrentPlaybackResponse)
 }
 
-func (s *Server) handleUpgradeProxy(w http.ResponseWriter, r *http.Request, proxyURL *url.URL, session *Session, upstream upstreamRequestSnapshot, gatewayToken, rel string) {
-	started := time.Now()
-	inbound := r
-	r = r.WithContext(withRedirectCredentialTokens(r.Context(), gatewayToken, upstream.token))
-	trackedWriter := &upgradeResponseWriter{ResponseWriter: w}
-	proxy := &httputil.ReverseProxy{
-		Transport: &upgradeRetryTransport{base: s.proxyClient.Transport, server: s, original: inbound, session: session, upstream: upstream, gatewayToken: gatewayToken, rel: rel},
-		Director: func(req *http.Request) {
-			req.URL = proxyURL
-			req.Host = proxyURL.Host
-			s.rewriteRequestHeaders(req.Header, upstream)
-		},
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			if trackedWriter.finalResponse.Load() || trackedWriter.hijacked.Load() {
-				return
-			}
-			s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_backend_unavailable", AuditMessage: "backend unavailable", ClientBody: "backend unavailable", FallbackKind: "upstream_request_error", Duration: time.Since(started)})
-		},
-	}
-	proxy.ServeHTTP(trackedWriter, r)
-}
-
-// prepareBackendUpgrade is best-effort: a failed validity probe must not block
-// a usable websocket handshake.
-func (s *Server) prepareBackendUpgrade(ctx context.Context, r *http.Request, rel string, session *Session, upstream upstreamRequestSnapshot) upstreamRequestSnapshot {
-	if refreshed, confirmed, err := s.refreshAfterUnauthorized(ctx, upstream); confirmed && err == nil {
-		s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh", "backend token refreshed before upgrade", http.StatusOK)
-		return refreshed
-	} else {
-		s.auditBackendTokenRefreshFailure(ctx, r, rel, session, confirmed, err, "backend token refresh failed before upgrade")
-	}
-	return upstream
-}
-
 // refreshAfterUnauthorized confirms that a route-specific 401 reflects shared
 // source credentials before rotating them. Probe failures deliberately leave
 // the original response in place, since they do not establish global expiry.
@@ -927,7 +890,7 @@ func (s *Server) refreshAfterUnauthorized(ctx context.Context, upstream upstream
 	if err != nil || !unauthorized {
 		return upstream, false, err
 	}
-	runtime, err := s.upstreamAuth.Refresh(ctx, upstream.token)
+	runtime, err := s.managedAuthUpstream.Refresh(ctx, upstream.token)
 	if err != nil {
 		return upstream, true, err
 	}
@@ -938,27 +901,25 @@ func (s *Server) refreshAfterUnauthorized(ctx context.Context, upstream upstream
 	return refreshed, true, nil
 }
 
-// upstreamSnapshotUnauthorized probes the exact failed source credentials
-// without cookies or redirects. Only a literal 401 confirms global expiry.
+// upstreamSnapshotUnauthorized probes the exact failed source credentials via
+// the managed-auth port. Only a literal 401 confirms global expiry.
 func (s *Server) upstreamSnapshotUnauthorized(ctx context.Context, upstream upstreamRequestSnapshot) (bool, error) {
-	u, err := backendURL(upstream.baseURL, "/System/Info")
-	if err != nil {
-		return false, err
-	}
 	probeCtx, cancel := context.WithTimeout(ctx, upstreamAuthTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, u, nil)
-	if err != nil {
-		return false, err
+	runtime := UpstreamRuntime{
+		Endpoint: UpstreamEndpoint{BaseURL: upstream.baseURL},
+		Source: UpstreamSource{
+			ServerID:       upstream.serverID,
+			BackendUserID:  upstream.userID,
+			BackendToken:   upstream.token,
+			ClientIdentity: upstream.identity,
+		},
 	}
-	s.rewriteRequestHeaders(req.Header, upstream)
-	resp, err := s.upstreamAuth.client.Do(req)
-	wrapResponseBodyOnce(resp)
-	if err != nil {
-		return false, err
+	_, err := s.managedAuthUpstream.Probe(managedAuthProbeRequest{Context: probeCtx, Snapshot: runtime})
+	if errors.Is(err, errManagedAuthUnauthorized) {
+		return true, nil
 	}
-	defer resp.Body.Close()
-	return resp.StatusCode == http.StatusUnauthorized, nil
+	return false, err
 }
 
 // activeSession authenticates the gateway session without emitting telemetry.
@@ -984,6 +945,7 @@ func (s *Server) lookupActiveSession(w http.ResponseWriter, r *http.Request, tok
 			panic(http.ErrAbortHandler)
 		}
 		if errors.Is(err, ErrNotFound) {
+			s.removeTokenLeases(HashToken(token))
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return nil, false
 		}
@@ -997,10 +959,200 @@ func (s *Server) lookupActiveSession(w http.ResponseWriter, r *http.Request, tok
 		return nil, false
 	}
 	if session == nil || !session.Active(time.Now().UTC()) {
+		s.removeTokenLeases(HashToken(token))
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return nil, false
 	}
 	return session, true
+}
+
+func validateExternalMetadataSelector(r *http.Request, session *Session) error {
+	if r == nil || r.URL == nil || session == nil || !relUserMatches(r.URL.Path, session.SyntheticUserID) {
+		return ErrForbidden
+	}
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return ErrBadRequest
+	}
+	_, err = SanitizeMetadataQuery(query, session.SyntheticUserID, "managed-upstream-user")
+	return err
+}
+
+func isNegotiationOperation(operation routeclass.Operation) bool {
+	switch operation {
+	case routeclass.OperationPlaybackInfo,
+		routeclass.OperationLiveStreamOpen,
+		routeclass.OperationLiveStreamMediaInfo,
+		routeclass.OperationLiveStreamClose,
+		routeclass.OperationActiveEncodingsDelete,
+		routeclass.OperationActiveEncodingsDeleteCompat:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) preflightMediaLeaseSelectors(r *http.Request, session *Session, operation routeclass.Operation) error {
+	if r == nil || session == nil {
+		return ErrBadRequest
+	}
+	var body []byte
+	if isNegotiationOperation(operation) {
+		var err error
+		body, err = readBoundedRequestBody(r)
+		if err != nil {
+			return err
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
+	}
+	selectors, _, err := collectNegotiationSelectors(body, r.URL.RawQuery)
+	if err != nil {
+		return err
+	}
+	return validateNegotiationSelectors(s.mediaLeases, session.GatewayTokenHash, selectors, time.Now().UTC())
+}
+
+func (s *Server) writeUpstreamRequestDenied(w http.ResponseWriter, r *http.Request, rel string, session *Session, decision routeclass.Decision, cause error) {
+	status := http.StatusForbidden
+	message := "forbidden"
+	switch {
+	case !decision.MethodAllowed:
+		status = http.StatusMethodNotAllowed
+		message = "method not allowed"
+		if decision.Allow != "" {
+			w.Header().Set("Allow", decision.Allow)
+		}
+	case errors.Is(cause, ErrNotFound):
+		status = http.StatusNotFound
+		message = "not found"
+	case errors.Is(cause, ErrStoreUnavailable):
+		status = http.StatusServiceUnavailable
+		message = "service unavailable"
+	case errors.Is(cause, ErrRequestBodyTooLarge):
+		status = http.StatusRequestEntityTooLarge
+		message = "request body too large"
+	case errors.Is(cause, ErrBadRequest):
+		status = http.StatusBadRequest
+		message = "bad request"
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "upstream_request_denied", Message: "upstream request denied", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: status})
+	s.emitSessionDeniedRequest(session, r.Method, decision, status)
+	http.Error(w, message, status)
+}
+
+func isUpstreamRedirectError(err error) bool {
+	return errors.Is(err, ErrUpstreamRedirectRejected) || errors.Is(err, ErrMediaRedirectLimit) || errors.Is(err, ErrMediaRedirectScheme) || errors.Is(err, ErrMediaRedirectDowngrade)
+}
+
+func (s *Server) writeUpstreamRedirectDenied(w http.ResponseWriter, r *http.Request, rel string, session *Session) {
+	w.Header().Set("Cache-Control", "no-store")
+	s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "upstream_redirect_denied", Message: "upstream redirect denied", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusBadGateway})
+	http.Error(w, "backend unavailable", http.StatusBadGateway)
+}
+
+func (s *Server) removeTokenLeases(tokenHash string) {
+	if s == nil || s.mediaLeases == nil || tokenHash == "" {
+		return
+	}
+	s.mediaLeases.RemoveSession(tokenHash)
+	if s.sessionHub != nil {
+		s.sessionHub.CloseByToken(tokenHash)
+	}
+}
+
+func (s *Server) startMediaLeaseCleanup() {
+	if s == nil || s.mediaLeases == nil || s.sessions == nil {
+		return
+	}
+	s.leaseCleanupOnce.Do(func() {
+		s.leaseCleanupStarted.Store(true)
+		go func() {
+			defer close(s.leaseCleanupDone)
+			interval := s.leaseCleanupInterval
+			if interval <= 0 {
+				interval = time.Minute
+			}
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					s.revalidateMediaLeaseOwners(context.Background(), time.Now().UTC())
+				case <-s.leaseCleanupStop:
+					return
+				}
+			}
+		}()
+	})
+}
+
+func (s *Server) revalidateMediaLeaseOwners(ctx context.Context, now time.Time) {
+	if s == nil || s.mediaLeases == nil || s.sessions == nil {
+		return
+	}
+	s.mediaLeases.Sweep(now)
+	for _, owner := range s.mediaLeases.Owners() {
+		session, err := s.sessions.FindSessionByTokenHash(ctx, owner)
+		if errors.Is(err, ErrNotFound) || err == nil && (session == nil || !session.Active(now)) {
+			s.removeTokenLeases(owner)
+		}
+	}
+}
+
+// Close stops process-local maintenance and closes live local sessions.
+func (s *Server) Close() {
+	if s == nil {
+		return
+	}
+	s.closeOnce.Do(func() {
+		select {
+		case <-s.leaseCleanupStop:
+		default:
+			close(s.leaseCleanupStop)
+		}
+		if s.leaseCleanupStarted.Load() {
+			<-s.leaseCleanupDone
+		}
+		s.CloseWebSockets()
+	})
+}
+
+func methodEnforcedBeforeUpstream(decision routeclass.Decision) bool {
+	switch decision.Operation {
+	case routeclass.OperationMetadataProxy,
+		routeclass.OperationMediaProxy,
+		routeclass.OperationPlaybackInfo,
+		routeclass.OperationLiveStreamOpen,
+		routeclass.OperationLiveStreamMediaInfo,
+		routeclass.OperationLiveStreamClose,
+		routeclass.OperationActiveEncodingsDelete,
+		routeclass.OperationActiveEncodingsDeleteCompat:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) handleLocalWebSocket(w http.ResponseWriter, r *http.Request, rel string, session *Session, decision routeclass.Decision) {
+	s.serveLocalWebSocket(w, r, rel, session, decision)
+}
+
+func (s *Server) writeUpgradeRouteNotFound(w http.ResponseWriter, r *http.Request, rel string, session *Session, decision routeclass.Decision) {
+	w.Header().Set("Cache-Control", "no-store")
+	s.audit(r.Context(), AuditLog{
+		GatewayUserID:   session.GatewayUserID,
+		SyntheticUserID: session.SyntheticUserID,
+		Event:           "upstream_request_denied",
+		Message:         "websocket upgrade is only available on the local websocket route",
+		RemoteIP:        remoteIP(r),
+		Method:          r.Method,
+		Path:            rel,
+		Status:          http.StatusNotFound,
+	})
+	s.emitSessionDeniedRequest(session, r.Method, decision, http.StatusNotFound)
+	http.Error(w, "not found", http.StatusNotFound)
 }
 
 // sessionMethodEnforced reports whether 405/403 Session ownership rules apply.
@@ -1074,7 +1226,7 @@ func (s *Server) emitSessionDeniedRequest(session *Session, method string, decis
 	s.emit(observe.Event{
 		Kind:        observe.KindRequest,
 		Outcome:     observe.OutcomeDenied,
-		StatusClass: observe.Status4xx,
+		StatusClass: observe.StatusClassOf(status),
 		RouteClass:  observe.RouteClassOf(decision),
 		Method:      method,
 		UserID:      session.GatewayUserID,
@@ -1082,7 +1234,6 @@ func (s *Server) emitSessionDeniedRequest(session *Session, method string, decis
 		SessionID:   session.GatewayTokenHash,
 		Device:      session.Device,
 	})
-	_ = status // status class is fixed Status4xx for Session denials
 }
 
 func (s *Server) pathPolicyAllows(w http.ResponseWriter, r *http.Request, rel string) bool {
@@ -1175,7 +1326,21 @@ func (s *Server) audit(ctx context.Context, entry AuditLog) {
 }
 
 func (s *Server) auditBackendTokenRefresh(r *http.Request, rel string, session *Session, event, message string, status int) {
-	s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: event, Message: message, RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: status})
+	ctx := context.Background()
+	entry := AuditLog{Event: event, Message: message, Path: rel, Status: status}
+	if r != nil {
+		ctx = r.Context()
+		entry.RemoteIP = remoteIP(r)
+		entry.Method = r.Method
+		if entry.Path == "" && r.URL != nil {
+			entry.Path = r.URL.Path
+		}
+	}
+	if session != nil {
+		entry.GatewayUserID = session.GatewayUserID
+		entry.SyntheticUserID = session.SyntheticUserID
+	}
+	s.audit(ctx, entry)
 	s.emitBackendAuthRefresh(session, event, status)
 }
 
@@ -1186,6 +1351,17 @@ func (s *Server) auditBackendTokenRefreshFailure(ctx context.Context, r *http.Re
 		return
 	}
 	s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh_failure", message, http.StatusUnauthorized)
+}
+
+func (s *Server) reportUpstreamRefreshResult(result upstreamRefreshResult) {
+	if !result.Confirmed {
+		return
+	}
+	if result.Err == nil {
+		s.auditBackendTokenRefresh(nil, "", nil, "backend_token_refresh", "backend token refreshed after unauthorized response", http.StatusOK)
+		return
+	}
+	s.auditBackendTokenRefreshFailure(context.Background(), nil, "", nil, true, result.Err, "backend token refresh failed after unauthorized response")
 }
 
 func shouldReportBackendAuthRefreshFailure(ctx context.Context, confirmed bool, err error) bool {
@@ -1231,45 +1407,6 @@ func (s *Server) emitAuthUnavailable(session *Session) {
 	})
 }
 
-func (s *Server) proxyURL(upstream upstreamRequestSnapshot, session *Session, rel, rawQuery, gatewayToken string) (*url.URL, error) {
-	backend, err := backendURL(upstream.baseURL, rel)
-	if err != nil {
-		return nil, err
-	}
-	u, err := url.Parse(backend)
-	if err != nil {
-		return nil, err
-	}
-	q, err := parseRawQuery(rawQuery)
-	if err != nil {
-		return nil, errMalformedQuery
-	}
-	rewriteProxyQueryValues(q, gatewayToken, session, upstream)
-	u.RawQuery = q.Encode()
-	u.Path = strings.ReplaceAll(u.Path, session.SyntheticUserID, upstream.userID)
-	return u, nil
-}
-
-func (s *Server) rewriteRequestHeaders(h http.Header, upstream upstreamRequestSnapshot) {
-	stripResourceCookie(h)
-	// Set replaces all values for a key, collapsing duplicate client headers.
-	for _, name := range []string{"X-Emby-Token", "X-MediaBrowser-Token"} {
-		if len(h.Values(name)) > 0 {
-			h.Set(name, upstream.token)
-		}
-	}
-	if len(h.Values("X-Emby-Token")) == 0 {
-		h.Set("X-Emby-Token", upstream.token)
-	}
-	identity := upstream.identity.WithDefaults()
-	h.Set("User-Agent", identity.UserAgent)
-	auth := backendAuthHeader(identity, upstream.userID, upstream.token).String()
-	h.Set("X-Emby-Authorization", auth)
-	if len(h.Values("Authorization")) > 0 {
-		h.Set("Authorization", auth)
-	}
-}
-
 func backendAuthHeader(identity BackendClientIdentity, userID, token string) AuthHeader {
 	identity = identity.WithDefaults()
 	return AuthHeader{
@@ -1282,26 +1419,6 @@ func backendAuthHeader(identity BackendClientIdentity, userID, token string) Aut
 		Token:    token,
 		Fields:   map[string]string{},
 	}
-}
-
-func (s *Server) rewriteRequestBody(r *http.Request, session *Session, upstream upstreamRequestSnapshot, gatewayToken string) (io.Reader, []byte, bool, error) {
-	if r.Body == nil || r.Method == http.MethodGet || r.Method == http.MethodHead {
-		return nil, nil, true, nil
-	}
-	if !isRewriteableContentType(r.Header.Get("Content-Type")) {
-		return r.Body, nil, false, nil
-	}
-	data, err := io.ReadAll(http.MaxBytesReader(nilResponseWriter{}, r.Body, 10<<20))
-	if err != nil {
-		return nil, nil, false, err
-	}
-	return s.rewriteRequestBodyData(data, session, upstream, gatewayToken), data, true, nil
-}
-
-func (s *Server) rewriteRequestBodyData(data []byte, session *Session, upstream upstreamRequestSnapshot, gatewayToken string) io.Reader {
-	text := strings.ReplaceAll(string(data), gatewayToken, upstream.token)
-	text = strings.ReplaceAll(text, session.SyntheticUserID, upstream.userID)
-	return strings.NewReader(text)
 }
 
 func isPlaybackReportRequest(method, rel string) bool {
@@ -1369,66 +1486,18 @@ func (s *Server) handlePlaybackReport(w http.ResponseWriter, r *http.Request, re
 		writeEmptyPlaybackError(w, http.StatusBadRequest, "bad request")
 		return false
 	}
-	now := time.Now().UTC()
-	cmd := playbackReportCommandFromDetails(kind, session.GatewayTokenHash, now, remoteIP(r), details)
-	// Body SessionId is never authoritative; command builder already ignores it.
-	cmd.Policy = s.playbackResumePolicyFromConfig()
-	cmd, err = PreparePlaybackReportCommand(cmd)
-	if err != nil {
-		if errors.Is(err, ErrBadRequest) {
-			writeEmptyPlaybackError(w, http.StatusBadRequest, "bad request")
-			return false
-		}
-		s.auditPlaybackReportFailure(r, rel, session, "playback_report_prepare_failed", "playback report preparation failed")
-		writeEmptyPlaybackError(w, http.StatusInternalServerError, "playback state unavailable")
-		return false
-	}
-	// Guard suppression is a true no-op success: no activity/event/durable/current.
-	if cmd.ItemID != "" {
-		key := playbackGuardKey{GatewayTokenHash: session.GatewayTokenHash, ItemID: cmd.ItemID}
-		if active, auditEligible := s.playbackGuards.suppress(key); active {
-			if auditEligible {
-				s.audit(r.Context(), AuditLog{
-					GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID,
-					Event: "playback_report_suppressed", Message: "playback report suppressed after concurrent playback denial",
-					RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: http.StatusOK,
-				})
-			}
-			writeEmptyPlaybackOK(w)
-			return true
-		}
-	}
-
-	repo, err := s.playbackRepo()
-	if err != nil {
-		s.auditPlaybackReportFailure(r, rel, session, "playback_repository_unavailable", "playback repository unavailable")
-		writeEmptyPlaybackError(w, http.StatusInternalServerError, "playback state unavailable")
-		return false
-	}
-
-	// Best-effort metadata resolution before the repository transaction.
-	// Cancellation aborts without write or response body.
-	if cmd.ItemID != "" && shouldResolvePlaybackMetadata(kind, details) {
-		resolved, metadataConfirmed, resolveErr := s.resolvePlaybackItemSnapshot(r.Context(), r, session, gatewayToken, cmd.ItemID)
-		if resolveErr != nil {
-			if r.Context().Err() != nil || errors.Is(resolveErr, context.Canceled) {
-				panic(http.ErrAbortHandler)
-			}
-			// Soft failure: continue with partial reported data.
-		} else if metadataConfirmed {
-			details.ItemID = cmd.ItemID
-			details.ItemSnapshotID = cmd.ItemSnapshot.ID
-			merged := mergePlaybackDetailsWithSnapshot(details, resolved)
-			candidate := playbackReportCommandFromDetails(kind, session.GatewayTokenHash, now, remoteIP(r), merged)
-			candidate.Policy = s.playbackResumePolicyFromConfig()
-			if prepared, prepareErr := PreparePlaybackReportCommand(candidate); prepareErr == nil && prepared.ItemID == cmd.ItemID {
-				prepared.MetadataConfirmed = true
-				cmd = prepared
-			}
-		}
-	}
-
-	result, err := repo.ApplyPlaybackReport(r.Context(), cmd)
+	_, err = s.applyPlaybackReportCore(r.Context(), playbackReportApplication{
+		Kind:       kind,
+		Session:    session,
+		Details:    details,
+		ReceivedAt: time.Now().UTC(),
+		RemoteIP:   remoteIP(r),
+		Method:     r.Method,
+		Path:       rel,
+		ResolveMetadata: func(ctx context.Context, itemID string) (PlaybackItemSnapshot, bool, error) {
+			return s.resolvePlaybackItemSnapshot(ctx, r, session, gatewayToken, itemID)
+		},
+	})
 	if err != nil {
 		if r.Context().Err() != nil || errors.Is(err, context.Canceled) {
 			panic(http.ErrAbortHandler)
@@ -1441,12 +1510,90 @@ func (s *Server) handlePlaybackReport(w http.ResponseWriter, r *http.Request, re
 			writeEmptyPlaybackError(w, http.StatusUnauthorized, "unauthorized")
 			return false
 		}
-		s.auditPlaybackReportFailure(r, rel, session, "playback_report_apply_failed", "playback report apply failed")
 		writeEmptyPlaybackError(w, http.StatusInternalServerError, "playback state unavailable")
 		return false
 	}
+	writeEmptyPlaybackOK(w)
+	return true
+}
 
-	// Telemetry only after successful commit, only when the report applied.
+type playbackMetadataResolver func(context.Context, string) (PlaybackItemSnapshot, bool, error)
+
+type playbackReportApplication struct {
+	Kind            PlaybackReportKind
+	Session         *Session
+	Details         playbackDetails
+	ReceivedAt      time.Time
+	RemoteIP        string
+	Method          string
+	Path            string
+	ResolveMetadata playbackMetadataResolver
+}
+
+func (s *Server) applyPlaybackReportCore(ctx context.Context, application playbackReportApplication) (PlaybackReportResult, error) {
+	if application.Session == nil {
+		return PlaybackReportResult{}, ErrUnauthorized
+	}
+	session := application.Session
+	cmd := playbackReportCommandFromDetails(application.Kind, session.GatewayTokenHash, application.ReceivedAt, application.RemoteIP, application.Details)
+	cmd.Policy = s.playbackResumePolicyFromConfig()
+	prepared, err := PreparePlaybackReportCommand(cmd)
+	if err != nil {
+		if !errors.Is(err, ErrBadRequest) {
+			s.auditPlaybackApplicationFailure(ctx, application, "playback_report_prepare_failed", "playback report preparation failed")
+		}
+		return PlaybackReportResult{}, err
+	}
+	cmd = prepared
+
+	if cmd.ItemID != "" {
+		key := playbackGuardKey{GatewayTokenHash: session.GatewayTokenHash, ItemID: cmd.ItemID}
+		if active, auditEligible := s.playbackGuards.suppress(key); active {
+			if auditEligible {
+				s.audit(ctx, AuditLog{
+					GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID,
+					Event: "playback_report_suppressed", Message: "playback report suppressed after concurrent playback denial",
+					RemoteIP: application.RemoteIP, Method: application.Method, Path: application.Path, Status: http.StatusOK,
+				})
+			}
+			s.publishSessionsForUser(session.GatewayUserID)
+			return PlaybackReportResult{}, nil
+		}
+	}
+
+	repo, err := s.playbackRepo()
+	if err != nil {
+		s.auditPlaybackApplicationFailure(ctx, application, "playback_repository_unavailable", "playback repository unavailable")
+		return PlaybackReportResult{}, err
+	}
+
+	if cmd.ItemID != "" && application.ResolveMetadata != nil && shouldResolvePlaybackMetadata(application.Kind, application.Details) {
+		resolved, metadataConfirmed, resolveErr := application.ResolveMetadata(ctx, cmd.ItemID)
+		if resolveErr != nil {
+			if ctx.Err() != nil || errors.Is(resolveErr, context.Canceled) {
+				return PlaybackReportResult{}, resolveErr
+			}
+		} else if metadataConfirmed {
+			details := application.Details
+			details.ItemID = cmd.ItemID
+			details.ItemSnapshotID = cmd.ItemSnapshot.ID
+			merged := mergePlaybackDetailsWithSnapshot(details, resolved)
+			candidate := playbackReportCommandFromDetails(application.Kind, session.GatewayTokenHash, application.ReceivedAt, application.RemoteIP, merged)
+			candidate.Policy = s.playbackResumePolicyFromConfig()
+			if prepared, prepareErr := PreparePlaybackReportCommand(candidate); prepareErr == nil && prepared.ItemID == cmd.ItemID {
+				prepared.MetadataConfirmed = true
+				cmd = prepared
+			}
+		}
+	}
+
+	result, err := repo.ApplyPlaybackReport(ctx, cmd)
+	if err != nil {
+		if !errors.Is(err, ErrBadRequest) && !errors.Is(err, ErrUnauthorized) && ctx.Err() == nil {
+			s.auditPlaybackApplicationFailure(ctx, application, "playback_report_apply_failed", "playback report apply failed")
+		}
+		return PlaybackReportResult{}, err
+	}
 	if result.Applied {
 		pos := int64(0)
 		if cmd.PlayState.PositionTicks != nil {
@@ -1458,16 +1605,28 @@ func (s *Server) handlePlaybackReport(w http.ResponseWriter, r *http.Request, re
 			RouteClass:    observe.RoutePlayback,
 			UserID:        result.GatewayUserID,
 			Username:      session.GatewayUsername,
-			SessionID:     result.PublicSessionID, // never token hash
+			SessionID:     result.PublicSessionID,
 			Device:        session.Device,
 			ItemID:        result.ItemID,
 			ItemName:      cmd.ItemSnapshot.Name,
 			PositionTicks: pos,
-			PlaybackEvent: playbackReportEventName(kind),
+			PlaybackEvent: playbackReportEventName(application.Kind),
 		})
 	}
-	writeEmptyPlaybackOK(w)
-	return true
+	s.publishSessionsForUser(session.GatewayUserID)
+	return result, nil
+}
+
+func (s *Server) auditPlaybackApplicationFailure(ctx context.Context, application playbackReportApplication, event, message string) {
+	if application.Session == nil {
+		return
+	}
+	s.audit(ctx, AuditLog{
+		GatewayUserID:   application.Session.GatewayUserID,
+		SyntheticUserID: application.Session.SyntheticUserID,
+		Event:           event, Message: message, RemoteIP: application.RemoteIP,
+		Method: application.Method, Path: application.Path, Status: http.StatusInternalServerError,
+	})
 }
 
 func writeEmptyPlaybackOK(w http.ResponseWriter) {
@@ -1703,6 +1862,27 @@ func playbackDetailsFromRequestChecked(r *http.Request, data []byte) (playbackDe
 		}
 	}
 	return playbackDetailsFromValuesChecked(r.URL.Query())
+}
+
+func playbackDetailsFromJSONBytes(data []byte) (playbackDetails, error) {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 || !json.Valid(data) {
+		return playbackDetails{}, fmt.Errorf("%w: invalid playback JSON", ErrBadRequest)
+	}
+	if err := validateRawPlaybackJSONIdentityKeys(data); err != nil {
+		return playbackDetails{}, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var body any
+	if err := decoder.Decode(&body); err != nil {
+		return playbackDetails{}, fmt.Errorf("%w: invalid playback JSON: %v", ErrBadRequest, err)
+	}
+	details, _, err := playbackDetailsFromJSONChecked(body)
+	if err != nil {
+		return playbackDetails{}, err
+	}
+	return details, nil
 }
 
 // mergePlaybackDetails overlays lower-priority details without collapsing the
@@ -2435,6 +2615,7 @@ func (s *Server) playbackResumePolicyFromConfig() PlaybackResumePolicy {
 }
 
 func (s *Server) writeProxyResponseWithSnapshot(w http.ResponseWriter, r *http.Request, rel string, resp *http.Response, session *Session, upstream upstreamRequestSnapshot, gatewayToken, publicGatewayBase string) {
+	sanitizeHopHeaders(resp.Header)
 	ct := resp.Header.Get("Content-Type")
 	cookieRoute := resourceRouteFromContext(r)
 	if !responseAllowsBody(r.Method, resp.StatusCode) {
@@ -3300,8 +3481,10 @@ func rewriteStringWithSnapshot(s string, session *Session, upstream upstreamRequ
 }
 
 func copyResponseHeadersWithSnapshot(dst, src http.Header, rel string, session *Session, upstream upstreamRequestSnapshot, gatewayToken, publicGatewayBase, gatewayServerID string) {
-	for k, vals := range src {
-		if isHopHeader(k) || strings.EqualFold(k, "Content-Length") {
+	headers := src.Clone()
+	sanitizeHopHeaders(headers)
+	for k, vals := range headers {
+		if strings.EqualFold(k, "Content-Length") {
 			continue
 		}
 		for _, val := range vals {
@@ -3318,30 +3501,16 @@ func copyResponseHeadersWithSnapshot(dst, src http.Header, rel string, session *
 	}
 }
 
-func copyRequestHeaders(dst, src http.Header) {
-	for k, vals := range src {
-		if isHopHeader(k) || strings.EqualFold(k, "Content-Length") || strings.EqualFold(k, "Accept-Encoding") {
-			continue
-		}
-		for _, val := range vals {
-			dst.Add(k, val)
+func sanitizeHopHeaders(header http.Header) {
+	for _, value := range header.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			if token = strings.TrimSpace(token); token != "" {
+				header.Del(token)
+			}
 		}
 	}
-	stripResourceCookie(dst)
-}
-
-func removeHopHeaders(h http.Header) {
-	for _, key := range []string{"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade"} {
-		h.Del(key)
-	}
-}
-
-func isHopHeader(k string) bool {
-	switch strings.ToLower(k) {
-	case "connection", "proxy-connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
-		return true
-	default:
-		return false
+	for _, name := range []string{"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "TE", "Trailer", "Transfer-Encoding", "Upgrade"} {
+		header.Del(name)
 	}
 }
 
@@ -3383,14 +3552,6 @@ func headerHasToken(h http.Header, name, token string) bool {
 		}
 	}
 	return false
-}
-
-func isRewriteableContentType(ct string) bool {
-	if ct == "" {
-		return true
-	}
-	mt, _, _ := mime.ParseMediaType(ct)
-	return mt == "application/json" || strings.HasSuffix(mt, "+json") || strings.HasPrefix(mt, "text/") || mt == "application/x-www-form-urlencoded"
 }
 
 func backendURL(base, rel string) (string, error) {
@@ -3637,16 +3798,6 @@ func remoteIP(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return host
-}
-
-func contentLength(r io.Reader) int64 {
-	if sr, ok := r.(*strings.Reader); ok {
-		return int64(sr.Len())
-	}
-	if br, ok := r.(*bytes.Reader); ok {
-		return int64(br.Len())
-	}
-	return -1
 }
 
 func readLimited(r io.Reader, limit int64) ([]byte, error) {

@@ -69,7 +69,7 @@ func TestClassifyPublicAndLocal(t *testing.T) {
 			name:   "deeper user path is not current user",
 			method: "GET",
 			path:   "/Users/gateway-user/Items",
-			want:   Decision{Ownership: MetadataProxy, Operation: OperationLegacyProxy, MethodAllowed: true},
+			want:   Decision{Ownership: MetadataProxy, Operation: OperationMetadataProxy, MethodAllowed: true, Allow: "GET, HEAD"},
 		},
 		{
 			name:   "branding configuration",
@@ -219,37 +219,37 @@ func TestClassifyDeniedSession(t *testing.T) {
 			name:   "targeted playing",
 			method: "POST",
 			path:   "/Sessions/sid-1/Playing",
-			want:   Decision{Ownership: DeniedSession, Operation: OperationDeniedSession, MethodAllowed: true, Allow: "POST"},
+			want:   Decision{Ownership: LocalSession, Operation: OperationSessionPlay, MethodAllowed: true, Allow: "POST"},
 		},
 		{
 			name:   "targeted playing command",
 			method: "POST",
 			path:   "/Sessions/sid-1/Playing/Unpause",
-			want:   Decision{Ownership: DeniedSession, Operation: OperationDeniedSession, MethodAllowed: true, Allow: "POST"},
+			want:   Decision{Ownership: LocalSession, Operation: OperationSessionPlaystate, MethodAllowed: true, Allow: "POST"},
 		},
 		{
 			name:   "targeted playing wrong method",
 			method: "GET",
 			path:   "/Sessions/sid-1/Playing/Unpause",
-			want:   Decision{Ownership: DeniedSession, Operation: OperationDeniedSession, MethodAllowed: false, Allow: "POST"},
+			want:   Decision{Ownership: LocalSession, Operation: OperationSessionPlaystate, MethodAllowed: false, Allow: "POST"},
 		},
 		{
 			name:   "targeted command",
 			method: "POST",
 			path:   "/Sessions/sid-1/Command",
-			want:   Decision{Ownership: DeniedSession, Operation: OperationDeniedSession, MethodAllowed: true, Allow: "POST"},
+			want:   Decision{Ownership: LocalSession, Operation: OperationSessionGeneralCommand, MethodAllowed: true, Allow: "POST"},
 		},
 		{
 			name:   "targeted command name",
 			method: "POST",
 			path:   "/Sessions/sid-1/Command/MoveUp",
-			want:   Decision{Ownership: DeniedSession, Operation: OperationDeniedSession, MethodAllowed: true, Allow: "POST"},
+			want:   Decision{Ownership: LocalSession, Operation: OperationSessionGeneralCommand, MethodAllowed: true, Allow: "POST"},
 		},
 		{
 			name:   "targeted command wrong method",
 			method: "DELETE",
 			path:   "/Sessions/sid-1/Command/MoveUp",
-			want:   Decision{Ownership: DeniedSession, Operation: OperationDeniedSession, MethodAllowed: false, Allow: "POST"},
+			want:   Decision{Ownership: LocalSession, Operation: OperationSessionGeneralCommand, MethodAllowed: false, Allow: "POST"},
 		},
 		{
 			name:   "targeted system",
@@ -374,7 +374,7 @@ func TestClassifyNormalizationAndNonSession(t *testing.T) {
 			method: "GET",
 			path:   "/System/Info/Public  ",
 			// trailing space breaks exact Public match; remaining /System/Info* is MetadataProxy
-			want: Decision{Ownership: MetadataProxy, Operation: OperationLegacyProxy, MethodAllowed: true},
+			want: Decision{Ownership: MetadataProxy, Operation: OperationMetadataProxy, MethodAllowed: true, Allow: "GET, HEAD"},
 		},
 		{
 			name:   "sessionsx is not sessions",
@@ -461,31 +461,31 @@ func TestClassifyPersonalMetadataMedia(t *testing.T) {
 			name:   "user items list metadata",
 			method: "GET",
 			path:   "/Users/u1/Items",
-			want:   Decision{Ownership: MetadataProxy, Operation: OperationLegacyProxy, MethodAllowed: true},
+			want:   Decision{Ownership: MetadataProxy, Operation: OperationMetadataProxy, MethodAllowed: true, Allow: "GET, HEAD"},
 		},
 		{
 			name:   "playback info metadata",
 			method: "GET",
 			path:   "/Items/abc/PlaybackInfo",
-			want:   Decision{Ownership: MetadataProxy, Operation: OperationLegacyProxy, MethodAllowed: true},
+			want:   Decision{Ownership: MediaProxy, Operation: OperationPlaybackInfo, MethodAllowed: true, Allow: "GET, POST"},
 		},
 		{
 			name:   "video stream media",
 			method: "GET",
 			path:   "/Videos/item1/stream",
-			want:   Decision{Ownership: MediaProxy, Operation: OperationLegacyProxy, MethodAllowed: true},
+			want:   Decision{Ownership: MediaProxy, Operation: OperationMediaProxy, MethodAllowed: true, Allow: "GET, HEAD"},
 		},
 		{
 			name:   "audio stream media",
 			method: "GET",
 			path:   "/Audio/item1/stream.mp3",
-			want:   Decision{Ownership: MediaProxy, Operation: OperationLegacyProxy, MethodAllowed: true},
+			want:   Decision{Ownership: MediaProxy, Operation: OperationMediaProxy, MethodAllowed: true, Allow: "GET, HEAD"},
 		},
 		{
 			name:   "download media",
 			method: "GET",
 			path:   "/Items/x/Download",
-			want:   Decision{Ownership: MediaProxy, Operation: OperationLegacyProxy, MethodAllowed: true},
+			want:   Decision{Ownership: MediaProxy, Operation: OperationMediaProxy, MethodAllowed: true, Allow: "GET, HEAD"},
 		},
 		{
 			name:   "unknown legacy",
@@ -497,6 +497,133 @@ func TestClassifyPersonalMetadataMedia(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			assertDecision(t, Classify(tc.method, tc.path), tc.want)
+		})
+	}
+}
+
+func TestPhase5MethodMatrix(t *testing.T) {
+	methods := []string{"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
+	cases := []struct {
+		name      string
+		path      string
+		ownership Ownership
+		operation Operation
+		allow     string
+		allowed   map[string]bool
+	}{
+		{"metadata", "/Items", MetadataProxy, OperationMetadataProxy, "GET, HEAD", map[string]bool{"GET": true, "HEAD": true}},
+		{"media", "/Videos/item/stream", MediaProxy, OperationMediaProxy, "GET, HEAD", map[string]bool{"GET": true, "HEAD": true}},
+		{"playback info", "/Items/item/PlaybackInfo", MediaProxy, OperationPlaybackInfo, "GET, POST", map[string]bool{"GET": true, "POST": true}},
+		{"live stream open", "/LiveStreams/Open", MediaProxy, OperationLiveStreamOpen, "POST", map[string]bool{"POST": true}},
+		{"live stream media info", "/LiveStreams/MediaInfo", MediaProxy, OperationLiveStreamMediaInfo, "POST", map[string]bool{"POST": true}},
+		{"live stream close", "/LiveStreams/Close", MediaProxy, OperationLiveStreamClose, "POST", map[string]bool{"POST": true}},
+		{"active encodings delete", "/Videos/ActiveEncodings", MediaProxy, OperationActiveEncodingsDelete, "DELETE", map[string]bool{"DELETE": true}},
+		{"active encodings delete compat", "/Videos/ActiveEncodings/Delete", MediaProxy, OperationActiveEncodingsDeleteCompat, "POST", map[string]bool{"POST": true}},
+		{"websocket", "/embywebsocket", LocalSession, OperationWebSocket, "GET", map[string]bool{"GET": true}},
+		{"general command", "/Sessions/public-id/Command", LocalSession, OperationSessionGeneralCommand, "POST", map[string]bool{"POST": true}},
+		{"named general command", "/Sessions/public-id/Command/DisplayContent", LocalSession, OperationSessionGeneralCommand, "POST", map[string]bool{"POST": true}},
+		{"play command", "/Sessions/public-id/Playing", LocalSession, OperationSessionPlay, "POST", map[string]bool{"POST": true}},
+		{"playstate command", "/Sessions/public-id/Playing/Pause", LocalSession, OperationSessionPlaystate, "POST", map[string]bool{"POST": true}},
+	}
+
+	for _, tc := range cases {
+		for _, method := range methods {
+			t.Run(tc.name+"/"+method, func(t *testing.T) {
+				want := Decision{
+					Ownership:     tc.ownership,
+					Operation:     tc.operation,
+					MethodAllowed: tc.allowed[method],
+					Allow:         tc.allow,
+				}
+				assertDecision(t, Classify(method, tc.path), want)
+			})
+		}
+	}
+}
+
+func TestPhase5NegotiationExactAndNearMisses(t *testing.T) {
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		want   Decision
+	}{
+		{"playback info mixed case", "post", "/iTeMs/ITEM/pLaYbAcKiNfO/", Decision{MediaProxy, OperationPlaybackInfo, true, "GET, POST"}},
+		{"playback info missing id", "POST", "/Items/PlaybackInfo", Decision{MetadataProxy, OperationMetadataProxy, false, "GET, HEAD"}},
+		{"playback info descendant", "GET", "/Items/item/PlaybackInfo/Extra", Decision{MetadataProxy, OperationMetadataProxy, true, "GET, HEAD"}},
+		{"playback info descendant post", "POST", "/Items/item/PlaybackInfo/Extra", Decision{MetadataProxy, OperationMetadataProxy, false, "GET, HEAD"}},
+		{"live stream open descendant", "GET", "/LiveStreams/Open/Extra", Decision{MediaProxy, OperationMediaProxy, true, "GET, HEAD"}},
+		{"live stream open lookalike", "POST", "/LiveStreams/Opened", Decision{MediaProxy, OperationMediaProxy, false, "GET, HEAD"}},
+		{"live stream media info descendant", "POST", "/LiveStreams/MediaInfo/Extra", Decision{MediaProxy, OperationMediaProxy, false, "GET, HEAD"}},
+		{"live stream close lookalike", "HEAD", "/LiveStreams/Closed", Decision{MediaProxy, OperationMediaProxy, true, "GET, HEAD"}},
+		{"active encodings descendant", "GET", "/Videos/ActiveEncodings/Extra", Decision{MediaProxy, OperationMediaProxy, true, "GET, HEAD"}},
+		{"active encodings descendant delete", "DELETE", "/Videos/ActiveEncodings/Extra", Decision{MediaProxy, OperationMediaProxy, false, "GET, HEAD"}},
+		{"active encodings delete descendant", "POST", "/Videos/ActiveEncodings/Delete/Extra", Decision{MediaProxy, OperationMediaProxy, false, "GET, HEAD"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assertDecision(t, Classify(tc.method, tc.path), tc.want)
+		})
+	}
+}
+
+func TestPhase5ImageClassification(t *testing.T) {
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		want   Decision
+	}{
+		{"item images root", "GET", "/Items/item/Images", Decision{MediaProxy, OperationMediaProxy, true, "GET, HEAD"}},
+		{"item image", "HEAD", "/Items/item/Images/Primary", Decision{MediaProxy, OperationMediaProxy, true, "GET, HEAD"}},
+		{"item image wrong method", "POST", "/Items/item/Images/Primary/0", Decision{MediaProxy, OperationMediaProxy, false, "GET, HEAD"}},
+		{"user images root", "GET", "/Users/user/Images", Decision{MediaProxy, OperationMediaProxy, true, "GET, HEAD"}},
+		{"user image", "HEAD", "/Users/user/Images/Primary", Decision{MediaProxy, OperationMediaProxy, true, "GET, HEAD"}},
+		{"user image wrong method", "DELETE", "/Users/user/Images/Primary", Decision{MediaProxy, OperationMediaProxy, false, "GET, HEAD"}},
+		{"user image near miss", "GET", "/Users/user/Image/Primary", Decision{MetadataProxy, OperationMetadataProxy, true, "GET, HEAD"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assertDecision(t, Classify(tc.method, tc.path), tc.want)
+		})
+	}
+}
+
+func TestPhase5WebSocketAndCommandBoundaries(t *testing.T) {
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		want   Decision
+	}{
+		{"websocket case and trailing slash", "GET", "/EmbyWebSocket/", Decision{LocalSession, OperationWebSocket, true, "GET"}},
+		{"websocket descendant", "GET", "/embywebsocket/extra", Decision{LegacyProxy, OperationLegacyProxy, true, ""}},
+		{"websocket lookalike", "GET", "/embywebsockets", Decision{LegacyProxy, OperationLegacyProxy, true, ""}},
+		{"command extra descendant denied", "POST", "/Sessions/public-id/Command/Name/Extra", Decision{DeniedSession, OperationDeniedSession, true, ""}},
+		{"playing extra descendant denied", "POST", "/Sessions/public-id/Playing/Pause/Extra", Decision{DeniedSession, OperationDeniedSession, true, ""}},
+		{"system remains denied", "POST", "/Sessions/public-id/System/DisplayContent", Decision{DeniedSession, OperationDeniedSession, true, "POST"}},
+		{"queue remains denied", "GET", "/Sessions/public-id/PlayQueue", Decision{DeniedSession, OperationDeniedSession, true, ""}},
+		{"viewing remains denied", "POST", "/Sessions/public-id/Viewing", Decision{DeniedSession, OperationDeniedSession, true, "POST"}},
+		{"unknown descendant remains denied", "PATCH", "/Sessions/public-id/Unknown/Thing", Decision{DeniedSession, OperationDeniedSession, true, ""}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assertDecision(t, Classify(tc.method, tc.path), tc.want)
+		})
+	}
+}
+
+func TestPhase5UnknownNonSessionRemainsLegacy(t *testing.T) {
+	for _, method := range []string{"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"} {
+		t.Run(method, func(t *testing.T) {
+			assertDecision(t, Classify(method, "/Unknown/Path"), Decision{
+				Ownership:     LegacyProxy,
+				Operation:     OperationLegacyProxy,
+				MethodAllowed: true,
+			})
 		})
 	}
 }

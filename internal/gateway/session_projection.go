@@ -1,14 +1,16 @@
 package gateway
 
-import (
-	"time"
-)
+import "time"
 
 // sessionInfoDTO projects a gateway Session into Emby SessionInfo JSON.
 // current is nil for idle sessions (login and sessions without now-playing).
 // userData is gateway-local UserData for the authenticated user/item; nil when idle.
 // NowPlayingItem is omitted while idle (Phase 3 shape).
 func sessionInfoDTO(session *Session, serverID string, current *CurrentPlayback, userData map[string]any) map[string]any {
+	return sessionInfoDTOWithRemoteControl(session, serverID, current, userData, false)
+}
+
+func sessionInfoDTOWithRemoteControl(session *Session, serverID string, current *CurrentPlayback, userData map[string]any, supportsRemoteControl bool) map[string]any {
 	if session == nil {
 		return map[string]any{}
 	}
@@ -39,7 +41,7 @@ func sessionInfoDTO(session *Session, serverID string, current *CurrentPlayback,
 		"SupportedCommands":     commands,
 		"PlayableMediaTypes":    media,
 		"AdditionalUsers":       []any{},
-		"SupportsRemoteControl": false,
+		"SupportsRemoteControl": supportsRemoteControl,
 		"LastActivityDate":      activity.UTC().Format(time.RFC3339Nano),
 		"PlayState":             idlePlayStateDTO(),
 	}
@@ -49,6 +51,20 @@ func sessionInfoDTO(session *Session, serverID string, current *CurrentPlayback,
 	out["PlayState"] = activePlayStateDTO(current.PlayState, current.MediaSourceID)
 	out["NowPlayingItem"] = nowPlayingItemDTO(current.ItemSnapshot, current.ItemID, userData)
 	return out
+}
+
+func sessionSupportsRemoteControl(session *Session, live func(SessionConnectionIdentity) bool) bool {
+	if session == nil || live == nil || session.GatewayTokenHash == "" || session.GatewayUserID == "" || session.PublicID == "" {
+		return false
+	}
+	if !live(SessionConnectionIdentity{
+		TokenHash:     session.GatewayTokenHash,
+		PublicID:      session.PublicID,
+		GatewayUserID: session.GatewayUserID,
+	}) {
+		return false
+	}
+	return sessionCapabilitiesSupportRemoteControl(session.Capabilities)
 }
 
 func idlePlayStateDTO() map[string]any {

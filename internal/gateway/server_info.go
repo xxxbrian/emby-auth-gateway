@@ -29,27 +29,19 @@ func (s *Server) probeUpstreamPublic(ctx context.Context, runtime *UpstreamRunti
 	if err := ValidateUpstreamRuntime(*runtime); err != nil {
 		return publicInfoMetadata{}, errors.New("public upstream probe unavailable")
 	}
-	u, err := backendURL(runtime.Endpoint.BaseURL, "/System/Info/Public")
-	if err != nil {
-		return publicInfoMetadata{}, errors.New("public upstream probe unavailable")
-	}
 	probeCtx, cancel := context.WithTimeout(ctx, publicInfoProbeTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, u, nil)
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, "/System/Info/Public", nil)
 	if err != nil {
 		return publicInfoMetadata{}, errors.New("public upstream probe unavailable")
 	}
-	identity := runtime.Source.ClientIdentity
-	req.Header.Set("User-Agent", identity.UserAgent)
-	req.Header.Set("X-Emby-Authorization", backendAuthHeader(identity, "", "").String())
-	client := *s.client
-	client.Jar = nil
-	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	resp, err := client.Do(req)
+	snapshot := upstreamRequestSnapshot{baseURL: runtime.Endpoint.BaseURL, serverID: runtime.Source.ServerID, identity: runtime.Source.ClientIdentity}
+	resp, err := s.metadataUpstream.RoundTripMetadata(metadataUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: req, Snapshot: snapshot}, Internal: true, Public: true})
 	if err != nil {
 		return publicInfoMetadata{}, errors.New("public upstream probe unavailable")
 	}
-	defer resp.Body.Close()
+	owner := wrapResponseBodyOnce(resp)
+	defer owner.Close()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return publicInfoMetadata{}, errors.New("public upstream probe unavailable")
 	}

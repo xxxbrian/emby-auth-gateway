@@ -545,7 +545,9 @@ func TestRegisteredOnServeMediaBufferOrdering(t *testing.T) {
 	})
 
 	var stages []string
+	var constructedGateway *gateway.Server
 	installServeOrderingSeams := func(fake *mediaBufferStartupFake, wantProvider bool) {
+		constructedGateway = nil
 		mediaBufferStartupDepsForServe = func() mediaBufferStartupDeps { return fake.deps() }
 		startTelemetryForServe = func(registry *telemetry.Registry) {
 			stages = append(stages, "telemetry-start")
@@ -559,7 +561,8 @@ func TestRegisteredOnServeMediaBufferOrdering(t *testing.T) {
 			if (cfg.MediaBuffer != nil) != wantProvider || cfg.MediaBufferLive == nil {
 				t.Fatalf("gateway media buffer enabled=%v live=%v want provider=%v", cfg.MediaBuffer != nil, cfg.MediaBufferLive != nil, wantProvider)
 			}
-			return gateway.NewServer(cfg, gateway.NewMemoryStore())
+			constructedGateway = gateway.NewServer(cfg, gateway.NewMemoryStore())
+			return constructedGateway
 		}
 		mountGatewayRoutesForServe = func(*router.Router[*core.RequestEvent], http.Handler, http.Handler, bool) {
 			stages = append(stages, "gateway-routes")
@@ -574,7 +577,16 @@ func TestRegisteredOnServeMediaBufferOrdering(t *testing.T) {
 			}
 			return nil
 		}
-		startGatewayBackgroundForServe = func(*core.ServeEvent, *gateway.Server) {}
+		startGatewayBackgroundForServe = func(_ *core.ServeEvent, lifecycle *gatewayServerLifecycle) {
+			stages = append(stages, "gateway-background")
+			var current gatewayLifecycleServer
+			if lifecycle != nil {
+				current = lifecycle.Current()
+			}
+			if current != constructedGateway {
+				t.Fatalf("background lifecycle current=%v want constructed gateway=%v", current, constructedGateway)
+			}
+		}
 	}
 
 	invalid := newMediaBufferStartupFake(map[string]string{mediaBufferEnabledEnv: "invalid"})
@@ -605,7 +617,7 @@ func TestRegisteredOnServeMediaBufferOrdering(t *testing.T) {
 		stages = append(stages, "next")
 		return nil
 	})
-	wantStages := []string{"gateway-construction", "telemetry-start", "gateway-routes", "admin-routes", "next"}
+	wantStages := []string{"gateway-construction", "telemetry-start", "gateway-routes", "admin-routes", "gateway-background", "next"}
 	if err != nil || !reflect.DeepEqual(stages, wantStages) {
 		t.Fatalf("valid startup error=%v stages=%v want=%v", err, stages, wantStages)
 	}

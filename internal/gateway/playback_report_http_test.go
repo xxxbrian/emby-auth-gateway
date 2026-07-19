@@ -952,8 +952,6 @@ func TestPlaybackReportCancellationAbortsWithoutWrite(t *testing.T) {
 	store := testStore(backend.URL + "/emby")
 	store.Sessions[HashToken("gateway-token")] = testSession()
 	server := NewServer(Config{GatewayBasePath: "/emby", HTTPClient: backend.Client()}, store)
-	// Use backend client for proxy as well.
-	server.proxyClient = backend.Client()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	req := mustRequest(t, http.MethodPost, "http://gateway/emby/Sessions/Playing?api_key=gateway-token", strings.NewReader(`{"ItemId":"cancel-1","PositionTicks":1}`))

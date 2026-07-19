@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -164,74 +163,6 @@ func TestRefreshedProxyRetryFailureUsesStructuredHandler(t *testing.T) {
 				t.Fatal("retry failure audit fields were incorrect")
 			}
 		})
-	}
-}
-
-func TestUpgradeProxyFailureUsesStructuredHandler(t *testing.T) {
-	target, err := url.Parse("http://backend.test/emby")
-	if err != nil {
-		t.Fatal("failed to parse upgrade target")
-	}
-	for _, tt := range []struct {
-		name       string
-		err        error
-		wantStatus int
-		wantKind   string
-		canceled   bool
-	}{
-		{name: "timeout", err: timeoutMediaError{}, wantStatus: http.StatusGatewayTimeout, wantKind: "upstream_timeout"},
-		{name: "generic", err: errors.New("https://backend.test/socket?api_key=backend-token"), wantStatus: http.StatusBadGateway, wantKind: "upstream_request_error"},
-		{name: "canceled", err: timeoutMediaError{}, canceled: true},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			store := NewMemoryStore()
-			server := NewServer(Config{HTTPClient: &http.Client{Transport: proxyFailureRoundTripper{err: tt.err}}}, store)
-			ctx := context.Background()
-			if tt.canceled {
-				ctx = canceledContext()
-			}
-			req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/socket", nil).WithContext(ctx)
-			writer := httptest.NewRecorder()
-			if tt.canceled {
-				requireAbortHandler(t, func() {
-					server.handleUpgradeProxy(writer, req, target, &Session{}, upstreamRequestSnapshot{}, "", "/socket")
-				})
-				if len(store.AuditLogs) != 0 || len(writer.Header()) != 0 || writer.Body.Len() != 0 {
-					t.Fatal("canceled upgrade produced an audit, headers, or body")
-				}
-				return
-			}
-			server.handleUpgradeProxy(writer, req, target, &Session{}, upstreamRequestSnapshot{}, "", "/socket")
-			if writer.Code != tt.wantStatus || len(store.AuditLogs) != 1 {
-				t.Fatal("upgrade failure response or audit was incorrect")
-			}
-			entry := store.AuditLogs[0]
-			if entry.Event != "proxy_backend_unavailable" || entry.ErrorKind != tt.wantKind || entry.Direction != mediaDirectionUpstream || entry.ResponseCommitted || entry.Status != tt.wantStatus {
-				t.Fatal("upgrade failure audit fields were incorrect")
-			}
-			if strings.Contains(entry.Message, "backend-token") || strings.Contains(writer.Body.String(), "backend-token") {
-				t.Fatal("upgrade failure exposed backend details")
-			}
-		})
-	}
-}
-
-func TestUpgradeProxySuppressesFailureAfterSuccessfulHijack(t *testing.T) {
-	store := NewMemoryStore()
-	server := NewServer(Config{HTTPClient: &http.Client{Transport: upgrade101RoundTripper{}}}, store)
-	target, err := url.Parse("http://backend.test/emby")
-	if err != nil {
-		t.Fatal("failed to parse upgrade target")
-	}
-	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/socket", nil)
-	req.Header.Set("Connection", "Upgrade")
-	req.Header.Set("Upgrade", "websocket")
-	writer := &hijackFailureWriter{header: http.Header{}}
-	wrappedWriter := &unwrapOnlyResponseWriter{ResponseWriter: writer}
-
-	server.handleUpgradeProxy(wrappedWriter, req, target, &Session{}, upstreamRequestSnapshot{}, "", "/socket")
-	if len(store.AuditLogs) != 0 || writer.writeHeaders != 0 || writer.writes != 0 || !writer.hijacked {
-		t.Fatal("post-hijack upgrade failure produced an audit or fallback response")
 	}
 }
 

@@ -272,6 +272,35 @@ func TestTerminateAndResetRunsHook(t *testing.T) {
 	}
 }
 
+type lifecycleCloseSpy struct{ closes int }
+
+func (s *lifecycleCloseSpy) Close()                                                { s.closes++ }
+func (s *lifecycleCloseSpy) ValidateAnonymousImageNamespace(context.Context) error { return nil }
+func (s *lifecycleCloseSpy) RefreshUpstreamServerInfo(context.Context) error       { return nil }
+
+func TestGatewayServerLifecycleReplacesAndTerminatesExactlyOnce(t *testing.T) {
+	app := pocketbase.New()
+	lifecycle := &gatewayServerLifecycle{}
+	bindGatewayLifecycle(app, lifecycle)
+	first := &lifecycleCloseSpy{}
+	second := &lifecycleCloseSpy{}
+	lifecycle.Replace(first)
+	lifecycle.Replace(second)
+	if first.closes != 1 || second.closes != 0 {
+		t.Fatalf("replace closes=%d/%d", first.closes, second.closes)
+	}
+	event := &core.TerminateEvent{App: app}
+	if err := app.OnTerminate().Trigger(event, func(*core.TerminateEvent) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.OnTerminate().Trigger(event, func(*core.TerminateEvent) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if first.closes != 1 || second.closes != 1 {
+		t.Fatalf("terminate closes=%d/%d", first.closes, second.closes)
+	}
+}
+
 func TestTerminationFailureResetsAndFailsRun(t *testing.T) {
 	original := newCLIAppForRun
 	defer func() { newCLIAppForRun = original }()

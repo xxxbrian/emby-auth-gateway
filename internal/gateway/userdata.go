@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/xxxbrian/emby-auth-gateway/internal/routeclass"
 )
 
 type personalDataHandlingOutcome struct {
@@ -31,6 +33,7 @@ func (s *Server) handlePersonalDataRequest(w http.ResponseWriter, r *http.Reques
 		return handledPersonalData
 	}
 	if s.handlePersonalStateWrite(w, r, rel, session, gatewayToken) {
+		s.publishSessionsForUser(session.GatewayUserID)
 		return handledPersonalData
 	}
 	if r.Method != http.MethodGet {
@@ -68,9 +71,11 @@ func (s *Server) handleLocalSessionStateRequest(w http.ResponseWriter, r *http.R
 	case isSessionCapabilitiesRequest(r.Method, rel):
 		if equalPath(rel, "/Sessions/Capabilities/Full") {
 			s.handleSessionCapabilitiesFull(w, r, session)
+			s.publishSessionsForUser(session.GatewayUserID)
 			return personalDataHandlingOutcome{Handled: true, NoteSuccess: true}
 		}
 		s.handleSessionCapabilitiesSlim(w, r, session)
+		s.publishSessionsForUser(session.GatewayUserID)
 		return personalDataHandlingOutcome{Handled: true, NoteSuccess: true}
 	default:
 		return personalDataHandlingOutcome{}
@@ -306,20 +311,35 @@ func (s *Server) writeLatestItems(w http.ResponseWriter, r *http.Request, rel st
 // one batched ListCurrentPlaybacks and optional batched local UserData load.
 // Returns a raw SessionInfo array with no-store.
 func (s *Server) writeLocalSessions(w http.ResponseWriter, r *http.Request, session *Session) {
-	now := time.Now().UTC()
-	sessions, err := s.sessions.ListActiveSessions(r.Context(), session.GatewayUserID, now)
+	items, err := s.projectLocalSessions(r.Context(), session, r.URL.Query())
 	if err != nil {
 		s.audit(r.Context(), AuditLog{
 			GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID,
-			Event: "session_list_failed", Message: "session list failed",
+			Event: "session_projection_failed", Message: "session projection failed",
 			RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusInternalServerError,
-			ErrorKind: "session_list",
+			ErrorKind: "session_projection",
 		})
 		w.Header().Set("Cache-Control", "no-store")
 		http.Error(w, "sessions unavailable", http.StatusInternalServerError)
 		return
 	}
-	filtered := filterLocalSessions(sessions, session, r.URL.Query())
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, items)
+}
+
+// projectLocalSessions is the transport-neutral local SessionInfo projector.
+// It performs one active-session list, one current-playback batch, and one
+// gateway-local UserData batch for the viewer's gateway user.
+func (s *Server) projectLocalSessions(ctx context.Context, viewer *Session, filters url.Values) ([]any, error) {
+	if viewer == nil {
+		return nil, ErrUnauthorized
+	}
+	now := time.Now().UTC()
+	sessions, err := s.sessions.ListActiveSessions(ctx, viewer.GatewayUserID, now)
+	if err != nil {
+		return nil, fmt.Errorf("list active sessions: %w", err)
+	}
+	filtered := filterLocalSessions(sessions, viewer, filters)
 
 	// Collect token hashes after filter; one batch current-playback load (no N+1).
 	hashes := make([]string, 0, len(filtered))
@@ -333,27 +353,11 @@ func (s *Server) writeLocalSessions(w http.ResponseWriter, r *http.Request, sess
 	if len(hashes) > 0 {
 		repo, repoErr := s.playbackRepo()
 		if repoErr != nil {
-			s.audit(r.Context(), AuditLog{
-				GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID,
-				Event: "session_current_playback_list_failed", Message: "current playback list unavailable",
-				RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusInternalServerError,
-				ErrorKind: "current_playback_list",
-			})
-			w.Header().Set("Cache-Control", "no-store")
-			http.Error(w, "sessions unavailable", http.StatusInternalServerError)
-			return
+			return nil, repoErr
 		}
-		listed, listErr := repo.ListCurrentPlaybacks(r.Context(), hashes)
+		listed, listErr := repo.ListCurrentPlaybacks(ctx, hashes)
 		if listErr != nil {
-			s.audit(r.Context(), AuditLog{
-				GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID,
-				Event: "session_current_playback_list_failed", Message: "current playback list failed",
-				RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusInternalServerError,
-				ErrorKind: "current_playback_list",
-			})
-			w.Header().Set("Cache-Control", "no-store")
-			http.Error(w, "sessions unavailable", http.StatusInternalServerError)
-			return
+			return nil, fmt.Errorf("list current playbacks: %w", listErr)
 		}
 		if listed != nil {
 			currents = listed
@@ -371,15 +375,7 @@ func (s *Server) writeLocalSessions(w http.ResponseWriter, r *http.Request, sess
 			continue
 		}
 		if err := ValidateCurrentPlayback(&cp, hash); err != nil {
-			s.audit(r.Context(), AuditLog{
-				GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID,
-				Event: "session_current_playback_corrupt", Message: "current playback integrity failure",
-				RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusInternalServerError,
-				ErrorKind: "current_playback_integrity",
-			})
-			w.Header().Set("Cache-Control", "no-store")
-			http.Error(w, "sessions unavailable", http.StatusInternalServerError)
-			return
+			return nil, fmt.Errorf("validate current playback: %w", err)
 		}
 		validated[hash] = cp
 		if _, seen := seenItems[cp.ItemID]; !seen && cp.ItemID != "" {
@@ -391,17 +387,9 @@ func (s *Server) writeLocalSessions(w http.ResponseWriter, r *http.Request, sess
 	// Batch gateway-local UserData for the authenticated gateway user only.
 	states := map[string]*PlaybackState{}
 	if len(itemIDs) > 0 {
-		loaded, loadErr := s.store.ListPlaybackStatesByItemIDs(r.Context(), session.GatewayUserID, itemIDs)
+		loaded, loadErr := s.store.ListPlaybackStatesByItemIDs(ctx, viewer.GatewayUserID, itemIDs)
 		if loadErr != nil {
-			s.audit(r.Context(), AuditLog{
-				GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID,
-				Event: "session_playback_state_list_failed", Message: "playback state list failed",
-				RemoteIP: remoteIP(r), Method: r.Method, Path: r.URL.Path, Status: http.StatusInternalServerError,
-				ErrorKind: "playback_state_list",
-			})
-			w.Header().Set("Cache-Control", "no-store")
-			http.Error(w, "sessions unavailable", http.StatusInternalServerError)
-			return
+			return nil, fmt.Errorf("list playback states: %w", loadErr)
 		}
 		if loaded != nil {
 			states = loaded
@@ -420,17 +408,21 @@ func (s *Server) writeLocalSessions(w http.ResponseWriter, r *http.Request, sess
 			state := states[cp.ItemID]
 			if state == nil {
 				state = &PlaybackState{
-					GatewayUserID:   session.GatewayUserID,
-					SyntheticUserID: session.SyntheticUserID,
+					GatewayUserID:   viewer.GatewayUserID,
+					SyntheticUserID: viewer.SyntheticUserID,
 					ItemID:          cp.ItemID,
 				}
 			}
 			userData = userDataDTO(state)
 		}
-		items = append(items, sessionInfoDTO(&filtered[i], s.cfg.GatewayServerID, currentPtr, userData))
+		var live func(SessionConnectionIdentity) bool
+		if s.sessionHub != nil {
+			live = s.sessionHub.Present
+		}
+		supportsRemoteControl := sessionSupportsRemoteControl(&filtered[i], live)
+		items = append(items, sessionInfoDTOWithRemoteControl(&filtered[i], s.cfg.GatewayServerID, currentPtr, userData, supportsRemoteControl))
 	}
-	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, http.StatusOK, items)
+	return items, nil
 }
 
 func (s *Server) writeNextUpItems(w http.ResponseWriter, r *http.Request, session *Session, gatewayToken string) {
@@ -726,7 +718,27 @@ func lowerSet(values []string) map[string]bool {
 }
 
 func (s *Server) fetchBackendJSON(ctx context.Context, r *http.Request, rel, rawQuery string, session *Session, gatewayToken string) (any, int, upstreamRequestSnapshot, error) {
-	runtime, err := s.upstreamAuth.Ensure(ctx)
+	if s.metadataUpstream == nil {
+		return nil, 0, upstreamRequestSnapshot{}, errors.New("metadata upstream unavailable")
+	}
+	query, err := parseRawQuery(rawQuery)
+	if err != nil {
+		return nil, 0, upstreamRequestSnapshot{}, err
+	}
+	if !relUserMatches(rel, session.SyntheticUserID) {
+		return nil, 0, upstreamRequestSnapshot{}, ErrForbidden
+	}
+	for key, values := range query {
+		if !strings.EqualFold(key, "UserId") {
+			continue
+		}
+		for _, value := range values {
+			if value != session.SyntheticUserID {
+				return nil, 0, upstreamRequestSnapshot{}, ErrForbidden
+			}
+		}
+	}
+	runtime, err := s.managedAuthUpstream.Ensure(ctx)
 	if err != nil {
 		// Confirmed Ensure failure only; cancellation/deadline must not flip auth state.
 		if ctx.Err() == nil {
@@ -738,53 +750,18 @@ func (s *Server) fetchBackendJSON(ctx context.Context, r *http.Request, rel, raw
 	if err != nil {
 		return nil, 0, upstreamRequestSnapshot{}, err
 	}
-	u, err := s.proxyURL(upstream, session, rel, rawQuery, gatewayToken)
+	requestURL := (&url.URL{Path: rel, RawQuery: query.Encode()}).String()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 	if err != nil {
 		return nil, 0, upstreamRequestSnapshot{}, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	request := metadataUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: req, Session: session, Snapshot: upstream, refreshResult: s.reportUpstreamRefreshResult}, Ownership: routeclass.MetadataProxy, Internal: true, SnapshotRef: &upstream}
+	resp, err := s.metadataUpstream.RoundTripMetadata(request)
 	if err != nil {
 		return nil, 0, upstreamRequestSnapshot{}, err
 	}
-	copyRequestHeaders(req.Header, r.Header)
-	s.rewriteRequestHeaders(req.Header, upstream)
-	req.Host = u.Host
-	attemptStarted := time.Now()
-	resp, err := s.proxyClient.Do(req)
-	if err != nil {
-		s.emitUpstreamAttempt(attemptStarted, 0, err)
-		return nil, 0, upstreamRequestSnapshot{}, err
-	}
-	s.emitUpstreamAttempt(attemptStarted, resp.StatusCode, nil)
+	wrapResponseBodyOnce(resp)
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusUnauthorized {
-		if refreshed, confirmed, refreshErr := s.refreshAfterUnauthorized(ctx, upstream); confirmed && refreshErr == nil {
-			upstream = refreshed
-			s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh", "backend token refreshed after unauthorized response", http.StatusOK)
-			_ = resp.Body.Close()
-			u, err = s.proxyURL(upstream, session, rel, rawQuery, gatewayToken)
-			if err != nil {
-				return nil, 0, upstreamRequestSnapshot{}, err
-			}
-			req, err = http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-			if err != nil {
-				return nil, 0, upstreamRequestSnapshot{}, err
-			}
-			copyRequestHeaders(req.Header, r.Header)
-			s.rewriteRequestHeaders(req.Header, upstream)
-			req.Host = u.Host
-			attemptStarted = time.Now()
-			resp, err = s.proxyClient.Do(req)
-			if err != nil {
-				s.emitUpstreamAttempt(attemptStarted, 0, err)
-				return nil, 0, upstreamRequestSnapshot{}, err
-			}
-			s.emitUpstreamAttempt(attemptStarted, resp.StatusCode, nil)
-			defer resp.Body.Close()
-		} else {
-			s.auditBackendTokenRefreshFailure(ctx, r, rel, session, confirmed, refreshErr, "backend token refresh failed after unauthorized response")
-		}
-	}
 	data, err := readLimited(resp.Body, proxyJSONLimit)
 	if err != nil {
 		return nil, resp.StatusCode, upstream, err

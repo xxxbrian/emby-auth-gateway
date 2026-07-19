@@ -52,6 +52,13 @@ func TestResourceCookieRouteAndCredentialPolicy(t *testing.T) {
 	if _, _, ok := resourceCookieToken(malformed, "/Items/i/Images/Primary"); ok {
 		t.Fatal("malformed explicit credential allowed cookie fallback")
 	}
+	for _, rawQuery := range []string{"API_KEY=wrong", "TOKEN=wrong", "x-mediabrowser-token=wrong"} {
+		req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items/i/Images/Primary?"+rawQuery, nil)
+		req.AddCookie(&http.Cookie{Name: resourceCookieName, Value: "gateway-token"})
+		if _, _, ok := resourceCookieToken(req, "/Items/i/Images/Primary"); ok {
+			t.Fatalf("folded credential %q allowed cookie fallback", rawQuery)
+		}
+	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest(tt.method, "http://gateway.test/emby"+tt.path, nil)

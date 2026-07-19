@@ -145,7 +145,7 @@ func TestClassifyRoute(t *testing.T) {
 	}{
 		{"POST", "/Users/AuthenticateByName", RouteAuth},
 		{"POST", "/Sessions/Logout", RouteAuth},
-		{"GET", "/Items/abc/PlaybackInfo", RouteMetadata},
+		{"GET", "/Items/abc/PlaybackInfo", RouteMedia},
 		{"POST", "/Sessions/Playing/Progress", RoutePlayback},
 		{"GET", "/Videos/item1/stream", RouteMedia},
 		{"GET", "/Audio/item1/stream.mp3", RouteMedia},

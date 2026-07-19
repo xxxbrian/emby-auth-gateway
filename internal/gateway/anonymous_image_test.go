@@ -15,7 +15,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/xxxbrian/emby-auth-gateway/internal/telemetry"
 	"golang.org/x/image/webp"
 )
 
@@ -71,6 +73,164 @@ func TestAnonymousItemImageForwardsOnlyValidatedTokenlessRequest(t *testing.T) {
 	}
 }
 
+type anonymousMediaSpy struct {
+	calls int
+}
+
+func (s *anonymousMediaSpy) RoundTripMedia(in mediaUpstreamRequest) (*http.Response, error) {
+	s.calls++
+	if !in.Internal || !in.Anonymous || in.Session != nil || in.Snapshot.token != "" || in.Snapshot.userID != "" || in.Request.Header.Get("Authorization") != "" || in.Request.Header.Get("Cookie") != "" {
+		return nil, ErrForbidden
+	}
+	body := anonymousGIF()
+	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"image/gif"}}, Body: io.NopCloser(bytes.NewReader(body)), ContentLength: int64(len(body)), Request: in.Request}, nil
+}
+
+func (s *anonymousMediaSpy) RoundTripNegotiation(negotiationUpstreamRequest) (*http.Response, error) {
+	return nil, errors.New("unexpected negotiation")
+}
+
+type anonymousLifecycleMediaSpy struct {
+	status   int
+	header   http.Header
+	body     *anonymousLifecycleBody
+	response *http.Response
+}
+
+func (s *anonymousLifecycleMediaSpy) RoundTripMedia(in mediaUpstreamRequest) (*http.Response, error) {
+	if !in.Internal || !in.Anonymous {
+		return nil, ErrForbidden
+	}
+	s.response = &http.Response{
+		StatusCode:    s.status,
+		Header:        s.header.Clone(),
+		Body:          s.body,
+		ContentLength: int64(s.body.Len()),
+		Request:       in.Request,
+	}
+	return s.response, nil
+}
+
+func (*anonymousLifecycleMediaSpy) RoundTripNegotiation(negotiationUpstreamRequest) (*http.Response, error) {
+	return nil, errors.New("unexpected negotiation")
+}
+
+type anonymousLifecycleBody struct {
+	*bytes.Reader
+	closeCount int
+}
+
+func (b *anonymousLifecycleBody) Close() error {
+	b.closeCount++
+	return nil
+}
+
+func TestAnonymousFullImageLifecycleAndExactTrafficAccounting(t *testing.T) {
+	payload := anonymousGIF()
+	spy := &anonymousLifecycleMediaSpy{
+		status: http.StatusOK,
+		header: http.Header{"Content-Type": {"image/gif"}},
+		body:   &anonymousLifecycleBody{Reader: bytes.NewReader(payload)},
+	}
+	server, meter := anonymousLifecycleServer(t, spy)
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items/item/Images/Primary", nil)
+	server.handleAnonymousItemImage(recorder, req, "/Items/item/Images/Primary")
+
+	assertAnonymousLifecycleAccounting(t, recorder, spy, meter, payload, http.StatusOK)
+}
+
+func TestAnonymousPartialImageLifecycleAndExactTrafficAccounting(t *testing.T) {
+	payload := anonymousGIF()
+	spy := &anonymousLifecycleMediaSpy{
+		status: http.StatusPartialContent,
+		header: http.Header{
+			"Content-Type":  {"image/gif"},
+			"Content-Range": {"bytes 0-13/14"},
+		},
+		body: &anonymousLifecycleBody{Reader: bytes.NewReader(payload)},
+	}
+	server, meter := anonymousLifecycleServer(t, spy)
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items/item/Images/Primary", nil)
+	server.handleAnonymousItemImage(recorder, req, "/Items/item/Images/Primary")
+
+	assertAnonymousLifecycleAccounting(t, recorder, spy, meter, payload, http.StatusPartialContent)
+}
+
+func anonymousLifecycleServer(t *testing.T, spy MediaUpstream) (*Server, *telemetry.ByteMeter) {
+	t.Helper()
+	store := anonymousImageTestStore("http://backend.invalid/emby", "namespace-1")
+	meter := telemetry.NewByteMeter()
+	server := NewServer(Config{Meter: meter}, store)
+	runtime, err := store.LoadDefaultUpstreamRuntime(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := anonymousImageNamespaceKeyFor(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.setAnonymousImageNamespaceSnapshot(anonymousImageNamespaceSnapshot{
+		origin:      anonymousImageOriginFor(runtime),
+		key:         key,
+		validatedAt: time.Now().UTC(),
+		available:   true,
+	})
+	server.mediaUpstream = spy
+	return server, meter
+}
+
+func assertAnonymousLifecycleAccounting(t *testing.T, recorder *httptest.ResponseRecorder, spy *anonymousLifecycleMediaSpy, meter *telemetry.ByteMeter, payload []byte, status int) {
+	t.Helper()
+	if recorder.Code != status || !bytes.Equal(recorder.Body.Bytes(), payload) {
+		t.Fatalf("status/body=%d/%x want %d/%x", recorder.Code, recorder.Body.Bytes(), status, payload)
+	}
+	owner, ok := spy.response.Body.(*onceReadCloser)
+	if !ok {
+		t.Fatalf("response body type=%T, want *onceReadCloser", spy.response.Body)
+	}
+	if spy.body.closeCount != 1 {
+		t.Fatalf("source close count=%d, want 1", spy.body.closeCount)
+	}
+	if err := owner.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if spy.body.closeCount != 1 {
+		t.Fatalf("source close count after repeated close=%d, want 1", spy.body.closeCount)
+	}
+	ingress, egress := meter.Totals()
+	if ingress != uint64(len(payload)) || egress != uint64(len(payload)) {
+		t.Fatalf("traffic ingress/egress=%d/%d, want %d/%d", ingress, egress, len(payload), len(payload))
+	}
+	if meter.ActiveTransferCount() != 0 {
+		t.Fatalf("active transfers=%d, want 0", meter.ActiveTransferCount())
+	}
+}
+
+func TestAnonymousImageUsesMediaPortWithoutDirectClient(t *testing.T) {
+	store := testStore("http://backend.invalid/emby")
+	server := NewServer(Config{GatewayBasePath: "/emby", HTTPClient: &http.Client{Transport: phase5PanicTransport{}}}, store)
+	defer server.Close()
+	runtime, err := store.LoadDefaultUpstreamRuntime(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := anonymousImageNamespaceKeyFor(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.setAnonymousImageNamespaceSnapshot(anonymousImageNamespaceSnapshot{origin: anonymousImageOriginFor(runtime), key: key, validatedAt: time.Now().UTC(), available: true})
+	spy := &anonymousMediaSpy{}
+	server.mediaUpstream = spy
+	writer := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items/person/Images/Primary", nil)
+	server.ServeHTTP(writer, req)
+	if writer.Code != http.StatusOK || spy.calls != 1 || !bytes.Equal(writer.Body.Bytes(), anonymousGIF()) {
+		t.Fatalf("status=%d calls=%d body=%q", writer.Code, spy.calls, writer.Body.Bytes())
+	}
+}
+
 func TestAnonymousItemImagePrecedenceAndAvailability(t *testing.T) {
 	const namespace = "namespace-1"
 	var calls int
@@ -94,6 +254,9 @@ func TestAnonymousItemImagePrecedenceAndAvailability(t *testing.T) {
 		{"invalid query", func(r *http.Request) { r.URL.RawQuery = "api_key=invalid" }},
 		{"empty query", func(r *http.Request) { r.URL.RawQuery = "api_key=" }},
 		{"empty generic query", func(r *http.Request) { r.URL.RawQuery = "token=" }},
+		{"upper api key", func(r *http.Request) { r.URL.RawQuery = "API_KEY=invalid" }},
+		{"upper token", func(r *http.Request) { r.URL.RawQuery = "TOKEN=invalid" }},
+		{"folded media token", func(r *http.Request) { r.URL.RawQuery = "x-mediabrowser-token=invalid" }},
 		{"invalid header", func(r *http.Request) { r.Header.Set("X-Emby-Token", "invalid") }},
 		{"empty header", func(r *http.Request) { r.Header.Set("X-Emby-Token", "") }},
 		{"empty media header", func(r *http.Request) { r.Header.Set("X-MediaBrowser-Token", "") }},
@@ -132,6 +295,35 @@ func TestAnonymousItemImagePrecedenceAndAvailability(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Cache-Control") != "no-store" {
 		t.Fatalf("absent singleton status/cache = %d/%q", resp.StatusCode, resp.Header.Get("Cache-Control"))
+	}
+}
+
+func TestAnonymousImageQueryStripsFoldedCredentialAliases(t *testing.T) {
+	raw := "width=100&API_KEY=a&TOKEN=b&x-emby-token=c&X-MediaBrowser-Token=d&access_TOKEN=e&sig=a%2Bb"
+	got, err := anonymousImageQuery(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "width=100&sig=a%2Bb" {
+		t.Fatalf("anonymous query=%q", got)
+	}
+}
+
+func TestAnonymousImageResponseStripsConnectionNominatedHeaders(t *testing.T) {
+	source := make(http.Header)
+	source.Add("Connection", "X-Hop")
+	source.Set("X-Hop", "remove")
+	source.Set("Keep-Alive", "remove")
+	source.Set("Content-Type", "image/gif")
+	source.Set("Content-Range", "bytes 0-13/14")
+	source.Set("ETag", `"keep"`)
+	destination := make(http.Header)
+	copyAnonymousImageResponseHeaders(destination, source)
+	if destination.Get("Connection") != "" || destination.Get("X-Hop") != "" || destination.Get("Keep-Alive") != "" {
+		t.Fatalf("hop headers leaked: %#v", destination)
+	}
+	if destination.Get("Content-Type") != "image/gif" || destination.Get("Content-Range") != "bytes 0-13/14" || destination.Get("ETag") != `"keep"` {
+		t.Fatalf("end-to-end headers lost: %#v", destination)
 	}
 }
 

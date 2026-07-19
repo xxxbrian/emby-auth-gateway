@@ -22,6 +22,13 @@ var recognizedBackendAuthQueryKeys = map[string]struct{}{
 	"token":        {},
 }
 
+// recognizedBackendMetadataNeutralQueryKeys are expected query keys for metadata
+// enrichment egress after canonical identity rewriting.
+var recognizedBackendMetadataNeutralQueryKeys = map[string]struct{}{
+	"EnableUserData": {},
+	"UserId":        {},
+}
+
 // egressRequest is one observed upstream request (test-only).
 type egressRequest struct {
 	Method  string
@@ -149,13 +156,25 @@ func assertCleanBackendAuthQuery(t *testing.T, rawQuery, gatewayToken string) {
 		t.Fatalf("parse egress query %q: %v", rawQuery, err)
 	}
 	for key, vals := range q {
-		if _, isAuth := recognizedBackendAuthQueryKeys[key]; !isAuth {
-			// Non-auth query keys are not expected on neutral enrichment/proxy metadata reads.
+		if _, isAuth := recognizedBackendAuthQueryKeys[key]; isAuth {
+			for _, val := range vals {
+				if gatewayToken != "" && val == gatewayToken {
+					t.Fatalf("gateway token leaked into auth query key %q", key)
+				}
+			}
+			continue
+		}
+
+		if _, isNeutralMetadata := recognizedBackendMetadataNeutralQueryKeys[key]; !isNeutralMetadata {
+			// Non-auth/metadata-neutral query keys are not expected on neutral metadata reads.
 			t.Fatalf("unexpected non-auth query key %q=%v in %q", key, vals, rawQuery)
 		}
-		for _, val := range vals {
-			if gatewayToken != "" && val == gatewayToken {
-				t.Fatalf("gateway token leaked into auth query key %q", key)
+
+		if key == "EnableUserData" {
+			for _, val := range vals {
+				if val != "false" {
+					t.Fatalf("unexpected %s=%q in %q", key, val, rawQuery)
+				}
 			}
 		}
 	}

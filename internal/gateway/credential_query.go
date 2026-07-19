@@ -28,6 +28,26 @@ func isStrictQueryAuthKey(key string) bool {
 	}
 }
 
+// isEgressCredentialQueryKey is deliberately case-insensitive and broader
+// than ingress selection. It is defense-in-depth at upstream boundaries only.
+func isEgressCredentialQueryKey(key string) bool {
+	switch strings.ToLower(key) {
+	case "api_key", "access_token", "token", "x-emby-token", "x-mediabrowser-token":
+		return true
+	default:
+		return false
+	}
+}
+
+func isEgressCredentialAliasQueryKey(key string) bool {
+	switch strings.ToLower(key) {
+	case "api_key", "access_token", "x-emby-token", "x-mediabrowser-token":
+		return true
+	default:
+		return false
+	}
+}
+
 // IsGatewayShapedToken reports whether token matches the canonical gateway token
 // encoding: 32 raw bytes as base64url without padding (43 characters), with
 // decode+re-encode equality so non-canonical trailing bits are rejected.
@@ -121,31 +141,27 @@ func (s *Server) guardGenericQueryTokens(ctx context.Context, values []string, g
 
 func rewriteProxyQueryValues(q url.Values, gatewayToken string, session *Session, upstream upstreamRequestSnapshot) {
 	for key, vals := range q {
-		for i, val := range vals {
-			if val == session.SyntheticUserID {
-				vals[i] = upstream.userID
-			}
-			// Any query value exactly equal to the selected gateway token must
-			// be rewritten, including under arbitrary keys such as signature=.
-			if gatewayToken != "" && val == gatewayToken {
-				vals[i] = upstream.token
-			}
-		}
-		q[key] = vals
-	}
-
-	for _, key := range strictQueryAuthKeys {
-		vals := q[key]
-		if len(vals) == 0 {
+		if isEgressCredentialAliasQueryKey(key) {
+			delete(q, key)
 			continue
 		}
-		for i, val := range vals {
-			if strings.TrimSpace(val) != "" {
-				vals[i] = upstream.token
+		kept := vals[:0]
+		for _, val := range vals {
+			if gatewayToken != "" && val == gatewayToken {
+				continue
 			}
+			if val == session.SyntheticUserID {
+				val = upstream.userID
+			}
+			kept = append(kept, val)
 		}
-		q[key] = vals
+		if len(kept) == 0 {
+			delete(q, key)
+			continue
+		}
+		q[key] = kept
 	}
+	q.Set("api_key", upstream.token)
 }
 
 func writeCredentialQueryError(w http.ResponseWriter, err error) {

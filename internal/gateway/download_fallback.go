@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"mime"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -68,10 +70,24 @@ func (s *Server) tryDownloadDirectStreamFallback(r *http.Request, rel string, se
 		return nil, errDownloadFallbackUnavailable
 	}
 	mediaSourceID := strings.TrimSpace(r.URL.Query().Get("MediaSourceId"))
-	playback, err := s.fetchDownloadPlaybackInfo(r.Context(), itemID, mediaSourceID, upstream)
+	playback, leases, err := s.fetchDownloadPlaybackInfo(r.Context(), itemID, mediaSourceID, session, &upstream)
 	if err != nil || playback.ErrorCode != nil {
+		if s.mediaLeases != nil && !leases.empty() {
+			_ = s.mediaLeases.Release(session.GatewayTokenHash, leases.PlaySessionIDs, leases.LiveStreamIDs)
+		}
 		return nil, errDownloadFallbackUnavailable
 	}
+	releaseLeases := func() {
+		if s.mediaLeases != nil && !leases.empty() {
+			_ = s.mediaLeases.Release(session.GatewayTokenHash, leases.PlaySessionIDs, leases.LiveStreamIDs)
+		}
+	}
+	fallbackFailed := true
+	defer func() {
+		if fallbackFailed {
+			releaseLeases()
+		}
+	}()
 	source, ok := selectDownloadMediaSource(playback.MediaSources, mediaSourceID)
 	if !ok {
 		return nil, errDownloadFallbackUnavailable
@@ -80,28 +96,28 @@ func (s *Server) tryDownloadDirectStreamFallback(r *http.Request, rel string, se
 	if err != nil {
 		return nil, errDownloadFallbackUnavailable
 	}
-	request, err := http.NewRequestWithContext(withRedirectCredentialTokens(r.Context(), gatewayToken, upstream.token), r.Method, mediaURL.String(), nil)
+	request, err := http.NewRequestWithContext(r.Context(), r.Method, mediaURL.String(), nil)
 	if err != nil {
 		return nil, errDownloadFallbackUnavailable
 	}
-	copyRequestHeaders(request.Header, r.Header)
+	copyDownloadFallbackHeaders(request.Header, r.Header)
 	for name, value := range source.RequiredHTTPHeaders {
 		if validDownloadRequiredHeader(name, value) {
 			request.Header.Set(name, value)
 		}
 	}
-	s.rewriteRequestHeaders(request.Header, upstream)
-	request.Host = mediaURL.Host
-
-	attemptStarted := time.Now()
-	response, err := s.proxyClient.Do(request)
-	wrapResponseBodyOnce(response)
-	if err != nil {
-		s.emitUpstreamAttempt(attemptStarted, 0, err)
+	response, err := s.mediaUpstream.RoundTripMedia(mediaUpstreamRequest{
+		upstreamHTTPRequest: upstreamHTTPRequest{Request: request, Session: session, Snapshot: upstream},
+		Internal:            true,
+		SnapshotRef:         &upstream,
+	})
+	if err == nil {
+		wrapResponseBodyOnce(response)
+	}
+	if err != nil || response == nil || response.Body == nil {
 		closeResponseOnError(response)
 		return nil, errDownloadFallbackUnavailable
 	}
-	s.emitUpstreamAttempt(attemptStarted, response.StatusCode, nil)
 	if !downloadFallbackResponseAllowed(response.StatusCode) {
 		_ = response.Body.Close()
 		return nil, errDownloadFallbackUnavailable
@@ -109,13 +125,16 @@ func (s *Server) tryDownloadDirectStreamFallback(r *http.Request, rel string, se
 	if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
 		response.Header.Set("Content-Disposition", downloadContentDisposition(source, itemID))
 	}
+	response.Body = &downloadFallbackLeaseBody{body: response.Body, release: releaseLeases}
+	fallbackFailed = false
+	s.startMediaLeaseCleanup()
 	return response, nil
 }
 
-func (s *Server) fetchDownloadPlaybackInfo(ctx context.Context, itemID, mediaSourceID string, upstream upstreamRequestSnapshot) (embyPlaybackInfoResponseDTO, error) {
+func (s *Server) fetchDownloadPlaybackInfo(ctx context.Context, itemID, mediaSourceID string, session *Session, upstream *upstreamRequestSnapshot) (embyPlaybackInfoResponseDTO, negotiationSelectorSet, error) {
 	payload, err := json.Marshal(embyPlaybackInfoRequestDTO{
 		ID:                 itemID,
-		UserID:             upstream.userID,
+		UserID:             session.SyntheticUserID,
 		MediaSourceID:      mediaSourceID,
 		EnableDirectPlay:   true,
 		EnableDirectStream: true,
@@ -123,42 +142,44 @@ func (s *Server) fetchDownloadPlaybackInfo(ctx context.Context, itemID, mediaSou
 		IsPlayback:         false,
 	})
 	if err != nil {
-		return embyPlaybackInfoResponseDTO{}, err
+		return embyPlaybackInfoResponseDTO{}, negotiationSelectorSet{}, err
 	}
-	target, err := backendURL(upstream.baseURL, "/Items/"+url.PathEscape(itemID)+"/PlaybackInfo")
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "/Items/"+url.PathEscape(itemID)+"/PlaybackInfo", bytes.NewReader(payload))
 	if err != nil {
-		return embyPlaybackInfoResponseDTO{}, err
-	}
-	request, err := http.NewRequestWithContext(withRedirectCredentialTokens(ctx, upstream.token), http.MethodPost, target, bytes.NewReader(payload))
-	if err != nil {
-		return embyPlaybackInfoResponseDTO{}, err
+		return embyPlaybackInfoResponseDTO{}, negotiationSelectorSet{}, err
 	}
 	request.Header.Set("Content-Type", "application/json")
-	s.rewriteRequestHeaders(request.Header, upstream)
-	request.Host = request.URL.Host
-
-	attemptStarted := time.Now()
-	response, err := s.proxyClient.Do(request)
-	wrapResponseBodyOnce(response)
-	if err != nil {
-		s.emitUpstreamAttempt(attemptStarted, 0, err)
-		closeResponseOnError(response)
-		return embyPlaybackInfoResponseDTO{}, err
+	response, err := s.mediaUpstream.RoundTripNegotiation(negotiationUpstreamRequest{
+		upstreamHTTPRequest: upstreamHTTPRequest{Request: request, Session: session, Snapshot: *upstream},
+		SnapshotRef:         upstream,
+	})
+	if err == nil {
+		wrapResponseBodyOnce(response)
 	}
-	s.emitUpstreamAttempt(attemptStarted, response.StatusCode, nil)
+	if err != nil || response == nil || response.Body == nil {
+		closeResponseOnError(response)
+		return embyPlaybackInfoResponseDTO{}, negotiationSelectorSet{}, errDownloadFallbackUnavailable
+	}
 	defer response.Body.Close()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return embyPlaybackInfoResponseDTO{}, errDownloadFallbackUnavailable
+		return embyPlaybackInfoResponseDTO{}, negotiationSelectorSet{}, errDownloadFallbackUnavailable
 	}
 	data, err := readLimited(response.Body, proxyJSONLimit)
 	if err != nil {
-		return embyPlaybackInfoResponseDTO{}, err
+		return embyPlaybackInfoResponseDTO{}, negotiationSelectorSet{}, err
+	}
+	selectors, _, err := collectNegotiationSelectors(data, "")
+	if err != nil {
+		return embyPlaybackInfoResponseDTO{}, negotiationSelectorSet{}, err
 	}
 	var playback embyPlaybackInfoResponseDTO
 	if err := json.Unmarshal(data, &playback); err != nil {
-		return embyPlaybackInfoResponseDTO{}, err
+		return embyPlaybackInfoResponseDTO{}, negotiationSelectorSet{}, err
 	}
-	return playback, nil
+	if err := validateNegotiationSelectors(s.mediaLeases, session.GatewayTokenHash, selectors, time.Time{}); err != nil {
+		return embyPlaybackInfoResponseDTO{}, selectors, err
+	}
+	return playback, selectors, nil
 }
 
 func selectDownloadMediaSource(sources []embyMediaSourceInfoDTO, requestedID string) (embyMediaSourceInfoDTO, bool) {
@@ -194,7 +215,34 @@ func (s *Server) downloadMediaURL(raw, itemID, mediaSourceID string, session *Se
 	if signedSourceID := parsed.Query().Get("MediaSourceId"); signedSourceID != "" && signedSourceID != mediaSourceID {
 		return nil, errDownloadFallbackUnavailable
 	}
-	return s.proxyURL(upstream, session, parsed.Path, parsed.RawQuery, gatewayToken)
+	return parsed, nil
+}
+
+type downloadFallbackLeaseBody struct {
+	body    io.ReadCloser
+	release func()
+	once    sync.Once
+	err     error
+}
+
+func (b *downloadFallbackLeaseBody) Read(p []byte) (int, error) {
+	return b.body.Read(p)
+}
+
+func (b *downloadFallbackLeaseBody) Close() error {
+	b.once.Do(func() {
+		b.err = b.body.Close()
+		b.release()
+	})
+	return b.err
+}
+
+func copyDownloadFallbackHeaders(dst, src http.Header) {
+	for _, name := range []string{"Accept", "If-Match", "If-Modified-Since", "If-None-Match", "If-Range", "If-Unmodified-Since", "Range"} {
+		for _, value := range src.Values(name) {
+			dst.Add(name, value)
+		}
+	}
 }
 
 func downloadFallbackResponseAllowed(status int) bool {
@@ -215,11 +263,9 @@ func validDownloadRequiredHeader(name, value string) bool {
 }
 
 func protectedDownloadRequestHeader(name string) bool {
-	if isHopHeader(name) {
-		return true
-	}
 	switch strings.ToLower(name) {
-	case "accept-encoding", "authorization", "content-length", "host", "if-match", "if-modified-since", "if-none-match", "if-range", "if-unmodified-since", "range", "x-emby-authorization", "x-emby-token", "x-mediabrowser-token":
+	case "connection", "proxy-connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade",
+		"accept-encoding", "authorization", "content-length", "host", "if-match", "if-modified-since", "if-none-match", "if-range", "if-unmodified-since", "range", "x-emby-authorization", "x-emby-token", "x-mediabrowser-token":
 		return true
 	default:
 		return false

@@ -66,35 +66,21 @@ func (s *Server) handleAnonymousItemImage(w http.ResponseWriter, r *http.Request
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	u, err := backendURL(origin.BaseURL, rel)
-	if err != nil {
-		http.Error(w, "anonymous image service unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	upstreamURL, err := url.Parse(u)
-	if err != nil {
-		http.Error(w, "bad gateway", http.StatusBadGateway)
-		return
-	}
-	upstreamURL.RawQuery = query
+	upstreamURL := &url.URL{Path: rel, RawQuery: query}
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL.String(), nil)
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 	copyAnonymousImageRequestHeaders(req.Header, r.Header)
-	identity := origin.ClientIdentity.WithDefaults()
-	req.Header.Set("User-Agent", identity.UserAgent)
-	req.Header.Set("X-Emby-Authorization", backendAuthHeader(identity, "", "").String())
-	client := *s.client
-	client.Jar = nil
-	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	resp, err := client.Do(req)
+	snapshot := upstreamRequestSnapshot{baseURL: origin.BaseURL, serverID: origin.BackendServerID, identity: origin.ClientIdentity}
+	resp, err := s.mediaUpstream.RoundTripMedia(mediaUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: req, Snapshot: snapshot}, Internal: true, Anonymous: true})
 	if err != nil {
 		writeAnonymousImageError(w, http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
+	owner := wrapResponseBodyOnce(resp)
+	defer owner.Close()
 	s.writeAnonymousImageResponse(w, r, resp)
 }
 
@@ -110,7 +96,7 @@ func anonymousImageQuery(raw string) (string, error) {
 		if err != nil {
 			return "", errMalformedQuery
 		}
-		if isStrictQueryAuthKey(decodedKey) || decodedKey == genericQueryAuthKey {
+		if isEgressCredentialQueryKey(decodedKey) {
 			continue
 		}
 		if strings.EqualFold(decodedKey, "UserId") || strings.EqualFold(decodedKey, "ServerId") {
@@ -144,6 +130,7 @@ func copyAnonymousImageRequestHeaders(dst, src http.Header) {
 }
 
 func (s *Server) writeAnonymousImageResponse(w http.ResponseWriter, r *http.Request, resp *http.Response) {
+	sanitizeHopHeaders(resp.Header)
 	w.Header().Set("Cache-Control", "no-store")
 	if resp.StatusCode >= http.StatusMultipleChoices && resp.StatusCode < http.StatusBadRequest && resp.StatusCode != http.StatusNotModified {
 		writeAnonymousImageError(w, http.StatusBadGateway)
@@ -280,15 +267,17 @@ func validAnonymousFullImage(data []byte, contentType string) bool {
 }
 
 func copyAnonymousImageResponseHeaders(dst, src http.Header) {
+	headers := src.Clone()
+	sanitizeHopHeaders(headers)
 	for _, name := range []string{"Content-Type", "ETag", "Last-Modified", "Accept-Ranges", "Content-Range", "Content-Disposition"} {
-		for _, value := range src.Values(name) {
+		for _, value := range headers.Values(name) {
 			if name == "Content-Disposition" && (strings.ContainsAny(value, "\r\n") || strings.Contains(strings.ToLower(value), "filename*=")) {
 				continue
 			}
 			dst.Add(name, value)
 		}
 	}
-	if value := src.Get("Content-Length"); value != "" {
+	if value := headers.Get("Content-Length"); value != "" {
 		dst.Set("Content-Length", value)
 	}
 }

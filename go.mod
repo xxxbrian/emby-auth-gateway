@@ -3,6 +3,7 @@ module github.com/xxxbrian/emby-auth-gateway
 go 1.26.4
 
 require (
+	github.com/coder/websocket v1.8.15
 	github.com/pocketbase/dbx v1.12.0
 	github.com/pocketbase/pocketbase v0.39.6
 	github.com/spf13/cobra v1.10.2

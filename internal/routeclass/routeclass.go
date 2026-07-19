@@ -44,6 +44,18 @@ const (
 	OperationPlaybackPing
 	OperationCapabilities
 	OperationDeniedSession
+	OperationMetadataProxy
+	OperationMediaProxy
+	OperationPlaybackInfo
+	OperationLiveStreamOpen
+	OperationLiveStreamMediaInfo
+	OperationLiveStreamClose
+	OperationActiveEncodingsDelete
+	OperationActiveEncodingsDeleteCompat
+	OperationWebSocket
+	OperationSessionGeneralCommand
+	OperationSessionPlay
+	OperationSessionPlaystate
 )
 
 // Decision is the pure classification result for one method+path pair.
@@ -70,16 +82,19 @@ func Classify(method, relPath string) Decision {
 	if d, ok := classifyExact(method, parts); ok {
 		return d
 	}
+	if d, ok := classifyNegotiation(method, parts); ok {
+		return d
+	}
 	if d, ok := classifySessions(method, parts); ok {
 		return d
 	}
 	if d, ok := classifyPersonal(parts); ok {
 		return d
 	}
-	if d, ok := classifyMedia(parts); ok {
+	if d, ok := classifyMedia(method, parts); ok {
 		return d
 	}
-	if d, ok := classifyMetadata(parts); ok {
+	if d, ok := classifyMetadata(method, parts); ok {
 		return d
 	}
 	return Decision{
@@ -103,9 +118,30 @@ func classifyExact(method string, parts []string) (Decision, bool) {
 		return methodDecision(method, LocalPublic, OperationBrandingConfiguration, "GET"), true
 	case len(parts) == 2 && parts[0] == "branding" && parts[1] == "css.css":
 		return methodDecision(method, LocalPublic, OperationBrandingCSS, "GET"), true
+	case len(parts) == 1 && parts[0] == "embywebsocket":
+		return methodDecision(method, LocalSession, OperationWebSocket, "GET"), true
 	case len(parts) == 2 && parts[0] == "users" && parts[1] != "":
 		// Single-user shape: /Users/{id} or /Users/Me. Deeper user paths are not current-user.
 		return methodDecision(method, LocalPersonal, OperationCurrentUser, "GET"), true
+	default:
+		return Decision{}, false
+	}
+}
+
+func classifyNegotiation(method string, parts []string) (Decision, bool) {
+	switch {
+	case len(parts) == 3 && parts[0] == "items" && parts[1] != "" && parts[2] == "playbackinfo":
+		return methodDecision(method, MediaProxy, OperationPlaybackInfo, "GET", "POST"), true
+	case len(parts) == 2 && parts[0] == "livestreams" && parts[1] == "open":
+		return methodDecision(method, MediaProxy, OperationLiveStreamOpen, "POST"), true
+	case len(parts) == 2 && parts[0] == "livestreams" && parts[1] == "mediainfo":
+		return methodDecision(method, MediaProxy, OperationLiveStreamMediaInfo, "POST"), true
+	case len(parts) == 2 && parts[0] == "livestreams" && parts[1] == "close":
+		return methodDecision(method, MediaProxy, OperationLiveStreamClose, "POST"), true
+	case len(parts) == 2 && parts[0] == "videos" && parts[1] == "activeencodings":
+		return methodDecision(method, MediaProxy, OperationActiveEncodingsDelete, "DELETE"), true
+	case len(parts) == 3 && parts[0] == "videos" && parts[1] == "activeencodings" && parts[2] == "delete":
+		return methodDecision(method, MediaProxy, OperationActiveEncodingsDeleteCompat, "POST"), true
 	default:
 		return Decision{}, false
 	}
@@ -162,11 +198,13 @@ func classifyTargetedSession(method string, parts []string) (Decision, bool) {
 
 	switch {
 	// /Sessions/{id}/Playing and /Sessions/{id}/Playing/{command}
-	case rest[0] == "playing" && (len(rest) == 1 || len(rest) == 2):
-		return methodDecision(method, DeniedSession, OperationDeniedSession, "POST"), true
+	case rest[0] == "playing" && len(rest) == 1:
+		return methodDecision(method, LocalSession, OperationSessionPlay, "POST"), true
+	case rest[0] == "playing" && len(rest) == 2:
+		return methodDecision(method, LocalSession, OperationSessionPlaystate, "POST"), true
 	// /Sessions/{id}/Command and /Sessions/{id}/Command/{command}
 	case rest[0] == "command" && (len(rest) == 1 || len(rest) == 2):
-		return methodDecision(method, DeniedSession, OperationDeniedSession, "POST"), true
+		return methodDecision(method, LocalSession, OperationSessionGeneralCommand, "POST"), true
 	// /Sessions/{id}/System/{command}
 	case rest[0] == "system" && len(rest) == 2:
 		return methodDecision(method, DeniedSession, OperationDeniedSession, "POST"), true
@@ -229,42 +267,46 @@ func hasPersonalListShape(tail []string) bool {
 	}
 }
 
-func classifyMedia(parts []string) (Decision, bool) {
+func classifyMedia(method string, parts []string) (Decision, bool) {
 	if len(parts) == 0 {
 		return Decision{}, false
 	}
 	joined := strings.Join(parts, "/")
 	switch {
+	case len(parts) >= 3 && parts[0] == "items" && parts[2] == "images":
+		return media(method), true
+	case len(parts) >= 3 && parts[0] == "users" && parts[2] == "images":
+		return media(method), true
 	case parts[0] == "videos", parts[0] == "audio", parts[0] == "livestreams", parts[0] == "hls":
-		return media(), true
+		return media(method), true
 	case strings.HasSuffix(joined, "/download"):
-		return media(), true
+		return media(method), true
 	case strings.Contains(joined, "/stream"):
-		return media(), true
+		return media(method), true
 	case strings.HasSuffix(joined, ".m3u8"), strings.HasSuffix(joined, ".ts"):
-		return media(), true
+		return media(method), true
 	default:
 		return Decision{}, false
 	}
 }
 
-func classifyMetadata(parts []string) (Decision, bool) {
+func classifyMetadata(method string, parts []string) (Decision, bool) {
 	if len(parts) == 0 {
 		return Decision{}, false
 	}
 	switch parts[0] {
 	case "items", "genres", "studios", "persons", "shows", "movies", "artists", "trailers", "live", "channels", "scheduledtasks":
-		return metadata(), true
+		return metadata(method), true
 	case "users":
 		// Remaining user-scoped library paths (e.g. /Users/{id}/Items, /Users/{id}/Views).
 		if len(parts) >= 3 {
-			return metadata(), true
+			return metadata(method), true
 		}
 		return Decision{}, false
 	case "system":
 		// Non-public system info and similar metadata reads.
 		if len(parts) >= 2 && parts[1] == "info" {
-			return metadata(), true
+			return metadata(method), true
 		}
 		return Decision{}, false
 	default:
@@ -276,12 +318,12 @@ func personal() Decision {
 	return Decision{Ownership: LocalPersonal, Operation: OperationPersonal, MethodAllowed: true}
 }
 
-func media() Decision {
-	return Decision{Ownership: MediaProxy, Operation: OperationLegacyProxy, MethodAllowed: true}
+func media(method string) Decision {
+	return methodDecision(method, MediaProxy, OperationMediaProxy, "GET", "HEAD")
 }
 
-func metadata() Decision {
-	return Decision{Ownership: MetadataProxy, Operation: OperationLegacyProxy, MethodAllowed: true}
+func metadata(method string) Decision {
+	return methodDecision(method, MetadataProxy, OperationMetadataProxy, "GET", "HEAD")
 }
 
 func methodDecision(method string, ownership Ownership, operation Operation, allowed ...string) Decision {

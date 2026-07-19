@@ -24,46 +24,6 @@ func TestSnapshotFailedHTTPRefreshKeepsOriginalResponseSanitization(t *testing.T
 	}
 }
 
-func TestSnapshotFailedWebSocketPreflightRetainsOriginalSnapshot(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/emby/System/Info":
-			w.WriteHeader(http.StatusUnauthorized)
-		case "/emby/Users/AuthenticateByName":
-			http.Error(w, "refresh failed", http.StatusBadGateway)
-		default:
-			t.Fatalf("unexpected request %s", r.URL.Path)
-		}
-	}))
-	defer backend.Close()
-	store := testStore(backend.URL + "/emby")
-	session := testSession()
-	upstream := upstreamRequestSnapshot{baseURL: backend.URL + "/emby", serverID: "backend-server", userID: "backend-user", token: "backend-token", identity: backendIdentityForTest("backend-device")}
-	server := NewServer(Config{HTTPClient: backend.Client()}, store)
-	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/embywebsocket", nil)
-	got := server.prepareBackendUpgrade(context.Background(), req, "/embywebsocket", session, upstream)
-	if got != upstream {
-		t.Fatalf("preflight snapshot changed on failed refresh: %#v", got)
-	}
-}
-
-func TestSnapshotSuccessfulRefreshUsesCompleteReplacement(t *testing.T) {
-	server := NewServer(Config{}, NewMemoryStore())
-	session := testSession()
-	old := upstreamRequestSnapshot{baseURL: "https://old.example/emby", serverID: "old-server", userID: "old-user", token: "old-token", identity: backendIdentityForTest("old-device")}
-	newSnapshot := upstreamRequestSnapshot{baseURL: "https://new.example/emby", serverID: "new-server", userID: "new-user", token: "new-token", identity: BackendClientIdentity{UserAgent: "new-agent", Client: "new-client", Device: "new-device", DeviceID: "new-device-id", Version: "new-version"}}
-	q, err := server.proxyURL(newSnapshot, session, "/Users/"+session.SyntheticUserID+"/Items", "api_key=gateway-token", "gateway-token")
-	if err != nil {
-		t.Fatal(err)
-	}
-	h := http.Header{}
-	server.rewriteRequestHeaders(h, newSnapshot)
-	body := server.rewriteRequestBodyData([]byte(`{"Token":"gateway-token","UserId":"`+session.SyntheticUserID+`"}`), session, newSnapshot, "gateway-token")
-	if q.Host != "new.example" || q.Query().Get("api_key") != "new-token" || !strings.Contains(h.Get("X-Emby-Authorization"), `UserId="new-user"`) || h.Get("User-Agent") != "new-agent" || !strings.Contains(readString(body), "new-token") || strings.Contains(q.String()+h.Get("X-Emby-Authorization"), old.token) {
-		t.Fatalf("retry mixed snapshots: url=%q headers=%#v body=%q", q.String(), h, readString(server.rewriteRequestBodyData([]byte(`x`), session, newSnapshot, "gateway-token")))
-	}
-}
-
 func TestSnapshotUserdataRewriteUsesPayloadSnapshotAfterRefresh(t *testing.T) {
 	store := NewMemoryStore()
 	server := NewServer(Config{GatewayServerID: "gateway-server"}, store)
@@ -76,10 +36,4 @@ func TestSnapshotUserdataRewriteUsesPayloadSnapshotAfterRefresh(t *testing.T) {
 	if got["AccessToken"] != "gateway-token" || got["ServerId"] != "gateway-server" || got["UserId"] != session.SyntheticUserID || strings.Contains(got["DirectStreamUrl"].(string), "new-token") || strings.Contains(got["DirectStreamUrl"].(string), laterRuntime.baseURL) {
 		t.Fatalf("userdata rewrite used wrong snapshot: %#v", got)
 	}
-}
-
-func readString(r interface{ Read([]byte) (int, error) }) string {
-	b := make([]byte, 256)
-	n, _ := r.Read(b)
-	return string(b[:n])
 }

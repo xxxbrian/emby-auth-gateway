@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/xxxbrian/emby-auth-gateway/internal/sessionid"
 )
 
 type MemoryStore struct {
@@ -543,6 +546,58 @@ func (m *MemoryStore) FindSessionByTokenHash(ctx context.Context, tokenHash stri
 		return nil, err
 	}
 	return cloneSession(session), nil
+}
+
+func (m *MemoryStore) FindActiveSessionByPublicID(ctx context.Context, gatewayUserID, publicID string, now time.Time) (*Session, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	gatewayUserID = strings.TrimSpace(gatewayUserID)
+	if gatewayUserID == "" {
+		return nil, fmt.Errorf("%w: gateway user id required", ErrBadRequest)
+	}
+	if !sessionid.Valid(publicID) {
+		return nil, fmt.Errorf("%w: invalid public session id", ErrBadRequest)
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	var matched *Session
+	for tokenHash, session := range m.Sessions {
+		if session == nil || session.PublicID != publicID {
+			continue
+		}
+		if matched != nil {
+			return nil, fmt.Errorf("session profile integrity: duplicate public session id %q", publicID)
+		}
+		if tokenHash == "" || session.GatewayTokenHash == "" || tokenHash != session.GatewayTokenHash {
+			return nil, fmt.Errorf("session integrity: token hash relation mismatch")
+		}
+		matched = cloneSession(session)
+	}
+	if matched == nil {
+		return nil, ErrNotFound
+	}
+	// PublicID is present, so this is strict validation on a clone and cannot repair.
+	if err := repairSessionAggregate(matched, now); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(matched.GatewayUserID) == "" {
+		return nil, fmt.Errorf("session integrity: missing gateway user")
+	}
+	if matched.GatewayUserID != gatewayUserID || !matched.Active(now) {
+		return nil, ErrNotFound
+	}
+	return matched, nil
 }
 
 func (m *MemoryStore) SessionTokenExists(ctx context.Context, tokenHash string) (bool, error) {

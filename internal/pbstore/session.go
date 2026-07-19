@@ -170,6 +170,79 @@ func (s *Store) FindSessionByTokenHash(ctx context.Context, tokenHash string) (*
 	return s.hydrateOrRepairSession(ctx, auth)
 }
 
+func (s *Store) FindActiveSessionByPublicID(ctx context.Context, gatewayUserID, publicID string, now time.Time) (*gateway.Session, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	gatewayUserID = strings.TrimSpace(gatewayUserID)
+	if gatewayUserID == "" {
+		return nil, fmt.Errorf("%w: gateway user id required", gateway.ErrBadRequest)
+	}
+	if !sessionid.Valid(publicID) {
+		return nil, fmt.Errorf("%w: invalid public session id", gateway.ErrBadRequest)
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+
+	var result *gateway.Session
+	err := s.app.RunInTransaction(func(tx core.App) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		profiles, err := tx.FindRecordsByFilter(
+			collectionGatewaySessionProfiles,
+			"public_session_id = {:publicID}",
+			"",
+			2,
+			0,
+			dbx.Params{"publicID": publicID},
+		)
+		if err != nil {
+			return err
+		}
+		if len(profiles) == 0 {
+			return gateway.ErrNotFound
+		}
+		if len(profiles) != 1 {
+			return fmt.Errorf("session profile integrity: duplicate public session id %q", publicID)
+		}
+		profile := profiles[0]
+		authID := strings.TrimSpace(profile.GetString("gateway_session"))
+		if authID == "" {
+			return fmt.Errorf("session profile integrity: missing gateway_session relation")
+		}
+		auth, err := tx.FindRecordById(collectionGatewaySessions, authID)
+		if err != nil {
+			if isNotFoundError(err) {
+				return fmt.Errorf("session profile integrity: missing parent session %q", authID)
+			}
+			return err
+		}
+		hydrated, err := sessionFromRecords(auth, profile)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(hydrated.GatewayTokenHash) == "" {
+			return fmt.Errorf("session integrity: missing gateway token hash")
+		}
+		if strings.TrimSpace(hydrated.GatewayUserID) == "" {
+			return fmt.Errorf("session integrity: missing gateway user")
+		}
+		if hydrated.GatewayUserID != gatewayUserID || !hydrated.Active(now) {
+			return gateway.ErrNotFound
+		}
+		result = hydrated
+		return ctx.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 func (s *Store) RevokeSession(ctx context.Context, tokenHash string) error {
 	if err := ctx.Err(); err != nil {
 		return err

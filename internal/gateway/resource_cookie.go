@@ -105,8 +105,11 @@ func hasExplicitCredentialInput(r *http.Request) bool {
 		}
 	}
 	q := r.URL.Query()
-	for _, name := range append(append([]string{}, strictQueryAuthKeys...), genericQueryAuthKey) {
-		for _, value := range q[name] {
+	for name, values := range q {
+		if !isEgressCredentialQueryKey(name) {
+			continue
+		}
+		for _, value := range values {
 			if strings.TrimSpace(value) != "" {
 				return true
 			}
@@ -129,8 +132,8 @@ func hasAuthControlOccurrence(r *http.Request) bool {
 	if err != nil {
 		return true
 	}
-	for _, name := range append(append([]string{}, strictQueryAuthKeys...), genericQueryAuthKey) {
-		if _, ok := q[name]; ok {
+	for name := range q {
+		if isEgressCredentialQueryKey(name) {
 			return true
 		}
 	}

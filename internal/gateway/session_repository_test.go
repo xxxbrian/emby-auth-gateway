@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -343,6 +344,123 @@ func TestMemoryStoreRepairParityWithPersistedProfile(t *testing.T) {
 			t.Fatal("invalid capabilities: want integrity error")
 		}
 	})
+}
+
+func TestMemoryStoreFindActiveSessionByPublicID(t *testing.T) {
+	t.Parallel()
+	store := NewMemoryStore()
+	base := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	publicID := "session-" + strings.Repeat("a", 32)
+	_, err := store.CreateSession(context.Background(), Session{
+		GatewayTokenHash: "target", GatewayUserID: "user-1", SyntheticUserID: "syn-1",
+		PublicID: publicID, CreatedAt: base, ExpiresAt: base.Add(time.Hour), LastActivityAt: base,
+		Capabilities: SessionCapabilities{RawJSON: `{"PlayableMediaTypes":["Video"],"SupportedCommands":["Play"]}`},
+	})
+	if err != nil {
+		t.Fatalf("create target: %v", err)
+	}
+	for i := 0; i < 12; i++ {
+		uid := "user-1"
+		if i%2 == 1 {
+			uid = "user-2"
+		}
+		_, err := store.CreateSession(context.Background(), Session{
+			GatewayTokenHash: "extra-" + strconv.Itoa(i), GatewayUserID: uid, SyntheticUserID: "syn",
+			PublicID: "session-" + fmt.Sprintf("%032x", i+1), CreatedAt: base, ExpiresAt: base.Add(time.Hour),
+		})
+		if err != nil {
+			t.Fatalf("create extra %d: %v", i, err)
+		}
+	}
+
+	found, err := store.FindActiveSessionByPublicID(context.Background(), "  user-1  ", publicID, base.Add(time.Minute))
+	if err != nil || found.GatewayTokenHash != "target" {
+		t.Fatalf("find target = %#v, %v", found, err)
+	}
+	found.Capabilities.PlayableMediaTypes[0] = "Audio"
+	found.Capabilities.SupportedCommands[0] = "Stop"
+	again, err := store.FindActiveSessionByPublicID(context.Background(), "user-1", publicID, base.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("find target again: %v", err)
+	}
+	if again.Capabilities.PlayableMediaTypes[0] != "Video" || again.Capabilities.SupportedCommands[0] != "Play" {
+		t.Fatalf("returned session was not deeply cloned: %#v", again.Capabilities)
+	}
+
+	for _, tc := range []struct{ name, uid, id string }{
+		{name: "foreign", uid: "user-2", id: publicID},
+		{name: "absent", uid: "user-1", id: "session-" + strings.Repeat("b", 32)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := store.FindActiveSessionByPublicID(context.Background(), tc.uid, tc.id, base.Add(time.Minute)); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("err = %v, want ErrNotFound", err)
+			}
+		})
+	}
+	revokedAt := base.Add(time.Minute)
+	store.Sessions["revoked"] = &Session{GatewayTokenHash: "revoked", GatewayUserID: "user-1", PublicID: "session-" + strings.Repeat("c", 32), Capabilities: SessionCapabilities{RawJSON: "{}"}, CreatedAt: base, ExpiresAt: base.Add(time.Hour), LastActivityAt: base, RevokedAt: &revokedAt}
+	store.Sessions["expired"] = &Session{GatewayTokenHash: "expired", GatewayUserID: "user-1", PublicID: "session-" + strings.Repeat("d", 32), Capabilities: SessionCapabilities{RawJSON: "{}"}, CreatedAt: base.Add(-time.Hour), ExpiresAt: base, LastActivityAt: base.Add(-time.Hour)}
+	for _, id := range []string{store.Sessions["revoked"].PublicID, store.Sessions["expired"].PublicID} {
+		if _, err := store.FindActiveSessionByPublicID(context.Background(), "user-1", id, base.Add(time.Minute)); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("inactive %q err = %v, want ErrNotFound", id, err)
+		}
+	}
+
+	hole := &Session{GatewayTokenHash: "hole", GatewayUserID: "user-1", CreatedAt: base, ExpiresAt: base.Add(time.Hour)}
+	store.Sessions["hole"] = hole
+	if _, err := store.FindActiveSessionByPublicID(context.Background(), "user-1", "session-"+strings.Repeat("e", 32), base); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("profile hole err = %v, want ErrNotFound", err)
+	}
+	if hole.PublicID != "" || hole.Capabilities.RawJSON != "" || !hole.LastActivityAt.IsZero() {
+		t.Fatalf("profile hole was repaired: %#v", hole)
+	}
+
+	for _, tc := range []struct{ uid, id string }{
+		{uid: "", id: publicID}, {uid: "   ", id: publicID}, {uid: "user-1", id: ""},
+		{uid: "user-1", id: strings.ToUpper(publicID)}, {uid: "user-1", id: " " + publicID},
+	} {
+		if _, err := store.FindActiveSessionByPublicID(context.Background(), tc.uid, tc.id, base); !errors.Is(err, ErrBadRequest) {
+			t.Fatalf("malformed (%q, %q) err = %v, want ErrBadRequest", tc.uid, tc.id, err)
+		}
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := store.FindActiveSessionByPublicID(canceled, "user-1", publicID, base); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled err = %v", err)
+	}
+}
+
+func TestMemoryStoreFindActiveSessionByPublicIDCorruption(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	publicID := "session-" + strings.Repeat("f", 32)
+	for _, tc := range []struct {
+		name, key string
+		mutate    func(*Session)
+	}{
+		{name: "invalid_capabilities", key: "bad", mutate: func(s *Session) { s.Capabilities.RawJSON = "null" }},
+		{name: "zero_activity", key: "bad", mutate: func(s *Session) { s.LastActivityAt = time.Time{} }},
+		{name: "token_relation_mismatch", key: "wrong", mutate: func(*Session) {}},
+		{name: "missing_gateway_user", key: "bad", mutate: func(s *Session) { s.GatewayUserID = "" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewMemoryStore()
+			session := &Session{GatewayTokenHash: "bad", GatewayUserID: "user-1", PublicID: publicID, Capabilities: SessionCapabilities{RawJSON: "{}"}, CreatedAt: base, ExpiresAt: base.Add(time.Hour), LastActivityAt: base}
+			tc.mutate(session)
+			store.Sessions[tc.key] = session
+			_, err := store.FindActiveSessionByPublicID(context.Background(), "user-1", publicID, base)
+			if err == nil || errors.Is(err, ErrNotFound) || errors.Is(err, ErrBadRequest) {
+				t.Fatalf("err = %v, want operational integrity error", err)
+			}
+		})
+	}
+	store := NewMemoryStore()
+	for _, key := range []string{"one", "two"} {
+		store.Sessions[key] = &Session{GatewayTokenHash: key, GatewayUserID: "user-1", PublicID: publicID, Capabilities: SessionCapabilities{RawJSON: "{}"}, ExpiresAt: base.Add(time.Hour), LastActivityAt: base}
+	}
+	if _, err := store.FindActiveSessionByPublicID(context.Background(), "user-1", publicID, base); err == nil || errors.Is(err, ErrNotFound) {
+		t.Fatalf("duplicate err = %v, want operational integrity error", err)
+	}
 }
 
 func TestParseSessionCapabilities(t *testing.T) {
