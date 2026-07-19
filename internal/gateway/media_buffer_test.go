@@ -2,13 +2,12 @@ package gateway
 
 import (
 	"errors"
-	"math"
 	"sync"
 	"testing"
 	"time"
 )
 
-func TestMediaBufferConstructorAndAutomaticBudgetBoundaries(t *testing.T) {
+func TestMediaBufferConstructorBoundaries(t *testing.T) {
 	for _, budget := range []int64{-1, 0, mediaBufferChunkSize - 1, mediaBufferChunkSize + 1} {
 		if _, err := newMediaBuffer(budget); !errors.Is(err, errMediaBufferBudget) {
 			t.Fatalf("newMediaBuffer(%d) error=%v, want budget error", budget, err)
@@ -18,35 +17,45 @@ func TestMediaBufferConstructorAndAutomaticBudgetBoundaries(t *testing.T) {
 	if got := buffer.Snapshot(); got.HardBudget != mediaBufferChunkSize || got.Allocated != 0 || got.Owned != 0 || got.Free != 0 || !got.Enabled {
 		t.Fatalf("initial snapshot=%+v", got)
 	}
+}
 
-	if candidate, ok := minimumPositiveMediaBufferCandidate(0, -1, 16<<30, 8<<30); !ok || candidate != 8<<30 {
-		t.Fatalf("minimum candidate=%d ok=%v", candidate, ok)
+func TestMediaBufferReleaseDoesNotScanRetainedChunks(t *testing.T) {
+	const retained = 1 << 16
+	ownedChunk := &mediaBufferChunk{id: 1, generation: 1, ownerID: 1, data: make([]byte, mediaBufferChunkSize)}
+	request := &mediaBufferRequest{
+		id:     1,
+		target: mediaBufferChunkSize,
+		owned:  mediaBufferChunkSize,
+		notify: make(chan struct{}, 1),
+		chunks: map[*mediaBufferChunk]uint64{ownedChunk: 1},
 	}
-	if _, ok := minimumPositiveMediaBufferCandidate(0, -1); ok {
-		t.Fatal("non-positive candidates were accepted")
+	buffer := &mediaBuffer{
+		hardBudget: int64(retained+1) * mediaBufferChunkSize,
+		allocated:  int64(retained+1) * mediaBufferChunkSize,
+		owned:      mediaBufferChunkSize,
+		free:       make([]*mediaBufferChunk, retained, retained+1),
+		requests:   []*mediaBufferRequest{request},
 	}
+	request.buffer = buffer
+	lease := mediaBufferLease{chunk: ownedChunk, requestID: request.id, generation: ownedChunk.generation}
 
-	tests := []struct {
-		name       string
-		candidates []int64
-		want       int64
-		wantErr    error
-	}{
-		{name: "no candidate", wantErr: errMediaBufferNoCandidate},
-		{name: "non-positive only", candidates: []int64{0, -1, math.MinInt64}, wantErr: errMediaBufferNoCandidate},
-		{name: "minimum and one eighth", candidates: []int64{16 << 30, 8 << 30}, want: 1 << 30},
-		{name: "two GiB cap", candidates: []int64{math.MaxInt64}, want: mediaBufferAutoBudgetCap},
-		{name: "alignment", candidates: []int64{8 * (3*mediaBufferChunkSize + 123)}, want: 3 * mediaBufferChunkSize},
-		{name: "exact one chunk", candidates: []int64{8 * mediaBufferChunkSize}, want: mediaBufferChunkSize},
-		{name: "below one chunk", candidates: []int64{8*mediaBufferChunkSize - 1}, wantErr: errMediaBufferBudget},
+	// Nil retained entries deliberately make any exhaustive pool scan panic.
+	// Production release needs only lease-map validation and scalar accounting.
+	allocations := testing.AllocsPerRun(100, func() {
+		buffer.free = buffer.free[:retained]
+		buffer.owned = mediaBufferChunkSize
+		request.owned = mediaBufferChunkSize
+		ownedChunk.ownerID = request.id
+		request.chunks[ownedChunk] = ownedChunk.generation
+		if err := request.releaseOptional(lease); err != nil {
+			panic(err)
+		}
+	})
+	if allocations != 0 {
+		t.Fatalf("release allocations=%f want 0", allocations)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := automaticMediaBufferBudget(tt.candidates...)
-			if !errors.Is(err, tt.wantErr) || got != tt.want {
-				t.Fatalf("budget=%d error=%v, want budget=%d error=%v", got, err, tt.want, tt.wantErr)
-			}
-		})
+	if buffer.owned != 0 || len(buffer.free) != retained+1 || buffer.allocated != int64(len(buffer.free))*mediaBufferChunkSize {
+		t.Fatalf("accounting after release: allocated=%d owned=%d free=%d", buffer.allocated, buffer.owned, len(buffer.free))
 	}
 }
 

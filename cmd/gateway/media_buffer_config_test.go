@@ -188,6 +188,34 @@ func TestAutomaticMediaBufferCandidates(t *testing.T) {
 			"/run/cgroup/service/memory.max": "8589934592\n",
 			"/sys/fs/cgroup/memory.max":      "4294967296\n",
 		}, want: 512 << 20},
+		{name: "v2 unlimited leaf finite parent", files: map[string]string{
+			"/proc/self/cgroup":                  "0::/parent/leaf\n",
+			"/proc/self/mountinfo":               "36 25 0:32 / /run/cgroup rw - cgroup2 cgroup rw\n",
+			"/run/cgroup/parent/leaf/memory.max": "max\n",
+			"/run/cgroup/parent/memory.max":      "4294967296\n",
+			"/run/cgroup/memory.max":             "8589934592\n",
+		}, want: 512 << 20},
+		{name: "v1 unlimited leaf finite parent", files: map[string]string{
+			"/proc/self/cgroup":                             "5:memory:/parent/leaf\n",
+			"/proc/self/mountinfo":                          "31 25 0:26 / /run/memory rw - cgroup cgroup rw,memory\n",
+			"/run/memory/parent/leaf/memory.limit_in_bytes": "9223372036854771712\n",
+			"/run/memory/parent/memory.limit_in_bytes":      "8589934592\n",
+			"/run/memory/memory.limit_in_bytes":             "17179869184\n",
+		}, want: oneGiB},
+		{name: "multiple finite ancestors choose tightest", files: map[string]string{
+			"/proc/self/cgroup":                        "0::/grand/parent/leaf\n",
+			"/proc/self/mountinfo":                     "36 25 0:32 / /run/cgroup rw - cgroup2 cgroup rw\n",
+			"/run/cgroup/grand/parent/leaf/memory.max": "8589934592\n",
+			"/run/cgroup/grand/parent/memory.max":      "2147483648\n",
+			"/run/cgroup/grand/memory.max":             "4294967296\n",
+			"/run/cgroup/memory.max":                   "17179869184\n",
+		}, want: 256 << 20},
+		{name: "bad ancestors omit independently", files: map[string]string{
+			"/proc/self/cgroup":                  "0::/parent/leaf\n",
+			"/proc/self/mountinfo":               "36 25 0:32 / /run/cgroup rw - cgroup2 cgroup rw\n",
+			"/run/cgroup/parent/leaf/memory.max": "malformed\n",
+			"/run/cgroup/memory.max":             "8589934592\n",
+		}, fileErrors: map[string]error{"/run/cgroup/parent/memory.max": os.ErrPermission}, want: oneGiB},
 		{name: "cgroup v2 max omitted", files: map[string]string{"/sys/fs/cgroup/memory.max": "max\n"}, physical: 16 << 30, want: 2 << 30},
 		{name: "cgroup v1 nested finite", files: map[string]string{"/sys/fs/cgroup/memory/memory.limit_in_bytes": "8589934592"}, want: oneGiB},
 		{name: "cgroup v1 root finite", files: map[string]string{"/sys/fs/cgroup/memory.limit_in_bytes": "8589934592"}, want: oneGiB},
@@ -270,7 +298,10 @@ func TestCgroupMemorySources(t *testing.T) {
 			name:      "systemd service v2",
 			cgroup:    "0::/system.slice/emby-auth-gateway.service\n",
 			mountinfo: "36 25 0:32 / /sys/fs/cgroup rw,nosuid,nodev - cgroup2 cgroup rw\n",
-			want:      []cgroupMemorySource{{path: "/sys/fs/cgroup/system.slice/emby-auth-gateway.service/memory.max"}},
+			want: []cgroupMemorySource{
+				{path: "/sys/fs/cgroup/system.slice/emby-auth-gateway.service/memory.max"},
+				{path: "/sys/fs/cgroup/system.slice/memory.max"},
+			},
 		},
 		{
 			name:      "container namespace root",
@@ -282,14 +313,20 @@ func TestCgroupMemorySources(t *testing.T) {
 			name:      "alternate escaped mountpoint and root",
 			cgroup:    "0::/tenant slice/service.scope\n",
 			mountinfo: "41 25 0:44 /tenant\\040slice /run/cgroup\\040v2 rw - cgroup2 cgroup rw\n",
-			want:      []cgroupMemorySource{{path: "/run/cgroup v2/service.scope/memory.max"}},
+			want: []cgroupMemorySource{
+				{path: "/run/cgroup v2/service.scope/memory.max"},
+				{path: "/run/cgroup v2/memory.max"},
+			},
 		},
 		{
 			name:   "v1 memory among multiple controllers",
 			cgroup: "2:cpu,cpuacct:/docker/id\n5:memory,blkio:/docker/id\n",
 			mountinfo: "30 25 0:25 / /sys/fs/cgroup/cpu rw - cgroup cgroup rw,cpu,cpuacct\n" +
 				"31 25 0:26 /docker /alt/memory rw - cgroup cgroup rw,memory\n",
-			want: []cgroupMemorySource{{path: "/alt/memory/id/memory.limit_in_bytes", v1: true}},
+			want: []cgroupMemorySource{
+				{path: "/alt/memory/id/memory.limit_in_bytes", v1: true},
+				{path: "/alt/memory/memory.limit_in_bytes", v1: true},
+			},
 		},
 		{
 			name:      "duplicate mounts deduplicated",
@@ -301,7 +338,10 @@ func TestCgroupMemorySources(t *testing.T) {
 			name:      "root mountpoint",
 			cgroup:    "0::/service\n",
 			mountinfo: "36 25 0:32 / / rw - cgroup2 cgroup rw\n",
-			want:      []cgroupMemorySource{{path: "/service/memory.max"}},
+			want: []cgroupMemorySource{
+				{path: "/service/memory.max"},
+				{path: "/memory.max"},
+			},
 		},
 		{
 			name:      "malformed cgroup line omitted independently",
@@ -319,7 +359,10 @@ func TestCgroupMemorySources(t *testing.T) {
 		{name: "missing mountinfo falls back", missing: "/proc/self/mountinfo", cgroup: "0::/service", want: fallback},
 		{name: "malformed cgroup falls back", cgroup: "malformed\n0::../../escape\n", mountinfo: "36 25 0:32 / /sys/fs/cgroup rw - cgroup2 cgroup rw", want: fallback},
 		{name: "malformed mountinfo falls back", cgroup: "0::/service", mountinfo: "malformed", want: fallback},
-		{name: "namespace relative descendant", cgroup: "0::/other/service", mountinfo: "36 25 0:32 /tenant /sys/fs/cgroup rw - cgroup2 cgroup rw", want: []cgroupMemorySource{{path: "/sys/fs/cgroup/other/service/memory.max"}}},
+		{name: "namespace relative descendant", cgroup: "0::/other/service", mountinfo: "36 25 0:32 /tenant /sys/fs/cgroup rw - cgroup2 cgroup rw", want: []cgroupMemorySource{
+			{path: "/sys/fs/cgroup/other/service/memory.max"},
+			{path: "/sys/fs/cgroup/other/memory.max"},
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -368,6 +411,46 @@ func TestResolveCgroupLimitPath(t *testing.T) {
 			got, ok := resolveCgroupLimitPath(tt.processPath, tt.mount)
 			if got != tt.want || ok != tt.ok {
 				t.Fatalf("resolveCgroupLimitPath()=%q,%v want %q,%v", got, ok, tt.want, tt.ok)
+			}
+		})
+	}
+}
+
+func TestResolveCgroupLimitPathsIncludesVisibleAncestors(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		processPath string
+		mount       cgroupMount
+		want        []string
+	}{
+		{
+			name:        "v2 namespace leaf to mountpoint",
+			processPath: "/parent/leaf",
+			mount:       cgroupMount{root: "/host/container", mountpoint: "/run/cgroup"},
+			want:        []string{"/run/cgroup/parent/leaf/memory.max", "/run/cgroup/parent/memory.max", "/run/cgroup/memory.max"},
+		},
+		{
+			name:        "v1 host prefixed leaf to mountpoint",
+			processPath: "/docker/container/parent/leaf",
+			mount:       cgroupMount{root: "/docker/container", mountpoint: "/run/memory", v1: true},
+			want:        []string{"/run/memory/parent/leaf/memory.limit_in_bytes", "/run/memory/parent/memory.limit_in_bytes", "/run/memory/memory.limit_in_bytes"},
+		},
+		{
+			name:        "namespace root stops at mountpoint",
+			processPath: "/",
+			mount:       cgroupMount{root: "/host/container", mountpoint: "/run/cgroup"},
+			want:        []string{"/run/cgroup/memory.max"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := resolveCgroupLimitPaths(tt.processPath, tt.mount)
+			if !ok || !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("paths=%v ok=%v want=%v", got, ok, tt.want)
+			}
+			for _, candidate := range got {
+				if !pathWithinMountpoint(candidate, tt.mount.mountpoint) {
+					t.Fatalf("candidate escaped mountpoint: %q", candidate)
+				}
 			}
 		})
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -204,6 +205,43 @@ func TestCLIAppRegistersSystemCommandsExactlyOnce(t *testing.T) {
 	for _, name := range []string{"serve", "superuser"} {
 		if counts[name] != 1 {
 			t.Fatalf("%s registrations = %d", name, counts[name])
+		}
+	}
+}
+
+func TestServeInvalidMediaBufferConfigExitsNonzeroBeforeListen(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(mediaBufferEnabledEnv, "true")
+	t.Setenv(mediaBufferBudgetEnv, "")
+	output, err := gatewayCLIOutput(t, "--dir", t.TempDir(), "serve", "--http="+address)
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok || exitErr.ExitCode() != 1 {
+		t.Fatalf("exit error=%v output=%s", err, output)
+	}
+	if !strings.Contains(string(output), mediaBufferBudgetEnv) || !strings.Contains(string(output), "explicit value is empty") {
+		t.Fatalf("output=%q", output)
+	}
+	connection, dialErr := net.DialTimeout("tcp", address, 100*time.Millisecond)
+	if dialErr == nil {
+		_ = connection.Close()
+		t.Fatalf("invalid startup opened listener %s", address)
+	}
+}
+
+func TestInvalidMediaBufferEnvDoesNotAffectUnrelatedCommands(t *testing.T) {
+	t.Setenv(mediaBufferEnabledEnv, "true")
+	t.Setenv(mediaBufferBudgetEnv, "")
+	for _, args := range [][]string{{"setup", "--help"}, {"superuser", "--help"}, {"version"}} {
+		output, err := gatewayCLIOutput(t, args...)
+		if err != nil {
+			t.Fatalf("args=%v error=%v output=%s", args, err, output)
 		}
 	}
 }

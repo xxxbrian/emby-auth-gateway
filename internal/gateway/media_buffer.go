@@ -7,17 +7,15 @@ import (
 )
 
 const (
-	mediaBufferChunkSize     int64 = 32 << 10
-	mediaBufferRequestCap    int64 = 512 << 20
-	mediaBufferAutoBudgetCap int64 = 2 << 30
+	mediaBufferChunkSize  int64 = 32 << 10
+	mediaBufferRequestCap int64 = 512 << 20
 )
 
 var (
-	errMediaBufferBudget      = errors.New("invalid media buffer budget")
-	errMediaBufferNoCandidate = errors.New("no finite media buffer memory candidate")
-	errMediaBufferClosed      = errors.New("media buffer request closed")
-	errMediaBufferNoGrant     = errors.New("media buffer grant not pending")
-	errMediaBufferOwnership   = errors.New("invalid media buffer lease ownership")
+	errMediaBufferBudget    = errors.New("invalid media buffer budget")
+	errMediaBufferClosed    = errors.New("media buffer request closed")
+	errMediaBufferNoGrant   = errors.New("media buffer grant not pending")
+	errMediaBufferOwnership = errors.New("invalid media buffer lease ownership")
 )
 
 type mediaBuffer struct {
@@ -117,33 +115,6 @@ func alignMediaBufferSize(size int64) int64 {
 	return size / mediaBufferChunkSize * mediaBufferChunkSize
 }
 
-func minimumPositiveMediaBufferCandidate(candidates ...int64) (int64, bool) {
-	var minimum int64
-	for _, candidate := range candidates {
-		if candidate <= 0 || minimum != 0 && candidate >= minimum {
-			continue
-		}
-		minimum = candidate
-	}
-	return minimum, minimum > 0
-}
-
-func automaticMediaBufferBudget(candidates ...int64) (int64, error) {
-	limit, ok := minimumPositiveMediaBufferCandidate(candidates...)
-	if !ok {
-		return 0, errMediaBufferNoCandidate
-	}
-	budget := limit / 8
-	if budget > mediaBufferAutoBudgetCap {
-		budget = mediaBufferAutoBudgetCap
-	}
-	budget = alignMediaBufferSize(budget)
-	if budget < mediaBufferChunkSize {
-		return 0, fmt.Errorf("%w: automatic budget below one chunk", errMediaBufferBudget)
-	}
-	return budget, nil
-}
-
 func (b *mediaBuffer) register() *mediaBufferRequest {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -158,7 +129,7 @@ func (b *mediaBuffer) register() *mediaBufferRequest {
 	b.requests = append(b.requests, r)
 	b.recomputeTargetsLocked()
 	b.scheduleLocked()
-	b.assertInvariantsLocked()
+	b.assertAccountingLocked()
 	return r
 }
 
@@ -200,7 +171,7 @@ func (r *mediaBufferRequest) requestOptional() (<-chan struct{}, error) {
 	r.waiting = true
 	b.waiters = append(b.waiters, r)
 	b.scheduleLocked()
-	b.assertInvariantsLocked()
+	b.assertAccountingLocked()
 	return r.notify, nil
 }
 
@@ -219,7 +190,7 @@ func (r *mediaBufferRequest) acceptOptional() (mediaBufferLease, error) {
 	r.pending = nil
 	drainMediaBufferNotification(r.notify)
 	r.chunks[lease.chunk] = lease.generation
-	b.assertInvariantsLocked()
+	b.assertAccountingLocked()
 	return lease, nil
 }
 
@@ -240,7 +211,7 @@ func (r *mediaBufferRequest) cancelOptionalRequest() error {
 		drainMediaBufferNotification(r.notify)
 	}
 	b.scheduleLocked()
-	b.assertInvariantsLocked()
+	b.assertAccountingLocked()
 	return nil
 }
 
@@ -257,7 +228,7 @@ func (r *mediaBufferRequest) releaseOptional(lease mediaBufferLease) error {
 	}
 	b.releaseAcceptedLocked(r, lease.chunk)
 	b.scheduleLocked()
-	b.assertInvariantsLocked()
+	b.assertAccountingLocked()
 	return nil
 }
 
@@ -289,7 +260,7 @@ func (r *mediaBufferRequest) close() error {
 	close(r.notify)
 	b.recomputeTargetsLocked()
 	b.scheduleLocked()
-	b.assertInvariantsLocked()
+	b.assertAccountingLocked()
 	return nil
 }
 
@@ -456,122 +427,15 @@ func drainMediaBufferNotification(notify chan struct{}) {
 	}
 }
 
-func (b *mediaBuffer) assertInvariants() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.assertInvariantsLocked()
-}
-
 func (b *mediaBuffer) assertAccountingLocked() {
+	if int64(len(b.free)) > b.hardBudget/mediaBufferChunkSize {
+		panic("invalid media buffer byte accounting")
+	}
 	freeBytes := int64(len(b.free)) * mediaBufferChunkSize
-	if b.allocated < 0 || b.owned < 0 || b.owned > b.allocated || b.allocated > b.hardBudget || b.allocated != b.owned+freeBytes {
+	if b.hardBudget < mediaBufferChunkSize || b.hardBudget%mediaBufferChunkSize != 0 ||
+		b.allocated < 0 || b.allocated%mediaBufferChunkSize != 0 || b.allocated > b.hardBudget ||
+		b.owned < 0 || b.owned%mediaBufferChunkSize != 0 || b.owned > b.allocated ||
+		freeBytes < 0 || b.allocated != b.owned+freeBytes || len(b.waiters) > len(b.requests) {
 		panic("invalid media buffer byte accounting")
-	}
-}
-
-func (b *mediaBuffer) assertInvariantsLocked() {
-	b.assertAccountingLocked()
-	if b.hardBudget < mediaBufferChunkSize || b.hardBudget%mediaBufferChunkSize != 0 || b.allocated%mediaBufferChunkSize != 0 || b.owned%mediaBufferChunkSize != 0 {
-		panic("invalid media buffer byte accounting")
-	}
-
-	seenChunks := make(map[*mediaBufferChunk]string, b.allocated/mediaBufferChunkSize)
-	seenGenerations := make(map[uint64]struct{}, b.owned/mediaBufferChunkSize)
-	for _, chunk := range b.free {
-		if chunk == nil || len(chunk.data) != int(mediaBufferChunkSize) || chunk.ownerID != 0 {
-			panic("invalid free media buffer chunk")
-		}
-		if _, exists := seenChunks[chunk]; exists {
-			panic("duplicate free media buffer chunk")
-		}
-		seenChunks[chunk] = "free"
-	}
-
-	requestSet := make(map[*mediaBufferRequest]struct{}, len(b.requests))
-	requestIDs := make(map[uint64]struct{}, len(b.requests))
-	expectedTarget := int64(0)
-	if len(b.requests) > 0 {
-		expectedTarget = alignMediaBufferSize(b.hardBudget / int64(len(b.requests)))
-		if expectedTarget > mediaBufferRequestCap {
-			expectedTarget = mediaBufferRequestCap
-		}
-	}
-	var requestOwned int64
-	for _, r := range b.requests {
-		if r == nil || r.buffer != b || r.closed {
-			panic("invalid registered media buffer request")
-		}
-		if _, exists := requestSet[r]; exists {
-			panic("duplicate registered media buffer request")
-		}
-		if _, exists := requestIDs[r.id]; exists || r.id == 0 {
-			panic("duplicate media buffer request id")
-		}
-		requestSet[r] = struct{}{}
-		requestIDs[r.id] = struct{}{}
-		expectedDebt := r.owned - r.target
-		if expectedDebt < 0 {
-			expectedDebt = 0
-		}
-		if r.target != expectedTarget || r.debt != expectedDebt || r.owned < 0 || r.owned%mediaBufferChunkSize != 0 {
-			panic("invalid media buffer request accounting")
-		}
-		expectedOwned := int64(len(r.chunks)) * mediaBufferChunkSize
-		if r.pending != nil {
-			expectedOwned += mediaBufferChunkSize
-		}
-		if r.owned != expectedOwned {
-			panic("media buffer request ownership map mismatch")
-		}
-		for chunk, generation := range r.chunks {
-			if chunk == nil || generation == 0 || chunk.ownerID != r.id || chunk.generation != generation || len(chunk.data) != int(mediaBufferChunkSize) {
-				panic("invalid accepted media buffer lease")
-			}
-			if _, exists := seenChunks[chunk]; exists {
-				panic("media buffer chunk has multiple owners")
-			}
-			if _, exists := seenGenerations[generation]; exists {
-				panic("duplicate active media buffer generation")
-			}
-			seenChunks[chunk] = "accepted"
-			seenGenerations[generation] = struct{}{}
-		}
-		if r.pending != nil {
-			lease := r.pending
-			if lease.chunk == nil || lease.requestID != r.id || lease.generation == 0 || lease.chunk.ownerID != r.id || lease.chunk.generation != lease.generation || r.waiting {
-				panic("invalid pending media buffer lease")
-			}
-			if _, exists := seenChunks[lease.chunk]; exists {
-				panic("pending media buffer chunk has multiple owners")
-			}
-			if _, exists := seenGenerations[lease.generation]; exists {
-				panic("duplicate active media buffer generation")
-			}
-			seenChunks[lease.chunk] = "pending"
-			seenGenerations[lease.generation] = struct{}{}
-		} else if len(r.notify) != 0 {
-			panic("media buffer notification without pending lease")
-		}
-		requestOwned += r.owned
-	}
-	if requestOwned != b.owned || int64(len(seenChunks))*mediaBufferChunkSize != b.allocated {
-		panic("media buffer aggregate ownership mismatch")
-	}
-
-	waiterSet := make(map[*mediaBufferRequest]struct{}, len(b.waiters))
-	for _, r := range b.waiters {
-		if _, registered := requestSet[r]; !registered || r.closed || !r.waiting || r.pending != nil {
-			panic("invalid media buffer waiter")
-		}
-		if _, exists := waiterSet[r]; exists {
-			panic("duplicate media buffer waiter")
-		}
-		waiterSet[r] = struct{}{}
-	}
-	for _, r := range b.requests {
-		_, queued := waiterSet[r]
-		if queued != r.waiting {
-			panic("media buffer waiter state mismatch")
-		}
 	}
 }

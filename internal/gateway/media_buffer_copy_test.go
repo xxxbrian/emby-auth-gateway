@@ -443,6 +443,130 @@ func TestMediaBufferCopyBurstPauseReadsAheadOfBlockedWriter(t *testing.T) {
 	}
 }
 
+func TestSharedMediaBufferCopyEnginesStressLifecycle(t *testing.T) {
+	controller := mustMediaBufferCopyController(t, 2*mediaBufferChunkSize)
+	var postClosePublications atomic.Int32
+	type engine struct {
+		request *mediaBufferRequest
+		source  *mediaBufferTestSource
+		closed  *atomic.Bool
+		result  chan mediaCopyResult
+	}
+	start := func(ctx context.Context, writer io.Writer, reader io.Reader, onClose func(), hooks *mediaBufferCopyHooks) engine {
+		request := controller.register()
+		closed := &atomic.Bool{}
+		source := newMediaBufferTestSource(reader, func() {
+			closed.Store(true)
+			if onClose != nil {
+				onClose()
+			}
+		})
+		if hooks == nil {
+			hooks = &mediaBufferCopyHooks{}
+		}
+		originalPublished := hooks.onPublished
+		hooks.onPublished = func(terminal bool) {
+			if closed.Load() {
+				postClosePublications.Add(1)
+			}
+			if originalPublished != nil {
+				originalPublished(terminal)
+			}
+		}
+		result := make(chan mediaCopyResult, 1)
+		go func() {
+			result <- copyBufferedMediaBodyWithHooks(ctx, writer, source, source, make([]byte, mediaCopyBufferSize), request, -1, hooks)
+		}()
+		return engine{request: request, source: source, closed: closed, result: result}
+	}
+
+	ownerCtx, cancelOwner := context.WithCancel(context.Background())
+	ownerReader := &mediaBufferOptionalBlockingReader{
+		optionalRead:  make(chan struct{}),
+		closed:        make(chan struct{}),
+		closeObserved: make(chan struct{}),
+		allowReturn:   make(chan struct{}),
+	}
+	ownerWriter := newMediaBufferBlockingWriter(nil)
+	owner := start(ownerCtx, ownerWriter, ownerReader, func() { close(ownerReader.closed) }, nil)
+	awaitMediaBufferSignal(t, ownerWriter.started)
+	awaitMediaBufferSignal(t, ownerReader.optionalRead)
+
+	downstreamErr := errors.New("shared downstream failure")
+	failingWriter := newMediaBufferBlockingWriter(downstreamErr)
+	failingReader := &mediaBufferReadCountReader{data: bytes.Repeat([]byte("f"), 2*mediaCopyBufferSize), reached: make(chan struct{})}
+	failing := start(context.Background(), failingWriter, failingReader, nil, nil)
+	awaitMediaBufferSignal(t, failingWriter.started)
+	awaitMediaBufferSignal(t, failingReader.reached)
+
+	waitCtx, cancelWait := context.WithCancel(context.Background())
+	waitWriter := newMediaBufferBlockingWriter(nil)
+	waiting := make(chan struct{})
+	waitHooks := &mediaBufferCopyHooks{onOptionalWait: func() { close(waiting) }}
+	waiter := start(waitCtx, waitWriter, bytes.NewReader(bytes.Repeat([]byte("w"), 2*mediaCopyBufferSize)), nil, waitHooks)
+	awaitMediaBufferSignal(t, waitWriter.started)
+	awaitMediaBufferSignal(t, waiting)
+
+	normal := start(context.Background(), io.Discard, &mediaBufferNErrorReader{data: []byte("normal"), err: io.EOF}, nil, nil)
+	normalResult := awaitMediaBufferResult(t, normal.result)
+	if normalResult.Err != nil || normalResult.BytesWritten != int64(len("normal")) {
+		t.Fatalf("normal result=%+v", normalResult)
+	}
+
+	cancelWait()
+	close(waitWriter.release)
+	waitResult := awaitMediaBufferResult(t, waiter.result)
+	if !errors.Is(waitResult.Err, context.Canceled) {
+		t.Fatalf("waiting result=%+v", waitResult)
+	}
+
+	close(failingWriter.release)
+	failingResult := awaitMediaBufferResult(t, failing.result)
+	if !errors.Is(failingResult.Err, downstreamErr) || failingResult.Direction != mediaDirectionDownstream {
+		t.Fatalf("failing result=%+v", failingResult)
+	}
+
+	cancelOwner()
+	close(ownerWriter.release)
+	awaitMediaBufferSignal(t, ownerReader.closeObserved)
+	select {
+	case result := <-owner.result:
+		t.Fatalf("owner returned before blocked producer joined: %+v", result)
+	default:
+	}
+	close(ownerReader.allowReturn)
+	ownerResult := awaitMediaBufferResult(t, owner.result)
+	if !errors.Is(ownerResult.Err, context.Canceled) {
+		t.Fatalf("owner result=%+v", ownerResult)
+	}
+
+	engines := []engine{owner, failing, waiter, normal}
+	for index, current := range engines {
+		if current.source.closeCount() != 1 || !current.closed.Load() {
+			t.Fatalf("engine %d closes=%d closed=%v", index, current.source.closeCount(), current.closed.Load())
+		}
+		beforeClose := current.request.snapshot()
+		if beforeClose.Owned != 0 || beforeClose.Pending || beforeClose.Requesting {
+			t.Fatalf("engine %d before close=%+v", index, beforeClose)
+		}
+		if err := current.request.close(); err != nil {
+			t.Fatal(err)
+		}
+		afterClose := current.request.snapshot()
+		if !afterClose.Closed || afterClose.Owned != 0 || afterClose.Pending || afterClose.Requesting || afterClose.Debt != 0 {
+			t.Fatalf("engine %d after close=%+v", index, afterClose)
+		}
+		controller.assertInvariants()
+	}
+	if postClosePublications.Load() != 0 {
+		t.Fatalf("post-close publications=%d", postClosePublications.Load())
+	}
+	final := controller.Snapshot()
+	if final.Owned != 0 || final.Free != final.Allocated || final.Allocated > final.HardBudget || final.ActiveRequests != 0 || final.IndebtedRequests != 0 || final.RequestDebtBytes != 0 {
+		t.Fatalf("final snapshot=%+v", final)
+	}
+}
+
 func runMediaBufferCopy(t *testing.T, ctx context.Context, dst io.Writer, reader io.Reader, expectedLength, budget int64, hooks *mediaBufferCopyHooks) (mediaCopyResult, *mediaBufferTestSource) {
 	t.Helper()
 	buffer := mustMediaBufferCopyController(t, budget)

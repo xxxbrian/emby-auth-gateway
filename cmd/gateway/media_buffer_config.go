@@ -282,22 +282,53 @@ func validMountInfoIdentity(mountID, parentID, device string) bool {
 }
 
 func resolveCgroupMemorySources(paths []cgroupProcessPath, mounts []cgroupMount) []cgroupMemorySource {
-	seen := make(map[string]bool)
+	seen := make(map[cgroupMemorySource]bool)
 	var result []cgroupMemorySource
 	for _, processPath := range paths {
 		for _, mount := range mounts {
 			if processPath.v1 != mount.v1 {
 				continue
 			}
-			limitPath, ok := resolveCgroupLimitPath(processPath.path, mount)
-			if !ok || seen[limitPath] {
+			limitPaths, ok := resolveCgroupLimitPaths(processPath.path, mount)
+			if !ok {
 				continue
 			}
-			seen[limitPath] = true
-			result = append(result, cgroupMemorySource{path: limitPath, v1: processPath.v1})
+			for _, limitPath := range limitPaths {
+				source := cgroupMemorySource{path: limitPath, v1: processPath.v1}
+				if seen[source] {
+					continue
+				}
+				seen[source] = true
+				result = append(result, source)
+			}
 		}
 	}
 	return result
+}
+
+func resolveCgroupLimitPaths(processPath string, mount cgroupMount) ([]string, bool) {
+	leaf, ok := resolveCgroupLimitPath(processPath, mount)
+	if !ok {
+		return nil, false
+	}
+	mountpoint := path.Clean(mount.mountpoint)
+	filename := path.Base(leaf)
+	directory := path.Dir(leaf)
+	var result []string
+	for {
+		if !pathWithinMountpoint(directory, mountpoint) {
+			return nil, false
+		}
+		result = append(result, path.Join(directory, filename))
+		if directory == mountpoint {
+			return result, true
+		}
+		parent := path.Dir(directory)
+		if parent == directory {
+			return nil, false
+		}
+		directory = parent
+	}
 }
 
 func resolveCgroupLimitPath(processPath string, mount cgroupMount) (string, bool) {

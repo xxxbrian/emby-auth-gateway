@@ -42,8 +42,11 @@ func runGateway(args []string) int {
 	app.RootCmd.SetArgs(args)
 	switch mode {
 	case commandServe:
-		if err := app.Execute(); err != nil {
-			fmt.Fprintln(os.Stderr, err)
+		if err := executeServe(app); err != nil {
+			var printed *serveCommandError
+			if !errors.As(err, &printed) {
+				fmt.Fprintln(os.Stderr, err)
+			}
 			return 1
 		}
 		return 0
@@ -69,6 +72,42 @@ func runGateway(args []string) int {
 			return 1
 		}
 		return 0
+	}
+}
+
+type serveCommandError struct{ err error }
+
+func (e *serveCommandError) Error() string { return e.err.Error() }
+func (e *serveCommandError) Unwrap() error { return e.err }
+
+func executeServe(app *pocketbase.PocketBase) error {
+	var serve *cobra.Command
+	for _, command := range app.RootCmd.Commands() {
+		if command.Name() == "serve" {
+			serve = command
+			break
+		}
+	}
+	if serve == nil || serve.RunE == nil {
+		return errors.New("serve command is not registered")
+	}
+	originalRunE := serve.RunE
+	commandResult := make(chan error, 1)
+	serve.RunE = func(command *cobra.Command, args []string) error {
+		err := originalRunE(command, args)
+		commandResult <- err
+		return err
+	}
+	executeErr := app.Execute()
+	select {
+	case commandErr := <-commandResult:
+		if commandErr != nil {
+			return &serveCommandError{err: errors.Join(commandErr, executeErr)}
+		}
+		return executeErr
+	default:
+		// PocketBase may return on a termination signal before Serve exits.
+		return executeErr
 	}
 }
 

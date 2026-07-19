@@ -133,7 +133,7 @@ func copyBufferedMediaBodyWithHooks(ctx context.Context, dst io.Writer, src io.R
 	_ = source.Close()
 	producerResult := <-producerDone
 	invariantErr = errors.Join(invariantErr, producerResult.invariant)
-	for _, event := range append(queued, queue.drain()...) {
+	for _, event := range queued {
 		if event.terminal {
 			continue
 		}
@@ -417,12 +417,6 @@ func (q *mediaBufferCopyQueue) close() []mediaBufferCopyEvent {
 	default:
 	}
 	return events
-}
-
-func (q *mediaBufferCopyQueue) drain() []mediaBufferCopyEvent {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return q.takeAllLocked()
 }
 
 func (q *mediaBufferCopyQueue) compactLocked() {
