@@ -24,7 +24,7 @@ type Config struct {
 	MinResumeDurationSeconds float64
 	Emitter                  *observe.Emitter // optional; nil = no-op
 	Meter                    TrafficMeter     // optional live bandwidth meter; nil = no-op
-	MediaBuffer              *mediaBuffer     // optional; nil preserves synchronous media copying
+	MediaBuffer              *MediaBuffer     // optional; nil preserves synchronous media copying
 }
 
 type Store interface {

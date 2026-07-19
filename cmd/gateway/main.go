@@ -82,6 +82,15 @@ const (
 
 var newCLIAppForRun = newCLIApp
 
+var (
+	mediaBufferStartupDepsForServe = productionMediaBufferStartupDeps
+	startTelemetryForServe         = func(registry *telemetry.Registry) { go registry.Start(context.Background()) }
+	newGatewayServerForServe       = gateway.NewServer
+	mountGatewayRoutesForServe     = mountGatewayRoutes
+	mountAdminForServe             = mountAdmin
+	startGatewayBackgroundForServe = startGatewayBackground
+)
+
 func newCLIApp() *pocketbase.PocketBase {
 	app := newGatewayApp()
 	registerSystemCommands(app)
@@ -177,13 +186,20 @@ func newGatewayApp() *pocketbase.PocketBase {
 	})
 
 	app.OnServe().BindFunc(func(e *core.ServeEvent) error {
+		var mediaBuffer *gateway.MediaBuffer
+		if err := injectMediaBufferStartup(mediaBufferStartupDepsForServe(), func(controller *gateway.MediaBuffer) {
+			mediaBuffer = controller
+		}); err != nil {
+			return err
+		}
+
 		startedAt := time.Now().UTC()
 		emitter := observe.NewEmitter(1024)
 		registry := telemetry.New(emitter)
 		// Telemetry consumer is best-effort; never block gateway start.
-		go registry.Start(context.Background())
+		startTelemetryForServe(registry)
 
-		gw := gateway.NewServer(gateway.Config{
+		gw := newGatewayServerForServe(gateway.Config{
 			PublicBaseURL:            strings.TrimRight(os.Getenv("GATEWAY_PUBLIC_URL"), "/"),
 			GatewayBasePath:          fixedGatewayBasePath,
 			GatewayServerID:          envDefault("GATEWAY_SERVER_ID", "emby-auth-gateway"),
@@ -192,6 +208,7 @@ func newGatewayApp() *pocketbase.PocketBase {
 			MinResumeDurationSeconds: envFloatDefault("GATEWAY_MIN_RESUME_DURATION_SECONDS", 0),
 			Emitter:                  emitter,
 			Meter:                    registry.Meter(),
+			MediaBuffer:              mediaBuffer,
 		}, pbstore.New(e.App))
 		web, err := newEmbyWebServer(webAssetsDirFromEnv(), os.Getenv("GATEWAY_PUBLIC_URL"))
 		if err != nil {
@@ -199,7 +216,7 @@ func newGatewayApp() *pocketbase.PocketBase {
 		}
 
 		webReady := webReadyForRootRedirect(web)
-		mountGatewayRoutes(e.Router, web, gw, webReady)
+		mountGatewayRoutesForServe(e.Router, web, gw, webReady)
 
 		adminCfg := adminConfigFromEnv()
 		// Exclusive reconfigure gate: media copies (RWMutex) + active playbacks.
@@ -211,18 +228,11 @@ func newGatewayApp() *pocketbase.PocketBase {
 			}
 			return gw.TryAcquireReconfigure(force)
 		}
-		if err := mountAdmin(e.Router, e.App, adminCfg, registry, nil, acquireReconfigure, webReady, startedAt, registry.Snapshot().BootID); err != nil {
+		if err := mountAdminForServe(e.Router, e.App, adminCfg, registry, nil, acquireReconfigure, webReady, startedAt, registry.Snapshot().BootID); err != nil {
 			return err
 		}
 
-		go func() {
-			if err := gw.ValidateAnonymousImageNamespace(context.Background()); err != nil {
-				e.App.Logger().Warn("Anonymous image namespace unavailable", "error", err)
-			}
-			if err := gw.RefreshUpstreamServerInfo(context.Background()); err != nil {
-				e.App.Logger().Warn("Failed to refresh backend server info", "error", err)
-			}
-		}()
+		startGatewayBackgroundForServe(e, gw)
 
 		if err := e.App.Cron().Add("gatewayPlaybackEventCleanup", "@hourly", func() {
 			if err := cleanupPlaybackEvents(e.App, time.Now().UTC()); err != nil {
@@ -256,6 +266,17 @@ func newGatewayApp() *pocketbase.PocketBase {
 	})
 
 	return app
+}
+
+func startGatewayBackground(e *core.ServeEvent, gw *gateway.Server) {
+	go func() {
+		if err := gw.ValidateAnonymousImageNamespace(context.Background()); err != nil {
+			e.App.Logger().Warn("Anonymous image namespace unavailable", "error", err)
+		}
+		if err := gw.RefreshUpstreamServerInfo(context.Background()); err != nil {
+			e.App.Logger().Warn("Failed to refresh backend server info", "error", err)
+		}
+	}()
 }
 
 func cleanupPlaybackEvents(app core.App, now time.Time) error {

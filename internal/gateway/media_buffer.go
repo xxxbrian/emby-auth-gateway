@@ -33,6 +33,11 @@ type mediaBuffer struct {
 	nextGrant     uint64
 }
 
+// MediaBuffer is the opaque adaptive media buffering controller.
+type MediaBuffer struct {
+	controller *mediaBuffer
+}
+
 type mediaBufferChunk struct {
 	id         uint64
 	generation uint64
@@ -86,6 +91,23 @@ func newMediaBuffer(hardBudget int64) (*mediaBuffer, error) {
 		return nil, fmt.Errorf("%w: must be a positive multiple of %d bytes", errMediaBufferBudget, mediaBufferChunkSize)
 	}
 	return &mediaBuffer{hardBudget: hardBudget}, nil
+}
+
+// NewMediaBuffer constructs an adaptive media buffering controller with an
+// aligned hard budget in bytes.
+func NewMediaBuffer(hardBudget int64) (*MediaBuffer, error) {
+	controller, err := newMediaBuffer(hardBudget)
+	if err != nil {
+		return nil, err
+	}
+	return &MediaBuffer{controller: controller}, nil
+}
+
+func configuredMediaBuffer(controller *MediaBuffer) *mediaBuffer {
+	if controller == nil {
+		return nil
+	}
+	return controller.controller
 }
 
 func alignMediaBufferSize(size int64) int64 {

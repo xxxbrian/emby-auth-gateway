@@ -140,7 +140,7 @@ func NewServer(cfg Config, store Store) *Server {
 		client = &http.Client{Timeout: backendAuthTimeout}
 	}
 	proxyClient := newProxyClient(cfg.HTTPClient)
-	return &Server{cfg: cfg, store: store, client: client, proxyClient: proxyClient, emitter: cfg.Emitter, meter: cfg.Meter, upstreamAuth: newUpstreamAuthenticator(store, client), logins: newLoginFailureLimiter(), playbackGuards: newPlaybackGuardTracker(), mediaBuffer: cfg.MediaBuffer, anonymousImageNow: time.Now, anonymousImageSlots: make(chan struct{}, anonymousImageValidationConcurrency)}
+	return &Server{cfg: cfg, store: store, client: client, proxyClient: proxyClient, emitter: cfg.Emitter, meter: cfg.Meter, upstreamAuth: newUpstreamAuthenticator(store, client), logins: newLoginFailureLimiter(), playbackGuards: newPlaybackGuardTracker(), mediaBuffer: configuredMediaBuffer(cfg.MediaBuffer), anonymousImageNow: time.Now, anonymousImageSlots: make(chan struct{}, anonymousImageValidationConcurrency)}
 }
 
 // Emitter returns the optional non-blocking observe emitter (nil if unset).

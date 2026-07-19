@@ -33,7 +33,7 @@ func TestMediaBufferServerEnabledAndDisabledResponses(t *testing.T) {
 			if tt.enabled {
 				controller = mustMediaBufferCopyController(t, 2*mediaBufferChunkSize)
 			}
-			server := NewServer(Config{MediaBuffer: controller}, NewMemoryStore())
+			server := NewServer(Config{MediaBuffer: &MediaBuffer{controller: controller}}, NewMemoryStore())
 			req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Videos/item/stream", nil)
 			body := newMediaBufferServerBody(bytes.NewBufferString("media"))
 			resp := mediaBufferServerResponse(req, tt.status, tt.contentLength, body)
@@ -66,7 +66,7 @@ func TestMediaBufferServerEnabledAndDisabledResponses(t *testing.T) {
 
 func TestMediaBufferServerPlainReaderPathsRemainSynchronous(t *testing.T) {
 	controller := mustMediaBufferCopyController(t, mediaBufferChunkSize)
-	server := NewServer(Config{MediaBuffer: controller}, NewMemoryStore())
+	server := NewServer(Config{MediaBuffer: &MediaBuffer{controller: controller}}, NewMemoryStore())
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Videos/item/stream", nil)
 	body := newMediaBufferServerBody(bytes.NewBufferString("media"))
 	resp := mediaBufferServerResponse(req, http.StatusOK, 5, body)
@@ -89,7 +89,7 @@ func TestMediaBufferServerPlainReaderPathsRemainSynchronous(t *testing.T) {
 func TestMediaBufferServerDeadlineAndCountedTelemetry(t *testing.T) {
 	controller := mustMediaBufferCopyController(t, 2*mediaBufferChunkSize)
 	meter := telemetry.NewByteMeter()
-	server := NewServer(Config{MediaBuffer: controller, Meter: meter}, NewMemoryStore())
+	server := NewServer(Config{MediaBuffer: &MediaBuffer{controller: controller}, Meter: meter}, NewMemoryStore())
 	payload := bytes.Repeat([]byte("m"), 3*mediaCopyBufferSize+7)
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Videos/item/stream", nil)
 	body := newMediaBufferServerBody(bytes.NewReader(payload))
@@ -119,7 +119,7 @@ func testMediaBufferServerCancellation(t *testing.T, useHTTP2 bool) {
 	t.Helper()
 	controller := mustMediaBufferCopyController(t, mediaBufferChunkSize)
 	store := NewMemoryStore()
-	server := NewServer(Config{MediaBuffer: controller}, store)
+	server := NewServer(Config{MediaBuffer: &MediaBuffer{controller: controller}}, store)
 	body := &mediaBufferServerBlockingBody{started: make(chan struct{}), closed: make(chan struct{})}
 	handlerDone := make(chan struct{})
 	protocol := make(chan int, 1)
@@ -172,7 +172,7 @@ func TestMediaBufferServerGateHeldThroughJoinAuditAndAbort(t *testing.T) {
 	controller := mustMediaBufferCopyController(t, mediaBufferChunkSize)
 	store := NewMemoryStore()
 	meter := telemetry.NewByteMeter()
-	server := NewServer(Config{MediaBuffer: controller, Meter: meter}, store)
+	server := NewServer(Config{MediaBuffer: &MediaBuffer{controller: controller}, Meter: meter}, store)
 	headerCommitted := make(chan struct{})
 	allowCopy := make(chan struct{})
 	beforeAudit := make(chan struct{})
