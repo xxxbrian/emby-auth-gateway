@@ -14,6 +14,20 @@ type Snapshot struct {
 	Reliability ReliabilityStatus `json:"reliability"`
 	Runtime     RuntimeStatus     `json:"runtime"`
 	Series      SeriesData        `json:"series"`
+	MediaBuffer MediaBufferStatus `json:"media_buffer"`
+}
+
+// MediaBufferStatus is the bounded aggregate state of adaptive media buffering.
+type MediaBufferStatus struct {
+	Enabled          bool  `json:"enabled"`
+	HardBudgetBytes  int64 `json:"hard_budget_bytes"`
+	AllocatedBytes   int64 `json:"allocated_bytes"`
+	OwnedBytes       int64 `json:"owned_bytes"`
+	FreeBytes        int64 `json:"free_bytes"`
+	ActiveRequests   int   `json:"active_requests"`
+	BaseOnlyRequests int   `json:"base_only_requests"`
+	IndebtedRequests int   `json:"indebted_requests"`
+	RequestDebtBytes int64 `json:"request_debt_bytes"`
 }
 
 // Backend auth wire values for UpstreamStatus.AuthState.

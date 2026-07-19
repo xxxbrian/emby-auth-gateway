@@ -29,13 +29,14 @@ const (
 
 // Config configures the admin API.
 type Config struct {
-	App      core.App
+	App core.App
 	// Origin is deprecated/unused for CSRF. Writes use same-origin checks against
 	// the current request (Origin header vs scheme://Host, or Sec-Fetch-Site).
-	Origin   string
-	Sessions *adminauth.Store
-	Query    *adminquery.Querier
-	Telemetry *telemetry.Registry // optional
+	Origin              string
+	Sessions            *adminauth.Store
+	Query               *adminquery.Querier
+	Telemetry           *telemetry.Registry // optional
+	MediaBufferSnapshot func() telemetry.MediaBufferStatus
 	// AcquireReconfigure, when set, is the preferred reconfigure exclusion gate
 	// (holds exclusive lock over media copies for the duration of reconfigure).
 	// force=false fails immediately if media is active; force=true waits.
@@ -370,11 +371,19 @@ func (s *Server) handleSessionReauth(e *core.RequestEvent) error {
 // --- read handlers ---
 
 func (s *Server) handleOverview(e *core.RequestEvent) error {
-	if s.cfg.Telemetry == nil {
-		return e.JSON(http.StatusOK, telemetry.Snapshot{})
-	}
 	window := telemetry.ParseSeriesWindow(e.Request.URL.Query().Get("window"))
-	return e.JSON(http.StatusOK, s.cfg.Telemetry.SnapshotWindow(window))
+	return e.JSON(http.StatusOK, s.snapshot(window))
+}
+
+func (s *Server) snapshot(window telemetry.SeriesWindow) telemetry.Snapshot {
+	var snap telemetry.Snapshot
+	if s != nil && s.cfg.Telemetry != nil {
+		snap = s.cfg.Telemetry.SnapshotWindow(window)
+	}
+	if s != nil && s.cfg.MediaBufferSnapshot != nil {
+		snap.MediaBuffer = s.cfg.MediaBufferSnapshot()
+	}
+	return snap
 }
 
 func (s *Server) handleMetricsStream(e *core.RequestEvent) error {
@@ -392,11 +401,7 @@ func (s *Server) handleMetricsStream(e *core.RequestEvent) error {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	writeSnap := func() bool {
-		var snap telemetry.Snapshot
-		if s.cfg.Telemetry != nil {
-			snap = s.cfg.Telemetry.SnapshotWindow(window)
-		}
-		b, err := json.Marshal(snap)
+		b, err := json.Marshal(s.snapshot(window))
 		if err != nil {
 			return false
 		}

@@ -2,10 +2,13 @@ package adminapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -548,4 +551,162 @@ func TestOverviewWindowQuery(t *testing.T) {
 			t.Fatalf("%s: mbps_in points=%d want %d", path, len(snap.Series.MbpsIn), tc.points)
 		}
 	}
+}
+
+func TestOverviewMediaBufferStatus(t *testing.T) {
+	enabled := telemetry.MediaBufferStatus{
+		Enabled:          true,
+		HardBudgetBytes:  2 << 30,
+		AllocatedBytes:   96 << 10,
+		OwnedBytes:       64 << 10,
+		FreeBytes:        32 << 10,
+		ActiveRequests:   3,
+		BaseOnlyRequests: 1,
+		IndebtedRequests: 1,
+		RequestDebtBytes: 32 << 10,
+	}
+	for _, tt := range []struct {
+		name     string
+		callback func() telemetry.MediaBufferStatus
+		want     telemetry.MediaBufferStatus
+	}{
+		{name: "enabled", callback: func() telemetry.MediaBufferStatus { return enabled }, want: enabled},
+		{name: "disabled stable zeros"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			handler, cookie := buildMediaBufferAdminHandler(t, tt.callback)
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, "/admin/api/v1/overview", nil)
+			request.AddCookie(cookie)
+			handler.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("code=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			var snapshot telemetry.Snapshot
+			if err := json.Unmarshal(recorder.Body.Bytes(), &snapshot); err != nil {
+				t.Fatal(err)
+			}
+			if snapshot.MediaBuffer != tt.want {
+				t.Fatalf("media_buffer=%+v want %+v", snapshot.MediaBuffer, tt.want)
+			}
+		})
+	}
+}
+
+func TestMetricsStreamFirstFrameMatchesOverviewMediaBuffer(t *testing.T) {
+	status := telemetry.MediaBufferStatus{Enabled: true, HardBudgetBytes: 1 << 30, AllocatedBytes: 64 << 10, OwnedBytes: 32 << 10, FreeBytes: 32 << 10, ActiveRequests: 1}
+	handler, cookie := buildMediaBufferAdminHandler(t, func() telemetry.MediaBufferStatus { return status })
+
+	overviewRecorder := httptest.NewRecorder()
+	overviewRequest := httptest.NewRequest(http.MethodGet, "/admin/api/v1/overview", nil)
+	overviewRequest.AddCookie(cookie)
+	handler.ServeHTTP(overviewRecorder, overviewRequest)
+	if overviewRecorder.Code != http.StatusOK {
+		t.Fatalf("overview code=%d body=%s", overviewRecorder.Code, overviewRecorder.Body.String())
+	}
+	var overview telemetry.Snapshot
+	if err := json.Unmarshal(overviewRecorder.Body.Bytes(), &overview); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	streamRequest := httptest.NewRequest(http.MethodGet, "/admin/api/v1/metrics/stream", nil).WithContext(ctx)
+	streamRequest.AddCookie(cookie)
+	streamWriter := newFirstSSEWriter()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handler.ServeHTTP(streamWriter, streamRequest)
+	}()
+	frame := <-streamWriter.firstFrame
+	cancel()
+	<-done
+	if !bytes.HasPrefix(frame, []byte("data: ")) {
+		t.Fatalf("frame=%q", frame)
+	}
+	payload := bytes.TrimSpace(bytes.TrimPrefix(frame, []byte("data: ")))
+	var streamed telemetry.Snapshot
+	if err := json.Unmarshal(payload, &streamed); err != nil {
+		t.Fatalf("decode frame %q: %v", frame, err)
+	}
+	if !reflect.DeepEqual(streamed, overview) {
+		t.Fatalf("streamed snapshot=%+v overview=%+v", streamed, overview)
+	}
+}
+
+func buildMediaBufferAdminHandler(t *testing.T, callback func() telemetry.MediaBufferStatus) (http.Handler, *http.Cookie) {
+	t.Helper()
+	app := newTestApp(t)
+	superuser := createSuperuser(t, app, "buffer@example.test", "SuperSecret1!")
+	token, err := superuser.NewAuthToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions := adminauth.NewStore(10)
+	server, err := New(Config{
+		App:                 app,
+		Sessions:            sessions,
+		Query:               adminquery.New(app, 2),
+		MediaBufferSnapshot: callback,
+		StartedAt:           time.Now().UTC(),
+		BootID:              "test-boot",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := apis.NewRouter(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.Mount(r)
+	handler, err := r.BuildMux()
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(map[string]string{"token": token})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	request := withSameOrigin(httptest.NewRequest(http.MethodPost, "/admin/api/v1/session", bytes.NewReader(body)))
+	request.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("create session code=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	for _, cookie := range recorder.Result().Cookies() {
+		if cookie.Name == adminauth.CookieDev || cookie.Name == adminauth.CookieSecure {
+			return handler, cookie
+		}
+	}
+	t.Fatal("missing session cookie")
+	return nil, nil
+}
+
+type firstSSEWriter struct {
+	header     http.Header
+	mu         sync.Mutex
+	body       bytes.Buffer
+	firstFrame chan []byte
+	once       sync.Once
+}
+
+func newFirstSSEWriter() *firstSSEWriter {
+	return &firstSSEWriter{header: make(http.Header), firstFrame: make(chan []byte, 1)}
+}
+
+func (w *firstSSEWriter) Header() http.Header { return w.header }
+func (*firstSSEWriter) WriteHeader(int)       {}
+
+func (w *firstSSEWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.body.Write(p)
+}
+
+func (w *firstSSEWriter) Flush() {
+	w.mu.Lock()
+	frame := append([]byte(nil), w.body.Bytes()...)
+	w.mu.Unlock()
+	w.once.Do(func() { w.firstFrame <- frame })
 }

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xxxbrian/emby-auth-gateway/internal/adminapi"
 	"github.com/xxxbrian/emby-auth-gateway/internal/adminauth"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pbschema"
 	"github.com/xxxbrian/emby-auth-gateway/internal/telemetry"
@@ -35,8 +36,45 @@ func TestMountAdminEmptyOriginOK(t *testing.T) {
 		t.Fatal(err)
 	}
 	// No GATEWAY_ADMIN_ORIGIN / PUBLIC_URL required; empty config mounts.
-	if err := mountAdmin(r, app, adminConfig{}, nil, nil, nil, false, time.Now(), "boot"); err != nil {
+	if err := mountAdmin(r, app, adminConfig{}, nil, nil, nil, nil, false, time.Now(), "boot"); err != nil {
 		t.Fatalf("mount with empty origin must succeed: %v", err)
+	}
+}
+
+func TestMountAdminMediaBufferSnapshotWiring(t *testing.T) {
+	original := newAdminAPIForMount
+	t.Cleanup(func() { newAdminAPIForMount = original })
+	var captured adminapi.Config
+	newAdminAPIForMount = func(cfg adminapi.Config) (*adminapi.Server, error) {
+		captured = cfg
+		return adminapi.New(cfg)
+	}
+	app := newTestApp(t)
+	status := telemetry.MediaBufferStatus{Enabled: true, HardBudgetBytes: 64 << 20, ActiveRequests: 2}
+	callback := func() telemetry.MediaBufferStatus { return status }
+	r, err := apis.NewRouter(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mountAdmin(r, app, adminConfig{}, nil, callback, nil, nil, false, time.Now(), "boot"); err != nil {
+		t.Fatal(err)
+	}
+	if captured.MediaBufferSnapshot == nil {
+		t.Fatal("media buffer callback was not forwarded")
+	}
+	if got := captured.MediaBufferSnapshot(); got != status {
+		t.Fatalf("captured callback status=%+v want %+v", got, status)
+	}
+
+	r, err = apis.NewRouter(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mountAdmin(r, app, adminConfig{}, nil, nil, nil, nil, false, time.Now(), "boot"); err != nil {
+		t.Fatal(err)
+	}
+	if captured.MediaBufferSnapshot != nil {
+		t.Fatal("nil media buffer callback was not preserved")
 	}
 }
 
@@ -161,7 +199,7 @@ func TestRegistrationPathNotCapturedBySPAWhenAdminMountedWebDisabled(t *testing.
 	}), false)
 
 	reg := telemetry.New(nil)
-	err := mountAdmin(r, app, adminConfig{}, reg, nil, nil, false /* web not ready */, time.Now().UTC(), "boot")
+	err := mountAdmin(r, app, adminConfig{}, reg, nil, nil, nil, false /* web not ready */, time.Now().UTC(), "boot")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +250,7 @@ func TestRegistrationHandlerWhenWebReadyStillWorksWithAdmin(t *testing.T) {
 	// Web ready: registration mounted by mountGatewayRoutes.
 	mountGatewayRoutes(r, http.NotFoundHandler(), http.NotFoundHandler(), true)
 
-	err := mountAdmin(r, app, adminConfig{}, nil, nil, nil, true, time.Now().UTC(), "boot")
+	err := mountAdmin(r, app, adminConfig{}, nil, nil, nil, nil, true, time.Now().UTC(), "boot")
 	if err != nil {
 		t.Fatal(err)
 	}

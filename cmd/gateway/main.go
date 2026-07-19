@@ -228,7 +228,7 @@ func newGatewayApp() *pocketbase.PocketBase {
 			}
 			return gw.TryAcquireReconfigure(force)
 		}
-		if err := mountAdminForServe(e.Router, e.App, adminCfg, registry, nil, acquireReconfigure, webReady, startedAt, registry.Snapshot().BootID); err != nil {
+		if err := mountAdminForServe(e.Router, e.App, adminCfg, registry, gw.MediaBufferSnapshot, nil, acquireReconfigure, webReady, startedAt, registry.Snapshot().BootID); err != nil {
 			return err
 		}
 

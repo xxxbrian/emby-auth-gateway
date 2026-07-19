@@ -475,8 +475,11 @@ func TestRegisteredOnServeMediaBufferOrdering(t *testing.T) {
 		mountGatewayRoutesForServe = func(*router.Router[*core.RequestEvent], http.Handler, http.Handler, bool) {
 			stages = append(stages, "gateway-routes")
 		}
-		mountAdminForServe = func(*router.Router[*core.RequestEvent], core.App, adminConfig, *telemetry.Registry, func() bool, func(bool) (func(), error), bool, time.Time, string) error {
+		mountAdminForServe = func(_ *router.Router[*core.RequestEvent], _ core.App, _ adminConfig, _ *telemetry.Registry, mediaBufferSnapshot func() telemetry.MediaBufferStatus, _ func() bool, _ func(bool) (func(), error), _ bool, _ time.Time, _ string) error {
 			stages = append(stages, "admin-routes")
+			if mediaBufferSnapshot == nil || !mediaBufferSnapshot().Enabled {
+				t.Fatal("admin mount did not receive enabled media buffer snapshot callback")
+			}
 			return nil
 		}
 		startGatewayBackgroundForServe = func(*core.ServeEvent, *gateway.Server) {}

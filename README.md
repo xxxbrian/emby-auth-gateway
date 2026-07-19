@@ -21,6 +21,10 @@ Gateway environment variables:
 | `GATEWAY_ADMIN_AUDIT_RETENTION_DAYS` | No | `30` | Days to retain `audit_logs` rows for admin mutation history. |
 | `GATEWAY_SERVER_ID` | No | `emby-auth-gateway` | Synthetic server id returned to clients instead of the backend Emby server id. |
 | `GATEWAY_WEB_ASSETS_DIR` | No | unset (Web disabled) | Absolute or relative path to the Web assets root. Blank/unset disables Web: `/emby/web` returns 404 and never falls through to the authenticated API. |
+| `GATEWAY_MEDIA_BUFFER_ENABLED` | No | `false` | Enables adaptive media buffering. Invalid boolean values fail startup. |
+| `GATEWAY_MEDIA_BUFFER_BUDGET` | No | automatic when buffering is enabled | Optional hard budget as a positive integer immediately followed by `B`, `KiB`, `MiB`, or `GiB`; the parsed value is aligned down to 32 KiB. Leave unset for automatic memory-limit discovery. It is ignored while buffering is disabled; an explicitly empty value is invalid when enabled. |
+
+When adaptive media buffering is enabled without an explicit budget, the gateway chooses one eighth of the tightest finite cgroup, `GOMEMLIMIT`, or physical-memory limit, capped at 2 GiB and aligned down to 32 KiB.
 
 PocketBase runtime flags you will commonly use:
 

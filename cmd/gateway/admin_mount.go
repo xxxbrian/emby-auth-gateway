@@ -27,6 +27,8 @@ type adminConfig struct {
 	AuditRetentionDays int
 }
 
+var newAdminAPIForMount = adminapi.New
+
 func adminConfigFromEnv() adminConfig {
 	days := 30
 	if v := strings.TrimSpace(os.Getenv("GATEWAY_ADMIN_AUDIT_RETENTION_DAYS")); v != "" {
@@ -50,6 +52,7 @@ func mountAdmin(
 	app core.App,
 	cfg adminConfig,
 	registry *telemetry.Registry,
+	mediaBufferSnapshot func() telemetry.MediaBufferStatus,
 	activeMediaLoad func() bool,
 	acquireReconfigure func(force bool) (release func(), err error),
 	webReady bool,
@@ -74,15 +77,16 @@ func mountAdmin(
 	// Match both collection name and resolved id (clients may use either).
 	bindSuperuserAuthRateLimit(r, adminauth.NewRateLimiter(superuserAuthRateLimit, superuserAuthRateWindow), superuserAuthCollectionIDs(app)...)
 
-	api, err := adminapi.New(adminapi.Config{
-		App:                app,
-		Sessions:           adminauth.NewStore(adminauth.DefaultMaxSessions),
-		Query:              adminquery.New(app, adminquery.DefaultConcurrency),
-		Telemetry:          registry,
-		AcquireReconfigure: acquireReconfigure,
-		ActiveMediaLoad:    activeMediaLoad,
-		StartedAt:          startedAt,
-		BootID:             bootID,
+	api, err := newAdminAPIForMount(adminapi.Config{
+		App:                 app,
+		Sessions:            adminauth.NewStore(adminauth.DefaultMaxSessions),
+		Query:               adminquery.New(app, adminquery.DefaultConcurrency),
+		Telemetry:           registry,
+		MediaBufferSnapshot: mediaBufferSnapshot,
+		AcquireReconfigure:  acquireReconfigure,
+		ActiveMediaLoad:     activeMediaLoad,
+		StartedAt:           startedAt,
+		BootID:              bootID,
 	})
 	if err != nil {
 		return err

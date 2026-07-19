@@ -5,13 +5,15 @@ services:
     ports:
       - "${GATEWAY_PORT:-8090}:8090"
     environment:
-      GATEWAY_PUBLIC_URL: "${GATEWAY_PUBLIC_URL:-http://localhost:${GATEWAY_PORT:-8090}/emby}"
-      GATEWAY_SERVER_ID: "${GATEWAY_SERVER_ID:-emby-auth-gateway-dev}"
+      - GATEWAY_PUBLIC_URL=${GATEWAY_PUBLIC_URL:-http://localhost:${GATEWAY_PORT:-8090}/emby}
+      - GATEWAY_SERVER_ID=${GATEWAY_SERVER_ID:-emby-auth-gateway-dev}
+      - GATEWAY_MEDIA_BUFFER_ENABLED=${GATEWAY_MEDIA_BUFFER_ENABLED:-false}
+      - GATEWAY_MEDIA_BUFFER_BUDGET
       # Opt-in Web serving. Blank (default) keeps API-only mode.
       # Point at a directory that already contains Emby Web files (web root).
       # With docker-compose.web.yml, set GATEWAY_WEB_ASSETS_HOST on the host and
       # the overlay forces GATEWAY_WEB_ASSETS_DIR=/app/web_assets.
-      GATEWAY_WEB_ASSETS_DIR: "${GATEWAY_WEB_ASSETS_DIR:-}"
+      - GATEWAY_WEB_ASSETS_DIR=${GATEWAY_WEB_ASSETS_DIR:-}
     command: ["serve", "--http=0.0.0.0:8090"]
     volumes:
       - gateway_pb_data:/app/pb_data
