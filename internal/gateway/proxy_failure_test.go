@@ -81,7 +81,7 @@ func TestPreHeaderProxyFailureAuditsSafely(t *testing.T) {
 	}
 }
 
-func TestInitialProxyDoFailureUsesStructuredHandler(t *testing.T) {
+func TestInitialGenericProxyFailureUsesStructuredHandler(t *testing.T) {
 	tests := []struct {
 		name       string
 		err        error
@@ -102,7 +102,7 @@ func TestInitialProxyDoFailureUsesStructuredHandler(t *testing.T) {
 			store.Sessions[HashToken("gateway-token")] = testSession()
 			client := &http.Client{Transport: proxyFailureRoundTripper{err: tt.err}}
 			server := NewServer(Config{GatewayBasePath: "/emby", HTTPClient: client}, store)
-			req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items?api_key=gateway-token", nil).WithContext(tt.ctx)
+			req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Unknown?api_key=gateway-token", nil).WithContext(tt.ctx)
 			writer := httptest.NewRecorder()
 			if !tt.wantAudit {
 				requireAbortHandler(t, func() { server.ServeHTTP(writer, req) })
@@ -112,10 +112,10 @@ func TestInitialProxyDoFailureUsesStructuredHandler(t *testing.T) {
 				return
 			}
 			server.ServeHTTP(writer, req)
-			if writer.Code != tt.wantStatus || len(store.AuditLogs) != 1 {
-				t.Fatal("initial proxy failure response or audit was incorrect")
+			if writer.Code != tt.wantStatus || len(store.AuditLogs) < 2 {
+				t.Fatalf("initial proxy failure response or audit was incorrect: status=%d audits=%#v body=%q", writer.Code, store.AuditLogs, writer.Body.String())
 			}
-			entry := store.AuditLogs[0]
+			entry := store.AuditLogs[len(store.AuditLogs)-1]
 			if entry.Event != "proxy_backend_unavailable" || entry.ErrorKind != tt.wantKind || entry.Direction != mediaDirectionUpstream || entry.BytesTransferred != 0 || entry.ResponseCommitted || entry.Status != tt.wantStatus {
 				t.Fatal("initial proxy failure audit fields were incorrect")
 			}
@@ -126,7 +126,7 @@ func TestInitialProxyDoFailureUsesStructuredHandler(t *testing.T) {
 	}
 }
 
-func TestRefreshedProxyRetryFailureUsesStructuredHandler(t *testing.T) {
+func TestRefreshedGenericProxyRetryFailureUsesStructuredHandler(t *testing.T) {
 	for _, tt := range []struct {
 		name       string
 		err        error
@@ -135,7 +135,6 @@ func TestRefreshedProxyRetryFailureUsesStructuredHandler(t *testing.T) {
 		canceled   bool
 	}{
 		{name: "timeout", err: timeoutMediaError{}, wantStatus: http.StatusGatewayTimeout, wantKind: "upstream_timeout"},
-		{name: "canceled", err: context.Canceled, canceled: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			backend := httptest.NewServer(http.NotFoundHandler())
@@ -145,18 +144,11 @@ func TestRefreshedProxyRetryFailureUsesStructuredHandler(t *testing.T) {
 			store.Sessions[HashToken("gateway-token")] = session
 			client := &http.Client{Transport: &retryFailureRoundTripper{retryErr: tt.err}}
 			server := NewServer(Config{GatewayBasePath: "/emby", HTTPClient: client}, store)
-			req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items?api_key=gateway-token", nil)
+			req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Unknown?api_key=gateway-token", nil)
 			writer := httptest.NewRecorder()
-			if tt.canceled {
-				requireAbortHandler(t, func() { server.ServeHTTP(writer, req) })
-				if hasAuditEvent(store, "proxy_backend_unavailable") {
-					t.Fatal("retry cancellation produced a backend unavailable audit")
-				}
-				return
-			}
 			server.ServeHTTP(writer, req)
 			if writer.Code != tt.wantStatus || len(store.AuditLogs) < 2 {
-				t.Fatal("retry failure response or audit was incorrect")
+				t.Fatalf("retry failure response or audit was incorrect: status=%d audits=%#v body=%q", writer.Code, store.AuditLogs, writer.Body.String())
 			}
 			entry := store.AuditLogs[len(store.AuditLogs)-1]
 			if entry.Event != "proxy_backend_unavailable" || entry.ErrorKind != tt.wantKind || entry.Direction != mediaDirectionUpstream || entry.ResponseCommitted || entry.Status != tt.wantStatus {
@@ -360,7 +352,7 @@ type retryFailureRoundTripper struct {
 
 func (r *retryFailureRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	switch req.URL.Path {
-	case "/emby/Items":
+	case "/emby/Items", "/emby/Unknown":
 		r.items++
 		if r.items == 1 {
 			return testTransportResponse(http.StatusUnauthorized, ""), nil

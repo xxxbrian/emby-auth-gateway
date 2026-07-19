@@ -17,6 +17,7 @@ import (
 type faultInjectPlaybackStore struct {
 	*MemoryStore
 	findErr         error
+	listErr         error
 	saveErr         error
 	applyErr        error
 	resolutionErr   error
@@ -70,6 +71,13 @@ func (f *faultInjectPlaybackStore) FindPlaybackState(ctx context.Context, gatewa
 		return nil, f.findErr
 	}
 	return f.MemoryStore.FindPlaybackState(ctx, gatewayUserID, itemID)
+}
+
+func (f *faultInjectPlaybackStore) ListPlaybackStates(ctx context.Context, gatewayUserID string, filter PlaybackStateFilter) ([]PlaybackState, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return f.MemoryStore.ListPlaybackStates(ctx, gatewayUserID, filter)
 }
 
 func (f *faultInjectPlaybackStore) SavePlaybackState(ctx context.Context, state PlaybackState) error {
@@ -498,7 +506,7 @@ func TestResumeFindStoreOutageReturns500(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	store := &faultInjectPlaybackStore{MemoryStore: NewMemoryStore(), findErr: ErrStoreUnavailable}
+	store := &faultInjectPlaybackStore{MemoryStore: NewMemoryStore(), listErr: ErrStoreUnavailable}
 	configureTestUpstream(store.MemoryStore, backend.URL+"/emby")
 	store.Sessions[HashToken("gateway-token")] = testSession()
 	_ = store.MemoryStore.SavePlaybackState(context.Background(), PlaybackState{
@@ -523,7 +531,7 @@ func TestPersonalFilterFindStoreOutageReturns500(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	store := &faultInjectPlaybackStore{MemoryStore: NewMemoryStore(), findErr: ErrStoreUnavailable}
+	store := &faultInjectPlaybackStore{MemoryStore: NewMemoryStore(), listErr: ErrStoreUnavailable}
 	configureTestUpstream(store.MemoryStore, backend.URL+"/emby")
 	store.Sessions[HashToken("gateway-token")] = testSession()
 	_ = store.MemoryStore.SavePlaybackState(context.Background(), PlaybackState{

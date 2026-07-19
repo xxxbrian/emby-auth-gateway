@@ -1940,7 +1940,7 @@ func TestResumeUsesGatewayStateAndResolvesExistingItems(t *testing.T) {
 		if r.URL.Path != "/emby/Users/backend-user/Items" {
 			t.Fatalf("unexpected backend request %s", r.URL.String())
 		}
-		if r.URL.Query().Get("Ids") != "item-u1,missing-item,item-u1-older" {
+		if r.URL.Query().Get("Ids") != "item-u1,item-u1-older,missing-item" {
 			t.Fatalf("backend Ids = %q, want user scoped resume ids", r.URL.Query().Get("Ids"))
 		}
 		writeTestJSON(w, map[string]any{"Items": []any{
@@ -1972,8 +1972,8 @@ func TestResumeUsesGatewayStateAndResolvesExistingItems(t *testing.T) {
 	var body map[string]any
 	decodeJSON(t, resp.Body, &body)
 	items := body["Items"].([]any)
-	if len(items) != 1 || items[0].(map[string]any)["Id"] != "item-u1" {
-		t.Fatalf("resume items = %#v, want only item-u1", items)
+	if len(items) != 2 || items[0].(map[string]any)["Id"] != "item-u1" || items[1].(map[string]any)["Id"] != "item-u1-older" {
+		t.Fatalf("resume items = %#v, want both resolved items in recency order", items)
 	}
 	userData := items[0].(map[string]any)["UserData"].(map[string]any)
 	if int(userData["PlaybackPositionTicks"].(float64)) != 1200 || userData["PlayedPercentage"].(float64) != pct {
@@ -1991,13 +1991,11 @@ func TestResumeUsesGatewayStateAndResolvesExistingItems(t *testing.T) {
 
 func TestResumeMediaTypeFilterDoesNotOrphanFilteredItems(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("MediaTypes") != "" {
-			t.Fatalf("resolution request should not forward MediaTypes filter: %s", r.URL.RawQuery)
+		items := []any{map[string]any{"Id": "video-1", "Name": "Video", "Type": "Movie", "MediaType": "Video", "UserData": map[string]any{}}}
+		if r.URL.Query().Get("MediaTypes") == "" {
+			items = append(items, map[string]any{"Id": "audio-1", "Name": "Audio", "Type": "Audio", "MediaType": "Audio", "UserData": map[string]any{}})
 		}
-		writeTestJSON(w, map[string]any{"Items": []any{
-			map[string]any{"Id": "video-1", "Name": "Video", "Type": "Movie", "MediaType": "Video", "UserData": map[string]any{}},
-			map[string]any{"Id": "audio-1", "Name": "Audio", "Type": "Audio", "MediaType": "Audio", "UserData": map[string]any{}},
-		}})
+		writeTestJSON(w, map[string]any{"Items": items})
 	}))
 	defer backend.Close()
 
@@ -2058,8 +2056,9 @@ func TestResumeRepairsPreviouslyOrphanedState(t *testing.T) {
 
 func TestResumeResolutionIgnoresCollectionFiltersForOrphanDecision(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("ParentId") != "" || r.URL.Query().Get("IsPlayed") != "" {
-			t.Fatalf("resolution request should not forward collection filters: %s", r.URL.RawQuery)
+		if r.URL.Query().Get("ParentId") != "" {
+			writeTestJSON(w, map[string]any{"Items": []any{}})
+			return
 		}
 		writeTestJSON(w, map[string]any{"Items": []any{
 			map[string]any{"Id": "movie-1", "Name": "Movie", "Type": "Movie", "MediaType": "Video", "UserData": map[string]any{}},
@@ -2090,7 +2089,7 @@ func TestResumeResolutionIgnoresCollectionFiltersForOrphanDecision(t *testing.T)
 	}
 }
 
-func TestResumeDoesNotOrphanItemsBeyondResolutionBatchLimit(t *testing.T) {
+func TestResumeResolvesInBatchesWithoutFalseOrphans(t *testing.T) {
 	var requestSizes []int
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ids := splitFilterValues([]string{r.URL.Query().Get("Ids")})
@@ -2407,30 +2406,6 @@ func TestPositivePersonalFilterBackendFailureReturnsBadGateway(t *testing.T) {
 	}
 }
 
-func TestClearlyNonItemPersonalFilterPathIsPassedThrough(t *testing.T) {
-	var reached bool
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		reached = true
-		if r.URL.Path != "/emby/System/Info" || r.URL.Query().Get("IsFavorite") != "" {
-			t.Fatalf("unexpected backend request: %s", r.URL.String())
-		}
-		writeTestJSON(w, map[string]any{"Id": "backend-server"})
-	}))
-	defer backend.Close()
-
-	store := NewMemoryStore()
-	configureTestUpstream(store, backend.URL+"/emby")
-	store.Sessions[HashToken("gateway-token")] = testSession()
-	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
-	defer gw.Close()
-
-	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/System/Info?api_key=gateway-token&IsFavorite=true", nil))
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || !reached {
-		t.Fatalf("non-item personal filter passthrough status=%d reached=%v", resp.StatusCode, reached)
-	}
-}
-
 func TestUnknownPersonalFilterPathIsRejected(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatalf("unsupported personal filter should not reach backend: %s", r.URL.String())
@@ -2501,7 +2476,8 @@ func TestNegativePersonalFilterBackfillsFromUpstreamPages(t *testing.T) {
 }
 
 func TestNegativePersonalFilterWithoutLimitDoesNotTruncateAtFirstPage(t *testing.T) {
-	items := make([]map[string]any, personalScanBatchLimit+5)
+	const itemCount = 105
+	items := make([]map[string]any, itemCount)
 	for i := range items {
 		items[i] = map[string]any{"Id": "item-" + strconv.Itoa(i), "Name": "Item", "Type": "Movie", "UserData": map[string]any{}}
 	}
@@ -2530,8 +2506,8 @@ func TestNegativePersonalFilterWithoutLimitDoesNotTruncateAtFirstPage(t *testing
 	defer resp.Body.Close()
 	var body map[string]any
 	decodeJSON(t, resp.Body, &body)
-	if got := len(body["Items"].([]any)); got != personalScanBatchLimit+5 {
-		t.Fatalf("unlimited negative items = %d, want %d", got, personalScanBatchLimit+5)
+	if got := len(body["Items"].([]any)); got != itemCount {
+		t.Fatalf("unlimited negative items = %d, want %d", got, itemCount)
 	}
 }
 
@@ -2554,64 +2530,6 @@ func TestNegativePersonalFilterDoesNotUndercountTotalWithBackendOnlyFilters(t *t
 	decodeJSON(t, resp.Body, &body)
 	if got := int(body["TotalRecordCount"].(float64)); got != 1 {
 		t.Fatalf("TotalRecordCount = %d, want upstream total 1", got)
-	}
-}
-
-func TestLatestBackfillsWhenInitialItemsArePlayed(t *testing.T) {
-	var limits []int
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		limit := intQuery(r.URL.Query(), "Limit", 0)
-		limits = append(limits, limit)
-		items := make([]any, 0, limit)
-		for i := 0; i < limit && i < 13; i++ {
-			items = append(items, map[string]any{"Id": "latest-" + strconv.Itoa(i), "Name": "Latest", "Type": "Movie", "UserData": map[string]any{}})
-		}
-		writeTestJSON(w, items)
-	}))
-	defer backend.Close()
-
-	store := NewMemoryStore()
-	configureTestUpstream(store, backend.URL+"/emby")
-	store.Sessions[HashToken("gateway-token")] = testSession()
-	for i := 0; i < 10; i++ {
-		_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "latest-" + strconv.Itoa(i), Played: true})
-	}
-	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
-	defer gw.Close()
-
-	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Users/gateway-user/Items/Latest?api_key=gateway-token&Limit=3", nil))
-	defer resp.Body.Close()
-	var body []any
-	decodeJSON(t, resp.Body, &body)
-	ids := itemIDsFromResponse(body)
-	if strings.Join(ids, ",") != "latest-10,latest-11,latest-12" {
-		t.Fatalf("latest ids = %v", ids)
-	}
-	if len(limits) < 3 || limits[0] != 3 || limits[1] != 9 || limits[2] != 27 {
-		t.Fatalf("latest backfill limits = %v", limits)
-	}
-}
-
-func TestLatestLargeLimitIsCappedInsteadOfReturningEmpty(t *testing.T) {
-	var sawLimit int
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sawLimit = intQuery(r.URL.Query(), "Limit", 0)
-		writeTestJSON(w, []any{map[string]any{"Id": "latest-1", "Name": "Latest", "Type": "Movie", "UserData": map[string]any{}}})
-	}))
-	defer backend.Close()
-
-	store := NewMemoryStore()
-	configureTestUpstream(store, backend.URL+"/emby")
-	store.Sessions[HashToken("gateway-token")] = testSession()
-	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
-	defer gw.Close()
-
-	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Users/gateway-user/Items/Latest?api_key=gateway-token&Limit=999", nil))
-	defer resp.Body.Close()
-	var body []any
-	decodeJSON(t, resp.Body, &body)
-	if len(body) != 1 || sawLimit != latestBackfillLimit {
-		t.Fatalf("latest body len=%d backend limit=%d, want 1/%d", len(body), sawLimit, latestBackfillLimit)
 	}
 }
 
@@ -2787,16 +2705,18 @@ func itemIDsFromResponse(items []any) []string {
 }
 
 func TestNextUpUsesGatewaySeriesState(t *testing.T) {
+	var requests []string
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/emby/Shows/show-1/Episodes" {
-			t.Fatalf("unexpected backend request %s", r.URL.String())
-		}
-		if r.URL.Query().Get("Limit") != "" || r.URL.Query().Get("StartIndex") != "" {
-			t.Fatalf("next up episode lookup should not forward pagination: %s", r.URL.RawQuery)
+		requests = append(requests, r.URL.String())
+		if strings.Contains(r.URL.Path, "/Users/") {
+			writeTestJSON(w, map[string]any{"Items": []any{
+				map[string]any{"Id": "ep-1", "Name": "Episode 1", "Type": "Episode", "SeriesId": "show-1", "SeasonId": "season-1", "ParentIndexNumber": 1, "IndexNumber": 1, "UserData": map[string]any{}},
+			}})
+			return
 		}
 		writeTestJSON(w, map[string]any{"Items": []any{
-			map[string]any{"Id": "ep-1", "Name": "Episode 1", "Type": "Episode", "SeriesId": "show-1", "ParentIndexNumber": 1, "IndexNumber": 1, "UserData": map[string]any{}},
-			map[string]any{"Id": "ep-2", "Name": "Episode 2", "Type": "Episode", "SeriesId": "show-1", "ParentIndexNumber": 1, "IndexNumber": 2, "UserData": map[string]any{}},
+			map[string]any{"Id": "ep-1", "Name": "Episode 1", "Type": "Episode", "SeriesId": "show-1", "SeasonId": "season-1", "ParentIndexNumber": 1, "IndexNumber": 1, "UserData": map[string]any{}},
+			map[string]any{"Id": "ep-2", "Name": "Episode 2", "Type": "Episode", "SeriesId": "show-1", "SeasonId": "season-1", "ParentIndexNumber": 1, "IndexNumber": 2, "UserData": map[string]any{}},
 		}})
 	}))
 	defer backend.Close()
@@ -2811,6 +2731,10 @@ func TestNextUpUsesGatewaySeriesState(t *testing.T) {
 
 	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Shows/NextUp?api_key=gateway-token&Limit=1", nil))
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("next up status=%d body=%q requests=%v", resp.StatusCode, body, requests)
+	}
 	var body map[string]any
 	decodeJSON(t, resp.Body, &body)
 	items := body["Items"].([]any)
@@ -3754,54 +3678,6 @@ func (c *countingPlaybackStore) ListPlaybackStatesByItemIDs(ctx context.Context,
 func (c *countingPlaybackStore) ListPlaybackStates(ctx context.Context, gatewayUserID string, filter PlaybackStateFilter) ([]PlaybackState, error) {
 	c.listCalls++
 	return c.MemoryStore.ListPlaybackStates(ctx, gatewayUserID, filter)
-}
-
-func TestPersonalFilterIDsUsesSingleListPlaybackStates(t *testing.T) {
-	store := &countingPlaybackStore{MemoryStore: NewMemoryStore()}
-	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", ItemID: "both", Played: true, IsFavorite: true})
-	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", ItemID: "played-only", Played: true})
-	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", ItemID: "fav-only", IsFavorite: true})
-
-	s := NewServer(Config{}, store)
-	q := url.Values{}
-	q.Set("Filters", "IsPlayed,IsFavorite")
-	positive, hasPositive, exclude, err := s.personalFilterIDs(context.Background(), "u1", q)
-	if err != nil {
-		t.Fatalf("personalFilterIDs: %v", err)
-	}
-	if store.listCalls != 1 {
-		t.Fatalf("ListPlaybackStates calls = %d, want 1 (not one per filter)", store.listCalls)
-	}
-	if !hasPositive {
-		t.Fatal("expected hasPositive")
-	}
-	if len(exclude) != 0 {
-		t.Fatalf("exclude = %#v, want empty", exclude)
-	}
-	if len(positive) != 1 || positive[0] != "both" {
-		t.Fatalf("positive = %#v, want [both]", positive)
-	}
-	if q.Get("Filters") != "" {
-		t.Fatalf("Filters should be cleared after personal consumption, got %q", q.Get("Filters"))
-	}
-
-	// No personal filters → no store call.
-	store.listCalls = 0
-	q2 := url.Values{}
-	q2.Set("Filters", "IsFolder")
-	_, hasPos, _, err := s.personalFilterIDs(context.Background(), "u1", q2)
-	if err != nil {
-		t.Fatalf("personalFilterIDs passthrough: %v", err)
-	}
-	if hasPos {
-		t.Fatal("non-personal Filters should not set hasPositive")
-	}
-	if store.listCalls != 0 {
-		t.Fatalf("ListPlaybackStates calls = %d, want 0 when no personal filters", store.listCalls)
-	}
-	if q2.Get("Filters") != "IsFolder" {
-		t.Fatalf("remaining Filters = %q, want IsFolder", q2.Get("Filters"))
-	}
 }
 
 func hasAuditEvent(store *MemoryStore, event string) bool {

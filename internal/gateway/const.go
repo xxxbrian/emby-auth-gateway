@@ -15,9 +15,6 @@ const (
 	proxyJSONLimit                  = 20 << 20
 	proxyM3U8Limit                  = 20 << 20
 	personalIDBatchLimit            = 200
-	personalScanBatchLimit          = 100
-	personalScanItemLimit           = 2000
-	latestBackfillLimit             = 300
 	aggregateChildCountLookups      = 5
 	defaultMinResumePct             = 5.0
 	defaultMaxResumePct             = 90.0

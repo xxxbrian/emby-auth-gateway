@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -41,22 +40,27 @@ func (s *Server) handlePersonalDataRequest(w http.ResponseWriter, r *http.Reques
 	}
 	switch {
 	case isResumePath(rel):
-		s.writeResumeItems(w, r, session, gatewayToken)
+		s.writePersonalPlanHTTP(w, r, rel, personalRouteResume, session, gatewayToken)
 		return handledPersonalData
 	case isNextUpPath(rel):
-		s.writeNextUpItems(w, r, session, gatewayToken)
+		s.writePersonalPlanHTTP(w, r, rel, personalRouteNextUp, session, gatewayToken)
 		return handledPersonalData
 	case isLatestItemsPath(rel):
-		s.writeLatestItems(w, r, rel, session, gatewayToken)
+		s.writePersonalPlanHTTP(w, r, rel, personalRouteLatest, session, gatewayToken)
 		return handledPersonalData
 	case isSessionsPath(rel):
 		s.writeLocalSessions(w, r, session)
 		return handledPersonalData
-	case queryHasPersonalFilter(r.URL.Query()) && !isAllowedPersonalItemListPath(rel) && !isClearlyNonItemEndpoint(rel):
+	case queryHasPersonalFilter(r.URL.Query()) && !isAllowedPersonalItemListPath(rel):
+		w.Header().Set("Cache-Control", "no-store")
 		http.Error(w, "unsupported personal filter path", http.StatusBadRequest)
 		return handledPersonalData
-	case shouldLocalizePersonalFilter(rel, r.URL.Query()):
-		s.writePersonalFilteredItems(w, r, rel, session, gatewayToken)
+	case isAllowedPersonalItemListPath(rel):
+		route := personalRouteItems
+		if isShowPersonalItemListPath(rel) {
+			route = personalRouteShowItems
+		}
+		s.writePersonalPlanHTTP(w, r, rel, route, session, gatewayToken)
 		return handledPersonalData
 	default:
 		return personalDataHandlingOutcome{}
@@ -208,104 +212,6 @@ func (s *Server) handleDisplayPreferences(w http.ResponseWriter, r *http.Request
 	return true
 }
 
-func (s *Server) writeResumeItems(w http.ResponseWriter, r *http.Request, session *Session, gatewayToken string) {
-	if !pathUserMatches(r.URL.Path, s.cfg.GatewayBasePath, session.SyntheticUserID) {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-	resumable := true
-	states, err := s.store.ListPlaybackStates(r.Context(), session.GatewayUserID, PlaybackStateFilter{Resumable: &resumable, IncludeOrphaned: true})
-	if err != nil {
-		http.Error(w, "resume unavailable", http.StatusInternalServerError)
-		return
-	}
-	sort.SliceStable(states, func(i, j int) bool {
-		return stateRecency(states[i]).After(stateRecency(states[j]))
-	})
-	ids := playbackStateIDs(states)
-	items, err := s.resolveItemsByID(r.Context(), r, session, gatewayToken, ids)
-	if err != nil {
-		http.Error(w, "resume unavailable", http.StatusInternalServerError)
-		return
-	}
-	items = groupResumeItems(items)
-	total := len(items)
-	items = pageItems(items, r.URL.Query())
-	writeJSON(w, http.StatusOK, map[string]any{"Items": items, "TotalRecordCount": total, "StartIndex": intQuery(r.URL.Query(), "StartIndex", 0)})
-}
-
-func (s *Server) writePersonalFilteredItems(w http.ResponseWriter, r *http.Request, rel string, session *Session, gatewayToken string) {
-	if !relUserMatches(rel, session.SyntheticUserID) {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-	pq := parsePersonalQuery(rel, r.URL.Query())
-	if pq.hasPositive() {
-		s.writePositivePersonalItems(w, r, rel, session, gatewayToken, pq)
-		return
-	}
-	if pq.hasOnlyNegative() {
-		s.writeNegativePersonalItems(w, r, rel, session, gatewayToken, pq)
-		return
-	}
-	value, status, upstream, err := s.fetchBackendJSON(r.Context(), r, rel, pq.backend.Encode(), session, gatewayToken)
-	if err != nil {
-		http.Error(w, "backend unavailable", http.StatusBadGateway)
-		return
-	}
-	writeJSON(w, status, s.rewriteProxyJSONValueForRequestWithSnapshot(r.Context(), r, value, session, upstream, gatewayToken, s.gatewayBaseForRequest(r)))
-}
-
-func (s *Server) writeLatestItems(w http.ResponseWriter, r *http.Request, rel string, session *Session, gatewayToken string) {
-	if !relUserMatches(rel, session.SyntheticUserID) {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-	q := cloneQuery(r.URL.Query())
-	limit := intQuery(q, "Limit", 0)
-	if limit <= 0 {
-		limit = 20
-	}
-	if limit > latestBackfillLimit {
-		limit = latestBackfillLimit
-	}
-	played := true
-	states, _ := s.store.ListPlaybackStates(r.Context(), session.GatewayUserID, PlaybackStateFilter{Played: &played})
-	playedSet := playbackStateSet(states)
-	requestLimit := limit
-	status := http.StatusOK
-	items := []any{}
-	for requestLimit <= latestBackfillLimit {
-		q.Set("Limit", strconv.Itoa(requestLimit))
-		value, backendStatus, upstream, err := s.fetchBackendJSON(r.Context(), r, rel, q.Encode(), session, gatewayToken)
-		if err != nil {
-			http.Error(w, "backend unavailable", http.StatusBadGateway)
-			return
-		}
-		status = backendStatus
-		extracted := extractItems(value)
-		learnChildCountsFromItems(r.Context(), s.store, session, extracted)
-		kept := make([]any, 0, limit)
-		for _, item := range extracted {
-			id, _ := stringField(item, "Id")
-			if id != "" && playedSet[id] {
-				continue
-			}
-			rewritten := s.rewriteProxyJSONValueForRequestWithSnapshot(r.Context(), r, item, session, upstream, gatewayToken, s.gatewayBaseForRequest(r))
-			kept = append(kept, rewritten)
-			if len(kept) >= limit {
-				break
-			}
-		}
-		items = kept
-		if len(items) >= limit || len(extracted) < requestLimit {
-			break
-		}
-		requestLimit *= 3
-	}
-	writeJSON(w, status, items)
-}
-
 // writeLocalSessions serves GET /Sessions from gateway-owned session state only.
 // Zero upstream Ensure/dial (including no /Sessions proxy). Filter first, then
 // one batched ListCurrentPlaybacks and optional batched local UserData load.
@@ -423,298 +329,6 @@ func (s *Server) projectLocalSessions(ctx context.Context, viewer *Session, filt
 		items = append(items, sessionInfoDTOWithRemoteControl(&filtered[i], s.cfg.GatewayServerID, currentPtr, userData, supportsRemoteControl))
 	}
 	return items, nil
-}
-
-func (s *Server) writeNextUpItems(w http.ResponseWriter, r *http.Request, session *Session, gatewayToken string) {
-	states, err := s.store.ListPlaybackStates(r.Context(), session.GatewayUserID, PlaybackStateFilter{})
-	if err != nil {
-		http.Error(w, "next up unavailable", http.StatusInternalServerError)
-		return
-	}
-	series := recentlyActiveSeries(states)
-	if seriesID := strings.TrimSpace(r.URL.Query().Get("SeriesId")); seriesID != "" {
-		series = []string{seriesID}
-	}
-	maxSeries := intQuery(r.URL.Query(), "Limit", 20) + 20
-	if maxSeries > 0 && len(series) > maxSeries {
-		series = series[:maxSeries]
-	}
-	playedByID := playbackStateSet(filterStates(states, func(state PlaybackState) bool { return state.Played }))
-	items := make([]any, 0, len(series))
-	episodeQuery := queryForIDResolution(r.URL.Query())
-	for _, seriesID := range series {
-		episodeValue, status, upstream, err := s.fetchBackendJSON(r.Context(), r, "/Shows/"+seriesID+"/Episodes", episodeQuery.Encode(), session, gatewayToken)
-		if err != nil || status < 200 || status >= 300 {
-			continue
-		}
-		episodes := extractItems(episodeValue)
-		// Only cache when Emby reports a trusted total; len(episodes) may be a partial page.
-		if total, ok := totalRecordCount(episodeValue); ok && total > 0 {
-			_ = s.store.SaveItemChildCount(r.Context(), ItemChildCount{ItemID: seriesID, ChildCount: total})
-		}
-		sort.SliceStable(episodes, func(i, j int) bool {
-			return episodeOrderLess(episodes[i], episodes[j])
-		})
-		last := lastWatchedEpisodeIndex(states, seriesID)
-		for _, episode := range episodes {
-			id, _ := stringField(episode, "Id")
-			if id == "" || playedByID[id] || !episodeAfter(episode, last) {
-				continue
-			}
-			rewritten := s.rewriteProxyJSONValueForRequestWithSnapshot(r.Context(), r, episode, session, upstream, gatewayToken, s.gatewayBaseForRequest(r))
-			if item, ok := rewritten.(map[string]any); ok {
-				items = append(items, item)
-			}
-			break
-		}
-	}
-	total := len(items)
-	items = pageItems(items, r.URL.Query())
-	writeJSON(w, http.StatusOK, map[string]any{"Items": items, "TotalRecordCount": total, "StartIndex": intQuery(r.URL.Query(), "StartIndex", 0)})
-}
-
-func (s *Server) personalFilterIDs(ctx context.Context, gatewayUserID string, q url.Values) ([]string, bool, []string, error) {
-	filters := splitFilterValues(q["Filters"])
-	remaining := make([]string, 0, len(filters))
-	type personalFilterOp struct {
-		positive bool
-		filter   PlaybackStateFilter
-	}
-	ops := make([]personalFilterOp, 0, 6)
-	for _, filter := range filters {
-		switch strings.ToLower(filter) {
-		case "isplayed":
-			v := true
-			ops = append(ops, personalFilterOp{positive: true, filter: PlaybackStateFilter{Played: &v}})
-		case "isfavorite":
-			v := true
-			ops = append(ops, personalFilterOp{positive: true, filter: PlaybackStateFilter{Favorite: &v}})
-		case "isresumable":
-			v := true
-			ops = append(ops, personalFilterOp{positive: true, filter: PlaybackStateFilter{Resumable: &v}})
-		case "isunplayed":
-			v := true
-			ops = append(ops, personalFilterOp{positive: false, filter: PlaybackStateFilter{Played: &v}})
-		default:
-			remaining = append(remaining, filter)
-		}
-	}
-	for _, name := range []string{"IsPlayed", "IsFavorite", "IsResumable"} {
-		raw := q.Get(name)
-		if raw == "" {
-			continue
-		}
-		value, err := strconv.ParseBool(raw)
-		if err != nil {
-			q.Del(name)
-			continue
-		}
-		var filter PlaybackStateFilter
-		switch name {
-		case "IsPlayed":
-			v := true
-			filter = PlaybackStateFilter{Played: &v}
-		case "IsFavorite":
-			v := true
-			filter = PlaybackStateFilter{Favorite: &v}
-		case "IsResumable":
-			v := true
-			filter = PlaybackStateFilter{Resumable: &v}
-		}
-		ops = append(ops, personalFilterOp{positive: value, filter: filter})
-		q.Del(name)
-	}
-	q.Del("Filters")
-	if len(remaining) > 0 {
-		q.Set("Filters", strings.Join(remaining, ","))
-	}
-	if len(ops) == 0 {
-		return nil, false, nil, nil
-	}
-
-	allStates, err := s.store.ListPlaybackStates(ctx, gatewayUserID, PlaybackStateFilter{})
-	if err != nil {
-		return nil, false, nil, err
-	}
-
-	var positive map[string]bool
-	hasPositive := false
-	exclude := map[string]bool{}
-	intersectPositive := func(states []PlaybackState) {
-		ids := playbackStateSet(states)
-		if !hasPositive {
-			positive = ids
-			hasPositive = true
-			return
-		}
-		for id := range positive {
-			if !ids[id] {
-				delete(positive, id)
-			}
-		}
-	}
-	for _, op := range ops {
-		matched := statesMatchingFilter(allStates, op.filter)
-		if op.positive {
-			intersectPositive(matched)
-		} else {
-			for _, state := range matched {
-				exclude[state.ItemID] = true
-			}
-		}
-	}
-	return sortedSetKeys(positive), hasPositive, sortedSetKeys(exclude), nil
-}
-
-// statesMatchingFilter applies the same field checks as MemoryStore.ListPlaybackStates.
-func statesMatchingFilter(states []PlaybackState, filter PlaybackStateFilter) []PlaybackState {
-	out := make([]PlaybackState, 0, len(states))
-	for _, state := range states {
-		if !filter.IncludeOrphaned && state.OrphanedAt != nil {
-			continue
-		}
-		if filter.Played != nil && state.Played != *filter.Played {
-			continue
-		}
-		if filter.Favorite != nil && state.IsFavorite != *filter.Favorite {
-			continue
-		}
-		if filter.Resumable != nil {
-			resumable := state.PlaybackPositionTicks > 0 && !state.Played
-			if resumable != *filter.Resumable {
-				continue
-			}
-		}
-		if filter.SeriesID != "" && state.SeriesID != filter.SeriesID {
-			continue
-		}
-		if filter.SeasonID != "" && state.SeasonID != filter.SeasonID {
-			continue
-		}
-		out = append(out, state)
-	}
-	return out
-}
-
-func (s *Server) resolveItemsByID(ctx context.Context, r *http.Request, session *Session, gatewayToken string, ids []string) ([]any, error) {
-	if len(ids) == 0 {
-		return []any{}, nil
-	}
-	requestQuery := cloneQuery(r.URL.Query())
-	q := queryForIDResolution(requestQuery)
-	out := make([]any, 0, len(ids))
-	now := time.Now().UTC()
-	for start := 0; start < len(ids); start += personalIDBatchLimit {
-		end := start + personalIDBatchLimit
-		if end > len(ids) {
-			end = len(ids)
-		}
-		batchIDs := ids[start:end]
-		q.Set("Ids", strings.Join(batchIDs, ","))
-		value, status, upstream, err := s.fetchBackendJSON(ctx, r, "/Users/"+session.SyntheticUserID+"/Items", q.Encode(), session, gatewayToken)
-		if err != nil || status < 200 || status >= 300 {
-			continue
-		}
-		items := extractItems(value)
-		byID := map[string]map[string]any{}
-		for _, item := range items {
-			if id, _ := stringField(item, "Id"); id != "" {
-				byID[id] = item
-			}
-		}
-		for _, id := range batchIDs {
-			item, ok := byID[id]
-			state, err := s.stateForItem(ctx, session, id)
-			if err != nil {
-				return nil, err
-			}
-			if !ok {
-				_ = reconcileResolvedItem(state, nil, false, now)
-				if err := s.store.SavePlaybackResolution(ctx, *state); err != nil {
-					return nil, fmt.Errorf("%w: save playback resolution: %w", ErrStoreUnavailable, err)
-				}
-				continue
-			}
-			if !itemMatchesResolutionQuery(item, requestQuery) {
-				continue
-			}
-			outcome := reconcileResolvedItem(state, item, true, now)
-			if err := s.store.SavePlaybackResolution(ctx, *state); err != nil {
-				return nil, fmt.Errorf("%w: save playback resolution: %w", ErrStoreUnavailable, err)
-			}
-			if outcome != resolutionKeep {
-				continue
-			}
-			rewritten := s.rewriteProxyJSONValueForRequestWithSnapshot(ctx, r, item, session, upstream, gatewayToken, s.gatewayBaseForRequest(r))
-			if m, ok := rewritten.(map[string]any); ok {
-				out = append(out, m)
-			}
-		}
-	}
-	return out, nil
-}
-
-func queryForIDResolution(q url.Values) url.Values {
-	copy := cloneQuery(q)
-	for name := range copy {
-		if !isIDResolutionProjectionParam(name) {
-			copy.Del(name)
-		}
-	}
-	return copy
-}
-
-func isIDResolutionProjectionParam(name string) bool {
-	switch strings.ToLower(name) {
-	case "fields", "enableimagetypes", "imagetypelimit", "enableimages", "enableuserdata", "enableuserdatas", "enabletotalrecordcount":
-		return true
-	default:
-		return false
-	}
-}
-
-func itemMatchesResolutionQuery(item map[string]any, q url.Values) bool {
-	if mediaTypes := lowerSet(splitFilterValues(q["MediaTypes"])); len(mediaTypes) > 0 {
-		mediaType, _ := stringField(item, "MediaType")
-		if !mediaTypes[strings.ToLower(mediaType)] {
-			return false
-		}
-	}
-	if includeTypes := lowerSet(splitFilterValues(q["IncludeItemTypes"])); len(includeTypes) > 0 {
-		itemType, _ := stringField(item, "Type")
-		if !includeTypes[strings.ToLower(itemType)] {
-			return false
-		}
-	}
-	if excludeTypes := lowerSet(splitFilterValues(q["ExcludeItemTypes"])); len(excludeTypes) > 0 {
-		itemType, _ := stringField(item, "Type")
-		if excludeTypes[strings.ToLower(itemType)] {
-			return false
-		}
-	}
-	if parentID := strings.TrimSpace(q.Get("ParentId")); parentID != "" {
-		itemParentID, _ := stringField(item, "ParentId")
-		if itemParentID != parentID {
-			return false
-		}
-	}
-	if seriesID := strings.TrimSpace(q.Get("SeriesId")); seriesID != "" {
-		itemSeriesID, _ := stringField(item, "SeriesId")
-		if itemSeriesID != seriesID {
-			return false
-		}
-	}
-	return true
-}
-
-func lowerSet(values []string) map[string]bool {
-	set := map[string]bool{}
-	for _, value := range values {
-		if value != "" {
-			set[strings.ToLower(value)] = true
-		}
-	}
-	return set
 }
 
 func (s *Server) fetchBackendJSON(ctx context.Context, r *http.Request, rel, rawQuery string, session *Session, gatewayToken string) (any, int, upstreamRequestSnapshot, error) {
@@ -1005,13 +619,21 @@ func splitFilterValues(values []string) []string {
 }
 
 func queryHasPersonalFilter(q url.Values) bool {
-	if q.Get("IsPlayed") != "" || q.Get("IsFavorite") != "" || q.Get("IsResumable") != "" {
-		return true
-	}
-	for _, filter := range splitFilterValues(q["Filters"]) {
-		switch strings.ToLower(filter) {
-		case "isplayed", "isunplayed", "isresumable", "isfavorite":
+	for key := range q {
+		switch strings.ToLower(key) {
+		case "isplayed", "isfavorite", "isresumable", "isliked", "isdisliked":
 			return true
+		}
+	}
+	for key, values := range q {
+		if !strings.EqualFold(key, "Filters") {
+			continue
+		}
+		for _, filter := range splitFilterValues(values) {
+			switch strings.ToLower(filter) {
+			case "isplayed", "isunplayed", "isresumable", "isfavorite", "likes", "dislikes":
+				return true
+			}
 		}
 	}
 	return false
@@ -1027,13 +649,10 @@ func isLatestItemsPath(rel string) bool {
 	return len(parts) == 4 && strings.EqualFold(parts[0], "Users") && strings.EqualFold(parts[2], "Items") && strings.EqualFold(parts[3], "Latest")
 }
 
-func isItemsPath(rel string) bool {
+func isShowPersonalItemListPath(rel string) bool {
 	parts := strings.Split(strings.Trim(rel, "/"), "/")
-	return len(parts) == 3 && strings.EqualFold(parts[0], "Users") && strings.EqualFold(parts[2], "Items")
-}
-
-func shouldLocalizePersonalFilter(rel string, q url.Values) bool {
-	return queryHasPersonalFilter(q) && isAllowedPersonalItemListPath(rel)
+	return len(parts) == 3 && strings.EqualFold(parts[0], "Shows") &&
+		(strings.EqualFold(parts[2], "Episodes") || strings.EqualFold(parts[2], "Seasons"))
 }
 
 func isNextUpPath(rel string) bool {
@@ -1050,178 +669,6 @@ func relUserMatches(rel, syntheticUserID string) bool {
 		return true
 	}
 	return parts[1] == syntheticUserID
-}
-
-func pathUserMatches(requestPath, gatewayBasePath, syntheticUserID string) bool {
-	base := strings.TrimRight(gatewayBasePath, "/")
-	rel := strings.TrimPrefix(requestPath, base)
-	return relUserMatches(rel, syntheticUserID)
-}
-
-func groupResumeItems(items []any) []any {
-	grouped := make([]any, 0, len(items))
-	seenSeries := map[string]bool{}
-	for _, item := range items {
-		m, ok := item.(map[string]any)
-		if ok {
-			if seriesID, _ := stringField(m, "SeriesId"); seriesID != "" {
-				if seenSeries[seriesID] {
-					continue
-				}
-				seenSeries[seriesID] = true
-			} else if seriesID, _ := stringField(m, "SeriesID"); seriesID != "" {
-				if seenSeries[seriesID] {
-					continue
-				}
-				seenSeries[seriesID] = true
-			}
-		} else if state, ok := item.(PlaybackState); ok && state.SeriesID != "" {
-			if seenSeries[state.SeriesID] {
-				continue
-			}
-			seenSeries[state.SeriesID] = true
-		}
-		grouped = append(grouped, item)
-	}
-	return grouped
-}
-
-func playbackStateIDs(states []PlaybackState) []string {
-	ids := make([]string, 0, len(states))
-	for _, state := range states {
-		if state.ItemID != "" {
-			ids = append(ids, state.ItemID)
-		}
-	}
-	return ids
-}
-
-func playbackStateSet(states []PlaybackState) map[string]bool {
-	set := map[string]bool{}
-	for _, state := range states {
-		if state.ItemID != "" {
-			set[state.ItemID] = true
-		}
-	}
-	return set
-}
-
-func sortedSetKeys(set map[string]bool) []string {
-	if len(set) == 0 {
-		return nil
-	}
-	keys := make([]string, 0, len(set))
-	for key := range set {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
-func filterStates(states []PlaybackState, keep func(PlaybackState) bool) []PlaybackState {
-	filtered := make([]PlaybackState, 0, len(states))
-	for _, state := range states {
-		if keep(state) {
-			filtered = append(filtered, state)
-		}
-	}
-	return filtered
-}
-
-func recentlyActiveSeries(states []PlaybackState) []string {
-	latest := map[string]time.Time{}
-	for _, state := range states {
-		if state.SeriesID == "" || state.OrphanedAt != nil {
-			continue
-		}
-		recency := stateRecency(state)
-		if recency.After(latest[state.SeriesID]) {
-			latest[state.SeriesID] = recency
-		}
-	}
-	type pair struct {
-		seriesID string
-		time     time.Time
-	}
-	pairs := make([]pair, 0, len(latest))
-	for seriesID, t := range latest {
-		pairs = append(pairs, pair{seriesID: seriesID, time: t})
-	}
-	sort.SliceStable(pairs, func(i, j int) bool { return pairs[i].time.After(pairs[j].time) })
-	ids := make([]string, 0, len(pairs))
-	for _, p := range pairs {
-		ids = append(ids, p.seriesID)
-	}
-	return ids
-}
-
-func stateRecency(state PlaybackState) time.Time {
-	if state.LastPlayedDate != nil {
-		return *state.LastPlayedDate
-	}
-	return state.UpdatedAt
-}
-
-type episodeIndex struct {
-	season  int
-	episode int
-	valid   bool
-}
-
-func lastWatchedEpisodeIndex(states []PlaybackState, seriesID string) episodeIndex {
-	last := episodeIndex{}
-	for _, state := range states {
-		if state.SeriesID != seriesID || (!state.Played && state.PlaybackPositionTicks == 0) {
-			continue
-		}
-		idx := episodeIndex{season: state.ParentIndexNumber, episode: state.IndexNumber, valid: true}
-		if !last.valid || indexAfter(idx, last) {
-			last = idx
-		}
-	}
-	return last
-}
-
-func episodeAfter(item map[string]any, last episodeIndex) bool {
-	if !last.valid {
-		return true
-	}
-	idx := itemEpisodeIndex(item)
-	return idx.valid && indexAfter(idx, last)
-}
-
-func episodeOrderLess(a, b map[string]any) bool {
-	ai := itemEpisodeIndex(a)
-	bi := itemEpisodeIndex(b)
-	return indexAfter(bi, ai)
-}
-
-func itemEpisodeIndex(item map[string]any) episodeIndex {
-	season, _ := int64Field(item, "ParentIndexNumber")
-	episode, _ := int64Field(item, "IndexNumber")
-	return episodeIndex{season: int(season), episode: int(episode), valid: true}
-}
-
-func indexAfter(a, b episodeIndex) bool {
-	if a.season != b.season {
-		return a.season > b.season
-	}
-	return a.episode > b.episode
-}
-
-func pageItems(items []any, q url.Values) []any {
-	start := intQuery(q, "StartIndex", 0)
-	if start < 0 {
-		start = 0
-	}
-	if start >= len(items) {
-		return []any{}
-	}
-	limit := intQuery(q, "Limit", 0)
-	if limit <= 0 || start+limit > len(items) {
-		return items[start:]
-	}
-	return items[start : start+limit]
 }
 
 func intQuery(q url.Values, name string, fallback int) int {
