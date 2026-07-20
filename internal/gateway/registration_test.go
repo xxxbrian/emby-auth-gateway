@@ -65,6 +65,21 @@ func TestRegistrationHandlerStubs(t *testing.T) {
 	}
 }
 
+func TestRegistrationHandlerExactJSON(t *testing.T) {
+	cases := map[string]string{
+		"/admin/service/registration/validateDevice": `{"cacheExpirationDays":233,"message":"Device Valid","resultCode":"GOOD"}` + "\n",
+		"/admin/service/registration/validate":       `{"featId":"","registered":true,"expDate":"2333-10-01","key":""}` + "\n",
+		"/admin/service/registration/getStatus":      `{"deviceStatus":0,"planType":"Lifetime","subscriptions":[]}` + "\n",
+	}
+	for path, want := range cases {
+		rr := httptest.NewRecorder()
+		RegistrationHandler{}.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+		if rr.Code != http.StatusOK || rr.Body.String() != want {
+			t.Fatalf("%s status/body = %d/%q, want 200/%q", path, rr.Code, rr.Body.String(), want)
+		}
+	}
+}
+
 func TestRegistrationHandlerNotFoundAndMethod(t *testing.T) {
 	h := RegistrationHandler{}
 

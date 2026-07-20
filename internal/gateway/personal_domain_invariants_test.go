@@ -26,7 +26,7 @@ var recognizedBackendAuthQueryKeys = map[string]struct{}{
 // enrichment egress after canonical identity rewriting.
 var recognizedBackendMetadataNeutralQueryKeys = map[string]struct{}{
 	"EnableUserData": {},
-	"UserId":        {},
+	"UserId":         {},
 }
 
 // egressRequest is one observed upstream request (test-only).
@@ -336,6 +336,21 @@ func TestPersonalDomainTwoUserStateIsolationMatrix(t *testing.T) {
 			t.Fatalf("%s status = %d, want %d", path, resp.StatusCode, want)
 		}
 	}
+	fetchDirectUserData := func(t *testing.T, url string) map[string]any {
+		t.Helper()
+		resp := do(t, mustRequest(t, http.MethodGet, url, nil))
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("user data response status = %d, want 200", resp.StatusCode)
+		}
+		var item map[string]any
+		decodeJSON(t, resp.Body, &item)
+		userData, ok := item["UserData"].(map[string]any)
+		if !ok {
+			t.Fatalf("missing UserData in direct BaseItem %#v", item)
+		}
+		return userData
+	}
 
 	// User A mutates a representative personal matrix on the shared item.
 	recorder.reset()
@@ -378,16 +393,13 @@ func TestPersonalDomainTwoUserStateIsolationMatrix(t *testing.T) {
 	// Swap backend to return conflicting upstream UserData for neutral reads.
 	metaPath := "/emby/Items/" + itemID
 	metaRecorder := newEgressRecorder(func(w http.ResponseWriter, r *http.Request) {
-		writeTestJSON(w, map[string]any{
-			"Item":  backendItem,
-			"Items": []any{backendItem},
-		})
+		writeTestJSON(w, backendItem)
 	})
 	metaBackend := httptest.NewServer(metaRecorder)
 	defer metaBackend.Close()
 	configureTestUpstream(store, metaBackend.URL+"/emby")
 
-	userDataB := fetchUserData(t, gw.URL+"/emby/Items/"+itemID+"?api_key="+tokenB)
+	userDataB := fetchDirectUserData(t, gw.URL+"/emby/Items/"+itemID+"?api_key="+tokenB)
 	if userDataB["Played"] != false || userDataB["IsFavorite"] != false || int(userDataB["PlaybackPositionTicks"].(float64)) != 0 {
 		t.Fatalf("user B observed foreign/upstream state: %#v", userDataB)
 	}
@@ -397,7 +409,7 @@ func TestPersonalDomainTwoUserStateIsolationMatrix(t *testing.T) {
 	metaRecorder.assertNeutralMetadataReads(t, tokenB, metaPath)
 
 	metaRecorder.reset()
-	userDataA := fetchUserData(t, gw.URL+"/emby/Items/"+itemID+"?api_key="+tokenA)
+	userDataA := fetchDirectUserData(t, gw.URL+"/emby/Items/"+itemID+"?api_key="+tokenA)
 	if userDataA["IsFavorite"] != true || int(userDataA["PlaybackPositionTicks"].(float64)) != 4321 {
 		t.Fatalf("user A lost own state: %#v", userDataA)
 	}

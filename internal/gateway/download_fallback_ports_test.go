@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/xxxbrian/emby-auth-gateway/internal/observe"
+	"github.com/xxxbrian/emby-auth-gateway/internal/routeclass"
 	"github.com/xxxbrian/emby-auth-gateway/internal/telemetry"
 )
 
@@ -29,7 +30,7 @@ type downloadFallbackPortSpy struct {
 	cancel             context.CancelFunc
 }
 
-func (s *downloadFallbackPortSpy) RoundTripNegotiation(in negotiationUpstreamRequest) (*http.Response, error) {
+func (s *downloadFallbackPortSpy) RoundTripNegotiation(in negotiationUpstreamRequest) (negotiationUpstreamResponse, error) {
 	s.calls = append(s.calls, "negotiation")
 	if s.cancelPhase == "negotiation" && s.cancel != nil {
 		s.cancel()
@@ -47,8 +48,8 @@ func (s *downloadFallbackPortSpy) RoundTripNegotiation(in negotiationUpstreamReq
 	if request.UserID != "synthetic-user" {
 		s.t.Fatalf("negotiation UserId = %q", request.UserID)
 	}
-	if err := s.leases.RegisterAll(in.Session.GatewayTokenHash, []PlaySessionID{"play-1"}, nil); err != nil {
-		return nil, err
+	if _, err := s.leases.Validate(in.Session.GatewayTokenHash, "play-1", "", time.Time{}); !errors.Is(err, ErrNotFound) {
+		s.t.Fatalf("lease registered before fallback acceptance: %v", err)
 	}
 	refreshed := in.Snapshot
 	refreshed.token = "refreshed-token"
@@ -62,7 +63,11 @@ func (s *downloadFallbackPortSpy) RoundTripNegotiation(in negotiationUpstreamReq
 			RequiredHTTPHeaders:  map[string]string{"X-Required": "yes", "Authorization": "forbidden"},
 		}},
 	})
-	return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+	registration := newNegotiationLeaseRegistration(s.leases, in.Session.GatewayTokenHash, negotiationSelectorSet{PlaySessionIDs: []PlaySessionID{"play-1"}}, routeclass.OperationPlaybackInfo, in.Request.Context(), in.Snapshot, nil)
+	return negotiationUpstreamResponse{
+		Response:     &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))},
+		Registration: registration,
+	}, nil
 }
 
 func (s *downloadFallbackPortSpy) RoundTripMedia(in mediaUpstreamRequest) (*http.Response, error) {
@@ -81,6 +86,9 @@ func (s *downloadFallbackPortSpy) RoundTripMedia(in mediaUpstreamRequest) (*http
 	}
 	if in.Request.Header.Get("Range") != "bytes=0-" || in.Request.Header.Get("X-Required") != "yes" || in.Request.Header.Get("Authorization") != "" || in.Request.Header.Get("X-Unrelated") != "" {
 		s.t.Fatalf("media headers = %#v", in.Request.Header)
+	}
+	if _, err := s.leases.Validate(in.Session.GatewayTokenHash, "play-1", "", time.Time{}); err != nil {
+		s.t.Fatalf("lease not committed immediately before media: %v", err)
 	}
 	if s.mediaErr != nil {
 		return nil, s.mediaErr
@@ -247,14 +255,15 @@ func (p *malformedDownloadFallbackPort) RoundTripMedia(in mediaUpstreamRequest) 
 	return &http.Response{StatusCode: http.StatusForbidden, Header: make(http.Header), Body: io.NopCloser(bytes.NewBufferString("original forbidden")), Request: in.Request}, nil
 }
 
-func (p *malformedDownloadFallbackPort) RoundTripNegotiation(in negotiationUpstreamRequest) (*http.Response, error) {
+func (p *malformedDownloadFallbackPort) RoundTripNegotiation(in negotiationUpstreamRequest) (negotiationUpstreamResponse, error) {
 	p.calls++
 	playSessionID := PlaySessionID(fmt.Sprintf("malformed-%d", p.calls))
-	if err := p.leases.RegisterAll(in.Session.GatewayTokenHash, []PlaySessionID{playSessionID}, nil); err != nil {
-		return nil, err
-	}
 	body := fmt.Sprintf(`{"PlaySessionId":%q,"MediaSources":"malformed"}`, playSessionID)
-	return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewBufferString(body))}, nil
+	registration := newNegotiationLeaseRegistration(p.leases, in.Session.GatewayTokenHash, negotiationSelectorSet{PlaySessionIDs: []PlaySessionID{playSessionID}}, routeclass.OperationPlaybackInfo, in.Request.Context(), in.Snapshot, nil)
+	return negotiationUpstreamResponse{
+		Response:     &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewBufferString(body))},
+		Registration: registration,
+	}, nil
 }
 
 func TestDownloadFallbackMalformedTypedNegotiationReleasesRegisteredLeases(t *testing.T) {
@@ -281,5 +290,86 @@ func TestDownloadFallbackMalformedTypedNegotiationReleasesRegisteredLeases(t *te
 	}
 	if port.calls != mediaLeaseRegistryMaxPerToken+2 {
 		t.Fatalf("negotiation calls = %d", port.calls)
+	}
+}
+
+type failingRegisterLeaseRegistry struct {
+	MediaLeaseRegistry
+}
+
+func (failingRegisterLeaseRegistry) RegisterAll(string, []PlaySessionID, []LiveStreamID) error {
+	return ErrStoreUnavailable
+}
+
+type failedDownloadFallbackPort struct {
+	leases      MediaLeaseRegistry
+	mediaCalls  int
+	mediaFailed bool
+}
+
+func (p *failedDownloadFallbackPort) RoundTripMedia(in mediaUpstreamRequest) (*http.Response, error) {
+	p.mediaCalls++
+	if p.mediaCalls == 1 {
+		return &http.Response{StatusCode: http.StatusForbidden, Header: make(http.Header), Body: io.NopCloser(bytes.NewBufferString("original forbidden")), Request: in.Request}, nil
+	}
+	if p.mediaFailed {
+		return nil, errors.New("fallback media failed")
+	}
+	return nil, errors.New("fallback media should not run")
+}
+
+func (p *failedDownloadFallbackPort) RoundTripNegotiation(in negotiationUpstreamRequest) (negotiationUpstreamResponse, error) {
+	body, _ := json.Marshal(embyPlaybackInfoResponseDTO{
+		PlaySessionID: "play-failed",
+		MediaSources: []embyMediaSourceInfoDTO{{
+			ID:                   "source-1",
+			DirectStreamURL:      "/Videos/item-1/original.mkv?MediaSourceId=source-1&PlaySessionId=play-failed",
+			SupportsDirectStream: true,
+		}},
+	})
+	registration := newNegotiationLeaseRegistration(p.leases, in.Session.GatewayTokenHash, negotiationSelectorSet{PlaySessionIDs: []PlaySessionID{"play-failed"}}, routeclass.OperationPlaybackInfo, in.Request.Context(), in.Snapshot, nil)
+	return negotiationUpstreamResponse{
+		Response:     &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body)), Request: in.Request},
+		Registration: registration,
+	}, nil
+}
+
+func TestDownloadFallbackCommitAndMediaFailurePreserveOriginalForbidden(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		mediaFailed bool
+		failCommit  bool
+		wantCalls   int
+	}{
+		{name: "commit failure", failCommit: true, wantCalls: 1},
+		{name: "media failure", mediaFailed: true, wantCalls: 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store := testStore("http://backend.test/emby")
+			store.Sessions[HashToken("gateway-token")] = testSession()
+			server := NewServer(Config{GatewayBasePath: "/emby", GatewayServerID: "gateway"}, store)
+			leases := NewMediaLeaseRegistry(nil)
+			if tt.failCommit {
+				server.mediaLeases = failingRegisterLeaseRegistry{MediaLeaseRegistry: leases}
+			} else {
+				server.mediaLeases = leases
+			}
+			port := &failedDownloadFallbackPort{leases: server.mediaLeases, mediaFailed: tt.mediaFailed}
+			server.mediaUpstream = port
+
+			request := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items/item-1/Download?MediaSourceId=source-1&api_key=gateway-token", nil)
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, request)
+
+			if response.Code != http.StatusForbidden || response.Body.String() != "original forbidden" {
+				t.Fatalf("response = %d %q", response.Code, response.Body.String())
+			}
+			if port.mediaCalls != tt.wantCalls {
+				t.Fatalf("media calls = %d, want %d", port.mediaCalls, tt.wantCalls)
+			}
+			if owners := leases.Owners(); len(owners) != 0 {
+				t.Fatalf("failure retained owners = %#v", owners)
+			}
+		})
 	}
 }

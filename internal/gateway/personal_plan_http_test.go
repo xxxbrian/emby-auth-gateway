@@ -89,12 +89,13 @@ func TestPersonalPlanHTTPRejectsInvalidQueryAndIdentityBeforeEgress(t *testing.T
 
 func TestPersonalPlanHTTPPassthroughPreservesShapeAndSuppliedPagination(t *testing.T) {
 	tests := []struct {
-		name string
-		body string
+		name       string
+		body       string
+		wantStatus int
 	}{
-		{"document total", `{"Items":[],"TotalRecordCount":7,"StartIndex":2,"Marker":"kept"}`},
-		{"document absent total", `{"Items":[],"Marker":"kept"}`},
-		{"array", `[{"Id":"one"}]`},
+		{"document total", `{"Items":[],"TotalRecordCount":7,"StartIndex":2,"Marker":"kept","Big":9223372036854775808123}`, http.StatusOK},
+		{"document absent total", `{"Items":[],"Marker":"kept"}`, http.StatusOK},
+		{"undeclared array", `[{"Id":"one"}]`, http.StatusBadGateway},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -102,8 +103,11 @@ func TestPersonalPlanHTTPPassthroughPreservesShapeAndSuppliedPagination(t *testi
 			server, _, _ := personalPlanHTTPServer(t, fake)
 			defer server.Close()
 			response := personalPlanHTTPRequest(server, "/Items?api_key=gateway-token")
-			if response.Code != http.StatusOK || fake.calls != 1 {
+			if response.Code != test.wantStatus || fake.calls != 1 {
 				t.Fatalf("status=%d calls=%d body=%q", response.Code, fake.calls, response.Body.String())
+			}
+			if test.wantStatus != http.StatusOK {
+				return
 			}
 			var want, got any
 			if json.Unmarshal([]byte(test.body), &want) != nil || json.Unmarshal(response.Body.Bytes(), &got) != nil {
@@ -120,6 +124,9 @@ func TestPersonalPlanHTTPPassthroughPreservesShapeAndSuppliedPagination(t *testi
 						t.Fatalf("%s=%v, want %v", key, gotMap[key], wantMap[key])
 					}
 				}
+			}
+			if strings.Contains(test.body, "9223372036854775808123") && !strings.Contains(response.Body.String(), "9223372036854775808123") {
+				t.Fatalf("large integer changed: %q", response.Body.String())
 			}
 		})
 	}
@@ -169,6 +176,13 @@ func TestPersonalPlanHTTPPositiveTotalBeforeLimitZeroAndResumeDoesNotGroupSeries
 		}
 		if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &result) != nil || len(result.Items) != 0 || result.TotalRecordCount != 2 || result.StartIndex != 0 {
 			t.Fatalf("status=%d result=%+v body=%q", response.Code, result, response.Body.String())
+		}
+		var wire map[string]json.RawMessage
+		if json.Unmarshal(response.Body.Bytes(), &wire) != nil {
+			t.Fatal("invalid local QueryResult JSON")
+		}
+		if _, exists := wire["StartIndex"]; exists {
+			t.Fatalf("local QueryResult retained StartIndex: %s", response.Body.String())
 		}
 		if len(fake.requests) != 1 {
 			t.Fatalf("metadata requests=%d, want one", len(fake.requests))

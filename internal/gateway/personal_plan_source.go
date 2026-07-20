@@ -3,7 +3,6 @@ package gateway
 import (
 	"context"
 	"fmt"
-	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -161,12 +160,11 @@ func optionalJSONInt(object map[string]any, name string) (*int, error) {
 	if !exists {
 		return nil, nil
 	}
-	n, ok := value.(float64)
-	if !ok || math.IsNaN(n) || math.IsInf(n, 0) || n < 0 || n != math.Trunc(n) || n >= math.Ldexp(1, strconv.IntSize-1) {
+	n, ok := boundedNonNegativeJSONInt(value)
+	if !ok {
 		return nil, fmt.Errorf("%s is malformed", name)
 	}
-	result := int(n)
-	return &result, nil
+	return &n, nil
 }
 
 func (p *personalPlanSource) resolveIDs(ctx context.Context, plan personalPlan, snapshot personalStateSnapshot, ids []string) ([]resolvedPersonalItem, error) {

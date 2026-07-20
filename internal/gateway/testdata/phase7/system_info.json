@@ -1,0 +1,1 @@
+{"Id":"gateway-server","ServerId":"gateway-server","ServerName":"Emby Gateway","Version":"4.9.5.0","LocalAddress":"https://gateway.example/emby","WanAddress":"https://gateway.example/emby","RemoteAddresses":["https://gateway.example/emby"],"LocalAddresses":["https://gateway.example/emby"]}

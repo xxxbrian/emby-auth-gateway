@@ -3,10 +3,8 @@ package gateway
 import (
 	"context"
 	"fmt"
-	"math"
 	"net/url"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -264,24 +262,7 @@ func nextUpNonnegativeInt(item map[string]any, name string) (int, bool) {
 		if !strings.EqualFold(key, name) {
 			continue
 		}
-		var n float64
-		switch v := value.(type) {
-		case float64:
-			n = v
-		case int:
-			return v, v >= 0
-		case int64:
-			if v < 0 || (strconv.IntSize == 32 && v > math.MaxInt32) {
-				return 0, false
-			}
-			return int(v), true
-		default:
-			return 0, false
-		}
-		if math.IsNaN(n) || math.IsInf(n, 0) || n < 0 || n != math.Trunc(n) || n >= math.Ldexp(1, strconv.IntSize-1) {
-			return 0, false
-		}
-		return int(n), true
+		return boundedNonNegativeJSONInt(value)
 	}
 	return 0, false
 }

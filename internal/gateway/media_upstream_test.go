@@ -152,7 +152,7 @@ func TestNegotiationUpstreamReportsRefreshFailure(t *testing.T) {
 		return upstreamRequestSnapshot{}, true, refreshErr
 	}, NewMediaLeaseRegistry(nil), nil)
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/Items/item/PlaybackInfo", nil)
-	resp, err := adapter.RoundTripNegotiation(negotiationUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{
+	result, err := adapter.RoundTripNegotiation(negotiationUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{
 		Request: req, Session: &Session{GatewayTokenHash: "owner", SyntheticUserID: "gateway-user"}, Snapshot: testUpstreamSnapshot("http://backend.invalid"),
 		refreshResult: func(result upstreamRefreshResult) { results = append(results, result) },
 	}})
@@ -162,8 +162,9 @@ func TestNegotiationUpstreamReportsRefreshFailure(t *testing.T) {
 	if len(results) != 1 || !results[0].Confirmed || !errors.Is(results[0].Err, refreshErr) {
 		t.Fatalf("results=%+v", results)
 	}
-	_ = resp.Body.Close()
-	_ = resp.Body.Close()
+	defer result.Registration.Close()
+	_ = result.Response.Body.Close()
+	_ = result.Response.Body.Close()
 	if body.closes != 1 {
 		t.Fatalf("returned unauthorized closes=%d, want 1", body.closes)
 	}
@@ -182,16 +183,30 @@ func TestNegotiationStructuredRewriteAndLeaseRegistration(t *testing.T) {
 	adapter := newMediaUpstream(server.Client(), nil, registry, nil)
 	snapshot := testUpstreamSnapshot(server.URL)
 	session := &Session{GatewayTokenHash: "owner", SyntheticUserID: "gateway-user"}
-	req := httptest.NewRequest(http.MethodPost, "http://gateway.test/LiveStreams/Open", strings.NewReader(`{"UserId":"gateway-user","DeviceId":"client-device","SessionId":"secret","ControllingUserId":"other","Nested":{"UserId":"gateway-user"}}`))
-	resp, err := adapter.RoundTripNegotiation(negotiationUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: req, Session: session, Snapshot: snapshot}})
+	deviceProfile := `{"CodecProfiles":[{"Type":"Video","Conditions":[{"Property":"VideoCodec","Value":"h264+hevc"}]}],"Unknown":{"raw":"a+b"}}`
+	req := httptest.NewRequest(http.MethodPost, "http://gateway.test/LiveStreams/Open", strings.NewReader(`{"UserId":"gateway-user","DeviceId":"client-device","SessionId":"secret","ControllingUserId":"other","DeviceProfile":`+deviceProfile+`}`))
+	result, err := adapter.RoundTripNegotiation(negotiationUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: req, Session: session, Snapshot: snapshot}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer result.Response.Body.Close()
+	defer result.Registration.Close()
 	for _, secret := range []string{"gateway-user", "client-device", "\"SessionId\"", "\"ControllingUserId\""} {
 		if strings.Contains(gotBody, secret) {
 			t.Fatalf("rewrite leaked %q: %s", secret, gotBody)
 		}
+	}
+	if !strings.Contains(gotBody, `"DeviceProfile":`+deviceProfile) {
+		t.Fatalf("DeviceProfile changed: %s", gotBody)
+	}
+	if _, err := registry.Validate("owner", "play-1", "live-1", time.Time{}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("lease registered before commit: %v", err)
+	}
+	if err := result.Registration.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := result.Registration.Commit(); err != nil {
+		t.Fatalf("idempotent commit: %v", err)
 	}
 	if _, err := registry.Validate("owner", "play-1", "live-1", time.Time{}); err != nil {
 		t.Fatalf("registered lease unavailable: %v", err)
@@ -218,11 +233,17 @@ func TestPlaybackInfoNullableSelectorsAreAbsentAndValidIDsRegister(t *testing.T)
 		`{"DeviceProfile":{},"Nested":{"LiveStreamId":null}}`,
 	} {
 		req := httptest.NewRequest(http.MethodPost, "http://gateway.test/Items/item/PlaybackInfo?LiveStreamId=&playsessionid=", strings.NewReader(body))
-		resp, err := adapter.RoundTripNegotiation(negotiationUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: req, Session: session, Snapshot: testUpstreamSnapshot(backend.URL)}})
+		result, err := adapter.RoundTripNegotiation(negotiationUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: req, Session: session, Snapshot: testUpstreamSnapshot(backend.URL)}})
 		if err != nil {
 			t.Fatal(err)
 		}
-		_ = resp.Body.Close()
+		if result.Registration != nil {
+			defer result.Registration.Close()
+			if err := result.Registration.Commit(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		_ = result.Response.Body.Close()
 	}
 	if err := registry.ValidateAll("owner", []PlaySessionID{"play-valid"}, nil, time.Time{}); err != nil {
 		t.Fatalf("valid sibling identifier was not registered: %v", err)
@@ -298,17 +319,62 @@ func TestNegotiationRetryRebuildsCaseInsensitiveAliasesWithFreshSnapshot(t *test
 	adapter := newMediaUpstream(backend.Client(), func(context.Context, upstreamRequestSnapshot) (upstreamRequestSnapshot, bool, error) {
 		return second, true, nil
 	}, NewMediaLeaseRegistry(nil), nil)
-	body := `{"userID":"client-user","DEVICEid":"client-device","sessionID":"secret","CONTROLLINGuserID":"secret","Nested":{"Userid":"nested","deviceID":"nested-device"}}`
-	resp, err := adapter.RoundTripNegotiation(negotiationUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: httptest.NewRequest(http.MethodPost, "http://gateway.test/LiveStreams/Open", strings.NewReader(body)), Session: &Session{GatewayTokenHash: "owner", SyntheticUserID: "gateway-user"}, Snapshot: first}})
+	body := `{"userID":"client-user","DEVICEid":"client-device","sessionID":"secret","CONTROLLINGuserID":"secret","Nested":{"opaque":"old-user","device":"old-device"}}`
+	result, err := adapter.RoundTripNegotiation(negotiationUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: httptest.NewRequest(http.MethodPost, "http://gateway.test/LiveStreams/Open", strings.NewReader(body)), Session: &Session{GatewayTokenHash: "owner", SyntheticUserID: "gateway-user"}, Snapshot: first}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer result.Response.Body.Close()
+	defer result.Registration.Close()
+	if len(bodies) != 2 || bytes.Contains(bodies[1], []byte(`"UserId":"old-user"`)) || bytes.Contains(bodies[1], []byte(`"DeviceId":"old-device"`)) || bytes.Contains(bytes.ToLower(bodies[1]), []byte("sessionid")) || bytes.Contains(bytes.ToLower(bodies[1]), []byte("controllinguserid")) {
+		t.Fatalf("retry bodies=%s", bodies)
+	}
+	if !bytes.Contains(bodies[0], []byte(`"UserId":"old-user"`)) || !bytes.Contains(bodies[0], []byte(`"DeviceId":"old-device"`)) {
+		t.Fatalf("first attempt did not use original document with initial snapshot: %s", bodies[0])
+	}
+	if strings.Count(string(bodies[1]), `"UserId":"new-user"`) != 1 || strings.Count(string(bodies[1]), `"DeviceId":"new-device"`) != 1 || !bytes.Contains(bodies[1], []byte(`"Nested":{"opaque":"old-user","device":"old-device"}`)) {
+		t.Fatalf("fresh canonical rewrite=%s", bodies[1])
+	}
+}
+
+func TestNegotiationRejectsAmbiguousIdentityBeforeDial(t *testing.T) {
+	var hits int
+	adapter := newMediaUpstream(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		hits++
+		return nil, nil
+	})}, nil, NewMediaLeaseRegistry(nil), nil)
+	for _, body := range []string{
+		`{"UserId":"one","userID":"two"}`,
+		`{"DeviceProfile":{"UserId":"nested"}}`,
+		`{"Unknown":[{"DEVICEid":"nested"}]}`,
+	} {
+		req := httptest.NewRequest(http.MethodPost, "http://gateway.test/LiveStreams/Open", strings.NewReader(body))
+		_, err := adapter.RoundTripNegotiation(negotiationUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: req, Session: &Session{GatewayTokenHash: "owner", SyntheticUserID: "gateway-user"}, Snapshot: testUpstreamSnapshot("http://backend.invalid")}})
+		if !errors.Is(err, ErrBadRequest) {
+			t.Fatalf("body=%s err=%v", body, err)
+		}
+	}
+	if hits != 0 {
+		t.Fatalf("ambiguous bodies dialed upstream %d times", hits)
+	}
+}
+
+func TestMediaUpstreamPreservesRawQueryAndPathSubstring(t *testing.T) {
+	var requestURI string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestURI = r.RequestURI
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/Users/gateway-user/Images/gateway-user-copy?sig=a%2Bb&dup=one&dup=two+words&opaque=gateway-user&UserId=gateway-user", nil)
+	resp, err := newMediaUpstream(backend.Client(), nil, nil, nil).RoundTripMedia(mediaUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: req, Session: &Session{SyntheticUserID: "gateway-user"}, Snapshot: testUpstreamSnapshot(backend.URL)}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if len(bodies) != 2 || bytes.Contains(bodies[1], []byte("old-user")) || bytes.Contains(bodies[1], []byte("old-device")) || bytes.Contains(bytes.ToLower(bodies[1]), []byte("sessionid")) || bytes.Contains(bytes.ToLower(bodies[1]), []byte("controllinguserid")) {
-		t.Fatalf("retry bodies=%s", bodies)
-	}
-	if strings.Count(string(bodies[1]), `"UserId":"new-user"`) != 2 || strings.Count(string(bodies[1]), `"DeviceId":"new-device"`) != 2 {
-		t.Fatalf("fresh canonical rewrite=%s", bodies[1])
+	want := "/Users/backend-user/Images/gateway-user-copy?sig=a%2Bb&dup=one&dup=two+words&opaque=gateway-user&UserId=backend-user&api_key=backend-token"
+	if requestURI != want {
+		t.Fatalf("request URI=%q, want %q", requestURI, want)
 	}
 }
 
@@ -330,9 +396,18 @@ func TestPlaybackInfoLiveStreamRegistrationFailureClosesAutoOpen(t *testing.T) {
 		closed = append(closed, live)
 		return nil
 	}
-	_, err := adapter.RoundTripNegotiation(negotiationUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: httptest.NewRequest(http.MethodGet, "http://gateway.test/Items/item/PlaybackInfo", nil), Session: &Session{GatewayTokenHash: "owner", SyntheticUserID: "gateway-user"}, Snapshot: testUpstreamSnapshot(backend.URL)}})
+	result, err := adapter.RoundTripNegotiation(negotiationUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: httptest.NewRequest(http.MethodGet, "http://gateway.test/Items/item/PlaybackInfo", nil), Session: &Session{GatewayTokenHash: "owner", SyntheticUserID: "gateway-user"}, Snapshot: testUpstreamSnapshot(backend.URL)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer result.Response.Body.Close()
+	err = result.Registration.Commit()
 	if !errors.Is(err, ErrStoreUnavailable) || len(closed) != 1 || closed[0] != "auto-live" {
 		t.Fatalf("err=%v closed=%v", err, closed)
+	}
+	result.Registration.Close()
+	if len(closed) != 1 {
+		t.Fatalf("idempotent close count=%d", len(closed))
 	}
 }
 
@@ -346,11 +421,14 @@ func TestSuccessfulCloseReleasesAllSuppliedIdentifiers(t *testing.T) {
 	adapter := newMediaUpstream(backend.Client(), nil, registry, nil)
 	body := `{"PLAYSESSIONID":"play-b","Nested":{"livestreamid":"live-a"}}`
 	req := httptest.NewRequest(http.MethodPost, "http://gateway.test/LiveStreams/Close?PlaySessionId=play-a", strings.NewReader(body))
-	resp, err := adapter.RoundTripNegotiation(negotiationUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: req, Session: &Session{GatewayTokenHash: "owner", SyntheticUserID: "gateway-user"}, Snapshot: testUpstreamSnapshot(backend.URL)}})
+	result, err := adapter.RoundTripNegotiation(negotiationUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: req, Session: &Session{GatewayTokenHash: "owner", SyntheticUserID: "gateway-user"}, Snapshot: testUpstreamSnapshot(backend.URL)}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer result.Response.Body.Close()
+	if result.Registration != nil {
+		t.Fatal("close operation returned pending registration")
+	}
 	if err := registry.ValidateAll("owner", []PlaySessionID{"play-a"}, nil, time.Time{}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("released identifiers remain: %v", err)
 	}

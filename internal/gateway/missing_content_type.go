@@ -8,48 +8,104 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/xxxbrian/emby-auth-gateway/internal/routeclass"
 )
 
 const missingContentTypeSniffSize = 512
 
-func (s *Server) writeMissingContentTypeResponse(w http.ResponseWriter, r *http.Request, rel string, resp *http.Response, session *Session, upstream upstreamRequestSnapshot, gatewayToken, publicGatewayBase string) {
+func (s *Server) writeMissingContentTypeResponse(w http.ResponseWriter, r *http.Request, rel string, resp *http.Response, session *Session, upstream upstreamRequestSnapshot, gatewayToken, publicGatewayBase string, projection responseProjection, plan *responseHeaderPlan, registration *negotiationLeaseRegistration) {
 	started := time.Now()
-	reader, jsonCandidate, err := sniffMissingContentType(resp.Body)
+	data, err := readLimited(resp.Body, proxyJSONLimit)
 	if err != nil {
+		resetProjectionFailureHeaders(w.Header())
 		s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_read_failed", AuditMessage: "backend response read failed", ClientBody: "response read failed", FallbackKind: "upstream_read_error", Duration: time.Since(started), UpstreamStatus: resp.StatusCode})
 		return
 	}
-	if jsonCandidate {
-		data, readErr := readLimited(reader, proxyJSONLimit)
-		if readErr != nil {
-			s.handlePreHeaderProxyFailure(w, r, rel, session, readErr, proxyFailureDetails{Event: "proxy_read_failed", AuditMessage: "backend response read failed", ClientBody: "response read failed", FallbackKind: "upstream_read_error", Duration: time.Since(started), UpstreamStatus: resp.StatusCode})
-			return
-		}
-		var value any
-		if json.Unmarshal(data, &value) == nil {
-			if s.meter != nil && len(data) > 0 {
-				s.meter.AddIngress(int64(len(data)))
+	if s.meter != nil && len(data) > 0 {
+		s.meter.AddIngress(int64(len(data)))
+	}
+	header := plan.Header()
+	commit := func() bool {
+		if registration != nil {
+			if err := registration.Commit(); err != nil {
+				resetProjectionFailureHeaders(w.Header())
+				s.writeUpstreamRequestDenied(w, r, rel, session, routeclass.Classify(r.Method, rel), err)
+				return false
 			}
+		}
+		plan.Commit(w.Header())
+		return true
+	}
+	if projection.kind == responseProjectionLegacyCompatibility {
+		var value any
+		if looksLikeJSON(data) && json.Unmarshal(data, &value) == nil {
 			rewritten := s.rewriteProxyJSONValueForRequestWithSnapshot(r.Context(), r, value, session, upstream, gatewayToken, publicGatewayBase)
-			payload, encErr := json.Marshal(rewritten)
-			if encErr != nil {
-				s.handlePreHeaderProxyFailure(w, r, rel, session, encErr, proxyFailureDetails{Event: "proxy_rewrite_failed", AuditMessage: "proxy json encode failed", ClientBody: "response encode failed", FallbackKind: "upstream_read_error", Duration: time.Since(started), UpstreamStatus: resp.StatusCode})
+			payload, err := json.Marshal(rewritten)
+			if err != nil {
+				s.writeResponseProjectionFailure(w, r, rel, session)
 				return
 			}
-			payload = append(payload, '\n')
-			w.Header().Del("Content-Length")
-			w.Header().Set("Content-Type", "application/json")
+			clearProjectedEntityHeaders(header)
+			header.Set("Content-Type", "application/json")
+			if !commit() {
+				return
+			}
 			w.WriteHeader(resp.StatusCode)
-			_, _ = countEgressWrite(w, s.meter, nil, payload)
+			_, _ = countEgressWrite(w, s.meter, nil, appendJSONNewline(payload))
 			return
 		}
-		reader = bufio.NewReader(bytes.NewReader(data))
+		out := rewriteBytesWithSnapshot(data, session, upstream, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
+		setContentLength(header, int64(len(out)))
+		if !commit() {
+			return
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = countEgressWrite(w, s.meter, nil, out)
+		return
 	}
-
-	s.clearMediaWriteDeadlineNow(w, r, rel, resp, session)
-	setContentLength(w.Header(), resp.ContentLength)
+	if projection.kind == responseProjectionOpaque {
+		if looksLikeJSON(data) {
+			err = validateCredentialSafeOpaqueJSON(data, proxyJSONLimit, upstream.token)
+		} else {
+			err = validateCredentialSafeText(data, proxyJSONLimit, upstream.token)
+		}
+		if err != nil {
+			s.writeResponseProjectionFailure(w, r, rel, session)
+			return
+		}
+		setContentLength(header, int64(len(data)))
+		if !commit() {
+			return
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = countEgressWrite(w, s.meter, nil, data)
+		return
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		if !commit() {
+			return
+		}
+		w.WriteHeader(resp.StatusCode)
+		return
+	}
+	projectionContext, err := s.responseProjectionContextForDocument(r.Context(), r, session, upstream, gatewayToken, publicGatewayBase, data, projection)
+	if err != nil {
+		s.writeResponseProjectionFailure(w, r, rel, session)
+		return
+	}
+	projected, err := projectResponseDocument(data, projection, projectionContext)
+	if err != nil {
+		s.writeResponseProjectionFailure(w, r, rel, session)
+		return
+	}
+	clearProjectedEntityHeaders(header)
+	header.Set("Content-Type", "application/json")
+	if !commit() {
+		return
+	}
 	w.WriteHeader(resp.StatusCode)
-	s.copyMediaReaderOrAbort(w, r, rel, reader, resp.ContentLength, resp.StatusCode, session)
+	_, _ = countEgressWrite(w, s.meter, nil, appendJSONNewline(projected))
 }
 
 func sniffMissingContentType(body io.Reader) (*bufio.Reader, bool, error) {

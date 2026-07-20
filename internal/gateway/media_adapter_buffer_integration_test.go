@@ -109,7 +109,7 @@ func (o *mediaAdapterBufferObserver) RoundTripMedia(in mediaUpstreamRequest) (*h
 	return response, err
 }
 
-func (o *mediaAdapterBufferObserver) RoundTripNegotiation(in negotiationUpstreamRequest) (*http.Response, error) {
+func (o *mediaAdapterBufferObserver) RoundTripNegotiation(in negotiationUpstreamRequest) (negotiationUpstreamResponse, error) {
 	return o.inner.RoundTripNegotiation(in)
 }
 

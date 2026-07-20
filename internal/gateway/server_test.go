@@ -95,9 +95,11 @@ func TestWriteProxyResponseAllowsBodylessImageResponses(t *testing.T) {
 			store := NewMemoryStore()
 			server := NewServer(Config{GatewayBasePath: "/emby"}, store)
 			req := httptest.NewRequest(tt.method, "http://gateway.test/emby/Items/item-1/Images/Primary", nil)
+			header := http.Header{"Content-Type": []string{"image/jpeg"}}
+			header.Set("ETag", `"tag"`)
 			resp := &http.Response{
 				StatusCode:    tt.status,
-				Header:        http.Header{"Content-Type": []string{"image/jpeg"}, "ETag": []string{`"tag"`}},
+				Header:        header,
 				Body:          panicReadCloser{},
 				ContentLength: tt.length,
 				Request:       req,
@@ -1628,9 +1630,9 @@ func TestUserDataVirtualizationIsGatewayUserScoped(t *testing.T) {
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
-	u1 := fetchUserData(t, gw.URL+"/emby/Items/item-1?api_key=token-u1")
-	u2 := fetchUserData(t, gw.URL+"/emby/Items/item-1?api_key=token-u2")
-	u3 := fetchUserData(t, gw.URL+"/emby/Items/item-1?api_key=token-u3")
+	u1 := fetchUserData(t, gw.URL+"/emby/Items?api_key=token-u1")
+	u2 := fetchUserData(t, gw.URL+"/emby/Items?api_key=token-u2")
+	u3 := fetchUserData(t, gw.URL+"/emby/Items?api_key=token-u3")
 	if u1["Played"] != false || int(u1["PlaybackPositionTicks"].(float64)) != 4200 || u1["PlayedPercentage"].(float64) != 42 || int(u1["PlayCount"].(float64)) != 1 {
 		t.Fatalf("unexpected u1 user data: %#v", u1)
 	}
@@ -1926,7 +1928,7 @@ func TestProxyUserDataOverlayIgnoresOrphanedState(t *testing.T) {
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
-	userData := fetchUserData(t, gw.URL+"/emby/Items/episode-1?api_key=gateway-token")
+	userData := fetchUserData(t, gw.URL+"/emby/Items?api_key=gateway-token")
 	if userData["Played"] != false || int(userData["PlaybackPositionTicks"].(float64)) != 0 {
 		t.Fatalf("orphaned state should not overlay backend data: %#v", userData)
 	}

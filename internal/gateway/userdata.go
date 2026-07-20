@@ -157,13 +157,13 @@ func (s *Server) handlePersonalStateWrite(w http.ResponseWriter, r *http.Request
 	}
 
 	if len(parts) == 5 && strings.EqualFold(parts[2], "Items") && strings.EqualFold(parts[4], "UserData") && r.Method == http.MethodPost {
-		body, err := readJSONBody(r, 2<<20)
+		body, err := readUserDataWriteBody(r, 2<<20)
 		if err != nil {
 			http.Error(w, "bad request body", http.StatusBadRequest)
 			return true
 		}
 		writeState(parts[3], func(state *PlaybackState) {
-			applyUserDataBodyToState(body, state, now)
+			applyUserDataWriteToState(body, state, now)
 		})
 		return true
 	}
@@ -179,12 +179,9 @@ func (s *Server) handleDisplayPreferences(w http.ResponseWriter, r *http.Request
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		return false
 	}
-	client := r.URL.Query().Get("Client")
-	if client == "" {
-		client = session.Client
-	}
+	key := displayPreferenceRouteKey(parts[1], r.URL.Query(), session.Client)
 	if r.Method == http.MethodGet {
-		preference, err := s.store.FindDisplayPreference(r.Context(), session.GatewayUserID, parts[1], client)
+		preference, err := s.store.FindDisplayPreference(r.Context(), session.GatewayUserID, key.PreferenceID, key.Client)
 		if err != nil || preference == nil || strings.TrimSpace(preference.PayloadJSON) == "" {
 			writeJSON(w, http.StatusOK, map[string]any{})
 			return true
@@ -204,7 +201,7 @@ func (s *Server) handleDisplayPreferences(w http.ResponseWriter, r *http.Request
 		http.Error(w, "bad request body", http.StatusBadRequest)
 		return true
 	}
-	if err := s.store.SaveDisplayPreference(r.Context(), DisplayPreference{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, PreferenceID: parts[1], Client: client, PayloadJSON: string(data), UpdatedAt: time.Now().UTC()}); err != nil {
+	if err := s.store.SaveDisplayPreference(r.Context(), DisplayPreference{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, PreferenceID: key.PreferenceID, Client: key.Client, PayloadJSON: string(data), UpdatedAt: time.Now().UTC()}); err != nil {
 		http.Error(w, "display preferences unavailable", http.StatusInternalServerError)
 		return true
 	}
@@ -306,7 +303,7 @@ func (s *Server) projectLocalSessions(ctx context.Context, viewer *Session, filt
 	for i := range filtered {
 		hash := filtered[i].GatewayTokenHash
 		var currentPtr *CurrentPlayback
-		var userData map[string]any
+		var userData *embyUserItemData
 		if cp, ok := validated[hash]; ok {
 			// Copy into local so each session keeps its own row (no shared pointer).
 			cpCopy := cp
@@ -319,14 +316,15 @@ func (s *Server) projectLocalSessions(ctx context.Context, viewer *Session, filt
 					ItemID:          cp.ItemID,
 				}
 			}
-			userData = userDataDTO(state)
+			data := userDataWireDTO(state)
+			userData = &data
 		}
 		var live func(SessionConnectionIdentity) bool
 		if s.sessionHub != nil {
 			live = s.sessionHub.Present
 		}
 		supportsRemoteControl := sessionSupportsRemoteControl(&filtered[i], live)
-		items = append(items, sessionInfoDTOWithRemoteControl(&filtered[i], s.cfg.GatewayServerID, currentPtr, userData, supportsRemoteControl))
+		items = append(items, sessionInfoWireDTO(&filtered[i], s.cfg.GatewayServerID, currentPtr, userData, supportsRemoteControl))
 	}
 	return items, nil
 }
@@ -381,7 +379,7 @@ func (s *Server) fetchBackendJSON(ctx context.Context, r *http.Request, rel, raw
 		return nil, resp.StatusCode, upstream, err
 	}
 	var value any
-	if err := json.Unmarshal(data, &value); err != nil {
+	if err := decodeJSONUseNumber(data, &value); err != nil {
 		return nil, resp.StatusCode, upstream, err
 	}
 	return value, resp.StatusCode, upstream, nil
@@ -453,6 +451,105 @@ func applyUserDataBodyToState(body map[string]any, state *PlaybackState, now tim
 	}
 }
 
+type userDataWriteBody struct {
+	Played                json.RawMessage `json:"Played"`
+	PlaybackPositionTicks json.RawMessage `json:"PlaybackPositionTicks"`
+	PositionTicks         json.RawMessage `json:"PositionTicks"`
+	PlayedPercentage      json.RawMessage `json:"PlayedPercentage"`
+	PlayCount             json.RawMessage `json:"PlayCount"`
+	IsFavorite            json.RawMessage `json:"IsFavorite"`
+	Favorite              json.RawMessage `json:"Favorite"`
+	Likes                 json.RawMessage `json:"Likes"`
+}
+
+func readUserDataWriteBody(r *http.Request, limit int64) (userDataWriteBody, error) {
+	data, err := io.ReadAll(http.MaxBytesReader(nilResponseWriter{}, r.Body, limit))
+	if err != nil {
+		return userDataWriteBody{}, err
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		data = []byte(`{}`)
+	}
+	var body userDataWriteBody
+	if err := json.NewDecoder(bytes.NewReader(data)).Decode(&body); err != nil {
+		return userDataWriteBody{}, err
+	}
+	return body, nil
+}
+
+func applyUserDataWriteToState(body userDataWriteBody, state *PlaybackState, now time.Time) {
+	if played, ok := rawBool(body.Played); ok {
+		if played && !state.Played {
+			state.PlayCount++
+		}
+		state.Played = played
+		if played {
+			state.LastPlayedDate = &now
+		}
+	}
+	if ticks, ok := rawInt64(body.PlaybackPositionTicks); ok {
+		state.PlaybackPositionTicks = ticks
+	}
+	if ticks, ok := rawInt64(body.PositionTicks); ok {
+		state.PlaybackPositionTicks = ticks
+	}
+	if percentage, ok := rawFloat64(body.PlayedPercentage); ok {
+		state.PlayedPercentage = &percentage
+	}
+	if count, ok := rawInt64(body.PlayCount); ok {
+		state.PlayCount = int(count)
+	}
+	if favorite, ok := rawBool(body.IsFavorite); ok {
+		state.IsFavorite = favorite
+	}
+	if favorite, ok := rawBool(body.Favorite); ok {
+		state.IsFavorite = favorite
+	}
+	if likes, ok := rawBool(body.Likes); ok {
+		state.Likes = &likes
+	}
+}
+
+func rawBool(raw json.RawMessage) (bool, bool) {
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return false, false
+	}
+	var value bool
+	return value, json.Unmarshal(raw, &value) == nil
+}
+
+func rawInt64(raw json.RawMessage) (int64, bool) {
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return 0, false
+	}
+	var value int64
+	if json.Unmarshal(raw, &value) == nil {
+		return value, true
+	}
+	var text string
+	if json.Unmarshal(raw, &text) != nil {
+		return 0, false
+	}
+	value, err := strconv.ParseInt(strings.TrimSpace(text), 10, 64)
+	return value, err == nil
+}
+
+func rawFloat64(raw json.RawMessage) (float64, bool) {
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return 0, false
+	}
+	var value float64
+	if json.Unmarshal(raw, &value) == nil {
+		return value, true
+	}
+	var text string
+	if json.Unmarshal(raw, &text) != nil {
+		return 0, false
+	}
+	value, err := strconv.ParseFloat(strings.TrimSpace(text), 64)
+	return value, err == nil
+}
+
 func readJSONBody(r *http.Request, limit int64) (map[string]any, error) {
 	data, err := io.ReadAll(http.MaxBytesReader(nilResponseWriter{}, r.Body, limit))
 	if err != nil {
@@ -461,19 +558,84 @@ func readJSONBody(r *http.Request, limit int64) (map[string]any, error) {
 	if len(bytes.TrimSpace(data)) == 0 {
 		return map[string]any{}, nil
 	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
 	var body map[string]any
-	if err := decoder.Decode(&body); err != nil {
+	if err := decodeJSONUseNumber(data, &body); err != nil {
 		return nil, err
 	}
 	return body, nil
 }
 
 func userDataDTO(state *PlaybackState) map[string]any {
-	data := map[string]any{}
-	applyPlaybackStateToUserData(data, state, nil, nil)
-	return data
+	typed := userDataWireDTO(state)
+	data, _ := json.Marshal(typed)
+	var out map[string]any
+	_ = json.Unmarshal(data, &out)
+	return out
+}
+
+func userDataWireDTO(state *PlaybackState) embyUserItemData {
+	if state == nil {
+		return embyUserItemData{}
+	}
+	played := state.Played
+	position := state.PlaybackPositionTicks
+	playCount := state.PlayCount
+	favorite := state.IsFavorite
+	out := embyUserItemData{
+		PlaybackPositionTicks: &position,
+		PlayCount:             &playCount,
+		IsFavorite:            &favorite,
+		Played:                &played,
+		Key:                   state.ItemID,
+		ItemID:                state.ItemID,
+	}
+	if state.Played {
+		percentage := 100.0
+		unplayed := 0
+		out.PlayedPercentage = &percentage
+		out.UnplayedItemCount = &unplayed
+	} else if percentage, ok := playedPercentageForItem(state, nil); ok {
+		out.PlayedPercentage = &percentage
+	} else if state.PlayedPercentage != nil {
+		percentage := *state.PlayedPercentage
+		out.PlayedPercentage = &percentage
+	}
+	if state.LastPlayedDate != nil {
+		date := state.LastPlayedDate.UTC().Format(time.RFC3339)
+		out.LastPlayedDate = &date
+	}
+	if state.Likes != nil {
+		out.Likes = json.RawMessage(strconv.FormatBool(*state.Likes))
+	}
+	return out
+}
+
+func userDataMapToWireDTO(data map[string]any) *embyUserItemData {
+	if data == nil {
+		return nil
+	}
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		return nil
+	}
+	var out embyUserItemData
+	if err := json.Unmarshal(encoded, &out); err != nil {
+		return nil
+	}
+	return &out
+}
+
+type displayPreferenceRoute struct {
+	PreferenceID string
+	Client       string
+}
+
+func displayPreferenceRouteKey(preferenceID string, query url.Values, fallbackClient string) displayPreferenceRoute {
+	client := query.Get("Client")
+	if client == "" {
+		client = fallbackClient
+	}
+	return displayPreferenceRoute{PreferenceID: preferenceID, Client: client}
 }
 
 func requestLikes(r *http.Request) (bool, bool) {

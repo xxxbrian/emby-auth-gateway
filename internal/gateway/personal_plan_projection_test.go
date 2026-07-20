@@ -14,6 +14,8 @@ func TestPlannedPersonalProjectionUsesExplicitSnapshot(t *testing.T) {
 	item := map[string]any{
 		"Id": "item", "UserId": "backend-user-new", "ServerId": "backend-server-new",
 		"DirectStreamUrl": "/Videos/item/stream?api_key=backend-token-new",
+		"Name":            "backend-user-new on backend-server-new",
+		"UnknownUrl":      "https://backend.test/backend-user-new/backend-server-new",
 		"Nested":          map[string]any{"Source": "backend"},
 	}
 	original := clonePlannedPersonalJSONMap(item)
@@ -26,11 +28,29 @@ func TestPlannedPersonalProjectionUsesExplicitSnapshot(t *testing.T) {
 	if rewritten["DirectStreamUrl"] == item["DirectStreamUrl"] {
 		t.Fatalf("media URL was not rewritten: %#v", rewritten)
 	}
+	if rewritten["Name"] != item["Name"] || rewritten["UnknownUrl"] != item["UnknownUrl"] {
+		t.Fatalf("opaque planner fields were rewritten: %#v", rewritten)
+	}
 	if item["UserId"] != "backend-user-new" {
 		t.Fatal("identity rewrite mutated source item")
 	}
 	if !reflect.DeepEqual(item, original) {
 		t.Fatalf("rewrite mutated source item: got %#v want %#v", item, original)
+	}
+}
+
+func TestPlannedPersonalProjectionRejectsOpaqueBackendCredential(t *testing.T) {
+	server := NewServer(Config{GatewayServerID: "gateway-server", PublicBaseURL: "https://gateway.test/emby"}, NewMemoryStore())
+	request := httptest.NewRequest(http.MethodGet, "https://gateway.test/emby/Items", nil)
+	projected := server.rewritePlannedPersonalItem(
+		map[string]any{"Id": "item", "PluginValue": "opaque-backend-token-value"},
+		&Session{SyntheticUserID: "synthetic-user"},
+		upstreamRequestSnapshot{token: "backend-token"},
+		"gateway-token",
+		request,
+	)
+	if projected != nil {
+		t.Fatalf("unsafe planner projection = %#v", projected)
 	}
 }
 

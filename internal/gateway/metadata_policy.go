@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"errors"
+	"fmt"
 	"net/url"
 	"sort"
 	"strings"
@@ -40,53 +41,49 @@ var directPersonalMetadataKeys = foldedSet(
 // SanitizeMetadataQuery returns deterministic query text for metadata egress.
 // It never mutates input and binds all accepted UserId aliases to backendUserID.
 func SanitizeMetadataQuery(input url.Values, syntheticUserID, backendUserID string) (string, error) {
+	for key, values := range input {
+		if strings.EqualFold(key, "UserId") && len(values) == 0 {
+			return "", ErrForbidden
+		}
+	}
+	return sanitizeMetadataRawQuery(input.Encode(), syntheticUserID, backendUserID, "")
+}
+
+func sanitizeMetadataRawQuery(rawQuery, syntheticUserID, backendUserID, gatewayToken string) (string, error) {
 	if syntheticUserID == "" || backendUserID == "" {
 		return "", ErrForbidden
 	}
-
-	keys := sortedValueKeys(input)
-	out := make(url.Values, len(input)+2)
-	lists := make(map[string][]string, len(metadataListPolicies))
-
-	for _, key := range keys {
-		values := input[key]
-		foldedKey := strings.ToLower(key)
+	pairs, err := parseRawQueryPairs(rawQuery)
+	if err != nil {
+		return "", fmt.Errorf("%w: malformed metadata query", ErrBadRequest)
+	}
+	out := make([]string, 0, len(pairs)+2)
+	for _, pair := range pairs {
+		foldedKey := strings.ToLower(pair.key)
 		switch {
+		case matchesSelectedGatewayCredential(pair.value, gatewayToken, ""):
+			continue
 		case isEgressCredentialQueryKey(foldedKey):
-			// Managed metadata authentication is header-only.
+			continue
 		case foldedKey == "userid":
-			if len(values) == 0 {
+			if !pair.hasEquals || pair.value != syntheticUserID {
 				return "", ErrForbidden
 			}
-			for _, value := range values {
-				if value != syntheticUserID {
-					return "", ErrForbidden
-				}
-			}
 		case foldedKey == "enableuserdata" || foldedKey == "enableuserdatas":
-			// The canonical false value is emitted after all aliases are removed.
+			continue
 		case containsFolded(directPersonalMetadataKeys, foldedKey):
-			// Direct personal predicates must be evaluated by the gateway.
+			continue
 		case metadataListPolicies[foldedKey].canonical != "":
 			policy := metadataListPolicies[foldedKey]
-			for _, value := range values {
-				if sanitized, ok := sanitizeMetadataList(value, policy.personal); ok {
-					lists[foldedKey] = append(lists[foldedKey], sanitized)
-				}
+			if sanitized, ok := sanitizeMetadataList(pair.value, policy.personal); ok {
+				out = append(out, url.QueryEscape(policy.canonical)+"="+url.QueryEscape(sanitized))
 			}
 		default:
-			out[key] = append([]string(nil), values...)
+			out = append(out, pair.raw)
 		}
 	}
-
-	for foldedKey, values := range lists {
-		if len(values) != 0 {
-			out[metadataListPolicies[foldedKey].canonical] = values
-		}
-	}
-	out.Set("EnableUserData", "false")
-	out.Set("UserId", backendUserID)
-	return out.Encode(), nil
+	out = append(out, "EnableUserData=false", "UserId="+url.QueryEscape(backendUserID))
+	return strings.Join(out, "&"), nil
 }
 
 func sanitizeMetadataList(value string, personal map[string]struct{}) (string, bool) {

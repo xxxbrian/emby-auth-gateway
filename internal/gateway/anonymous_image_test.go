@@ -86,8 +86,8 @@ func (s *anonymousMediaSpy) RoundTripMedia(in mediaUpstreamRequest) (*http.Respo
 	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"image/gif"}}, Body: io.NopCloser(bytes.NewReader(body)), ContentLength: int64(len(body)), Request: in.Request}, nil
 }
 
-func (s *anonymousMediaSpy) RoundTripNegotiation(negotiationUpstreamRequest) (*http.Response, error) {
-	return nil, errors.New("unexpected negotiation")
+func (s *anonymousMediaSpy) RoundTripNegotiation(negotiationUpstreamRequest) (negotiationUpstreamResponse, error) {
+	return negotiationUpstreamResponse{}, errors.New("unexpected negotiation")
 }
 
 type anonymousLifecycleMediaSpy struct {
@@ -111,8 +111,8 @@ func (s *anonymousLifecycleMediaSpy) RoundTripMedia(in mediaUpstreamRequest) (*h
 	return s.response, nil
 }
 
-func (*anonymousLifecycleMediaSpy) RoundTripNegotiation(negotiationUpstreamRequest) (*http.Response, error) {
-	return nil, errors.New("unexpected negotiation")
+func (*anonymousLifecycleMediaSpy) RoundTripNegotiation(negotiationUpstreamRequest) (negotiationUpstreamResponse, error) {
+	return negotiationUpstreamResponse{}, errors.New("unexpected negotiation")
 }
 
 type anonymousLifecycleBody struct {

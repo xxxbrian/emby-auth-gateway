@@ -139,13 +139,13 @@ func TestWebSocketSessionsStartImmediateProjectionAndDisconnectPresence(t *testi
 
 func mapsFromAny(t *testing.T, items []any) []map[string]any {
 	t.Helper()
-	result := make([]map[string]any, 0, len(items))
-	for _, item := range items {
-		value, ok := item.(map[string]any)
-		if !ok {
-			t.Fatalf("projection item = %T", item)
-		}
-		result = append(result, value)
+	wire, err := json.Marshal(items)
+	if err != nil {
+		t.Fatalf("marshal projected sessions: %v", err)
+	}
+	var result []map[string]any
+	if err := json.Unmarshal(wire, &result); err != nil {
+		t.Fatalf("unmarshal projected sessions wire JSON: %v", err)
 	}
 	return result
 }

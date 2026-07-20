@@ -214,37 +214,27 @@ func mediaPathAfterPrefix(escapedPath, prefix string) (string, bool) {
 
 func rewriteOwnedQuery(raw string, session *Session, upstream upstreamRequestSnapshot, gatewayToken, gatewayServerID string, addGatewayToken ...bool) (string, bool) {
 	appendGatewayToken := len(addGatewayToken) > 0 && addGatewayToken[0]
-	parts := []string(nil)
-	if raw != "" {
-		parts = strings.Split(raw, "&")
+	pairs, err := parseRawQueryPairs(raw)
+	if err != nil {
+		return "", false
 	}
-	out := make([]string, 0, len(parts)+1)
-	for _, part := range parts {
-		key, value, ok := strings.Cut(part, "=")
-		decodedKey, err := url.QueryUnescape(key)
-		if err != nil {
-			return "", false
-		}
-		if isStrictQueryAuthKey(decodedKey) {
-			continue
-		}
-		if !ok {
-			out = append(out, part)
-			continue
-		}
-		decoded, err := url.QueryUnescape(value)
-		if err != nil {
-			return "", false
-		}
+	out := make([]string, 0, len(pairs)+1)
+	for _, pair := range pairs {
+		folded := strings.ToLower(pair.key)
 		switch {
-		case upstream.token != "" && decoded == upstream.token:
-			part = key + "=" + url.QueryEscape(gatewayToken)
-		case upstream.userID != "" && decoded == upstream.userID:
-			part = key + "=" + url.QueryEscape(session.SyntheticUserID)
-		case upstream.serverID != "" && decoded == upstream.serverID:
-			part = key + "=" + url.QueryEscape(gatewayServerID)
+		case isEgressCredentialAliasQueryKey(pair.key):
+			continue
+		case folded == genericQueryAuthKey && pair.hasEquals && upstream.token != "" && pair.value == upstream.token:
+			if gatewayToken != "" {
+				out = append(out, replaceRawQueryValue(pair, gatewayToken))
+			}
+		case folded == "userid" && pair.hasEquals && upstream.userID != "" && pair.value == upstream.userID:
+			out = append(out, replaceRawQueryValue(pair, session.SyntheticUserID))
+		case folded == "serverid" && pair.hasEquals && upstream.serverID != "" && pair.value == upstream.serverID:
+			out = append(out, replaceRawQueryValue(pair, gatewayServerID))
+		default:
+			out = append(out, pair.raw)
 		}
-		out = append(out, part)
 	}
 	if appendGatewayToken && gatewayToken != "" {
 		out = append(out, "api_key="+url.QueryEscape(gatewayToken))

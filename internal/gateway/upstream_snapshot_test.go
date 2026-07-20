@@ -9,18 +9,55 @@ import (
 	"testing"
 )
 
-func TestSnapshotFailedHTTPRefreshKeepsOriginalResponseSanitization(t *testing.T) {
+func TestSnapshotFailedHTTPRefreshFailsClosedWithoutLeakingUpstreamIdentity(t *testing.T) {
 	server := NewServer(Config{GatewayServerID: "gateway-server"}, NewMemoryStore())
 	session := testSession()
 	upstream := upstreamRequestSnapshot{baseURL: "https://old.example/emby", serverID: "backend-server", userID: "backend-user", token: "backend-token", identity: backendIdentityForTest("backend-device")}
-	// A failed refresh preserves this request attempt's immutable snapshot.
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items/a", nil)
-	resp := &http.Response{StatusCode: http.StatusUnauthorized, Header: http.Header{"Location": {"https://old.example/emby/Videos/backend-user/stream?api_key=backend-token"}}, Body: io.NopCloser(strings.NewReader(`{"AccessToken":"backend-token","ServerId":"backend-server","UserId":"backend-user"}`)), Request: req}
+	resp := &http.Response{
+		StatusCode: http.StatusUnauthorized,
+		Header: http.Header{
+			"Content-Length":   {"999"},
+			"Content-Range":    {"bytes 0-998/999"},
+			"Content-MD5":      {"backend-token"},
+			"Digest":           {"backend-server"},
+			"ETag":             {`"backend-token"`},
+			"Last-Modified":    {"yesterday"},
+			"Content-Location": {"https://old.example/emby/Items/a"},
+			"Location":         {"https://old.example/emby/Videos/backend-user/stream?api_key=backend-token"},
+		},
+		Body:    io.NopCloser(strings.NewReader(`{"AccessToken":"backend-token","ServerId":"backend-server","UserId":"backend-user","Url":"https://old.example/emby"}`)),
+		Request: req,
+	}
 	w := httptest.NewRecorder()
 	server.writeProxyResponseWithSnapshot(w, req, "/Items/a", resp, session, upstream, "gateway-token", "https://gateway.test/emby")
-	output := w.Body.String() + w.Header().Get("Location")
-	if strings.Contains(output, "backend-token") || strings.Contains(output, "old.example") || !strings.Contains(output, "gateway-token") {
-		t.Fatalf("failed-refresh response leaked or missed snapshot values: %q", output)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d; body=%q", w.Code, http.StatusBadGateway, w.Body.String())
+	}
+	if got := w.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+	var output strings.Builder
+	output.WriteString(w.Body.String())
+	for _, values := range w.Header() {
+		output.WriteString(strings.Join(values, "\n"))
+	}
+	for _, leak := range []string{"backend-token", upstream.baseURL, upstream.serverID, upstream.userID, "gateway-token"} {
+		if strings.Contains(output.String(), leak) {
+			t.Fatalf("failed-refresh response leaked %q: body=%q headers=%v", leak, w.Body.String(), w.Header())
+		}
+	}
+	for _, name := range []string{"Content-Length", "Content-Range", "Content-MD5", "Digest", "ETag", "Last-Modified", "Content-Location", "Location"} {
+		if got := w.Header().Get(name); got != "" {
+			t.Fatalf("unsafe or stale header %s survived with value %q", name, got)
+		}
+	}
+	lowerBody := strings.ToLower(w.Body.String())
+	for _, detail := range []string{"parse", "projection"} {
+		if strings.Contains(lowerBody, detail) {
+			t.Fatalf("response exposed %s details: %q", detail, w.Body.String())
+		}
 	}
 }
 

@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -71,7 +70,11 @@ func (s *Server) tryDownloadDirectStreamFallback(r *http.Request, rel string, se
 	}
 	mediaSourceID := strings.TrimSpace(r.URL.Query().Get("MediaSourceId"))
 	refreshResult := s.upstreamRefreshReporter(r.Context(), r, rel, session)
-	playback, leases, err := s.fetchDownloadPlaybackInfo(r.Context(), itemID, mediaSourceID, session, &upstream, refreshResult)
+	playback, registration, err := s.fetchDownloadPlaybackInfo(r.Context(), itemID, mediaSourceID, session, &upstream, refreshResult)
+	if registration != nil {
+		defer registration.Close()
+	}
+	leases := registration.Selectors()
 	if err != nil || playback.ErrorCode != nil {
 		if s.mediaLeases != nil && !leases.empty() {
 			_ = s.mediaLeases.Release(session.GatewayTokenHash, leases.PlaySessionIDs, leases.LiveStreamIDs)
@@ -107,6 +110,11 @@ func (s *Server) tryDownloadDirectStreamFallback(r *http.Request, rel string, se
 			request.Header.Set(name, value)
 		}
 	}
+	if registration != nil {
+		if err := registration.Commit(); err != nil {
+			return nil, errDownloadFallbackUnavailable
+		}
+	}
 	response, err := s.mediaUpstream.RoundTripMedia(mediaUpstreamRequest{
 		upstreamHTTPRequest: upstreamHTTPRequest{Request: request, Session: session, Snapshot: upstream, refreshResult: refreshResult},
 		Internal:            true,
@@ -132,7 +140,7 @@ func (s *Server) tryDownloadDirectStreamFallback(r *http.Request, rel string, se
 	return response, nil
 }
 
-func (s *Server) fetchDownloadPlaybackInfo(ctx context.Context, itemID, mediaSourceID string, session *Session, upstream *upstreamRequestSnapshot, refreshResult func(upstreamRefreshResult)) (embyPlaybackInfoResponseDTO, negotiationSelectorSet, error) {
+func (s *Server) fetchDownloadPlaybackInfo(ctx context.Context, itemID, mediaSourceID string, session *Session, upstream *upstreamRequestSnapshot, refreshResult func(upstreamRefreshResult)) (embyPlaybackInfoResponseDTO, *negotiationLeaseRegistration, error) {
 	payload, err := json.Marshal(embyPlaybackInfoRequestDTO{
 		ID:                 itemID,
 		UserID:             session.SyntheticUserID,
@@ -143,44 +151,80 @@ func (s *Server) fetchDownloadPlaybackInfo(ctx context.Context, itemID, mediaSou
 		IsPlayback:         false,
 	})
 	if err != nil {
-		return embyPlaybackInfoResponseDTO{}, negotiationSelectorSet{}, err
+		return embyPlaybackInfoResponseDTO{}, nil, err
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "/Items/"+url.PathEscape(itemID)+"/PlaybackInfo", bytes.NewReader(payload))
 	if err != nil {
-		return embyPlaybackInfoResponseDTO{}, negotiationSelectorSet{}, err
+		return embyPlaybackInfoResponseDTO{}, nil, err
 	}
 	request.Header.Set("Content-Type", "application/json")
-	response, err := s.mediaUpstream.RoundTripNegotiation(negotiationUpstreamRequest{
+	result, err := s.mediaUpstream.RoundTripNegotiation(negotiationUpstreamRequest{
 		upstreamHTTPRequest: upstreamHTTPRequest{Request: request, Session: session, Snapshot: *upstream, refreshResult: refreshResult},
 		SnapshotRef:         upstream,
 	})
 	if err == nil {
-		wrapResponseBodyOnce(response)
+		wrapResponseBodyOnce(result.Response)
 	}
+	response := result.Response
 	if err != nil || response == nil || response.Body == nil {
 		closeResponseOnError(response)
-		return embyPlaybackInfoResponseDTO{}, negotiationSelectorSet{}, errDownloadFallbackUnavailable
+		if result.Registration != nil {
+			result.Registration.Close()
+		}
+		return embyPlaybackInfoResponseDTO{}, nil, errDownloadFallbackUnavailable
 	}
 	defer response.Body.Close()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return embyPlaybackInfoResponseDTO{}, negotiationSelectorSet{}, errDownloadFallbackUnavailable
+		if result.Registration != nil {
+			result.Registration.Close()
+		}
+		return embyPlaybackInfoResponseDTO{}, nil, errDownloadFallbackUnavailable
 	}
 	data, err := readLimited(response.Body, proxyJSONLimit)
 	if err != nil {
-		return embyPlaybackInfoResponseDTO{}, negotiationSelectorSet{}, err
+		if result.Registration != nil {
+			result.Registration.Close()
+		}
+		return embyPlaybackInfoResponseDTO{}, nil, err
 	}
 	selectors, _, err := collectNegotiationSelectors(data, "")
 	if err != nil {
-		return embyPlaybackInfoResponseDTO{}, negotiationSelectorSet{}, err
+		if result.Registration != nil {
+			result.Registration.Close()
+		}
+		return embyPlaybackInfoResponseDTO{}, nil, err
 	}
 	var playback embyPlaybackInfoResponseDTO
 	if err := json.Unmarshal(data, &playback); err != nil {
-		return embyPlaybackInfoResponseDTO{}, selectors, err
+		if result.Registration != nil {
+			result.Registration.Close()
+		}
+		return embyPlaybackInfoResponseDTO{}, nil, err
 	}
-	if err := validateNegotiationSelectors(s.mediaLeases, session.GatewayTokenHash, selectors, time.Time{}); err != nil {
-		return embyPlaybackInfoResponseDTO{}, selectors, err
+	if !sameNegotiationSelectors(selectors, result.Registration.Selectors()) {
+		if result.Registration != nil {
+			result.Registration.Close()
+		}
+		return embyPlaybackInfoResponseDTO{}, nil, errDownloadFallbackUnavailable
 	}
-	return playback, selectors, nil
+	return playback, result.Registration, nil
+}
+
+func sameNegotiationSelectors(left, right negotiationSelectorSet) bool {
+	if len(left.PlaySessionIDs) != len(right.PlaySessionIDs) || len(left.LiveStreamIDs) != len(right.LiveStreamIDs) {
+		return false
+	}
+	for i := range left.PlaySessionIDs {
+		if left.PlaySessionIDs[i] != right.PlaySessionIDs[i] {
+			return false
+		}
+	}
+	for i := range left.LiveStreamIDs {
+		if left.LiveStreamIDs[i] != right.LiveStreamIDs[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func selectDownloadMediaSource(sources []embyMediaSourceInfoDTO, requestedID string) (embyMediaSourceInfoDTO, bool) {

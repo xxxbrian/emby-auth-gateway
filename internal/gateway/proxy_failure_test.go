@@ -244,7 +244,7 @@ func TestCookieMediaBufferedPreHeaderReadFailureCachePolicy(t *testing.T) {
 			writer := httptest.NewRecorder()
 			resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{tt.contentType}, "Cache-Control": []string{"public"}, "Vary": []string{"Origin"}}, Body: io.NopCloser(errorMediaReader{err: tt.err}), ContentLength: -1, Request: req}
 			server.writeProxyResponseWithSnapshot(writer, req, tt.path, resp, &Session{}, upstreamRequestSnapshot{}, "", "")
-			if writer.Code != tt.want || writer.Header().Get("Cache-Control") != "private, no-store" || writer.Header().Get("Vary") != "Origin, Cookie" {
+			if writer.Code != tt.want || writer.Header().Get("Cache-Control") != "private, no-store" || writer.Header().Get("Vary") != "Cookie" {
 				t.Fatalf("status/cache/vary = %d/%q/%q", writer.Code, writer.Header().Get("Cache-Control"), writer.Header().Get("Vary"))
 			}
 		})

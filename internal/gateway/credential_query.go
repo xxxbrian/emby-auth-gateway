@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"net/http"
-	"net/url"
 	"strings"
 )
 
@@ -46,6 +45,13 @@ func isEgressCredentialAliasQueryKey(key string) bool {
 	default:
 		return false
 	}
+}
+
+func matchesSelectedGatewayCredential(value, gatewayToken, gatewayTokenHash string) bool {
+	if gatewayToken != "" {
+		return value == gatewayToken
+	}
+	return gatewayTokenHash != "" && HashToken(value) == gatewayTokenHash
 }
 
 // IsGatewayShapedToken reports whether token matches the canonical gateway token
@@ -137,31 +143,6 @@ func (s *Server) guardGenericQueryTokens(ctx context.Context, values []string, g
 		return errCredentialConflict
 	}
 	return nil
-}
-
-func rewriteProxyQueryValues(q url.Values, gatewayToken string, session *Session, upstream upstreamRequestSnapshot) {
-	for key, vals := range q {
-		if isEgressCredentialAliasQueryKey(key) {
-			delete(q, key)
-			continue
-		}
-		kept := vals[:0]
-		for _, val := range vals {
-			if gatewayToken != "" && val == gatewayToken {
-				continue
-			}
-			if val == session.SyntheticUserID {
-				val = upstream.userID
-			}
-			kept = append(kept, val)
-		}
-		if len(kept) == 0 {
-			delete(q, key)
-			continue
-		}
-		q[key] = kept
-	}
-	q.Set("api_key", upstream.token)
 }
 
 func writeCredentialQueryError(w http.ResponseWriter, err error) {

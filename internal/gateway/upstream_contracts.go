@@ -84,7 +84,7 @@ type MetadataUpstream interface {
 // MediaUpstream owns media GET/HEAD and playback negotiation egress.
 type MediaUpstream interface {
 	RoundTripMedia(mediaUpstreamRequest) (*http.Response, error)
-	RoundTripNegotiation(negotiationUpstreamRequest) (*http.Response, error)
+	RoundTripNegotiation(negotiationUpstreamRequest) (negotiationUpstreamResponse, error)
 }
 
 type managedAuthProbeRequest struct {

@@ -436,7 +436,7 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Cache-Control", "no-store")
 	s.setResourceCookie(w, token, persisted.ExpiresAt)
-	writeJSON(w, http.StatusOK, authenticationResultDTO(*user, persisted, token, s.cfg.GatewayServerID))
+	writeJSON(w, http.StatusOK, authenticationResultWireDTO(*user, persisted, token, s.cfg.GatewayServerID))
 }
 
 type authenticateForm struct {
@@ -496,12 +496,12 @@ func (s *Server) handlePublicUsers(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "users unavailable", http.StatusInternalServerError)
 		return
 	}
-	items := make([]map[string]any, 0, len(users))
+	items := make([]embyUser, 0, len(users))
 	for _, user := range users {
 		if !user.Enabled {
 			continue
 		}
-		items = append(items, userDTO(user, s.cfg.GatewayServerID))
+		items = append(items, publicUserWireDTO(user, s.cfg.GatewayServerID))
 	}
 	writeJSON(w, http.StatusOK, items)
 }
@@ -509,16 +509,7 @@ func (s *Server) handlePublicUsers(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePublicSystemInfo(w http.ResponseWriter, r *http.Request) {
 	base := s.gatewayBaseForRequest(r)
 	version := s.publicSystemInfoVersion(r.Context())
-	writeJSON(w, http.StatusOK, map[string]any{
-		"Id":              s.cfg.GatewayServerID,
-		"ServerId":        s.cfg.GatewayServerID,
-		"ServerName":      "Emby Gateway",
-		"Version":         version,
-		"LocalAddress":    base,
-		"WanAddress":      base,
-		"RemoteAddresses": []string{base},
-		"LocalAddresses":  []string{base},
-	})
+	writeJSON(w, http.StatusOK, embySystemInfo{ID: s.cfg.GatewayServerID, ServerID: s.cfg.GatewayServerID, ServerName: "Emby Gateway", Version: version, LocalAddress: base, WanAddress: base, RemoteAddresses: nonNilStrings{base}, LocalAddresses: nonNilStrings{base}})
 }
 
 func (s *Server) publicSystemInfoVersion(ctx context.Context) string {
@@ -584,10 +575,11 @@ func (s *Server) handleCurrentUser(w http.ResponseWriter, r *http.Request, rel s
 	s.noteSession(session, decision)
 	s.touchSessionActivityBestEffort(r.Context(), session, r)
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, http.StatusOK, privateUserDTO(session.GatewayUsername, session.SyntheticUserID, s.cfg.GatewayServerID))
+	writeJSON(w, http.StatusOK, currentUserWireDTO(session.GatewayUsername, session.SyntheticUserID, s.cfg.GatewayServerID))
 }
 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string, decision routeclass.Decision) {
+	projection := responseProjectionForRoute(r.Method, rel, decision)
 	resourceKind := resourceRoute(r, rel)
 	if resourceKind != resourceRouteNone {
 		r = r.WithContext(context.WithValue(r.Context(), resourceCookieContextKey{}, resourceKind))
@@ -696,13 +688,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string,
 	adapterRequest.URL = &adapterURL
 	request := upstreamHTTPRequest{Request: adapterRequest, Session: session, Snapshot: upstream, refreshResult: s.upstreamRefreshReporter(r.Context(), r, rel, session)}
 	var resp *http.Response
+	var registration *negotiationLeaseRegistration
 	switch {
 	case decision.Ownership == routeclass.MetadataProxy && decision.Operation == routeclass.OperationMetadataProxy:
 		resp, err = s.metadataUpstream.RoundTripMetadata(metadataUpstreamRequest{upstreamHTTPRequest: request, Ownership: decision.Ownership, SnapshotRef: &upstream})
 	case decision.Ownership == routeclass.MediaProxy && decision.Operation == routeclass.OperationMediaProxy:
 		resp, err = s.mediaUpstream.RoundTripMedia(mediaUpstreamRequest{upstreamHTTPRequest: request, SnapshotRef: &upstream})
 	case decision.Ownership == routeclass.MediaProxy && isNegotiationOperation(decision.Operation):
-		resp, err = s.mediaUpstream.RoundTripNegotiation(negotiationUpstreamRequest{upstreamHTTPRequest: request, SnapshotRef: &upstream})
+		result, negotiationErr := s.mediaUpstream.RoundTripNegotiation(negotiationUpstreamRequest{upstreamHTTPRequest: request, SnapshotRef: &upstream})
+		resp, registration, err = result.Response, result.Registration, negotiationErr
 	case decision.Ownership == routeclass.LegacyProxy && decision.Operation == routeclass.OperationLegacyProxy:
 		resp, err = s.legacyHTTPUpstream.RoundTripLegacy(legacyUpstreamRequest{upstreamHTTPRequest: request, SnapshotRef: &upstream})
 	default:
@@ -713,6 +707,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string,
 		wrapResponseBodyOnce(resp)
 	}
 	if err != nil {
+		if registration != nil {
+			registration.Close()
+		}
 		if errors.Is(err, ErrForbidden) || errors.Is(err, ErrNotFound) || errors.Is(err, ErrStoreUnavailable) || errors.Is(err, ErrRequestBodyTooLarge) || errors.Is(err, ErrMediaRequestRejected) || errors.Is(err, ErrNegotiationRequestRejected) {
 			s.writeUpstreamRequestDenied(w, r, rel, session, decision, err)
 			return
@@ -728,6 +725,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string,
 		upstreamStatus := closeResponseOnError(resp)
 		s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_backend_unavailable", AuditMessage: "backend unavailable", ClientBody: "backend unavailable", FallbackKind: "upstream_request_error", UpstreamStatus: upstreamStatus})
 		return
+	}
+	if registration != nil {
+		defer registration.Close()
 	}
 	if resp.StatusCode == http.StatusForbidden {
 		if fallback, fallbackErr := s.tryDownloadDirectStreamFallback(r, rel, session, upstream, gatewayToken); fallbackErr == nil {
@@ -752,7 +752,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string,
 	if cookieAuthenticated {
 		rewriteToken = ""
 	}
-	s.writeProxyResponseWithSnapshot(w, r, rel, resp, session, upstream, rewriteToken, s.gatewayBaseForRequest(r))
+	s.writeProxyResponseWithProjectionGate(w, r, rel, resp, session, upstream, rewriteToken, s.gatewayBaseForRequest(r), projection, registration)
 }
 
 const concurrentPlaybackResponse = `{"error":"playback_access_denied","message":"Playback denied because the concurrent playback limit was exceeded.","reason_code":"max_concurrent_sessions_exceeded"}`
@@ -2617,17 +2617,53 @@ func (s *Server) playbackResumePolicyFromConfig() PlaybackResumePolicy {
 }
 
 func (s *Server) writeProxyResponseWithSnapshot(w http.ResponseWriter, r *http.Request, rel string, resp *http.Response, session *Session, upstream upstreamRequestSnapshot, gatewayToken, publicGatewayBase string) {
-	sanitizeHopHeaders(resp.Header)
+	decision := routeclass.Classify(r.Method, rel)
+	projection := responseProjectionForRoute(r.Method, rel, decision)
+	if strings.TrimSpace(resp.Header.Get("Content-Type")) == "" {
+		// Compatibility for direct unit callers predating dispatch-owned plans.
+		// Live dispatch always calls writeProxyResponseWithProjection explicitly.
+		projection = newResponseProjection(responseProjectionOpaque)
+	}
+	s.writeProxyResponseWithProjection(w, r, rel, resp, session, upstream, gatewayToken, publicGatewayBase, projection)
+}
+
+func (s *Server) writeProxyResponseWithProjection(w http.ResponseWriter, r *http.Request, rel string, resp *http.Response, session *Session, upstream upstreamRequestSnapshot, gatewayToken, publicGatewayBase string, projection responseProjection) {
+	s.writeProxyResponseWithProjectionGate(w, r, rel, resp, session, upstream, gatewayToken, publicGatewayBase, projection, nil)
+}
+
+func (s *Server) writeProxyResponseWithProjectionGate(w http.ResponseWriter, r *http.Request, rel string, resp *http.Response, session *Session, upstream upstreamRequestSnapshot, gatewayToken, publicGatewayBase string, projection responseProjection, registration *negotiationLeaseRegistration) {
+	if registration != nil {
+		defer registration.Close()
+	}
 	ct := resp.Header.Get("Content-Type")
 	cookieRoute := resourceRouteFromContext(r)
-	if !responseAllowsBody(r.Method, resp.StatusCode) {
-		if cookieRoute != resourceRouteNone {
-			w.Header().Del("Cache-Control")
+	plan, err := buildResponseHeaderPlan(w.Header(), resp.Header, rel, session, upstream, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID, cookieRoute, resp.StatusCode, projection)
+	if err != nil {
+		s.writeResponseProjectionFailure(w, r, rel, session)
+		return
+	}
+	header := plan.Header()
+	commit := func() bool {
+		if registration != nil {
+			if err := registration.Commit(); err != nil {
+				resetProjectionFailureHeaders(w.Header())
+				s.writeUpstreamRequestDenied(w, r, rel, session, routeclass.Classify(r.Method, rel), err)
+				return false
+			}
 		}
-		copyResponseHeadersWithSnapshot(w.Header(), resp.Header, rel, session, upstream, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
-		applyResourceCachePolicy(w.Header(), cookieRoute, resp.StatusCode)
-		setContentLength(w.Header(), resp.ContentLength)
+		plan.Commit(w.Header())
+		return true
+	}
+	if !responseAllowsBody(r.Method, resp.StatusCode) {
+		setContentLength(header, resp.ContentLength)
+		if !commit() {
+			return
+		}
 		w.WriteHeader(resp.StatusCode)
+		return
+	}
+	if isSuccessfulResponse(resp.StatusCode) && projection.kind != responseProjectionOpaque && projection.kind != responseProjectionLegacyCompatibility && strings.TrimSpace(ct) != "" && !isJSONContentType(ct) {
+		s.writeResponseProjectionFailure(w, r, rel, session)
 		return
 	}
 	s.clearMediaWriteDeadline(w, r, rel, resp, session)
@@ -2636,15 +2672,11 @@ func (s *Server) writeProxyResponseWithSnapshot(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	if cookieRoute != resourceRouteNone {
-		w.Header().Del("Cache-Control")
-	}
-	copyResponseHeadersWithSnapshot(w.Header(), resp.Header, rel, session, upstream, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
-	applyResourceCachePolicy(w.Header(), cookieRoute, resp.StatusCode)
-	if isM3U8ContentType(ct) || strings.HasSuffix(strings.ToLower(resp.Request.URL.Path), ".m3u8") {
+	if isSuccessfulResponse(resp.StatusCode) && (isM3U8ContentType(ct) || strings.HasSuffix(strings.ToLower(resp.Request.URL.Path), ".m3u8")) {
 		readStarted := time.Now()
 		data, err := readLimited(resp.Body, proxyM3U8Limit)
 		if err != nil {
+			resetProjectionFailureHeaders(w.Header())
 			s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_read_failed", AuditMessage: "backend response read failed", ClientBody: "response read failed", FallbackKind: "upstream_read_error", Duration: time.Since(readStarted), UpstreamStatus: resp.StatusCode})
 			return
 		}
@@ -2652,71 +2684,196 @@ func (s *Server) writeProxyResponseWithSnapshot(w http.ResponseWriter, r *http.R
 			s.meter.AddIngress(int64(len(data)))
 		}
 		rewritten := rewriteM3U8WithSnapshot(data, rel, session, upstream, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
-		w.Header().Del("Content-Length")
+		header.Del("Content-Length")
+		if !commit() {
+			return
+		}
 		w.WriteHeader(resp.StatusCode)
 		_, _ = countEgressWrite(w, s.meter, nil, rewritten)
 		return
 	}
 
 	if isMediaStreamResponse(r, rel, resp) {
+		plan.Commit(w.Header())
 		s.writeMediaResponseOrAbort(w, r, rel, resp, session)
 		return
 	}
 
 	if isStreamingContentType(ct) {
 		if isImageContentType(ct) {
-			s.writeImageProxyResponse(w, r, rel, resp, session)
+			s.writeImageProxyResponse(w, r, rel, resp, session, plan)
 			return
 		}
+		plan.Commit(w.Header())
 		s.writeMediaResponseOrAbort(w, r, rel, resp, session)
 		return
 	}
-	if resp.StatusCode == http.StatusOK && strings.TrimSpace(ct) == "" {
-		s.writeMissingContentTypeResponse(w, r, rel, resp, session, upstream, gatewayToken, publicGatewayBase)
-		return
-	}
-
-	if isJSONContentType(ct) || strings.TrimSpace(ct) == "" {
-		readStarted := time.Now()
+	if strings.TrimSpace(ct) == "" && !isSuccessfulResponse(resp.StatusCode) {
 		data, err := readLimited(resp.Body, proxyJSONLimit)
 		if err != nil {
-			s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_read_failed", AuditMessage: "backend response read failed", ClientBody: "response read failed", FallbackKind: "upstream_read_error", Duration: time.Since(readStarted), UpstreamStatus: resp.StatusCode})
-			return
-		}
-		var value any
-		if looksLikeJSON(data) && json.Unmarshal(data, &value) == nil {
-			if s.meter != nil && len(data) > 0 {
-				s.meter.AddIngress(int64(len(data)))
-			}
-			rewritten := s.rewriteProxyJSONValueForRequestWithSnapshot(r.Context(), r, value, session, upstream, gatewayToken, publicGatewayBase)
-			payload, err := json.Marshal(rewritten)
-			if err != nil {
-				s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_rewrite_failed", AuditMessage: "proxy json encode failed", ClientBody: "response encode failed", FallbackKind: "upstream_read_error", Duration: time.Since(readStarted), UpstreamStatus: resp.StatusCode})
-				return
-			}
-			// Encode matches writeJSON trailing newline for Emby clients.
-			payload = append(payload, '\n')
-			w.Header().Del("Content-Length")
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(resp.StatusCode)
-			_, _ = countEgressWrite(w, s.meter, nil, payload)
+			resetProjectionFailureHeaders(w.Header())
+			s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_read_failed", AuditMessage: "backend response read failed", ClientBody: "response read failed", FallbackKind: "upstream_read_error", UpstreamStatus: resp.StatusCode})
 			return
 		}
 		if s.meter != nil && len(data) > 0 {
 			s.meter.AddIngress(int64(len(data)))
 		}
+		if projection.kind != responseProjectionLegacyCompatibility && len(bytes.TrimSpace(data)) > 0 {
+			if err := validateCredentialSafeResponse(data, looksLikeJSON(data), upstream); err != nil {
+				s.writeResponseProjectionFailure(w, r, rel, session)
+				return
+			}
+		}
+		setContentLength(header, resp.ContentLength)
+		if !commit() {
+			return
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = countEgressWrite(w, s.meter, nil, data)
+		return
+	}
+	if strings.TrimSpace(ct) == "" {
+		s.writeMissingContentTypeResponse(w, r, rel, resp, session, upstream, gatewayToken, publicGatewayBase, projection, plan, registration)
+		return
+	}
+
+	if isJSONContentType(ct) {
+		readStarted := time.Now()
+		data, err := readLimited(resp.Body, proxyJSONLimit)
+		if err != nil {
+			resetProjectionFailureHeaders(w.Header())
+			s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_read_failed", AuditMessage: "backend response read failed", ClientBody: "response read failed", FallbackKind: "upstream_read_error", Duration: time.Since(readStarted), UpstreamStatus: resp.StatusCode})
+			return
+		}
+		if s.meter != nil && len(data) > 0 {
+			s.meter.AddIngress(int64(len(data)))
+		}
+		if projection.kind == responseProjectionLegacyCompatibility {
+			var value any
+			if looksLikeJSON(data) && json.Unmarshal(data, &value) == nil {
+				rewritten := s.rewriteProxyJSONValueForRequestWithSnapshot(r.Context(), r, value, session, upstream, gatewayToken, publicGatewayBase)
+				payload, err := json.Marshal(rewritten)
+				if err != nil {
+					resetProjectionFailureHeaders(w.Header())
+					s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_rewrite_failed", AuditMessage: "proxy json encode failed", ClientBody: "response encode failed", FallbackKind: "upstream_read_error", Duration: time.Since(readStarted), UpstreamStatus: resp.StatusCode})
+					return
+				}
+				clearProjectedEntityHeaders(header)
+				header.Set("Content-Type", "application/json")
+				if !commit() {
+					return
+				}
+				w.WriteHeader(resp.StatusCode)
+				_, _ = countEgressWrite(w, s.meter, nil, appendJSONNewline(payload))
+				return
+			}
+			out := rewriteBytesWithSnapshot(data, session, upstream, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
+			setContentLength(header, int64(len(out)))
+			if !commit() {
+				return
+			}
+			w.WriteHeader(resp.StatusCode)
+			_, _ = countEgressWrite(w, s.meter, nil, out)
+			return
+		}
+		if len(bytes.TrimSpace(data)) == 0 {
+			if !commit() {
+				return
+			}
+			w.WriteHeader(resp.StatusCode)
+			return
+		}
+		if !isSuccessfulResponse(resp.StatusCode) {
+			if err := validateCredentialSafeResponse(data, true, upstream); err != nil {
+				s.writeResponseProjectionFailure(w, r, rel, session)
+				return
+			}
+			setContentLength(header, int64(len(data)))
+			if !commit() {
+				return
+			}
+			w.WriteHeader(resp.StatusCode)
+			_, _ = countEgressWrite(w, s.meter, nil, data)
+			return
+		}
+		projectionContext := s.responseProjectionContext(r.Context(), r, session, upstream, gatewayToken, publicGatewayBase)
+		if projection.kind != responseProjectionOpaque {
+			projectionContext, err = s.responseProjectionContextForDocument(r.Context(), r, session, upstream, gatewayToken, publicGatewayBase, data, projection)
+			if err != nil {
+				s.writeResponseProjectionFailure(w, r, rel, session)
+				return
+			}
+		}
+		projected, err := projectResponseDocument(data, projection, projectionContext)
+		if err != nil {
+			s.writeResponseProjectionFailure(w, r, rel, session)
+			return
+		}
+		if projection.kind == responseProjectionOpaque {
+			setContentLength(header, int64(len(projected)))
+		} else {
+			clearProjectedEntityHeaders(header)
+		}
+		if projection.kind != responseProjectionOpaque {
+			header.Set("Content-Type", "application/json")
+		}
+		if !commit() {
+			return
+		}
+		w.WriteHeader(resp.StatusCode)
+		if projection.kind == responseProjectionOpaque {
+			_, _ = countEgressWrite(w, s.meter, nil, projected)
+		} else {
+			_, _ = countEgressWrite(w, s.meter, nil, appendJSONNewline(projected))
+		}
+		return
+	}
+	if isTextContentType(ct) {
+		data, err := readLimited(resp.Body, proxyJSONLimit)
+		if err != nil {
+			resetProjectionFailureHeaders(w.Header())
+			s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_read_failed", AuditMessage: "backend response read failed", ClientBody: "response read failed", FallbackKind: "upstream_read_error", UpstreamStatus: resp.StatusCode})
+			return
+		}
+		if s.meter != nil && len(data) > 0 {
+			s.meter.AddIngress(int64(len(data)))
+		}
+		if projection.kind != responseProjectionLegacyCompatibility {
+			if isSuccessfulResponse(resp.StatusCode) && projection.kind != responseProjectionOpaque && len(bytes.TrimSpace(data)) > 0 {
+				s.writeResponseProjectionFailure(w, r, rel, session)
+				return
+			}
+			if err := validateCredentialSafeResponse(data, false, upstream); err != nil {
+				s.writeResponseProjectionFailure(w, r, rel, session)
+				return
+			}
+			setContentLength(header, int64(len(data)))
+			if !commit() {
+				return
+			}
+			w.WriteHeader(resp.StatusCode)
+			_, _ = countEgressWrite(w, s.meter, nil, data)
+			return
+		}
 		out := rewriteBytesWithSnapshot(data, session, upstream, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
+		setContentLength(header, int64(len(out)))
+		if !commit() {
+			return
+		}
 		w.WriteHeader(resp.StatusCode)
 		_, _ = countEgressWrite(w, s.meter, nil, out)
 		return
 	}
 
-	setContentLength(w.Header(), resp.ContentLength)
+	setContentLength(header, resp.ContentLength)
+	if !commit() {
+		return
+	}
 	w.WriteHeader(resp.StatusCode)
 	s.copyProxyBodyOrAbort(w, r, rel, resp.Body, session)
 }
 
-func (s *Server) writeImageProxyResponse(w http.ResponseWriter, r *http.Request, rel string, resp *http.Response, session *Session) {
+func (s *Server) writeImageProxyResponse(w http.ResponseWriter, r *http.Request, rel string, resp *http.Response, session *Session, plan *responseHeaderPlan) {
 	var first [imageValidationTailSize]byte
 	readStarted := time.Now()
 	n, err := resp.Body.Read(first[:])
@@ -2739,6 +2896,7 @@ func (s *Server) writeImageProxyResponse(w http.ResponseWriter, r *http.Request,
 		s.meter.AddIngress(int64(n))
 	}
 
+	plan.Commit(w.Header())
 	setContentLength(w.Header(), resp.ContentLength)
 	w.WriteHeader(resp.StatusCode)
 	fullImage := resp.StatusCode == http.StatusOK && strings.TrimSpace(r.Header.Get("Range")) == "" && strings.TrimSpace(resp.Header.Get("Content-Range")) == ""
@@ -3032,6 +3190,7 @@ func (s *Server) abortProxyBody(r *http.Request, rel string, session *Session, e
 }
 
 func (s *Server) rejectInvalidImageResponse(w http.ResponseWriter, r *http.Request, rel string, session *Session, message string) {
+	resetProjectionFailureHeaders(w.Header())
 	if resourceRouteFromContext(r) == resourceRouteImage {
 		w.Header().Set("Cache-Control", "private, no-store")
 		mergeVaryCookie(w.Header())
@@ -3482,25 +3641,26 @@ func rewriteStringWithSnapshot(s string, session *Session, upstream upstreamRequ
 	return s
 }
 
-func copyResponseHeadersWithSnapshot(dst, src http.Header, rel string, session *Session, upstream upstreamRequestSnapshot, gatewayToken, publicGatewayBase, gatewayServerID string) {
+func copyResponseHeadersWithProjection(dst, src http.Header, rel string, session *Session, upstream upstreamRequestSnapshot, gatewayToken, publicGatewayBase, gatewayServerID string, projection responseProjection) {
 	headers := src.Clone()
 	sanitizeHopHeaders(headers)
 	for k, vals := range headers {
-		if strings.EqualFold(k, "Content-Length") {
+		if strings.EqualFold(k, "Content-Length") || isResponseCredentialHeader(k) {
 			continue
 		}
 		for _, val := range vals {
-			if strings.EqualFold(k, "Set-Cookie") && strings.HasPrefix(strings.TrimSpace(val), resourceCookieName+"=") {
-				continue
-			}
 			if strings.EqualFold(k, "Location") || strings.EqualFold(k, "Content-Location") {
 				val = rewriteResponseLocation(val, rel, session, upstream, gatewayToken, publicGatewayBase, gatewayServerID)
-			} else {
+			} else if projection.kind == responseProjectionLegacyCompatibility {
 				val = rewriteStringWithSnapshot(val, session, upstream, gatewayToken, publicGatewayBase, gatewayServerID)
 			}
 			dst.Add(k, val)
 		}
 	}
+}
+
+func copyResponseHeadersWithSnapshot(dst, src http.Header, rel string, session *Session, upstream upstreamRequestSnapshot, gatewayToken, publicGatewayBase, gatewayServerID string) {
+	copyResponseHeadersWithProjection(dst, src, rel, session, upstream, gatewayToken, publicGatewayBase, gatewayServerID, newResponseProjection(responseProjectionOpaque))
 }
 
 func sanitizeHopHeaders(header http.Header) {

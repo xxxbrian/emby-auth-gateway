@@ -1,11 +1,16 @@
 package gateway
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/xxxbrian/emby-auth-gateway/internal/routeclass"
 )
 
 func (s *Server) writePersonalPlanHTTP(w http.ResponseWriter, r *http.Request, rel string, route personalRouteKind, session *Session, gatewayToken string) {
@@ -40,16 +45,48 @@ func (s *Server) writePersonalPlanHTTP(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 	if plan.Shape == personalShapeArray {
-		writeJSON(w, http.StatusOK, items)
+		if err := writeLocalPersonalArray(w, items); err != nil {
+			s.writePersonalPlanInternalError(w, r, rel, session)
+		}
 		return
 	}
 	if result.Total == nil || *result.Total < 0 || result.StartIndex < 0 {
 		s.writePersonalPlanInternalError(w, r, rel, session)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"Items": items, "TotalRecordCount": *result.Total, "StartIndex": result.StartIndex,
-	})
+	rawItems, err := marshalPersonalItems(items)
+	if err != nil {
+		s.writePersonalPlanInternalError(w, r, rel, session)
+		return
+	}
+	writeJSON(w, http.StatusOK, embyLocalQueryResult{Items: nonNilRawMessages(rawItems), TotalRecordCount: int64(*result.Total)})
+}
+
+func writeLocalPersonalArray(w http.ResponseWriter, items []map[string]any) error {
+	raw, err := json.Marshal(items)
+	if err != nil {
+		return err
+	}
+	projected, err := projectResponseDocument(raw, newResponseProjection(responseProjectionBaseItemArray), responseProjectionContext{})
+	if err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, err = w.Write(appendJSONNewline(projected))
+	return err
+}
+
+func marshalPersonalItems(items []map[string]any) ([]json.RawMessage, error) {
+	result := make([]json.RawMessage, len(items))
+	for i, item := range items {
+		raw, err := json.Marshal(item)
+		if err != nil {
+			return nil, err
+		}
+		result[i] = raw
+	}
+	return result, nil
 }
 
 func preparePersonalHTTPPlan(route personalRouteKind, rel string, query url.Values, session *Session) (personalPlan, error) {
@@ -135,17 +172,85 @@ func executePersonalHTTPPlan(r *http.Request, source *personalPlanSource, plan p
 }
 
 func (s *Server) writePersonalPlanPassthrough(w http.ResponseWriter, r *http.Request, rel string, session *Session, gatewayToken string, plan personalPlan) {
-	value, status, upstream, err := s.fetchBackendJSON(r.Context(), r, rel, plan.Neutral.Encode(), session, gatewayToken)
+	data, status, upstream, err := s.fetchPersonalPassthroughDocument(r.Context(), r, rel, plan.Neutral.Encode(), session)
 	if err != nil {
 		s.writePersonalPlanError(w, r, rel, session, err)
 		return
 	}
-	if err := validatePersonalPassthroughDocument(value); err != nil {
+	if !isSuccessfulResponse(status) {
+		if len(bytes.TrimSpace(data)) > 0 && validateCredentialSafeJSON(data, proxyJSONLimit, upstream.token) != nil {
+			s.writePersonalPlanUpstreamError(w)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write(data)
+		return
+	}
+	projectionKind := responseProjectionBaseItemEnvelope
+	if plan.Shape == personalShapeArray {
+		projectionKind = responseProjectionBaseItemArray
+	}
+	projection := newResponseProjection(projectionKind)
+	projectionContext, err := s.responseProjectionContextForDocument(r.Context(), r, session, upstream, gatewayToken, s.gatewayBaseForRequest(r), data, projection)
+	if err != nil {
 		s.writePersonalPlanUpstreamError(w)
 		return
 	}
-	rewritten := s.rewriteProxyJSONValueForRequestWithSnapshot(r.Context(), r, value, session, upstream, gatewayToken, s.gatewayBaseForRequest(r))
-	writeJSON(w, status, rewritten)
+	projected, err := projectResponseDocument(data, projection, projectionContext)
+	if err != nil || validatePersonalPassthroughRawDocument(projected) != nil {
+		s.writePersonalPlanUpstreamError(w)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(appendJSONNewline(projected))
+}
+
+func (s *Server) fetchPersonalPassthroughDocument(ctx context.Context, request *http.Request, rel, rawQuery string, session *Session) ([]byte, int, upstreamRequestSnapshot, error) {
+	if s.metadataUpstream == nil {
+		return nil, 0, upstreamRequestSnapshot{}, errors.New("metadata upstream unavailable")
+	}
+	runtime, err := s.managedAuthUpstream.Ensure(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			s.emitAuthUnavailable(session)
+		}
+		return nil, 0, upstreamRequestSnapshot{}, err
+	}
+	upstream, err := upstreamRequestSnapshotFromRuntime(runtime)
+	if err != nil {
+		return nil, 0, upstreamRequestSnapshot{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, (&url.URL{Path: rel, RawQuery: rawQuery}).String(), nil)
+	if err != nil {
+		return nil, 0, upstream, err
+	}
+	in := metadataUpstreamRequest{
+		upstreamHTTPRequest: upstreamHTTPRequest{Request: req, Session: session, Snapshot: upstream, refreshResult: s.upstreamRefreshReporter(ctx, request, rel, session)},
+		Ownership:           routeclass.MetadataProxy,
+		Internal:            true,
+		SnapshotRef:         &upstream,
+	}
+	resp, err := s.metadataUpstream.RoundTripMetadata(in)
+	if err != nil {
+		return nil, 0, upstream, err
+	}
+	wrapResponseBodyOnce(resp)
+	defer resp.Body.Close()
+	data, err := readLimited(resp.Body, proxyJSONLimit)
+	if err != nil {
+		return nil, resp.StatusCode, upstream, err
+	}
+	return data, resp.StatusCode, upstream, nil
+}
+
+func validatePersonalPassthroughRawDocument(data []byte) error {
+	var value any
+	if err := decodeJSONUseNumber(data, &value); err != nil {
+		return err
+	}
+	return validatePersonalPassthroughDocument(value)
 }
 
 func validatePersonalPassthroughDocument(value any) error {

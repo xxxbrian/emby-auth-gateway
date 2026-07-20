@@ -82,6 +82,28 @@ func TestMetadataUpstreamSanitizesAndUsesManagedIdentity(t *testing.T) {
 	}
 }
 
+func TestMetadataUpstreamPreservesRawOpaqueQueryAndSubstringIDs(t *testing.T) {
+	var requestURI string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestURI = r.RequestURI
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+	snapshot := testMetadataSnapshot("backend-token")
+	snapshot.baseURL = backend.URL
+	session := &Session{SyntheticUserID: "synthetic"}
+	req := metadataRequest("/Users/synthetic/Items/synthetic-copy", "sig=a%2Bb&dup=one&dup=two+words&opaque=synthetic&UserId=synthetic", session)
+	resp, err := newMetadataUpstream(backend.Client(), nil, nil).RoundTripMetadata(metadataUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: req, Session: session, Snapshot: snapshot}, Ownership: routeclass.MetadataProxy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	want := "/Users/backend-user/Items/synthetic-copy?sig=a%2Bb&dup=one&dup=two+words&opaque=synthetic&EnableUserData=false&UserId=backend-user"
+	if requestURI != want {
+		t.Fatalf("request URI=%q, want %q", requestURI, want)
+	}
+}
+
 func TestMetadataUpstreamRejectsRedirectsAndRefreshesOnce(t *testing.T) {
 	type observedRequest struct {
 		path          string

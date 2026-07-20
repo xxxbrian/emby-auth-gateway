@@ -36,24 +36,11 @@ func (RegistrationHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	switch name {
 	case "validateDevice":
-		writeJSON(w, http.StatusOK, map[string]any{
-			"cacheExpirationDays": 233,
-			"message":             "Device Valid",
-			"resultCode":          "GOOD",
-		})
+		writeJSON(w, http.StatusOK, registrationValidateDevice{CacheExpirationDays: 233, Message: "Device Valid", ResultCode: "GOOD"})
 	case "validate":
-		writeJSON(w, http.StatusOK, map[string]any{
-			"featId":     "",
-			"registered": true,
-			"expDate":    "2333-10-01",
-			"key":        "",
-		})
+		writeJSON(w, http.StatusOK, registrationValidate{Registered: true, Expires: "2333-10-01"})
 	case "getStatus":
-		writeJSON(w, http.StatusOK, map[string]any{
-			"deviceStatus":  0,
-			"planType":      "Lifetime",
-			"subscriptions": []any{},
-		})
+		writeJSON(w, http.StatusOK, registrationStatus{PlanType: "Lifetime"})
 	default:
 		http.NotFound(w, r)
 	}

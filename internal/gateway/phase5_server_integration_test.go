@@ -54,17 +54,17 @@ type phase5FailMedia struct{ err error }
 func (s phase5FailMedia) RoundTripMedia(mediaUpstreamRequest) (*http.Response, error) {
 	return nil, s.err
 }
-func (s phase5FailMedia) RoundTripNegotiation(negotiationUpstreamRequest) (*http.Response, error) {
-	return nil, s.err
+func (s phase5FailMedia) RoundTripNegotiation(negotiationUpstreamRequest) (negotiationUpstreamResponse, error) {
+	return negotiationUpstreamResponse{}, s.err
 }
 
 func (s *phase5MediaSpy) RoundTripMedia(in mediaUpstreamRequest) (*http.Response, error) {
 	s.media++
 	return phase5Response(in.Request, http.StatusOK, "video/mp4", "media"), nil
 }
-func (s *phase5MediaSpy) RoundTripNegotiation(in negotiationUpstreamRequest) (*http.Response, error) {
+func (s *phase5MediaSpy) RoundTripNegotiation(in negotiationUpstreamRequest) (negotiationUpstreamResponse, error) {
 	s.negotiation++
-	return phase5Response(in.Request, http.StatusOK, "application/json", `{}`), nil
+	return negotiationUpstreamResponse{Response: phase5Response(in.Request, http.StatusOK, "application/json", `{}`)}, nil
 }
 
 type phase5LegacySpy struct{ calls int }

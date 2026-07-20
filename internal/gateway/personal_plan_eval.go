@@ -1,11 +1,11 @@
 package gateway
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
+	"math/big"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -110,7 +110,7 @@ func sortPersonalPlanItems(items []resolvedPersonalItem, terms []personalSortTer
 
 type personalComparable struct {
 	kind   byte
-	number float64
+	number *big.Rat
 	date   time.Time
 	text   string
 	raw    string
@@ -176,30 +176,25 @@ func normalizePersonalSortValue(value any) (personalComparable, bool) {
 			return personalComparable{kind: 'd', date: d, raw: v}, true
 		}
 		return personalComparable{kind: 's', text: strings.ToLower(v), raw: v}, true
-	case int:
-		return personalComparable{kind: 'n', number: float64(v), raw: strconv.Itoa(v)}, true
-	case int64:
-		return personalComparable{kind: 'n', number: float64(v), raw: strconv.FormatInt(v, 10)}, true
-	case float64:
-		return personalComparable{kind: 'n', number: v, raw: strconv.FormatFloat(v, 'g', -1, 64)}, !math.IsNaN(v)
-	case float32:
-		return personalComparable{kind: 'n', number: float64(v), raw: strconv.FormatFloat(float64(v), 'g', -1, 32)}, true
+	case json.Number, int, int64, float64, float32:
+		number, raw, ok := exactPersonalComparableNumber(v)
+		return personalComparable{kind: 'n', number: number, raw: raw}, ok
 	}
 	return personalComparable{}, false
 }
 
-func boolNumber(v bool) float64 {
+func boolNumber(v bool) *big.Rat {
 	if v {
-		return 1
+		return big.NewRat(1, 1)
 	}
-	return 0
+	return big.NewRat(0, 1)
 }
 
 func comparePersonalSortValue(a, b personalComparable) int {
 	if a.kind == b.kind {
 		switch a.kind {
 		case 'b', 'n':
-			return compareFloat(a.number, b.number)
+			return a.number.Cmp(b.number)
 		case 'd':
 			return compareTime(a.date, b.date)
 		case 's':

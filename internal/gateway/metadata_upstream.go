@@ -50,15 +50,7 @@ func (m *metadataUpstream) RoundTripMetadata(in metadataUpstreamRequest) (*http.
 		}
 		return nil, err
 	}
-	var clientQuery url.Values
-	if !in.Public {
-		q, err := url.ParseQuery(in.Request.URL.RawQuery)
-		if err != nil {
-			return nil, fmt.Errorf("%w: malformed metadata query", ErrBadRequest)
-		}
-		clientQuery = q
-	}
-	resp, snapshot, err := m.doAttempt(in, in.Snapshot, clientQuery)
+	resp, snapshot, err := m.doAttempt(in, in.Snapshot)
 	if err != nil {
 		if errors.Is(err, ErrForbidden) {
 			status = http.StatusForbidden
@@ -76,7 +68,7 @@ func (m *metadataUpstream) RoundTripMetadata(in metadataUpstreamRequest) (*http.
 			if in.SnapshotRef != nil {
 				*in.SnapshotRef = refreshed
 			}
-			resp, _, err = m.doAttempt(in, refreshed, clientQuery)
+			resp, _, err = m.doAttempt(in, refreshed)
 			if err != nil {
 				return nil, err
 			}
@@ -119,17 +111,16 @@ func validateMetadataRequest(in metadataUpstreamRequest) error {
 	return nil
 }
 
-func (m *metadataUpstream) doAttempt(in metadataUpstreamRequest, snapshot upstreamRequestSnapshot, clientQuery url.Values) (*http.Response, upstreamRequestSnapshot, error) {
+func (m *metadataUpstream) doAttempt(in metadataUpstreamRequest, snapshot upstreamRequestSnapshot) (*http.Response, upstreamRequestSnapshot, error) {
 	rel := in.Request.URL.Path
 	rawQuery := ""
 	if !in.Public {
 		var err error
-		stripMetadataSelectedToken(clientQuery, ExtractToken(in.Request))
-		rawQuery, err = SanitizeMetadataQuery(clientQuery, in.Session.SyntheticUserID, snapshot.userID)
+		rawQuery, err = sanitizeMetadataRawQuery(in.Request.URL.RawQuery, in.Session.SyntheticUserID, snapshot.userID, ExtractToken(in.Request))
 		if err != nil {
 			return nil, snapshot, err
 		}
-		rel = strings.ReplaceAll(rel, in.Session.SyntheticUserID, snapshot.userID)
+		rel = projectUserPath(rel, in.Session.SyntheticUserID, snapshot.userID)
 	}
 	return m.do(in.Request.Context(), snapshot, in.Request.Method, rel, rawQuery, in.Public)
 }
@@ -168,26 +159,6 @@ func rewriteManagedMetadataHeaders(header http.Header, snapshot upstreamRequestS
 	header.Set("User-Agent", identity.UserAgent)
 	header.Set("X-Emby-Token", snapshot.token)
 	header.Set("X-Emby-Authorization", backendAuthHeader(identity, snapshot.userID, snapshot.token).String())
-}
-
-func stripMetadataSelectedToken(query url.Values, gatewayToken string) {
-	if query == nil || gatewayToken == "" {
-		return
-	}
-	for key, values := range query {
-		kept := values[:0]
-		for _, value := range values {
-			if value == gatewayToken {
-				continue
-			}
-			kept = append(kept, value)
-		}
-		if len(kept) == 0 {
-			delete(query, key)
-			continue
-		}
-		query[key] = kept
-	}
 }
 
 func requestMethod(req *http.Request) string {

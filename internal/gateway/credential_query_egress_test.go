@@ -3,7 +3,6 @@ package gateway
 import (
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"testing"
 )
 
@@ -12,25 +11,29 @@ func TestEgressCredentialAliasesFoldWithoutChangingIngressSelection(t *testing.T
 	if got := ExtractToken(ingress); got != "selected" {
 		t.Fatalf("ingress selection changed: %q", got)
 	}
-	query := url.Values{
-		"API_KEY":              {"client-a", "client-b"},
-		"Token":                {"client-c"},
-		"x-emby-token":         {"client-d"},
-		"X-MEDIABROWSER-TOKEN": {"client-e"},
-		"access_TOKEN":         {"client-f"},
-		"signature":            {"gateway-token"},
-		"keep":                 {"gateway-user"},
+	raw := "API_KEY=client-a&API_KEY=client-b&Token=client-c&x-emby-token=client-d&X-MEDIABROWSER-TOKEN=client-e&access_TOKEN=client-f&signature=gateway-token&keep=gateway-user&UserId=gateway-user"
+	got, err := rewriteProxyRawQuery(raw, &Session{SyntheticUserID: "gateway-user"}, testUpstreamSnapshot("http://backend.invalid"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	rewriteProxyQueryValues(query, "gateway-token", &Session{SyntheticUserID: "gateway-user"}, testUpstreamSnapshot("http://backend.invalid"))
-	for key := range query {
-		if isEgressCredentialAliasQueryKey(key) && key != "api_key" {
-			t.Fatalf("credential alias survived: %q=%v", key, query[key])
-		}
+	want := "signature=gateway-token&keep=gateway-user&UserId=backend-user&api_key=backend-token"
+	if got != want {
+		t.Fatalf("sanitized query=%q, want %q", got, want)
 	}
-	if values := query["api_key"]; len(values) != 1 || values[0] != "backend-token" {
-		t.Fatalf("canonical credential=%v", values)
+}
+
+func TestEgressCredentialRemovesSelectedValueUnderArbitraryKey(t *testing.T) {
+	selected := "selected-gateway-credential"
+	raw := "before=one&signature=" + selected + "&signature=ordinary-signed-value&after=two"
+	got, err := rewriteProxyRawQuery(raw, &Session{
+		GatewayTokenHash: HashToken(selected),
+		SyntheticUserID:  "gateway-user",
+	}, testUpstreamSnapshot("http://backend.invalid"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if query.Get("signature") != "" || query.Get("keep") != "backend-user" {
-		t.Fatalf("sanitized query=%v", query)
+	want := "before=one&signature=ordinary-signed-value&after=two&api_key=backend-token"
+	if got != want {
+		t.Fatalf("sanitized query=%q, want %q", got, want)
 	}
 }

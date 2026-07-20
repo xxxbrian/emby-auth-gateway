@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 )
@@ -19,7 +20,24 @@ func (s *Server) rewritePlannedPersonalItem(item map[string]any, session *Sessio
 	if s != nil {
 		serverID = s.cfg.GatewayServerID
 	}
-	rewritten, _ := rewriteJSONValueWithSnapshot(clonePlannedPersonalJSONMap(item), session, upstream, gatewayToken, base, serverID).(map[string]any)
+	raw, err := json.Marshal(item)
+	if err != nil {
+		return nil
+	}
+	projected, err := projectBaseItemDocument(raw, responseProjectionContext{
+		session: session, upstream: upstream, gatewayToken: gatewayToken,
+		publicGatewayBase: base, gatewayServerID: serverID,
+	})
+	if err != nil {
+		return nil
+	}
+	if err := validateCredentialSafeJSON(projected, controlledProjectionMaxBytes, upstream.token); err != nil {
+		return nil
+	}
+	var rewritten map[string]any
+	if err := decodeJSONUseNumber(projected, &rewritten); err != nil {
+		return nil
+	}
 	return rewritten
 }
 

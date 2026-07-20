@@ -89,7 +89,7 @@ func (m *mediaUpstream) RoundTripMedia(in mediaUpstreamRequest) (resp *http.Resp
 func (m *mediaUpstream) mediaAttempt(in mediaUpstreamRequest, snapshot upstreamRequestSnapshot) (*http.Response, error) {
 	rel := in.Request.URL.Path
 	if !in.Anonymous {
-		rel = strings.ReplaceAll(rel, in.Session.SyntheticUserID, snapshot.userID)
+		rel = projectUserPath(rel, in.Session.SyntheticUserID, snapshot.userID)
 	}
 	u, err := backendURL(snapshot.baseURL, rel)
 	if err != nil {
@@ -102,12 +102,14 @@ func (m *mediaUpstream) mediaAttempt(in mediaUpstreamRequest, snapshot upstreamR
 	if in.Anonymous {
 		parsed.RawQuery = stripMediaRedirectCredentials(in.Request.URL.RawQuery, "", "")
 	} else {
-		query, err := parseRawQuery(in.Request.URL.RawQuery)
+		rawQuery, err := rewriteProxyRawQuery(in.Request.URL.RawQuery, in.Session, snapshot)
 		if err != nil {
+			if errors.Is(err, ErrForbidden) {
+				return nil, err
+			}
 			return nil, fmt.Errorf("%w: malformed query", ErrBadRequest)
 		}
-		rewriteProxyQueryValues(query, ExtractToken(in.Request), in.Session, snapshot)
-		parsed.RawQuery = query.Encode()
+		parsed.RawQuery = rawQuery
 	}
 	req, err := http.NewRequestWithContext(in.Request.Context(), in.Request.Method, parsed.String(), nil)
 	if err != nil {
@@ -194,33 +196,38 @@ func validSnapshotCredentials(snapshot upstreamRequestSnapshot) bool {
 	return isTrimmed(snapshot.baseURL) && isTrimmed(snapshot.userID) && isTrimmed(snapshot.token) && isTrimmed(snapshot.identity.DeviceID)
 }
 
-func (m *mediaUpstream) RoundTripNegotiation(in negotiationUpstreamRequest) (resp *http.Response, err error) {
+func (m *mediaUpstream) RoundTripNegotiation(in negotiationUpstreamRequest) (result negotiationUpstreamResponse, err error) {
 	status := 0
 	defer func() {
-		if resp != nil {
-			status = resp.StatusCode
+		if result.Response != nil {
+			status = result.Response.StatusCode
 		}
 		m.emitPurpose(upstreamPurposeNegotiation, status, err)
 	}()
 	if err := validateNegotiationRequest(in); err != nil {
-		return nil, err
+		return negotiationUpstreamResponse{}, err
 	}
 	data, err := readBoundedRequestBody(in.Request)
 	if err != nil {
-		return nil, err
+		return negotiationUpstreamResponse{}, err
 	}
-	selectors, document, err := collectNegotiationSelectors(data, in.Request.URL.RawQuery)
+	selectors, _, err := collectNegotiationSelectors(data, in.Request.URL.RawQuery)
 	if err != nil {
-		return nil, err
+		return negotiationUpstreamResponse{}, err
+	}
+	document, err := parseNegotiationDocument(data)
+	if err != nil {
+		return negotiationUpstreamResponse{}, err
 	}
 	if err := validateNegotiationSelectors(m.leases, in.Session.GatewayTokenHash, selectors, m.clock()); err != nil {
-		return nil, err
+		return negotiationUpstreamResponse{}, err
 	}
 	snapshot := in.Snapshot
+	var resp *http.Response
 	for attempt := 0; attempt < 2; attempt++ {
 		resp, err = m.negotiationAttempt(in, snapshot, document, len(data) != 0)
 		if err != nil {
-			return nil, err
+			return negotiationUpstreamResponse{}, err
 		}
 		if resp.StatusCode != http.StatusUnauthorized || attempt != 0 || m.refresh == nil {
 			break
@@ -243,14 +250,17 @@ func (m *mediaUpstream) RoundTripNegotiation(in negotiationUpstreamRequest) (res
 	in.Snapshot = snapshot
 	operation := routeclass.Classify(in.Request.Method, in.Request.URL.Path).Operation
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 && negotiationRegistersLease(operation) {
-		if err := m.registerNegotiationResponse(in, resp, operation); err != nil {
-			return nil, err
+		registration, registrationErr := m.prepareNegotiationResponse(in, resp, operation)
+		if registrationErr != nil {
+			return negotiationUpstreamResponse{}, registrationErr
 		}
+		result.Registration = registration
 	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 && negotiationReleasesLease(operation) && !selectors.empty() {
 		_ = m.leases.Release(in.Session.GatewayTokenHash, selectors.PlaySessionIDs, selectors.LiveStreamIDs)
 	}
-	return resp, nil
+	result.Response = resp
+	return result, nil
 }
 
 func validateNegotiationRequest(in negotiationUpstreamRequest) error {
@@ -286,8 +296,8 @@ func readBoundedRequestBody(r *http.Request) ([]byte, error) {
 	return data, nil
 }
 
-func (m *mediaUpstream) negotiationAttempt(in negotiationUpstreamRequest, snapshot upstreamRequestSnapshot, document any, hasBody bool) (*http.Response, error) {
-	rel := strings.ReplaceAll(in.Request.URL.Path, in.Session.SyntheticUserID, snapshot.userID)
+func (m *mediaUpstream) negotiationAttempt(in negotiationUpstreamRequest, snapshot upstreamRequestSnapshot, document *negotiationDocument, hasBody bool) (*http.Response, error) {
+	rel := projectUserPath(in.Request.URL.Path, in.Session.SyntheticUserID, snapshot.userID)
 	u, err := backendURL(snapshot.baseURL, rel)
 	if err != nil {
 		return nil, err
@@ -296,12 +306,14 @@ func (m *mediaUpstream) negotiationAttempt(in negotiationUpstreamRequest, snapsh
 	if err != nil {
 		return nil, err
 	}
-	query, err := parseRawQuery(in.Request.URL.RawQuery)
+	rawQuery, err := rewriteProxyRawQuery(in.Request.URL.RawQuery, in.Session, snapshot)
 	if err != nil {
+		if errors.Is(err, ErrForbidden) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("%w: malformed query", ErrBadRequest)
 	}
-	rewriteProxyQueryValues(query, ExtractToken(in.Request), in.Session, snapshot)
-	parsed.RawQuery = query.Encode()
+	parsed.RawQuery = rawQuery
 	var body []byte
 	if hasBody {
 		body, err = rewriteNegotiationDocument(document, snapshot)
@@ -329,51 +341,150 @@ func (m *mediaUpstream) negotiationAttempt(in negotiationUpstreamRequest, snapsh
 	return resp, nil
 }
 
-func rewriteNegotiationDocument(document any, snapshot upstreamRequestSnapshot) ([]byte, error) {
-	data, err := json.Marshal(document)
-	if err != nil {
-		return nil, fmt.Errorf("%w: negotiation body", ErrBadRequest)
-	}
-	var value any
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	if err := decoder.Decode(&value); err != nil {
-		return nil, fmt.Errorf("%w: negotiation body", ErrBadRequest)
-	}
-	rewriteNegotiationValue(value, snapshot)
-	return json.Marshal(value)
+type negotiationDocument struct {
+	members []negotiationMember
 }
 
-func rewriteNegotiationValue(value any, snapshot upstreamRequestSnapshot) {
-	switch v := value.(type) {
-	case []any:
-		for _, item := range v {
-			rewriteNegotiationValue(item, snapshot)
+type negotiationMember struct {
+	key      string
+	rawKey   []byte
+	rawValue []byte
+}
+
+func parseNegotiationDocument(data []byte) (*negotiationDocument, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+	var members []negotiationMember
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return nil, fmt.Errorf("%w: negotiation body must be an object", ErrBadRequest)
+	}
+	seenIdentity := make(map[string]struct{})
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return nil, fmt.Errorf("%w: malformed negotiation body", ErrBadRequest)
 		}
-	case map[string]any:
-		userAlias := false
-		deviceAlias := false
-		for key, child := range v {
-			switch strings.ToLower(key) {
-			case "sessionid", "controllinguserid":
-				delete(v, key)
-			case "userid":
-				delete(v, key)
-				userAlias = true
-			case "deviceid":
-				delete(v, key)
-				deviceAlias = true
-			default:
-				rewriteNegotiationValue(child, snapshot)
+		key, ok := keyToken.(string)
+		if !ok {
+			return nil, fmt.Errorf("%w: malformed negotiation key", ErrBadRequest)
+		}
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil {
+			return nil, fmt.Errorf("%w: malformed negotiation value", ErrBadRequest)
+		}
+		folded := strings.ToLower(key)
+		if isNegotiationIdentityKey(folded) {
+			if _, exists := seenIdentity[folded]; exists {
+				return nil, fmt.Errorf("%w: duplicate negotiation identity", ErrBadRequest)
 			}
+			seenIdentity[folded] = struct{}{}
 		}
-		if userAlias {
-			v["UserId"] = snapshot.userID
+		if err := rejectNestedNegotiationIdentity(raw); err != nil {
+			return nil, err
 		}
-		if deviceAlias {
-			v["DeviceId"] = snapshot.identity.DeviceID
+		rawKey, _ := json.Marshal(key)
+		members = append(members, negotiationMember{key: key, rawKey: rawKey, rawValue: append([]byte(nil), raw...)})
+	}
+	if _, err := decoder.Token(); err != nil || ensureJSONEOF(decoder) != nil {
+		return nil, fmt.Errorf("%w: malformed negotiation body", ErrBadRequest)
+	}
+	return &negotiationDocument{members: members}, nil
+}
+
+func isNegotiationIdentityKey(folded string) bool {
+	switch folded {
+	case "userid", "deviceid", "sessionid", "controllinguserid":
+		return true
+	default:
+		return false
+	}
+}
+
+func rejectNestedNegotiationIdentity(raw []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var walk func(int) error
+	walk = func(depth int) error {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		delim, ok := token.(json.Delim)
+		if !ok {
+			return nil
+		}
+		switch delim {
+		case '{':
+			for decoder.More() {
+				keyToken, err := decoder.Token()
+				if err != nil {
+					return err
+				}
+				key, _ := keyToken.(string)
+				if depth >= 0 && isNegotiationIdentityKey(strings.ToLower(key)) {
+					return fmt.Errorf("%w: nested negotiation identity", ErrBadRequest)
+				}
+				if err := walk(depth + 1); err != nil {
+					return err
+				}
+			}
+			_, err = decoder.Token()
+			return err
+		case '[':
+			for decoder.More() {
+				if err := walk(depth + 1); err != nil {
+					return err
+				}
+			}
+			_, err = decoder.Token()
+			return err
+		default:
+			return nil
 		}
 	}
+	if err := walk(0); err != nil {
+		return err
+	}
+	return nil
+}
+
+func rewriteNegotiationDocument(document *negotiationDocument, snapshot upstreamRequestSnapshot) ([]byte, error) {
+	if document == nil {
+		return nil, nil
+	}
+	var out bytes.Buffer
+	out.WriteByte('{')
+	wrote := false
+	for _, member := range document.members {
+		folded := strings.ToLower(member.key)
+		if folded == "sessionid" || folded == "controllinguserid" {
+			continue
+		}
+		if wrote {
+			out.WriteByte(',')
+		}
+		wrote = true
+		switch folded {
+		case "userid":
+			out.WriteString(`"UserId":`)
+			encoded, _ := json.Marshal(snapshot.userID)
+			out.Write(encoded)
+		case "deviceid":
+			out.WriteString(`"DeviceId":`)
+			encoded, _ := json.Marshal(snapshot.identity.DeviceID)
+			out.Write(encoded)
+		default:
+			out.Write(member.rawKey)
+			out.WriteByte(':')
+			out.Write(member.rawValue)
+		}
+	}
+	out.WriteByte('}')
+	return out.Bytes(), nil
 }
 
 type negotiationSelectorSet struct {
@@ -565,47 +676,21 @@ func validateNegotiationSelectors(registry MediaLeaseRegistry, owner string, sel
 	return registry.ValidateAll(owner, selectors.PlaySessionIDs, selectors.LiveStreamIDs, now)
 }
 
-func (m *mediaUpstream) registerNegotiationResponse(in negotiationUpstreamRequest, resp *http.Response, operation routeclass.Operation) error {
+func (m *mediaUpstream) prepareNegotiationResponse(in negotiationUpstreamRequest, resp *http.Response, operation routeclass.Operation) (*negotiationLeaseRegistration, error) {
 	data, err := io.ReadAll(io.LimitReader(resp.Body, negotiationResponseBodyLimit+1))
 	_ = resp.Body.Close()
 	if err != nil || len(data) > negotiationResponseBodyLimit {
-		return fmt.Errorf("%w: response body", ErrBadRequest)
+		return nil, fmt.Errorf("%w: response body", ErrBadRequest)
 	}
+	resp.Body = &onceReadCloser{reader: bytes.NewReader(data), closer: io.NopCloser(bytes.NewReader(nil))}
 	selectors, _, selectorErr := collectNegotiationSelectors(data, "")
 	if selectorErr != nil {
-		return selectorErr
+		return nil, selectorErr
 	}
 	if selectors.empty() {
-		resp.Body = io.NopCloser(bytes.NewReader(data))
-		return nil
+		return nil, nil
 	}
-	if m.leases == nil {
-		m.closeReturnedLiveStreams(in, selectors)
-		return fmt.Errorf("%w: lease registry unavailable", ErrStoreUnavailable)
-	}
-	err = m.leases.RegisterAll(in.Session.GatewayTokenHash, selectors.PlaySessionIDs, selectors.LiveStreamIDs)
-	if err != nil {
-		m.closeReturnedLiveStreams(in, selectors)
-		if errors.Is(err, ErrStoreUnavailable) {
-			return ErrStoreUnavailable
-		}
-		return err
-	}
-	resp.Body = io.NopCloser(bytes.NewReader(data))
-	return nil
-}
-
-func (m *mediaUpstream) closeReturnedLiveStreams(in negotiationUpstreamRequest, selectors negotiationSelectorSet) {
-	if len(selectors.LiveStreamIDs) == 0 || m.closeStream == nil {
-		return
-	}
-	var play PlaySessionID
-	if len(selectors.PlaySessionIDs) != 0 {
-		play = selectors.PlaySessionIDs[0]
-	}
-	for _, live := range selectors.LiveStreamIDs {
-		_ = m.closeStream(in.Request.Context(), in.Snapshot, play, live)
-	}
+	return newNegotiationLeaseRegistration(m.leases, in.Session.GatewayTokenHash, selectors, operation, in.Request.Context(), in.Snapshot, m.closeStream), nil
 }
 
 func (m *mediaUpstream) closeNegotiatedStream(ctx context.Context, snapshot upstreamRequestSnapshot, play PlaySessionID, live LiveStreamID) (err error) {

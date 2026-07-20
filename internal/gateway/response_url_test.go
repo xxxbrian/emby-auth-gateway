@@ -16,7 +16,7 @@ func TestRewriteMediaReference(t *testing.T) {
 		want string
 	}{
 		{"backend default port", "https://backend.example.com/emby/Videos/a/stream?api_key=backend-token#part", "/Videos/a/stream?api_key=gateway-token#part"},
-		{"alias root", "https://cdn.example.com/Videos/a/stream?x=backend-token", "/Videos/a/stream?x=gateway-token&api_key=gateway-token"},
+		{"alias root opaque token rejected", "https://cdn.example.com/Videos/a/stream?x=backend-token", ""},
 		{"alias mediabrowser", "https://cdn.example.com/mediabrowser/Audio/a/stream", "/Audio/a/stream?api_key=gateway-token"},
 		{"gateway idempotent", "https://media.example.com/emby/Videos/a/stream?api_key=backend-token", "/Videos/a/stream?api_key=gateway-token"},
 		{"relative owned", "/Videos/a/stream?api_key=backend-token", "/Videos/a/stream?api_key=gateway-token"},
@@ -87,7 +87,7 @@ func TestRewriteResponseLocation(t *testing.T) {
 		{"https://backend.example.com/emby/Items/a?api_key=backend-token", "https://media.example.com/emby/Items/a"},
 		{"/emby/Items/a?api_key=backend-token", "https://media.example.com/emby/Items/a"},
 		{"next?api_key=backend-token", "https://media.example.com/emby/Items/next"},
-		{"?x=backend-token", "https://media.example.com/emby/Items/a?x=gateway-token"},
+		{"?x=backend-token", ""},
 		{"/Users/u", "https://media.example.com/emby/Users/u"},
 		{"https://cdn.example.com/emby/Items/a?api_key=backend-token", ""},
 	}
@@ -191,6 +191,16 @@ func TestOwnedReferencesRewriteIdentityQueryValues(t *testing.T) {
 	}
 }
 
+func TestOwnedReferenceOnlyAdaptsSemanticQueryKeys(t *testing.T) {
+	session := testSession()
+	upstream := testResponseUpstreamSnapshot("https://backend.example.com/emby")
+	input := "/Videos/backend-user/stream?sig=a%2Bb&dup=one&dup=two+words&opaque=backend-user&UserId=backend-user&ServerId=backend-server&token=backend-token"
+	want := "/Videos/backend-user/stream?sig=a%2Bb&dup=one&dup=two+words&opaque=backend-user&UserId=gateway-user&ServerId=gateway-server&token=gateway-token&api_key=gateway-token"
+	if got := rewriteMediaReference(input, session, upstream, "gateway-token", "https://media.example.com/emby", "gateway-server", false); got != want {
+		t.Fatalf("owned query=%q, want %q", got, want)
+	}
+}
+
 func TestConfiguredOriginResolverForNonMediaHLSAndLocations(t *testing.T) {
 	cases := []struct{ base, input string }{
 		{"https://backend.example.com", "https://backend.example.com/emby/Items/a"},
@@ -269,8 +279,8 @@ func TestOwnedResourceQueriesAreCanonicalizedWithoutReorderingSignedSegments(t *
 	if got := rewriteMediaReference("/Videos/a/stream?sig=a%2Bb&api_key=stale", session, upstream, "", "https://media.example.com/emby", "gateway-server", false); got != "/Videos/a/stream?sig=a%2Bb" {
 		t.Fatalf("cookie resource query = %q", got)
 	}
-	if got := rewriteMediaReference("/Videos/a/stream?API_KEY=keep&sig=a%2Bb", session, upstream, "gateway-token", "https://media.example.com/emby", "gateway-server", false); got != "/Videos/a/stream?API_KEY=keep&sig=a%2Bb&api_key=gateway-token" {
-		t.Fatalf("mixed-case key was not preserved: %q", got)
+	if got := rewriteMediaReference("/Videos/a/stream?API_KEY=keep&sig=a%2Bb", session, upstream, "gateway-token", "https://media.example.com/emby", "gateway-server", false); got != "/Videos/a/stream?sig=a%2Bb&api_key=gateway-token" {
+		t.Fatalf("mixed-case credential alias was not removed: %q", got)
 	}
 }
 
