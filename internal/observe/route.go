@@ -37,6 +37,9 @@ func RouteClassOf(decision routeclass.Decision) string {
 		return RouteMedia
 	case routeclass.DeniedSession:
 		return RoutePlayback
+	case routeclass.Unclassified:
+		// Default-deny classifier outcome.
+		return RouteOther
 	default:
 		return RouteOther
 	}
@@ -52,7 +55,7 @@ func ClassifyRoute(method, relPath string) string {
 	return RouteClassOf(routeclass.Classify(method, sanitizeCompatPath(relPath)))
 }
 
-// sanitizeCompatPath strips query/fragment and trims whitespace for legacy
+// sanitizeCompatPath strips query/fragment and trims whitespace for older
 // telemetry callers that may pass non-path URI fragments. Live gateway dispatch
 // must pass path-only values directly to routeclass.Classify.
 func sanitizeCompatPath(relPath string) string {

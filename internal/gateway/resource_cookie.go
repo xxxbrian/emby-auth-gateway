@@ -5,6 +5,8 @@ import (
 	"path"
 	"strings"
 	"time"
+
+	"github.com/xxxbrian/emby-auth-gateway/internal/routeclass"
 )
 
 const resourceCookieName = "__Secure-EmbyGatewayResource"
@@ -50,22 +52,31 @@ func resourceRoute(r *http.Request, rel string) resourceRouteKind {
 	if !canonicalResourceRoute(r, rel) {
 		return resourceRouteNone
 	}
-	parts := strings.Split(rel[1:], "/")
+	return resourceRouteKindForRel(r.Method, rel)
+}
+
+// resourceRouteKindForRel selects image vs media kind. Media admission is
+// authoritative via routeclass.Classify so cookie recognition cannot drift from
+// the finite classifier allowlists (including shallow and nested HLS forms).
+func resourceRouteKindForRel(method, rel string) resourceRouteKind {
+	parts := strings.Split(strings.TrimPrefix(rel, "/"), "/")
+	// Image kind first: exact binary image shapes. Users images remain
+	// cookie-classifiable for existing tokenless image cache policy even when
+	// routeclass does not admit them as MediaProxy.
 	if resourceImageParts(parts) {
 		return resourceRouteImage
 	}
-	if len(parts) >= 3 && (strings.EqualFold(parts[0], "Videos") || strings.EqualFold(parts[0], "Audio")) && parts[1] != "" {
-		for _, part := range parts[2:] {
-			if part == "" {
-				return resourceRouteNone
-			}
-		}
-		return resourceRouteMedia
-	}
-	if len(parts) == 3 && strings.EqualFold(parts[0], "Items") && parts[1] != "" && strings.EqualFold(parts[2], "Download") {
+	if resourceMediaAdmittedByRouteclass(method, rel) {
 		return resourceRouteMedia
 	}
 	return resourceRouteNone
+}
+
+func resourceMediaAdmittedByRouteclass(method, rel string) bool {
+	d := routeclass.Classify(method, rel)
+	return d.Ownership == routeclass.MediaProxy &&
+		d.Operation == routeclass.OperationMediaProxy &&
+		d.MethodAllowed
 }
 
 func canonicalResourceRoute(r *http.Request, rel string) bool {
@@ -76,21 +87,33 @@ func canonicalResourceRoute(r *http.Request, rel string) bool {
 	return !strings.Contains(escaped, "%2f") && !strings.Contains(escaped, "%5c") && !strings.Contains(escaped, "%2e")
 }
 
+// resourceImageParts matches exact binary image templates:
+//
+//	/Items/{ItemId}/Images/{ImageType}[/{Index}]
+//	/Users/{UserId}/Images/{ImageType}[/{Index}]  (decimal index only)
+//
+// Rejects Images list metadata, non-decimal indexes, and deeper descendants.
 func resourceImageParts(parts []string) bool {
 	if len(parts) != 4 && len(parts) != 5 {
 		return false
 	}
-	if (!strings.EqualFold(parts[0], "Items") && !strings.EqualFold(parts[0], "Users")) || parts[1] == "" || !strings.EqualFold(parts[2], "Images") || parts[3] == "" {
+	if (!strings.EqualFold(parts[0], "Items") && !strings.EqualFold(parts[0], "Users")) ||
+		parts[1] == "" || !strings.EqualFold(parts[2], "Images") || parts[3] == "" {
 		return false
 	}
 	if len(parts) == 5 {
-		if parts[4] == "" {
+		return isDecimalPathSegment(parts[4])
+	}
+	return true
+}
+
+func isDecimalPathSegment(seg string) bool {
+	if seg == "" {
+		return false
+	}
+	for _, r := range seg {
+		if r < '0' || r > '9' {
 			return false
-		}
-		for _, r := range parts[4] {
-			if r < '0' || r > '9' {
-				return false
-			}
 		}
 	}
 	return true
@@ -168,13 +191,16 @@ func isResourceRedirectPath(rel string) bool {
 		return false
 	}
 	parts := strings.Split(rel[1:], "/")
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+	}
 	if resourceImageParts(parts) {
 		return true
 	}
-	if len(parts) >= 3 && (strings.EqualFold(parts[0], "Videos") || strings.EqualFold(parts[0], "Audio")) && parts[1] != "" {
-		return true
-	}
-	return len(parts) == 3 && strings.EqualFold(parts[0], "Items") && parts[1] != "" && strings.EqualFold(parts[2], "Download")
+	// Path-only redirect ownership uses GET admission (media templates are GET/HEAD).
+	return resourceMediaAdmittedByRouteclass(http.MethodGet, rel)
 }
 
 func applyResourceCachePolicy(h http.Header, kind resourceRouteKind, status int) {

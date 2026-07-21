@@ -15,7 +15,6 @@ func TestPhase7ResponseProjectionIsExplicit(t *testing.T) {
 	}
 	kinds := []responseProjectionKind{
 		responseProjectionOpaque,
-		responseProjectionLegacyCompatibility,
 		responseProjectionBaseItem,
 		responseProjectionBaseItemEnvelope,
 		responseProjectionBaseItemArray,

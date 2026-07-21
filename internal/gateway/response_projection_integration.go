@@ -12,9 +12,6 @@ import (
 )
 
 func responseProjectionForRoute(method, rel string, decision routeclass.Decision) responseProjection {
-	if decision.Ownership == routeclass.LegacyProxy || decision.Operation == routeclass.OperationLegacyProxy {
-		return newResponseProjection(responseProjectionLegacyCompatibility)
-	}
 	if decision.Operation == routeclass.OperationPlaybackInfo {
 		return newResponseProjection(responseProjectionPlaybackInfo)
 	}

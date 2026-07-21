@@ -146,7 +146,7 @@ func TestPersonalPlanHTTPLocalOutputPreservesOracleBigInteger(t *testing.T) {
 	if err := store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "item", IsFavorite: true}); err != nil {
 		t.Fatal(err)
 	}
-	response := personalPlanHTTPRequest(server, "/Items?api_key=gateway-token&IsFavorite=true")
+	response := personalPlanHTTPRequest(server, "/Users/gateway-user/Items?api_key=gateway-token&IsFavorite=true")
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"Big":`+oracleBigInteger) {
 		t.Fatalf("status=%d body=%q", response.Code, response.Body.String())
 	}

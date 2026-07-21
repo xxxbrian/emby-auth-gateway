@@ -47,7 +47,7 @@ func personalPlanHTTPServerWithStore(t *testing.T, store Store, base *MemoryStor
 
 func personalPlanHTTPServer(t *testing.T, fake *personalPlanSourceMetadataFake) (*Server, *MemoryStore, *phase5AuthSpy) {
 	t.Helper()
-	server, store, auth, _, _, _ := phase5DispatchServer(t)
+	server, store, auth, _, _ := phase5DispatchServer(t)
 	server.metadataUpstream = fake
 	return server, store, auth
 }
@@ -64,13 +64,13 @@ func TestPersonalPlanHTTPRejectsInvalidQueryAndIdentityBeforeEgress(t *testing.T
 		target string
 		status int
 	}{
-		{"malformed bool", "/Items?api_key=gateway-token&IsPlayed=maybe", http.StatusBadRequest},
-		{"malformed int", "/Items?api_key=gateway-token&IsFavorite=true&Limit=nope", http.StatusBadRequest},
-		{"duplicate alias", "/Items?api_key=gateway-token&IsFavorite=true&isfavorite=true", http.StatusBadRequest},
-		{"unknown filter", "/Items?api_key=gateway-token&Filters=NoSuchFilter", http.StatusBadRequest},
+		{"malformed bool", "/Users/gateway-user/Items?api_key=gateway-token&IsPlayed=maybe", http.StatusBadRequest},
+		{"malformed int", "/Users/gateway-user/Items?api_key=gateway-token&IsFavorite=true&Limit=nope", http.StatusBadRequest},
+		{"duplicate alias", "/Users/gateway-user/Items?api_key=gateway-token&IsFavorite=true&isfavorite=true", http.StatusBadRequest},
+		{"unknown filter", "/Users/gateway-user/Items?api_key=gateway-token&Filters=NoSuchFilter", http.StatusBadRequest},
 		{"foreign path", "/Users/foreign/Items?api_key=gateway-token&IsFavorite=true", http.StatusForbidden},
-		{"duplicate UserId", "/Items?api_key=gateway-token&UserId=gateway-user&UserId=gateway-user&IsFavorite=true", http.StatusBadRequest},
-		{"case variant UserId", "/Items?api_key=gateway-token&UserId=gateway-user&userid=gateway-user&IsFavorite=true", http.StatusBadRequest},
+		{"duplicate UserId", "/Users/gateway-user/Items?api_key=gateway-token&UserId=gateway-user&UserId=gateway-user&IsFavorite=true", http.StatusBadRequest},
+		{"case variant UserId", "/Users/gateway-user/Items?api_key=gateway-token&UserId=gateway-user&userid=gateway-user&IsFavorite=true", http.StatusBadRequest},
 		{"foreign query", "/Items?api_key=gateway-token&UserId=foreign&IsFavorite=true", http.StatusForbidden},
 		{"unsupported path", "/System/Info?api_key=gateway-token&Filters=Likes", http.StatusBadRequest},
 	}
@@ -102,7 +102,7 @@ func TestPersonalPlanHTTPPassthroughPreservesShapeAndSuppliedPagination(t *testi
 			fake := &personalPlanSourceMetadataFake{status: http.StatusOK, body: test.body, snapshot: personalPlanSourceUpstreamSnapshot()}
 			server, _, _ := personalPlanHTTPServer(t, fake)
 			defer server.Close()
-			response := personalPlanHTTPRequest(server, "/Items?api_key=gateway-token")
+			response := personalPlanHTTPRequest(server, "/Users/gateway-user/Items?api_key=gateway-token")
 			if response.Code != test.wantStatus || fake.calls != 1 {
 				t.Fatalf("status=%d calls=%d body=%q", response.Code, fake.calls, response.Body.String())
 			}
@@ -140,7 +140,7 @@ func TestPersonalPlanHTTPPassthroughRejectsMalformedSuppliedTotal(t *testing.T) 
 	} {
 		fake := &personalPlanSourceMetadataFake{status: http.StatusOK, body: body, snapshot: personalPlanSourceUpstreamSnapshot()}
 		server, _, _ := personalPlanHTTPServer(t, fake)
-		response := personalPlanHTTPRequest(server, "/Items?api_key=gateway-token")
+		response := personalPlanHTTPRequest(server, "/Users/gateway-user/Items?api_key=gateway-token")
 		server.Close()
 		if response.Code != http.StatusBadGateway || fake.calls != 1 || strings.HasPrefix(strings.TrimSpace(response.Body.String()), "{") {
 			t.Fatalf("status=%d calls=%d body=%q", response.Code, fake.calls, response.Body.String())
@@ -168,7 +168,7 @@ func TestPersonalPlanHTTPPositiveTotalBeforeLimitZeroAndResumeDoesNotGroupSeries
 				t.Fatal(err)
 			}
 		}
-		response := personalPlanHTTPRequest(server, "/Items?api_key=gateway-token&IsFavorite=true&Limit=0")
+		response := personalPlanHTTPRequest(server, "/Users/gateway-user/Items?api_key=gateway-token&IsFavorite=true&Limit=0")
 		var result struct {
 			Items            []any
 			TotalRecordCount int
@@ -222,7 +222,7 @@ func TestPersonalPlanHTTPNegativeTotalBeforeLimitZero(t *testing.T) {
 	request := func(target string) *httptest.ResponseRecorder {
 		return personalPlanHTTPRequest(server, target)
 	}
-	response := request("/Items?api_key=gateway-token&Filters=IsUnplayed&Limit=0")
+	response := request("/Users/gateway-user/Items?api_key=gateway-token&Filters=IsUnplayed&Limit=0")
 	var result struct {
 		Items            []any
 		TotalRecordCount int
@@ -270,6 +270,7 @@ func TestPersonalPlanHTTPLatestGroupedAndUngroupedArrays(t *testing.T) {
 		fake := &personalPlanSourceMetadataFake{responses: []personalPlanSourceMetadataResponse{
 			{status: http.StatusOK, body: `[{"Id":"episode-1","Type":"Episode","SeriesId":"series-1"}]`, snapshot: personalPlanSourceUpstreamSnapshot()},
 			{status: http.StatusOK, body: `{"Items":[{"Id":"series-1","Type":"Series"}]}`, snapshot: personalPlanSourceUpstreamSnapshot()},
+			{status: http.StatusOK, body: `[{"Id":"episode-1","Type":"Episode","SeriesId":"series-1"}]`, snapshot: personalPlanSourceUpstreamSnapshot()},
 		}}
 		server, _, _ := personalPlanHTTPServer(t, fake)
 		defer server.Close()
@@ -277,6 +278,9 @@ func TestPersonalPlanHTTPLatestGroupedAndUngroupedArrays(t *testing.T) {
 		var result []map[string]any
 		if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &result) != nil || len(result) != 1 || result[0]["Type"] != "Series" {
 			t.Fatalf("status=%d result=%v body=%q", response.Code, result, response.Body.String())
+		}
+		if result[0]["ChildCount"] != float64(1) {
+			t.Fatalf("ChildCount=%v", result[0]["ChildCount"])
 		}
 	})
 	t.Run("ungrouped", func(t *testing.T) {
@@ -310,8 +314,9 @@ func TestPersonalPlanHTTPShowRefinementAndErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := personalPlanHTTPRequest(server, "/Shows/show-1/Episodes?api_key=gateway-token&IsFavorite=true")
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"TotalRecordCount":0`) {
-		t.Fatalf("status=%d body=%q", response.Code, response.Body.String())
+	// Phase 8: Shows Episodes is Unclassified; classifier denies before personal plan.
+	if response.Code != http.StatusNotFound || response.Body.String() != "not found\n" {
+		t.Fatalf("status=%d body=%q, want Unclassified 404", response.Code, response.Body.String())
 	}
 }
 
@@ -323,7 +328,7 @@ func TestPersonalPlanHTTPStoreCandidateAndIncompleteErrors(t *testing.T) {
 		fake := &personalPlanSourceMetadataFake{}
 		server, auth := personalPlanHTTPServerWithStore(t, store, base, fake)
 		defer server.Close()
-		response := personalPlanHTTPRequest(server, "/Items?api_key=gateway-token&IsFavorite=true")
+		response := personalPlanHTTPRequest(server, "/Users/gateway-user/Items?api_key=gateway-token&IsFavorite=true")
 		if response.Code != http.StatusInternalServerError || auth.ensure != 0 || fake.calls != 0 {
 			t.Fatalf("status=%d ensure=%d metadata=%d", response.Code, auth.ensure, fake.calls)
 		}
@@ -346,7 +351,7 @@ func TestPersonalPlanHTTPStoreCandidateAndIncompleteErrors(t *testing.T) {
 			if err := store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "item-1", IsFavorite: true}); err != nil {
 				t.Fatal(err)
 			}
-			response := personalPlanHTTPRequest(server, "/Items?api_key=gateway-token&IsFavorite=true")
+			response := personalPlanHTTPRequest(server, "/Users/gateway-user/Items?api_key=gateway-token&IsFavorite=true")
 			if response.Code != http.StatusBadGateway {
 				t.Fatalf("status=%d body=%q", response.Code, response.Body.String())
 			}
@@ -365,12 +370,12 @@ func TestPersonalPlanHTTPIncompleteAuditIsSafe(t *testing.T) {
 	}
 	server, _ := personalPlanHTTPServerWithStore(t, store, base, &personalPlanSourceMetadataFake{})
 	defer server.Close()
-	response := personalPlanHTTPRequest(server, "/Items?api_key=gateway-token&IsFavorite=true&SearchTerm=secret")
+	response := personalPlanHTTPRequest(server, "/Users/gateway-user/Items?api_key=gateway-token&IsFavorite=true&SearchTerm=secret")
 	if response.Code != http.StatusServiceUnavailable || strings.HasPrefix(strings.TrimSpace(response.Body.String()), "{") || len(store.AuditLogs) != 1 {
 		t.Fatalf("status=%d audits=%d body=%q", response.Code, len(store.AuditLogs), response.Body.String())
 	}
 	audit := store.AuditLogs[0]
-	if audit.Event != "personal_query_incomplete" || audit.ErrorKind != "personal_query_incomplete" || audit.Status != http.StatusServiceUnavailable || audit.GatewayUserID != "u1" || audit.SyntheticUserID != "gateway-user" || audit.Path != "/Items" || strings.Contains(audit.Message, "secret") || strings.Contains(audit.Message, "gateway-token") || strings.Contains(audit.Message, "item-") {
+	if audit.Event != "personal_query_incomplete" || audit.ErrorKind != "personal_query_incomplete" || audit.Status != http.StatusServiceUnavailable || audit.GatewayUserID != "u1" || audit.SyntheticUserID != "gateway-user" || audit.Path != "/Users/gateway-user/Items" || strings.Contains(audit.Message, "secret") || strings.Contains(audit.Message, "gateway-token") || strings.Contains(audit.Message, "item-") {
 		t.Fatalf("unsafe or incorrect audit=%#v", audit)
 	}
 }
@@ -387,7 +392,7 @@ func TestPersonalPlanHTTPUnsafeNegativeCandidateIsUpstreamFailure(t *testing.T) 
 	server, _ := personalPlanHTTPServerWithStore(t, store, base, fake)
 	defer server.Close()
 
-	response := personalPlanHTTPRequest(server, "/Items?api_key=gateway-token&Filters=IsUnplayed")
+	response := personalPlanHTTPRequest(server, "/Users/gateway-user/Items?api_key=gateway-token&Filters=IsUnplayed")
 	body := response.Body.String()
 	if response.Code != http.StatusBadGateway {
 		t.Fatalf("status=%d, want 502; body=%q", response.Code, body)

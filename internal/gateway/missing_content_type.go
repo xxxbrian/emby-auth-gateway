@@ -3,7 +3,6 @@ package gateway
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -36,33 +35,6 @@ func (s *Server) writeMissingContentTypeResponse(w http.ResponseWriter, r *http.
 		}
 		plan.Commit(w.Header())
 		return true
-	}
-	if projection.kind == responseProjectionLegacyCompatibility {
-		var value any
-		if looksLikeJSON(data) && json.Unmarshal(data, &value) == nil {
-			rewritten := s.rewriteProxyJSONValueForRequestWithSnapshot(r.Context(), r, value, session, upstream, gatewayToken, publicGatewayBase)
-			payload, err := json.Marshal(rewritten)
-			if err != nil {
-				s.writeResponseProjectionFailure(w, r, rel, session)
-				return
-			}
-			clearProjectedEntityHeaders(header)
-			header.Set("Content-Type", "application/json")
-			if !commit() {
-				return
-			}
-			w.WriteHeader(resp.StatusCode)
-			_, _ = countEgressWrite(w, s.meter, nil, appendJSONNewline(payload))
-			return
-		}
-		out := rewriteBytesWithSnapshot(data, session, upstream, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
-		setContentLength(header, int64(len(out)))
-		if !commit() {
-			return
-		}
-		w.WriteHeader(resp.StatusCode)
-		_, _ = countEgressWrite(w, s.meter, nil, out)
-		return
 	}
 	if projection.kind == responseProjectionOpaque {
 		if looksLikeJSON(data) {

@@ -51,7 +51,7 @@ func TestProxyCloseLifecycleInitialSuccess(t *testing.T) {
 	body := newLifecycleCloseBody(`{"ok":true}`, nil)
 	var response *http.Response
 	transport := lifecycleRoundTripper(func(req *http.Request) (*http.Response, error) {
-		if req.URL.Path != "/emby/Items" {
+		if req.URL.Path != "/emby/Users/backend-user/Items" && req.URL.Path != "/emby/Users/gateway-user/Items" {
 			t.Fatalf("unexpected request %s", req.URL.Path)
 		}
 		response = lifecycleResponse(http.StatusOK, "application/json", body)
@@ -59,7 +59,7 @@ func TestProxyCloseLifecycleInitialSuccess(t *testing.T) {
 	})
 	server := newLifecycleTestServer(t, transport)
 	writer := httptest.NewRecorder()
-	server.ServeHTTP(writer, lifecycleGatewayRequest("/emby/Items?api_key=gateway-token"))
+	server.ServeHTTP(writer, lifecycleGatewayRequest("/emby/Users/gateway-user/Items?api_key=gateway-token"))
 	if writer.Code != http.StatusOK || !strings.Contains(writer.Body.String(), `"ok":true`) || body.closeCount() != 1 {
 		t.Fatalf("status=%d body=%q closes=%d", writer.Code, writer.Body.String(), body.closeCount())
 	}
@@ -76,7 +76,7 @@ func TestProxyUnauthorizedRetryCloseLifecycle(t *testing.T) {
 	itemsCalls := 0
 	transport := lifecycleRoundTripper(func(req *http.Request) (*http.Response, error) {
 		switch req.URL.Path {
-		case "/emby/Items":
+		case "/emby/Users/backend-user/Items", "/emby/Users/gateway-user/Items":
 			itemsCalls++
 			if itemsCalls == 1 {
 				initialResponse = lifecycleResponse(http.StatusUnauthorized, "text/plain", initial)
@@ -98,7 +98,8 @@ func TestProxyUnauthorizedRetryCloseLifecycle(t *testing.T) {
 	})
 	server := newLifecycleTestServer(t, transport)
 	writer := httptest.NewRecorder()
-	server.ServeHTTP(writer, lifecycleGatewayRequest("/emby/Items?api_key=gateway-token"))
+	// Curated user Items path (global /Items is Unclassified).
+	server.ServeHTTP(writer, lifecycleGatewayRequest("/emby/Users/gateway-user/Items?api_key=gateway-token"))
 	if writer.Code != http.StatusOK || itemsCalls != 2 {
 		t.Fatalf("status=%d item calls=%d body=%q", writer.Code, itemsCalls, writer.Body.String())
 	}
@@ -118,7 +119,7 @@ func TestProxyUnauthorizedRetryCloseLifecycle(t *testing.T) {
 
 func TestDownloadForbiddenFallbackCloseLifecycle(t *testing.T) {
 	original := newLifecycleCloseBody("forbidden", nil)
-	playback := newLifecycleCloseBody(`{"MediaSources":[{"Id":"source-1","Name":"movie","Container":"mkv","DirectStreamUrl":"/Videos/item-1/original.mkv?MediaSourceId=source-1","SupportsDirectStream":true}]}`, nil)
+	playback := newLifecycleCloseBody(`{"MediaSources":[{"Id":"source-1","Name":"movie","Container":"mkv","DirectStreamUrl":"/Videos/item-1/stream?MediaSourceId=source-1","SupportsDirectStream":true}]}`, nil)
 	replacement := newLifecycleCloseBody("data", nil)
 	var originalResponse, playbackResponse, replacementResponse *http.Response
 	transport := lifecycleRoundTripper(func(req *http.Request) (*http.Response, error) {
@@ -129,7 +130,7 @@ func TestDownloadForbiddenFallbackCloseLifecycle(t *testing.T) {
 		case "/emby/Items/item-1/PlaybackInfo":
 			playbackResponse = lifecycleResponse(http.StatusOK, "application/json", playback)
 			return playbackResponse, nil
-		case "/emby/Videos/item-1/original.mkv":
+		case "/emby/Videos/item-1/stream":
 			replacementResponse = lifecycleResponse(http.StatusOK, "application/octet-stream", replacement)
 			return replacementResponse, nil
 		default:

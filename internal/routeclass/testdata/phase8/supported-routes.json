@@ -1,0 +1,2225 @@
+{
+  "schemaVersion": 1,
+  "kind": "supported-routes",
+  "provenance": {
+    "kind": "curated",
+    "notes": "Authoritative ordinary-client allow set mirrored from routeclass.Inventory(). Each method+pathTemplate is exactly one inventory rule expansion. Classifier matches the same inventory (no runtime JSON parsing). Evidence refs retained from prior curation where present. Not generated from OpenAPI. Denied: global /Items, Shows Episodes/Seasons, HideFromResume, ScheduledTasks, generic filenames, admin families."
+  },
+  "routes": [
+    {
+      "id": "delete-users-userid-favoriteitems-itemid",
+      "method": "DELETE",
+      "path": "/Users/{UserId}/FavoriteItems/{ItemId}",
+      "pathTemplate": "/Users/{UserId}/FavoriteItems/{ItemId}",
+      "queryNames": [],
+      "ownership": "LocalPersonal",
+      "operation": "Personal",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable personal favorite delete; classifier LocalPersonal."
+        }
+      ]
+    },
+    {
+      "id": "delete-users-userid-items-itemid-rating",
+      "method": "DELETE",
+      "path": "/Users/{UserId}/Items/{ItemId}/Rating",
+      "pathTemplate": "/Users/{UserId}/Items/{ItemId}/Rating",
+      "queryNames": [],
+      "ownership": "LocalPersonal",
+      "operation": "Personal",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule DELETE /Users/{UserId}/Items/{ItemId}/Rating (LocalPersonal); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "delete-users-userid-playeditems-itemid",
+      "method": "DELETE",
+      "path": "/Users/{UserId}/PlayedItems/{ItemId}",
+      "pathTemplate": "/Users/{UserId}/PlayedItems/{ItemId}",
+      "queryNames": [],
+      "ownership": "LocalPersonal",
+      "operation": "Personal",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable personal played delete; classifier LocalPersonal (method-open personal)."
+        }
+      ]
+    },
+    {
+      "id": "delete-videos-activeencodings",
+      "method": "DELETE",
+      "path": "/Videos/ActiveEncodings",
+      "pathTemplate": "/Videos/ActiveEncodings",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "ActiveEncodingsDelete",
+      "projection": "none",
+      "egress": "negotiation",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable ActiveEncodings DELETE; classifier OperationActiveEncodingsDelete."
+        }
+      ]
+    },
+    {
+      "id": "get-audio-itemid-stream",
+      "method": "GET",
+      "path": "/Audio/{ItemId}/stream",
+      "pathTemplate": "/Audio/{ItemId}/stream",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable response_url_test Audio stream rewrite; official GET/HEAD /Audio/{Id}/stream. Compatibility decision."
+        }
+      ]
+    },
+    {
+      "id": "get-audio-itemid-stream-container",
+      "method": "GET",
+      "path": "/Audio/{ItemId}/stream.{Container}",
+      "pathTemplate": "/Audio/{ItemId}/stream.{Container}",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Official inventory GET/HEAD /Audio/{Id}/stream.{Container}; finite container allowlist. Compatibility decision."
+        }
+      ]
+    },
+    {
+      "id": "get-branding-configuration",
+      "method": "GET",
+      "path": "/Branding/Configuration",
+      "pathTemplate": "/Branding/Configuration",
+      "queryNames": [],
+      "ownership": "LocalPublic",
+      "operation": "BrandingConfiguration",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "public",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#login-home:2",
+          "notes": "status 200"
+        },
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#search-detail:2",
+          "notes": "status 200"
+        }
+      ]
+    },
+    {
+      "id": "get-branding-css-css",
+      "method": "GET",
+      "path": "/Branding/Css.css",
+      "pathTemplate": "/Branding/Css.css",
+      "queryNames": [],
+      "ownership": "LocalPublic",
+      "operation": "BrandingCSS",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "public",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable branding CSS handler; classifier OperationBrandingCSS."
+        }
+      ]
+    },
+    {
+      "id": "get-displaypreferences-id",
+      "method": "GET",
+      "path": "/DisplayPreferences/{Id}",
+      "pathTemplate": "/DisplayPreferences/{Id}",
+      "queryNames": [],
+      "ownership": "LocalPersonal",
+      "operation": "Personal",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#login-home:8",
+          "notes": "status 200"
+        },
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#search-detail:8",
+          "notes": "status 200"
+        }
+      ]
+    },
+    {
+      "id": "get-items-itemid-download",
+      "method": "GET",
+      "path": "/Items/{ItemId}/Download",
+      "pathTemplate": "/Items/{ItemId}/Download",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable: TestDownloadForbiddenFallsBackToOfficialPlaybackInfoDirectStream, TestDownloadNonForbiddenDoesNotResolvePlaybackInfo, TestResourceCookieRouteAndCredentialPolicy. Official inventory GET /Items/{Id}/Download. Compatibility decision (not stable-Web observed)."
+        }
+      ]
+    },
+    {
+      "id": "get-items-itemid-images-imagetype",
+      "method": "GET",
+      "path": "/Items/{ItemId}/Images/{ImageType}",
+      "pathTemplate": "/Items/{ItemId}/Images/{ImageType}",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "anonymous-or-resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "observed-detail-image.tsv empty; direct tokenless image HTTP 200 verified in browser during capture; executable coverage TestResourceCookieAuthenticatesImageWithoutForwardingCookie, TestResourceCookieRouteAndCredentialPolicy, TestAnonymousItemImageForwardsOnlyValidatedTokenlessRequest. No query values invented."
+        }
+      ]
+    },
+    {
+      "id": "get-items-itemid-images-imagetype-index",
+      "method": "GET",
+      "path": "/Items/{ItemId}/Images/{ImageType}/{Index}",
+      "pathTemplate": "/Items/{ItemId}/Images/{ImageType}/{Index}",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "anonymous-or-resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable anonymous/resource-cookie image with decimal index; classifier exact 5-segment image."
+        }
+      ]
+    },
+    {
+      "id": "get-items-itemid-playbackinfo",
+      "method": "GET",
+      "path": "/Items/{ItemId}/PlaybackInfo",
+      "pathTemplate": "/Items/{ItemId}/PlaybackInfo",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "PlaybackInfo",
+      "projection": "PlaybackInfo",
+      "egress": "negotiation",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable PlaybackInfo GET; classifier OperationPlaybackInfo GET/POST. Companion to curated POST."
+        }
+      ]
+    },
+    {
+      "id": "get-items-itemid-similar",
+      "method": "GET",
+      "path": "/Items/{ItemId}/Similar",
+      "pathTemplate": "/Items/{ItemId}/Similar",
+      "queryNames": [],
+      "ownership": "MetadataProxy",
+      "operation": "MetadataProxy",
+      "projection": "BaseItemEnvelope",
+      "egress": "metadata",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#search-detail:42",
+          "notes": "status 200"
+        }
+      ]
+    },
+    {
+      "id": "get-items-itemid-thememedia",
+      "method": "GET",
+      "path": "/Items/{ItemId}/ThemeMedia",
+      "pathTemplate": "/Items/{ItemId}/ThemeMedia",
+      "queryNames": [],
+      "ownership": "MetadataProxy",
+      "operation": "MetadataProxy",
+      "projection": "AllThemeMedia",
+      "egress": "metadata",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#search-detail:43",
+          "notes": "status 200"
+        }
+      ]
+    },
+    {
+      "id": "get-items-itemid-mediasourceid-subtitles-index-stream-format",
+      "method": "GET",
+      "path": "/Items/{ItemId}/{MediaSourceId}/Subtitles/{Index}/Stream.{Format}",
+      "pathTemplate": "/Items/{ItemId}/{MediaSourceId}/Subtitles/{Index}/Stream.{Format}",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Official inventory Items subtitle Stream.{Format} alias. Compatibility decision."
+        }
+      ]
+    },
+    {
+      "id": "get-items-itemid-mediasourceid-subtitles-index-startpositionticks-stream-format",
+      "method": "GET",
+      "path": "/Items/{ItemId}/{MediaSourceId}/Subtitles/{Index}/{StartPositionTicks}/Stream.{Format}",
+      "pathTemplate": "/Items/{ItemId}/{MediaSourceId}/Subtitles/{Index}/{StartPositionTicks}/Stream.{Format}",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Official inventory Items subtitle with StartPositionTicks. Compatibility decision."
+        }
+      ]
+    },
+    {
+      "id": "get-sessions",
+      "method": "GET",
+      "path": "/Sessions",
+      "pathTemplate": "/Sessions",
+      "queryNames": [],
+      "ownership": "LocalSession",
+      "operation": "SessionList",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable local Sessions list; classifier OperationSessionList."
+        }
+      ]
+    },
+    {
+      "id": "get-shows-nextup",
+      "method": "GET",
+      "path": "/Shows/NextUp",
+      "pathTemplate": "/Shows/NextUp",
+      "queryNames": [],
+      "ownership": "LocalPersonal",
+      "operation": "Personal",
+      "projection": "BaseItemEnvelope",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable personal NextUp plan; classifier LocalPersonal OperationPersonal."
+        }
+      ]
+    },
+    {
+      "id": "get-system-endpoint",
+      "method": "GET",
+      "path": "/System/Endpoint",
+      "pathTemplate": "/System/Endpoint",
+      "queryNames": [],
+      "ownership": "MetadataProxy",
+      "operation": "MetadataProxy",
+      "projection": "opaque",
+      "egress": "metadata",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#search-detail:38",
+          "notes": "status 200"
+        }
+      ]
+    },
+    {
+      "id": "get-system-info",
+      "method": "GET",
+      "path": "/System/Info",
+      "pathTemplate": "/System/Info",
+      "queryNames": [],
+      "ownership": "MetadataProxy",
+      "operation": "MetadataProxy",
+      "projection": "SystemInfo",
+      "egress": "metadata",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#login-home:9",
+          "notes": "status 200"
+        },
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#search-detail:9",
+          "notes": "status 200"
+        }
+      ]
+    },
+    {
+      "id": "get-system-info-public",
+      "method": "GET",
+      "path": "/System/Info/Public",
+      "pathTemplate": "/System/Info/Public",
+      "queryNames": [],
+      "ownership": "LocalPublic",
+      "operation": "PublicSystemInfo",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "public",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#login-home:0",
+          "notes": "status 200"
+        },
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#search-detail:0",
+          "notes": "status 200"
+        }
+      ]
+    },
+    {
+      "id": "get-system-ping",
+      "method": "GET",
+      "path": "/System/Ping",
+      "pathTemplate": "/System/Ping",
+      "queryNames": [],
+      "ownership": "LocalPublic",
+      "operation": "Ping",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "public",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable public ping handler; classifier OperationPing GET/POST."
+        }
+      ]
+    },
+    {
+      "id": "get-users-public",
+      "method": "GET",
+      "path": "/Users/Public",
+      "pathTemplate": "/Users/Public",
+      "queryNames": [],
+      "ownership": "LocalPublic",
+      "operation": "PublicUsers",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "public",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#login-home:1",
+          "notes": "status 200"
+        },
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#search-detail:1",
+          "notes": "status 200"
+        }
+      ]
+    },
+    {
+      "id": "get-users-userid",
+      "method": "GET",
+      "path": "/Users/{UserId}",
+      "pathTemplate": "/Users/{UserId}",
+      "queryNames": [],
+      "ownership": "LocalPersonal",
+      "operation": "CurrentUser",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#search-detail:37",
+          "notes": "status 200"
+        }
+      ]
+    },
+    {
+      "id": "get-users-userid-items",
+      "method": "GET",
+      "path": "/Users/{UserId}/Items",
+      "pathTemplate": "/Users/{UserId}/Items",
+      "queryNames": [],
+      "ownership": "MetadataProxy",
+      "operation": "MetadataProxy",
+      "projection": "BaseItemEnvelope",
+      "egress": "metadata",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#login-home:11",
+          "notes": "status 200"
+        },
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#search-detail:11",
+          "notes": "status 200"
+        }
+      ]
+    },
+    {
+      "id": "get-users-userid-items-latest",
+      "method": "GET",
+      "path": "/Users/{UserId}/Items/Latest",
+      "pathTemplate": "/Users/{UserId}/Items/Latest",
+      "queryNames": [],
+      "ownership": "LocalPersonal",
+      "operation": "Personal",
+      "projection": "BaseItemArray",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#login-home:15",
+          "notes": "status 200"
+        },
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#search-detail:15",
+          "notes": "status 200"
+        }
+      ]
+    },
+    {
+      "id": "get-users-userid-items-resume",
+      "method": "GET",
+      "path": "/Users/{UserId}/Items/Resume",
+      "pathTemplate": "/Users/{UserId}/Items/Resume",
+      "queryNames": [],
+      "ownership": "LocalPersonal",
+      "operation": "Personal",
+      "projection": "BaseItemEnvelope",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#login-home:13",
+          "notes": "status 200"
+        },
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#search-detail:13",
+          "notes": "status 200"
+        }
+      ]
+    },
+    {
+      "id": "get-users-userid-items-itemid",
+      "method": "GET",
+      "path": "/Users/{UserId}/Items/{ItemId}",
+      "pathTemplate": "/Users/{UserId}/Items/{ItemId}",
+      "queryNames": [],
+      "ownership": "MetadataProxy",
+      "operation": "MetadataProxy",
+      "projection": "BaseItem",
+      "egress": "metadata",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#search-detail:36",
+          "notes": "status 200"
+        }
+      ]
+    },
+    {
+      "id": "get-users-userid-items-itemid-specialfeatures",
+      "method": "GET",
+      "path": "/Users/{UserId}/Items/{ItemId}/SpecialFeatures",
+      "pathTemplate": "/Users/{UserId}/Items/{ItemId}/SpecialFeatures",
+      "queryNames": [],
+      "ownership": "MetadataProxy",
+      "operation": "MetadataProxy",
+      "projection": "BaseItemArray",
+      "egress": "metadata",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#search-detail:40",
+          "notes": "status 200"
+        }
+      ]
+    },
+    {
+      "id": "get-users-userid-views",
+      "method": "GET",
+      "path": "/Users/{UserId}/Views",
+      "pathTemplate": "/Users/{UserId}/Views",
+      "queryNames": [],
+      "ownership": "MetadataProxy",
+      "operation": "MetadataProxy",
+      "projection": "BaseItemEnvelope",
+      "egress": "metadata",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#login-home:10",
+          "notes": "status 200"
+        },
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#search-detail:10",
+          "notes": "status 200"
+        }
+      ]
+    },
+    {
+      "id": "get-videos-itemid-hls-playlistid-segmentid-segmentcontainer",
+      "method": "GET",
+      "path": "/Videos/{ItemId}/hls/{PlaylistId}/{SegmentId}.{SegmentContainer}",
+      "pathTemplate": "/Videos/{ItemId}/hls/{PlaylistId}/{SegmentId}.{SegmentContainer}",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Official inventory GET /Videos/{Id}/hls/{PlaylistId}/{SegmentId}.{SegmentContainer}. Exact 5-segment depth. Compatibility decision."
+        }
+      ]
+    },
+    {
+      "id": "get-videos-itemid-hls-segmentid-segmentcontainer",
+      "method": "GET",
+      "path": "/Videos/{ItemId}/hls/{SegmentId}.{SegmentContainer}",
+      "pathTemplate": "/Videos/{ItemId}/hls/{SegmentId}.{SegmentContainer}",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable m3u8 rewrite produces /Videos/{id}/hls/seg0.ts (server_test). Exact 4-segment depth; segment container allowlist ts/m4s/mp4/aac/vtt. Compatibility decision."
+        }
+      ]
+    },
+    {
+      "id": "get-videos-itemid-hls1-playlistid-segmentid-segmentcontainer",
+      "method": "GET",
+      "path": "/Videos/{ItemId}/hls1/{PlaylistId}/{SegmentId}.{SegmentContainer}",
+      "pathTemplate": "/Videos/{ItemId}/hls1/{PlaylistId}/{SegmentId}.{SegmentContainer}",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Official inventory GET/HEAD /Videos/{Id}/hls1/{PlaylistId}/{SegmentId}.{SegmentContainer}. Compatibility decision."
+        }
+      ]
+    },
+    {
+      "id": "get-videos-itemid-hls1-segmentid-segmentcontainer",
+      "method": "GET",
+      "path": "/Videos/{ItemId}/hls1/{SegmentId}.{SegmentContainer}",
+      "pathTemplate": "/Videos/{ItemId}/hls1/{SegmentId}.{SegmentContainer}",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Official inventory HEAD/GET hls1 segment family (paired with hls). Exact depth + container allowlist. Compatibility decision."
+        }
+      ]
+    },
+    {
+      "id": "get-videos-itemid-main-m3u8",
+      "method": "GET",
+      "path": "/Videos/{ItemId}/main.m3u8",
+      "pathTemplate": "/Videos/{ItemId}/main.m3u8",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Official inventory GET /Videos/{Id}/main.m3u8 (paired with master). Compatibility decision for forced-HLS family."
+        }
+      ]
+    },
+    {
+      "id": "get-videos-itemid-master-m3u8",
+      "method": "GET",
+      "path": "/Videos/{ItemId}/master.m3u8",
+      "pathTemplate": "/Videos/{ItemId}/master.m3u8",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable: TestGatewayMVPTokenMappingAndRewriting, TestCookieOnlyManifestAndChildrenDoNotExposeTokens, proxy_failure m3u8 matrix. Official GET/HEAD /Videos/{Id}/master.m3u8. Compatibility decision."
+        }
+      ]
+    },
+    {
+      "id": "get-videos-itemid-stream",
+      "method": "GET",
+      "path": "/Videos/{ItemId}/stream",
+      "pathTemplate": "/Videos/{ItemId}/stream",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable: media_upstream_test, resource_cookie_test, server_test stream/m3u8 rewrite, media_buffer tests. Official GET/HEAD /Videos/{Id}/stream. Maintained-client pin (plugin.video.emby) direct stream family. Compatibility decision (not stable-Web observed)."
+        }
+      ]
+    },
+    {
+      "id": "get-videos-itemid-stream-container",
+      "method": "GET",
+      "path": "/Videos/{ItemId}/stream.{Container}",
+      "pathTemplate": "/Videos/{ItemId}/stream.{Container}",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Official inventory GET/HEAD /Videos/{Id}/stream.{Container}. Classifier allowlists finite container set (ts/mp4/mkv/\u2026). Compatibility decision; not arbitrary StreamFileName."
+        }
+      ]
+    },
+    {
+      "id": "get-videos-itemid-mediasourceid-subtitles-index-stream-format",
+      "method": "GET",
+      "path": "/Videos/{ItemId}/{MediaSourceId}/Subtitles/{Index}/Stream.{Format}",
+      "pathTemplate": "/Videos/{ItemId}/{MediaSourceId}/Subtitles/{Index}/Stream.{Format}",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Official inventory GET/HEAD Videos subtitle Stream.{Format}. Numeric Index; finite format allowlist. Compatibility decision (not stable-Web observed)."
+        }
+      ]
+    },
+    {
+      "id": "get-videos-itemid-mediasourceid-subtitles-index-startpositionticks-stream-format",
+      "method": "GET",
+      "path": "/Videos/{ItemId}/{MediaSourceId}/Subtitles/{Index}/{StartPositionTicks}/Stream.{Format}",
+      "pathTemplate": "/Videos/{ItemId}/{MediaSourceId}/Subtitles/{Index}/{StartPositionTicks}/Stream.{Format}",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Official inventory Videos subtitle with StartPositionTicks. Compatibility decision."
+        }
+      ]
+    },
+    {
+      "id": "get-embywebsocket",
+      "method": "GET",
+      "path": "/embywebsocket",
+      "pathTemplate": "/embywebsocket",
+      "queryNames": [],
+      "ownership": "LocalSession",
+      "operation": "WebSocket",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable local WebSocket skeleton; classifier OperationWebSocket."
+        }
+      ]
+    },
+    {
+      "id": "head-audio-itemid-stream",
+      "method": "HEAD",
+      "path": "/Audio/{ItemId}/stream",
+      "pathTemplate": "/Audio/{ItemId}/stream",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /Audio/{ItemId}/stream (MediaProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "head-audio-itemid-stream-container",
+      "method": "HEAD",
+      "path": "/Audio/{ItemId}/stream.{Container}",
+      "pathTemplate": "/Audio/{ItemId}/stream.{Container}",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /Audio/{ItemId}/stream.{Container} (MediaProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "head-items-itemid-download",
+      "method": "HEAD",
+      "path": "/Items/{ItemId}/Download",
+      "pathTemplate": "/Items/{ItemId}/Download",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /Items/{ItemId}/Download (MediaProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "head-items-itemid-images-imagetype",
+      "method": "HEAD",
+      "path": "/Items/{ItemId}/Images/{ImageType}",
+      "pathTemplate": "/Items/{ItemId}/Images/{ImageType}",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "anonymous-or-resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /Items/{ItemId}/Images/{ImageType} (MediaProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "head-items-itemid-images-imagetype-index",
+      "method": "HEAD",
+      "path": "/Items/{ItemId}/Images/{ImageType}/{Index}",
+      "pathTemplate": "/Items/{ItemId}/Images/{ImageType}/{Index}",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "anonymous-or-resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /Items/{ItemId}/Images/{ImageType}/{Index} (MediaProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "head-items-itemid-similar",
+      "method": "HEAD",
+      "path": "/Items/{ItemId}/Similar",
+      "pathTemplate": "/Items/{ItemId}/Similar",
+      "queryNames": [],
+      "ownership": "MetadataProxy",
+      "operation": "MetadataProxy",
+      "projection": "BaseItemEnvelope",
+      "egress": "metadata",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /Items/{ItemId}/Similar (MetadataProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "head-items-itemid-thememedia",
+      "method": "HEAD",
+      "path": "/Items/{ItemId}/ThemeMedia",
+      "pathTemplate": "/Items/{ItemId}/ThemeMedia",
+      "queryNames": [],
+      "ownership": "MetadataProxy",
+      "operation": "MetadataProxy",
+      "projection": "AllThemeMedia",
+      "egress": "metadata",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /Items/{ItemId}/ThemeMedia (MetadataProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "head-items-itemid-mediasourceid-subtitles-index-stream-format",
+      "method": "HEAD",
+      "path": "/Items/{ItemId}/{MediaSourceId}/Subtitles/{Index}/Stream.{Format}",
+      "pathTemplate": "/Items/{ItemId}/{MediaSourceId}/Subtitles/{Index}/Stream.{Format}",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /Items/{ItemId}/{MediaSourceId}/Subtitles/{Index}/Stream.{Format} (MediaProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "head-items-itemid-mediasourceid-subtitles-index-startpositionticks-stream-format",
+      "method": "HEAD",
+      "path": "/Items/{ItemId}/{MediaSourceId}/Subtitles/{Index}/{StartPositionTicks}/Stream.{Format}",
+      "pathTemplate": "/Items/{ItemId}/{MediaSourceId}/Subtitles/{Index}/{StartPositionTicks}/Stream.{Format}",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /Items/{ItemId}/{MediaSourceId}/Subtitles/{Index}/{StartPositionTicks}/Stream.{Format} (MediaProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "head-system-endpoint",
+      "method": "HEAD",
+      "path": "/System/Endpoint",
+      "pathTemplate": "/System/Endpoint",
+      "queryNames": [],
+      "ownership": "MetadataProxy",
+      "operation": "MetadataProxy",
+      "projection": "opaque",
+      "egress": "metadata",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /System/Endpoint (MetadataProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "head-system-info",
+      "method": "HEAD",
+      "path": "/System/Info",
+      "pathTemplate": "/System/Info",
+      "queryNames": [],
+      "ownership": "MetadataProxy",
+      "operation": "MetadataProxy",
+      "projection": "SystemInfo",
+      "egress": "metadata",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /System/Info (MetadataProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "head-users-userid-items",
+      "method": "HEAD",
+      "path": "/Users/{UserId}/Items",
+      "pathTemplate": "/Users/{UserId}/Items",
+      "queryNames": [],
+      "ownership": "MetadataProxy",
+      "operation": "MetadataProxy",
+      "projection": "BaseItemEnvelope",
+      "egress": "metadata",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /Users/{UserId}/Items (MetadataProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "head-users-userid-items-itemid",
+      "method": "HEAD",
+      "path": "/Users/{UserId}/Items/{ItemId}",
+      "pathTemplate": "/Users/{UserId}/Items/{ItemId}",
+      "queryNames": [],
+      "ownership": "MetadataProxy",
+      "operation": "MetadataProxy",
+      "projection": "BaseItem",
+      "egress": "metadata",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /Users/{UserId}/Items/{ItemId} (MetadataProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "head-users-userid-items-itemid-specialfeatures",
+      "method": "HEAD",
+      "path": "/Users/{UserId}/Items/{ItemId}/SpecialFeatures",
+      "pathTemplate": "/Users/{UserId}/Items/{ItemId}/SpecialFeatures",
+      "queryNames": [],
+      "ownership": "MetadataProxy",
+      "operation": "MetadataProxy",
+      "projection": "BaseItemArray",
+      "egress": "metadata",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /Users/{UserId}/Items/{ItemId}/SpecialFeatures (MetadataProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "head-users-userid-views",
+      "method": "HEAD",
+      "path": "/Users/{UserId}/Views",
+      "pathTemplate": "/Users/{UserId}/Views",
+      "queryNames": [],
+      "ownership": "MetadataProxy",
+      "operation": "MetadataProxy",
+      "projection": "BaseItemEnvelope",
+      "egress": "metadata",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /Users/{UserId}/Views (MetadataProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "head-videos-itemid-hls-playlistid-segmentid-segmentcontainer",
+      "method": "HEAD",
+      "path": "/Videos/{ItemId}/hls/{PlaylistId}/{SegmentId}.{SegmentContainer}",
+      "pathTemplate": "/Videos/{ItemId}/hls/{PlaylistId}/{SegmentId}.{SegmentContainer}",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /Videos/{ItemId}/hls/{PlaylistId}/{SegmentId}.{SegmentContainer} (MediaProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "head-videos-itemid-hls-segmentid-segmentcontainer",
+      "method": "HEAD",
+      "path": "/Videos/{ItemId}/hls/{SegmentId}.{SegmentContainer}",
+      "pathTemplate": "/Videos/{ItemId}/hls/{SegmentId}.{SegmentContainer}",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /Videos/{ItemId}/hls/{SegmentId}.{SegmentContainer} (MediaProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "head-videos-itemid-hls1-playlistid-segmentid-segmentcontainer",
+      "method": "HEAD",
+      "path": "/Videos/{ItemId}/hls1/{PlaylistId}/{SegmentId}.{SegmentContainer}",
+      "pathTemplate": "/Videos/{ItemId}/hls1/{PlaylistId}/{SegmentId}.{SegmentContainer}",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /Videos/{ItemId}/hls1/{PlaylistId}/{SegmentId}.{SegmentContainer} (MediaProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "head-videos-itemid-hls1-segmentid-segmentcontainer",
+      "method": "HEAD",
+      "path": "/Videos/{ItemId}/hls1/{SegmentId}.{SegmentContainer}",
+      "pathTemplate": "/Videos/{ItemId}/hls1/{SegmentId}.{SegmentContainer}",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /Videos/{ItemId}/hls1/{SegmentId}.{SegmentContainer} (MediaProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "head-videos-itemid-main-m3u8",
+      "method": "HEAD",
+      "path": "/Videos/{ItemId}/main.m3u8",
+      "pathTemplate": "/Videos/{ItemId}/main.m3u8",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /Videos/{ItemId}/main.m3u8 (MediaProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "head-videos-itemid-master-m3u8",
+      "method": "HEAD",
+      "path": "/Videos/{ItemId}/master.m3u8",
+      "pathTemplate": "/Videos/{ItemId}/master.m3u8",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /Videos/{ItemId}/master.m3u8 (MediaProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "head-videos-itemid-stream",
+      "method": "HEAD",
+      "path": "/Videos/{ItemId}/stream",
+      "pathTemplate": "/Videos/{ItemId}/stream",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /Videos/{ItemId}/stream (MediaProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "head-videos-itemid-stream-container",
+      "method": "HEAD",
+      "path": "/Videos/{ItemId}/stream.{Container}",
+      "pathTemplate": "/Videos/{ItemId}/stream.{Container}",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /Videos/{ItemId}/stream.{Container} (MediaProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "head-videos-itemid-mediasourceid-subtitles-index-stream-format",
+      "method": "HEAD",
+      "path": "/Videos/{ItemId}/{MediaSourceId}/Subtitles/{Index}/Stream.{Format}",
+      "pathTemplate": "/Videos/{ItemId}/{MediaSourceId}/Subtitles/{Index}/Stream.{Format}",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /Videos/{ItemId}/{MediaSourceId}/Subtitles/{Index}/Stream.{Format} (MediaProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "head-videos-itemid-mediasourceid-subtitles-index-startpositionticks-stream-format",
+      "method": "HEAD",
+      "path": "/Videos/{ItemId}/{MediaSourceId}/Subtitles/{Index}/{StartPositionTicks}/Stream.{Format}",
+      "pathTemplate": "/Videos/{ItemId}/{MediaSourceId}/Subtitles/{Index}/{StartPositionTicks}/Stream.{Format}",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "MediaProxy",
+      "projection": "opaque",
+      "egress": "media",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "resource-cookie-or-session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule HEAD /Videos/{ItemId}/{MediaSourceId}/Subtitles/{Index}/{StartPositionTicks}/Stream.{Format} (MediaProxy); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "post-displaypreferences-id",
+      "method": "POST",
+      "path": "/DisplayPreferences/{Id}",
+      "pathTemplate": "/DisplayPreferences/{Id}",
+      "queryNames": [],
+      "ownership": "LocalPersonal",
+      "operation": "Personal",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Inventory rule POST /DisplayPreferences/{Id} (LocalPersonal); executable handler/classifier coverage."
+        }
+      ]
+    },
+    {
+      "id": "post-items-itemid-playbackinfo",
+      "method": "POST",
+      "path": "/Items/{ItemId}/PlaybackInfo",
+      "pathTemplate": "/Items/{ItemId}/PlaybackInfo",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "PlaybackInfo",
+      "projection": "PlaybackInfo",
+      "egress": "negotiation",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#search-detail:39",
+          "notes": "status 200"
+        }
+      ]
+    },
+    {
+      "id": "post-livestreams-close",
+      "method": "POST",
+      "path": "/LiveStreams/Close",
+      "pathTemplate": "/LiveStreams/Close",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "LiveStreamClose",
+      "projection": "none",
+      "egress": "negotiation",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable LiveStreams Close; classifier OperationLiveStreamClose."
+        }
+      ]
+    },
+    {
+      "id": "post-livestreams-mediainfo",
+      "method": "POST",
+      "path": "/LiveStreams/MediaInfo",
+      "pathTemplate": "/LiveStreams/MediaInfo",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "LiveStreamMediaInfo",
+      "projection": "MediaSource",
+      "egress": "negotiation",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable LiveStreams MediaInfo; classifier OperationLiveStreamMediaInfo."
+        }
+      ]
+    },
+    {
+      "id": "post-livestreams-open",
+      "method": "POST",
+      "path": "/LiveStreams/Open",
+      "pathTemplate": "/LiveStreams/Open",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "LiveStreamOpen",
+      "projection": "LiveStreamResponse",
+      "egress": "negotiation",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable LiveStreams Open negotiation; classifier OperationLiveStreamOpen."
+        }
+      ]
+    },
+    {
+      "id": "post-sessions-capabilities",
+      "method": "POST",
+      "path": "/Sessions/Capabilities",
+      "pathTemplate": "/Sessions/Capabilities",
+      "queryNames": [],
+      "ownership": "LocalSession",
+      "operation": "Capabilities",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable local capabilities; classifier OperationCapabilities."
+        }
+      ]
+    },
+    {
+      "id": "post-sessions-capabilities-full",
+      "method": "POST",
+      "path": "/Sessions/Capabilities/Full",
+      "pathTemplate": "/Sessions/Capabilities/Full",
+      "queryNames": [],
+      "ownership": "LocalSession",
+      "operation": "Capabilities",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#login-home:7",
+          "notes": "status 200"
+        },
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#search-detail:7",
+          "notes": "status 200"
+        }
+      ]
+    },
+    {
+      "id": "post-sessions-logout",
+      "method": "POST",
+      "path": "/Sessions/Logout",
+      "pathTemplate": "/Sessions/Logout",
+      "queryNames": [],
+      "ownership": "LocalSession",
+      "operation": "Logout",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Not present in phase8-current-evidence-fresh2 TSVs; executable coverage in TestAuditLogsForAuthAndLogout, TestLoginIssuesAndLogoutClearsResourceCookie, TestCredentialQueryLogoutRevokesSelectedToken"
+        }
+      ]
+    },
+    {
+      "id": "post-sessions-playing",
+      "method": "POST",
+      "path": "/Sessions/Playing",
+      "pathTemplate": "/Sessions/Playing",
+      "queryNames": [],
+      "ownership": "LocalSession",
+      "operation": "PlaybackReport",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable local playback report; classifier OperationPlaybackReport."
+        }
+      ]
+    },
+    {
+      "id": "post-sessions-playing-ping",
+      "method": "POST",
+      "path": "/Sessions/Playing/Ping",
+      "pathTemplate": "/Sessions/Playing/Ping",
+      "queryNames": [],
+      "ownership": "LocalSession",
+      "operation": "PlaybackPing",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable local playback ping; classifier OperationPlaybackPing."
+        }
+      ]
+    },
+    {
+      "id": "post-sessions-playing-progress",
+      "method": "POST",
+      "path": "/Sessions/Playing/Progress",
+      "pathTemplate": "/Sessions/Playing/Progress",
+      "queryNames": [],
+      "ownership": "LocalSession",
+      "operation": "PlaybackReport",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable local playback progress; classifier OperationPlaybackReport."
+        }
+      ]
+    },
+    {
+      "id": "post-sessions-playing-stopped",
+      "method": "POST",
+      "path": "/Sessions/Playing/Stopped",
+      "pathTemplate": "/Sessions/Playing/Stopped",
+      "queryNames": [],
+      "ownership": "LocalSession",
+      "operation": "PlaybackReport",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable local playback stopped; classifier OperationPlaybackReport."
+        }
+      ]
+    },
+    {
+      "id": "post-sessions-id-command",
+      "method": "POST",
+      "path": "/Sessions/{Id}/Command",
+      "pathTemplate": "/Sessions/{Id}/Command",
+      "queryNames": [],
+      "ownership": "LocalSession",
+      "operation": "SessionGeneralCommand",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable targeted general command; classifier OperationSessionGeneralCommand."
+        }
+      ]
+    },
+    {
+      "id": "post-sessions-id-command-command",
+      "method": "POST",
+      "path": "/Sessions/{Id}/Command/{Command}",
+      "pathTemplate": "/Sessions/{Id}/Command/{Command}",
+      "queryNames": [],
+      "ownership": "LocalSession",
+      "operation": "SessionGeneralCommand",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable named general command; classifier OperationSessionGeneralCommand."
+        }
+      ]
+    },
+    {
+      "id": "post-sessions-id-playing",
+      "method": "POST",
+      "path": "/Sessions/{Id}/Playing",
+      "pathTemplate": "/Sessions/{Id}/Playing",
+      "queryNames": [],
+      "ownership": "LocalSession",
+      "operation": "SessionPlay",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable targeted session play command; classifier OperationSessionPlay."
+        }
+      ]
+    },
+    {
+      "id": "post-sessions-id-playing-command",
+      "method": "POST",
+      "path": "/Sessions/{Id}/Playing/{Command}",
+      "pathTemplate": "/Sessions/{Id}/Playing/{Command}",
+      "queryNames": [],
+      "ownership": "LocalSession",
+      "operation": "SessionPlaystate",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable targeted session playstate; classifier OperationSessionPlaystate."
+        }
+      ]
+    },
+    {
+      "id": "post-system-ping",
+      "method": "POST",
+      "path": "/System/Ping",
+      "pathTemplate": "/System/Ping",
+      "queryNames": [],
+      "ownership": "LocalPublic",
+      "operation": "Ping",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "public",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable public ping handler; classifier OperationPing GET/POST."
+        }
+      ]
+    },
+    {
+      "id": "post-users-authenticatebyname",
+      "method": "POST",
+      "path": "/Users/AuthenticateByName",
+      "pathTemplate": "/Users/AuthenticateByName",
+      "queryNames": [],
+      "ownership": "LocalPublic",
+      "operation": "Authenticate",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "public",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#login-home:5",
+          "notes": "status 200"
+        },
+        {
+          "kind": "observed",
+          "ref": "observed-web-stable.jsonl#search-detail:5",
+          "notes": "status 200"
+        }
+      ]
+    },
+    {
+      "id": "post-users-userid-favoriteitems-itemid",
+      "method": "POST",
+      "path": "/Users/{UserId}/FavoriteItems/{ItemId}",
+      "pathTemplate": "/Users/{UserId}/FavoriteItems/{ItemId}",
+      "queryNames": [],
+      "ownership": "LocalPersonal",
+      "operation": "Personal",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable personal favorite write; classifier LocalPersonal."
+        }
+      ]
+    },
+    {
+      "id": "post-users-userid-items-itemid-rating",
+      "method": "POST",
+      "path": "/Users/{UserId}/Items/{ItemId}/Rating",
+      "pathTemplate": "/Users/{UserId}/Items/{ItemId}/Rating",
+      "queryNames": [],
+      "ownership": "LocalPersonal",
+      "operation": "Personal",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable personal rating write; classifier LocalPersonal."
+        }
+      ]
+    },
+    {
+      "id": "post-users-userid-items-itemid-userdata",
+      "method": "POST",
+      "path": "/Users/{UserId}/Items/{ItemId}/UserData",
+      "pathTemplate": "/Users/{UserId}/Items/{ItemId}/UserData",
+      "queryNames": [],
+      "ownership": "LocalPersonal",
+      "operation": "Personal",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable personal UserData write; classifier LocalPersonal."
+        }
+      ]
+    },
+    {
+      "id": "post-users-userid-playeditems-itemid",
+      "method": "POST",
+      "path": "/Users/{UserId}/PlayedItems/{ItemId}",
+      "pathTemplate": "/Users/{UserId}/PlayedItems/{ItemId}",
+      "queryNames": [],
+      "ownership": "LocalPersonal",
+      "operation": "Personal",
+      "projection": "none",
+      "egress": "none",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable personal played write; classifier LocalPersonal."
+        }
+      ]
+    },
+    {
+      "id": "post-videos-activeencodings-delete",
+      "method": "POST",
+      "path": "/Videos/ActiveEncodings/Delete",
+      "pathTemplate": "/Videos/ActiveEncodings/Delete",
+      "queryNames": [],
+      "ownership": "MediaProxy",
+      "operation": "ActiveEncodingsDeleteCompat",
+      "projection": "none",
+      "egress": "negotiation",
+      "provenanceKind": "curated",
+      "workflowTags": [
+        "inventory"
+      ],
+      "authMode": "session",
+      "expectedStatusClass": "2xx",
+      "evidence": [
+        {
+          "kind": "curated",
+          "ref": "gateway-local-test",
+          "notes": "Executable ActiveEncodings Delete compat POST; classifier OperationActiveEncodingsDeleteCompat."
+        }
+      ]
+    }
+  ]
+}

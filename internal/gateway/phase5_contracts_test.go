@@ -14,7 +14,6 @@ func TestUpstreamPurposeStringsArePrivateAndStable(t *testing.T) {
 		{upstreamPurposeMedia, "media"},
 		{upstreamPurposeNegotiation, "negotiation"},
 		{upstreamPurposeManagedAuth, "managed_auth"},
-		{upstreamPurposeLegacy, "legacy"},
 	}
 	for _, tt := range tests {
 		if got := tt.purpose.String(); got != tt.want {
@@ -33,7 +32,6 @@ func TestPhase5ContractShapes(t *testing.T) {
 	var _ MetadataUpstream
 	var _ MediaUpstream
 	var _ ManagedAuthUpstream
-	var _ LegacyHTTPUpstream
 	var _ SessionHub
 	var _ MediaLeaseRegistry
 

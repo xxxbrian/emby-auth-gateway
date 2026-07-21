@@ -102,7 +102,8 @@ func TestInitialGenericProxyFailureUsesStructuredHandler(t *testing.T) {
 			store.Sessions[HashToken("gateway-token")] = testSession()
 			client := &http.Client{Transport: proxyFailureRoundTripper{err: tt.err}}
 			server := NewServer(Config{GatewayBasePath: "/emby", HTTPClient: client}, store)
-			req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Unknown?api_key=gateway-token", nil).WithContext(tt.ctx)
+			// Curated media path still reaches the proxy/failure path; Unclassified would 404 first.
+			req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items/item/Images/Primary?api_key=gateway-token", nil).WithContext(tt.ctx)
 			writer := httptest.NewRecorder()
 			if !tt.wantAudit {
 				requireAbortHandler(t, func() { server.ServeHTTP(writer, req) })
@@ -112,7 +113,7 @@ func TestInitialGenericProxyFailureUsesStructuredHandler(t *testing.T) {
 				return
 			}
 			server.ServeHTTP(writer, req)
-			if writer.Code != tt.wantStatus || len(store.AuditLogs) < 2 {
+			if writer.Code != tt.wantStatus || len(store.AuditLogs) < 1 {
 				t.Fatalf("initial proxy failure response or audit was incorrect: status=%d audits=%#v body=%q", writer.Code, store.AuditLogs, writer.Body.String())
 			}
 			entry := store.AuditLogs[len(store.AuditLogs)-1]
@@ -144,10 +145,11 @@ func TestRefreshedGenericProxyRetryFailureUsesStructuredHandler(t *testing.T) {
 			store.Sessions[HashToken("gateway-token")] = session
 			client := &http.Client{Transport: &retryFailureRoundTripper{retryErr: tt.err}}
 			server := NewServer(Config{GatewayBasePath: "/emby", HTTPClient: client}, store)
-			req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Unknown?api_key=gateway-token", nil)
+			// Media adapter still performs unauthorized refresh/retry; Unclassified would 404 first.
+			req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items/item/Images/Primary?api_key=gateway-token", nil)
 			writer := httptest.NewRecorder()
 			server.ServeHTTP(writer, req)
-			if writer.Code != tt.wantStatus || len(store.AuditLogs) < 2 {
+			if writer.Code != tt.wantStatus || len(store.AuditLogs) < 1 {
 				t.Fatalf("retry failure response or audit was incorrect: status=%d audits=%#v body=%q", writer.Code, store.AuditLogs, writer.Body.String())
 			}
 			entry := store.AuditLogs[len(store.AuditLogs)-1]
@@ -352,7 +354,8 @@ type retryFailureRoundTripper struct {
 
 func (r *retryFailureRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	switch req.URL.Path {
-	case "/emby/Items", "/emby/Unknown":
+	case "/emby/Items", "/emby/Unknown", "/emby/Items/item/Images/Primary":
+		// First attempt unauthorized, then retry fails with retryErr (timeout/etc).
 		r.items++
 		if r.items == 1 {
 			return testTransportResponse(http.StatusUnauthorized, ""), nil

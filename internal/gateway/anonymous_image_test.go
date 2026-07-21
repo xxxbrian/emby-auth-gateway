@@ -375,6 +375,189 @@ func TestAnonymousItemImageScopeAndFailures(t *testing.T) {
 	}
 }
 
+// TestImageAuthenticationContractParity is the executable parity matrix for the
+// image authentication contract: tokenless anonymous Items binary images vs
+// authenticated cookie/session image access, with explicit denials for non-anonymous
+// shapes and credential-conflict precedence.
+func TestImageAuthenticationContractParity(t *testing.T) {
+	const namespace = "namespace-contract"
+	type observed struct {
+		path   string
+		method string
+		token  string
+		cookie string
+		auth   string
+		ua     string
+	}
+	var hits []observed
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/emby/System/Info/Public":
+			writeTestJSON(w, map[string]any{"Id": namespace})
+			return
+		case "/emby/Users/AuthenticateByName":
+			writeTestJSON(w, map[string]any{
+				"AccessToken": "backend-token",
+				"ServerId":    namespace,
+				"User":        map[string]any{"Id": "backend-user", "Name": "shared"},
+			})
+			return
+		}
+		hits = append(hits, observed{
+			path:   r.URL.Path,
+			method: r.Method,
+			token:  r.Header.Get("X-Emby-Token"),
+			cookie: r.Header.Get("Cookie"),
+			auth:   r.Header.Get("X-Emby-Authorization"),
+			ua:     r.UserAgent(),
+		})
+		w.Header().Set("Content-Type", "image/gif")
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		_, _ = w.Write(anonymousGIF())
+	}))
+	defer backend.Close()
+
+	// Managed-auth store with namespace ServerID matching Public System/Info for anonymous images.
+	store := testStore(backend.URL + "/emby")
+	src := store.UpstreamSources["source"]
+	src.ServerID = namespace
+	store.UpstreamSources["source"] = src
+	store.Sessions[HashToken("gateway-token")] = testSession()
+	server := NewServer(Config{GatewayBasePath: "/emby", HTTPClient: backend.Client()}, store)
+	if err := server.ValidateAnonymousImageNamespace(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	gw := httptest.NewServer(server)
+	defer gw.Close()
+
+	// --- Anonymous tokenless GET/HEAD on admitted Items binary images ---
+	for _, path := range []string{
+		"/Items/item/Images/Primary",
+		"/Items/item/Images/Primary/0",
+		"/items/item/images/backdrop/12",
+	} {
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			before := len(hits)
+			req := mustRequest(t, method, gw.URL+"/emby"+path, nil)
+			resp := do(t, req)
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("anonymous %s %s status=%d body=%q", method, path, resp.StatusCode, body)
+			}
+			// Anonymous image path uses no-store (not private cookie media policy).
+			if resp.Header.Get("Cache-Control") != "no-store" {
+				t.Fatalf("anonymous %s %s cache=%q, want no-store", method, path, resp.Header.Get("Cache-Control"))
+			}
+			if method == http.MethodGet && string(body) != string(anonymousGIF()) {
+				t.Fatalf("anonymous GET body mismatch for %s", path)
+			}
+			if method == http.MethodHead && len(body) != 0 {
+				t.Fatalf("anonymous HEAD body non-empty for %s", path)
+			}
+			if len(hits) != before+1 {
+				t.Fatalf("anonymous %s %s backend hits=%d", method, path, len(hits)-before)
+			}
+			got := hits[len(hits)-1]
+			if got.token != "" || got.cookie != "" || strings.Contains(got.auth, "Token=") || strings.Contains(got.auth, "UserId=") {
+				t.Fatalf("anonymous egress leaked credentials: %#v", got)
+			}
+			if got.ua != "SenPlayer/6.1.3" {
+				t.Fatalf("anonymous managed UA = %q", got.ua)
+			}
+		}
+	}
+
+	// --- Authenticated resource-cookie image: private cache, managed backend token ---
+	before := len(hits)
+	cookieReq := mustRequest(t, http.MethodGet, gw.URL+"/emby/Items/item/Images/Primary", nil)
+	cookieReq.AddCookie(&http.Cookie{Name: resourceCookieName, Value: "gateway-token"})
+	cookieResp := do(t, cookieReq)
+	_ = cookieResp.Body.Close()
+	_ = cookieResp.Body.Close()
+	if cookieResp.StatusCode != http.StatusOK || cookieResp.Header.Get("Cache-Control") != "private, no-store" || cookieResp.Header.Get("Vary") != "Cookie" {
+		t.Fatalf("cookie image status/cache/vary = %d/%q/%q hits=%#v", cookieResp.StatusCode, cookieResp.Header.Get("Cache-Control"), cookieResp.Header.Get("Vary"), hits)
+	}
+	if len(hits) != before+1 || hits[len(hits)-1].token != "backend-token" || strings.Contains(hits[len(hits)-1].cookie, resourceCookieName) {
+		t.Fatalf("cookie backend hit = %#v", hits[len(hits)-1:])
+	}
+
+	// --- Authenticated session token (header) image: private cache ---
+	before = len(hits)
+	tokenReq := mustRequest(t, http.MethodGet, gw.URL+"/emby/Items/item/Images/Primary", nil)
+	tokenReq.Header.Set("X-Emby-Token", "gateway-token")
+	tokenResp := do(t, tokenReq)
+	_ = tokenResp.Body.Close()
+	if tokenResp.StatusCode != http.StatusOK || tokenResp.Header.Get("Cache-Control") != "private, no-store" {
+		t.Fatalf("token image status/cache = %d/%q", tokenResp.StatusCode, tokenResp.Header.Get("Cache-Control"))
+	}
+	if len(hits) != before+1 || hits[len(hits)-1].token != "backend-token" {
+		t.Fatalf("token backend hit = %#v", hits[len(hits)-1:])
+	}
+
+	// --- Denials: not anonymous-admitted shapes / wrong methods / conflicts ---
+	denials := []struct {
+		name       string
+		method     string
+		path       string
+		apply      func(*http.Request)
+		wantStatus int
+		wantCache  string
+	}{
+		// Images list / wrong method are not resource-image routes; unauthenticated 401 has no private cache policy.
+		{"images list", http.MethodGet, "/Items/item/Images", nil, http.StatusUnauthorized, ""},
+		{"users images not anonymous", http.MethodGet, "/Users/user/Images/Primary", nil, http.StatusUnauthorized, "private, no-store"},
+		{"nondecimal index", http.MethodGet, "/Items/item/Images/Primary/x", nil, http.StatusUnauthorized, ""},
+		{"post method", http.MethodPost, "/Items/item/Images/Primary", nil, http.StatusUnauthorized, ""},
+		{"malformed path dots", http.MethodGet, "/Items/item/Images/..", nil, http.StatusBadRequest, "no-store"},
+		// Credential controls suppress anonymous handling → resource-image unauthorized (private, no-store).
+		{"credential conflict api_key", http.MethodGet, "/Items/item/Images/Primary?api_key=invalid", nil, http.StatusUnauthorized, "private, no-store"},
+		{"credential conflict header", http.MethodGet, "/Items/item/Images/Primary", func(r *http.Request) { r.Header.Set("X-Emby-Token", "invalid") }, http.StatusUnauthorized, "private, no-store"},
+		{"reserved cookie empty blocks anonymous", http.MethodGet, "/Items/item/Images/Primary", func(r *http.Request) { r.Header.Set("Cookie", resourceCookieName+"=") }, http.StatusUnauthorized, "private, no-store"},
+	}
+	anonHitsBeforeDenials := len(hits)
+	for _, tc := range denials {
+		t.Run("deny_"+tc.name, func(t *testing.T) {
+			req := mustRequest(t, tc.method, gw.URL+"/emby"+tc.path, nil)
+			if tc.apply != nil {
+				tc.apply(req)
+			}
+			resp := do(t, req)
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode != tc.wantStatus {
+				t.Fatalf("status = %d, want %d body=%q", resp.StatusCode, tc.wantStatus, body)
+			}
+			if tc.wantCache != "" && resp.Header.Get("Cache-Control") != tc.wantCache {
+				t.Fatalf("cache = %q, want %q", resp.Header.Get("Cache-Control"), tc.wantCache)
+			}
+		})
+	}
+	// Credential conflicts / non-anonymous shapes must not dial anonymous image upstream.
+	// (Authenticated denials also should not reach backend with invalid tokens.)
+	if len(hits) != anonHitsBeforeDenials {
+		t.Fatalf("denial cases dialed backend: before=%d after=%d extra=%#v", anonHitsBeforeDenials, len(hits), hits[anonHitsBeforeDenials:])
+	}
+
+	// Route helper parity: admitted anonymous shapes only.
+	for _, path := range []string{"/Items/i/Images/Primary", "/Items/i/Images/Primary/0"} {
+		req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby"+path, nil)
+		if !isAnonymousItemImageRoute(req, path) {
+			t.Fatalf("isAnonymousItemImageRoute(%q) = false", path)
+		}
+	}
+	for _, path := range []string{"/Items/i/Images", "/Users/u/Images/Primary", "/Items/i/Images/Primary/x", "/Videos/i/Images/Primary"} {
+		req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby"+path, nil)
+		if isAnonymousItemImageRoute(req, path) {
+			t.Fatalf("isAnonymousItemImageRoute(%q) = true, want false", path)
+		}
+	}
+	post := httptest.NewRequest(http.MethodPost, "http://gateway.test/emby/Items/i/Images/Primary", nil)
+	if isAnonymousItemImageRoute(post, "/Items/i/Images/Primary") {
+		t.Fatal("POST admitted as anonymous image")
+	}
+}
+
 func TestAnonymousItemImageOneBytePartialJPEG(t *testing.T) {
 	const namespace = "namespace-1"
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

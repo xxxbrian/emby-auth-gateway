@@ -35,7 +35,7 @@ type Server struct {
 	cfg                  Config
 	store                Store
 	sessions             SessionRepository
-	playback             PlaybackRepository // required; obtained from store (no legacy fallback)
+	playback             PlaybackRepository // required; obtained from store
 	sessionHub           SessionHub
 	sessionCommands      *SessionCommandService
 	websocketTiming      websocketTransportTiming
@@ -46,7 +46,6 @@ type Server struct {
 	metadataUpstream     MetadataUpstream
 	mediaUpstream        MediaUpstream
 	managedAuthUpstream  ManagedAuthUpstream
-	legacyHTTPUpstream   LegacyHTTPUpstream
 	mediaLeases          MediaLeaseRegistry
 	leaseCleanupOnce     sync.Once
 	leaseCleanupStarted  atomic.Bool
@@ -172,9 +171,8 @@ func newServerWithSessionHub(cfg Config, store Store, sessionHub SessionHub) *Se
 	media := newMediaUpstream(client, s.refreshAfterUnauthorized, s.mediaLeases, func(event observe.Event) { s.emit(event) })
 	media.closeStream = media.closeNegotiatedStream
 	s.mediaUpstream = media
-	s.legacyHTTPUpstream = newLegacyHTTPUpstream(client, func(ctx context.Context, entry AuditLog) { s.audit(ctx, entry) }, s.refreshAfterUnauthorized, func(event observe.Event) { s.emit(event) })
 	// Playback reports require PlaybackRepository; MemoryStore implements it.
-	// Missing implementation fails closed at request time (no silent legacy path).
+	// Missing implementation fails closed at request time.
 	if pr, ok := store.(PlaybackRepository); ok {
 		s.playback = pr
 	}
@@ -612,6 +610,19 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string,
 			return
 		}
 	}
+	// Cross-user path/query ownership before Unclassified 404 and before Ensure.
+	// Uses API-relative rel (not /emby-prefixed URL.Path).
+	if err := validateRequestUserOwnership(rel, r.URL.RawQuery, session.SyntheticUserID); err != nil {
+		s.writeUpstreamRequestDenied(w, r, rel, session, decision, err)
+		return
+	}
+	// Classifier is authoritative: Unclassified never reaches personal handlers,
+	// Ensure, adapters, or activity. Global /Items and Shows Episodes/Seasons that
+	// are not curated templates return exact route_not_found here.
+	if decision.Ownership == routeclass.Unclassified || decision.Operation == routeclass.OperationUnclassified {
+		s.writeRouteNotFound(w, r, rel, session, decision)
+		return
+	}
 	if !decision.MethodAllowed && methodEnforcedBeforeUpstream(decision) {
 		s.writeUpstreamRequestDenied(w, r, rel, session, decision, ErrForbidden)
 		return
@@ -634,6 +645,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string,
 	if isPlaybackInfo {
 		guardGeneration = s.playbackGuards.snapshot(guardKey)
 	}
+	// Personal/session-local handlers only for classifier-owned routes (Resume/Latest,
+	// NextUp, DisplayPreferences, Users/{id}/Items personal filters, playback reports, …).
 	if outcome := s.handlePersonalDataRequest(w, r, rel, session, gatewayToken); outcome.Handled {
 		if outcome.NoteSuccess {
 			s.noteSession(session, decision)
@@ -643,7 +656,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string,
 		}
 		return
 	}
-	// Fail closed: LocalSession must be consumed by a local handler, never proxied.
+	// Fail closed: LocalSession/LocalPersonal must be consumed by a local handler.
 	if decision.Ownership == routeclass.LocalPersonal || decision.Ownership == routeclass.LocalSession {
 		s.writeSessionRouteUnhandled(w, r, rel, session, decision)
 		return
@@ -651,7 +664,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string,
 	s.noteSession(session, decision)
 	s.touchSessionActivityBestEffort(r.Context(), session, r)
 	if decision.Ownership == routeclass.MetadataProxy {
-		if err := validateExternalMetadataSelector(r, session); err != nil {
+		if err := validateExternalMetadataSelector(rel, r, session); err != nil {
 			s.writeUpstreamRequestDenied(w, r, rel, session, decision, err)
 			return
 		}
@@ -697,8 +710,6 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string,
 	case decision.Ownership == routeclass.MediaProxy && isNegotiationOperation(decision.Operation):
 		result, negotiationErr := s.mediaUpstream.RoundTripNegotiation(negotiationUpstreamRequest{upstreamHTTPRequest: request, SnapshotRef: &upstream})
 		resp, registration, err = result.Response, result.Registration, negotiationErr
-	case decision.Ownership == routeclass.LegacyProxy && decision.Operation == routeclass.OperationLegacyProxy:
-		resp, err = s.legacyHTTPUpstream.RoundTripLegacy(legacyUpstreamRequest{upstreamHTTPRequest: request, SnapshotRef: &upstream})
 	default:
 		s.writeUpstreamRequestDenied(w, r, rel, session, decision, ErrForbidden)
 		return
@@ -966,8 +977,40 @@ func (s *Server) lookupActiveSession(w http.ResponseWriter, r *http.Request, tok
 	return session, true
 }
 
-func validateExternalMetadataSelector(r *http.Request, session *Session) error {
-	if r == nil || r.URL == nil || session == nil || !relUserMatches(r.URL.Path, session.SyntheticUserID) {
+// validateRequestUserOwnership rejects foreign /Users/{id}/... path segments and
+// foreign UserId query selectors. It uses the API-relative path (rel), never the
+// /emby-prefixed URL path, and never dials or loads managed auth.
+func validateRequestUserOwnership(rel, rawQuery, syntheticUserID string) error {
+	if syntheticUserID == "" || !relUserMatches(rel, syntheticUserID) {
+		return ErrForbidden
+	}
+	if rawQuery == "" {
+		return nil
+	}
+	query, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return ErrBadRequest
+	}
+	for key, values := range query {
+		if !strings.EqualFold(key, "UserId") {
+			continue
+		}
+		for _, value := range values {
+			if value != syntheticUserID {
+				return ErrForbidden
+			}
+		}
+	}
+	return nil
+}
+
+func validateExternalMetadataSelector(rel string, r *http.Request, session *Session) error {
+	if r == nil || r.URL == nil || session == nil {
+		return ErrForbidden
+	}
+	// Path ownership already enforced via validateRequestUserOwnership(rel, ...);
+	// re-check with rel (not r.URL.Path) so /emby-prefixed paths cannot bypass.
+	if !relUserMatches(rel, session.SyntheticUserID) {
 		return ErrForbidden
 	}
 	query, err := url.ParseQuery(r.URL.RawQuery)
@@ -1017,12 +1060,6 @@ func (s *Server) writeUpstreamRequestDenied(w http.ResponseWriter, r *http.Reque
 	status := http.StatusForbidden
 	message := "forbidden"
 	switch {
-	case !decision.MethodAllowed:
-		status = http.StatusMethodNotAllowed
-		message = "method not allowed"
-		if decision.Allow != "" {
-			w.Header().Set("Allow", decision.Allow)
-		}
 	case errors.Is(cause, ErrNotFound):
 		status = http.StatusNotFound
 		message = "not found"
@@ -1035,11 +1072,39 @@ func (s *Server) writeUpstreamRequestDenied(w http.ResponseWriter, r *http.Reque
 	case errors.Is(cause, ErrBadRequest):
 		status = http.StatusBadRequest
 		message = "bad request"
+	case !decision.MethodAllowed && decision.Ownership != routeclass.Unclassified:
+		// Known classified routes keep 405+Allow. Unclassified never uses Allow/405 here.
+		status = http.StatusMethodNotAllowed
+		message = "method not allowed"
+		if decision.Allow != "" {
+			w.Header().Set("Allow", decision.Allow)
+		}
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	s.audit(r.Context(), AuditLog{GatewayUserID: session.GatewayUserID, SyntheticUserID: session.SyntheticUserID, Event: "upstream_request_denied", Message: "upstream request denied", RemoteIP: remoteIP(r), Method: r.Method, Path: rel, Status: status})
 	s.emitSessionDeniedRequest(session, r.Method, decision, status)
 	http.Error(w, message, status)
+}
+
+// writeRouteNotFound is the Phase 8 authenticated Unclassified default-deny response.
+// Exact contract: 404, body "not found\n", text/plain; charset=utf-8, Cache-Control
+// no-store, no Allow. Emits route_not_found audit and one denied RouteOther request event.
+// Must not noteSession, touch activity, Ensure, or dial.
+func (s *Server) writeRouteNotFound(w http.ResponseWriter, r *http.Request, rel string, session *Session, decision routeclass.Decision) {
+	w.Header().Del("Allow")
+	w.Header().Set("Cache-Control", "no-store")
+	s.audit(r.Context(), AuditLog{
+		GatewayUserID:   session.GatewayUserID,
+		SyntheticUserID: session.SyntheticUserID,
+		Event:           "route_not_found",
+		Message:         "route not found",
+		RemoteIP:        remoteIP(r),
+		Method:          r.Method,
+		Path:            rel,
+		Status:          http.StatusNotFound,
+	})
+	s.emitSessionDeniedRequest(session, r.Method, decision, http.StatusNotFound)
+	http.Error(w, "not found", http.StatusNotFound)
 }
 
 func isUpstreamRedirectError(err error) bool {
@@ -1120,6 +1185,10 @@ func (s *Server) Close() {
 }
 
 func methodEnforcedBeforeUpstream(decision routeclass.Decision) bool {
+	// Unclassified is default-deny 404, never known-route 405.
+	if decision.Ownership == routeclass.Unclassified || decision.Operation == routeclass.OperationUnclassified {
+		return false
+	}
 	switch decision.Operation {
 	case routeclass.OperationMetadataProxy,
 		routeclass.OperationMediaProxy,
@@ -1459,7 +1528,7 @@ func isSessionCapabilitiesRequest(method, rel string) bool {
 
 // handlePlaybackReport serves authenticated local Playing/Progress/Stopped/Ping.
 // Success is empty HTTP 200 with Cache-Control: no-store. Exactly one
-// ApplyPlaybackReport is used for non-suppressed reports; there is no legacy
+// ApplyPlaybackReport is used for non-suppressed reports.
 // RecordPlaybackEvent/SavePlaybackState path.
 func (s *Server) handlePlaybackReport(w http.ResponseWriter, r *http.Request, rel string, session *Session, gatewayToken string) bool {
 	kind, ok := playbackReportKindFromRel(rel)
@@ -2662,7 +2731,7 @@ func (s *Server) writeProxyResponseWithProjectionGate(w http.ResponseWriter, r *
 		w.WriteHeader(resp.StatusCode)
 		return
 	}
-	if isSuccessfulResponse(resp.StatusCode) && projection.kind != responseProjectionOpaque && projection.kind != responseProjectionLegacyCompatibility && strings.TrimSpace(ct) != "" && !isJSONContentType(ct) {
+	if isSuccessfulResponse(resp.StatusCode) && projection.kind != responseProjectionOpaque && strings.TrimSpace(ct) != "" && !isJSONContentType(ct) {
 		s.writeResponseProjectionFailure(w, r, rel, session)
 		return
 	}
@@ -2718,7 +2787,7 @@ func (s *Server) writeProxyResponseWithProjectionGate(w http.ResponseWriter, r *
 		if s.meter != nil && len(data) > 0 {
 			s.meter.AddIngress(int64(len(data)))
 		}
-		if projection.kind != responseProjectionLegacyCompatibility && len(bytes.TrimSpace(data)) > 0 {
+		if len(bytes.TrimSpace(data)) > 0 {
 			if err := validateCredentialSafeResponse(data, looksLikeJSON(data), upstream); err != nil {
 				s.writeResponseProjectionFailure(w, r, rel, session)
 				return
@@ -2747,34 +2816,6 @@ func (s *Server) writeProxyResponseWithProjectionGate(w http.ResponseWriter, r *
 		}
 		if s.meter != nil && len(data) > 0 {
 			s.meter.AddIngress(int64(len(data)))
-		}
-		if projection.kind == responseProjectionLegacyCompatibility {
-			var value any
-			if looksLikeJSON(data) && json.Unmarshal(data, &value) == nil {
-				rewritten := s.rewriteProxyJSONValueForRequestWithSnapshot(r.Context(), r, value, session, upstream, gatewayToken, publicGatewayBase)
-				payload, err := json.Marshal(rewritten)
-				if err != nil {
-					resetProjectionFailureHeaders(w.Header())
-					s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_rewrite_failed", AuditMessage: "proxy json encode failed", ClientBody: "response encode failed", FallbackKind: "upstream_read_error", Duration: time.Since(readStarted), UpstreamStatus: resp.StatusCode})
-					return
-				}
-				clearProjectedEntityHeaders(header)
-				header.Set("Content-Type", "application/json")
-				if !commit() {
-					return
-				}
-				w.WriteHeader(resp.StatusCode)
-				_, _ = countEgressWrite(w, s.meter, nil, appendJSONNewline(payload))
-				return
-			}
-			out := rewriteBytesWithSnapshot(data, session, upstream, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
-			setContentLength(header, int64(len(out)))
-			if !commit() {
-				return
-			}
-			w.WriteHeader(resp.StatusCode)
-			_, _ = countEgressWrite(w, s.meter, nil, out)
-			return
 		}
 		if len(bytes.TrimSpace(data)) == 0 {
 			if !commit() {
@@ -2838,30 +2879,20 @@ func (s *Server) writeProxyResponseWithProjectionGate(w http.ResponseWriter, r *
 		if s.meter != nil && len(data) > 0 {
 			s.meter.AddIngress(int64(len(data)))
 		}
-		if projection.kind != responseProjectionLegacyCompatibility {
-			if isSuccessfulResponse(resp.StatusCode) && projection.kind != responseProjectionOpaque && len(bytes.TrimSpace(data)) > 0 {
-				s.writeResponseProjectionFailure(w, r, rel, session)
-				return
-			}
-			if err := validateCredentialSafeResponse(data, false, upstream); err != nil {
-				s.writeResponseProjectionFailure(w, r, rel, session)
-				return
-			}
-			setContentLength(header, int64(len(data)))
-			if !commit() {
-				return
-			}
-			w.WriteHeader(resp.StatusCode)
-			_, _ = countEgressWrite(w, s.meter, nil, data)
+		if isSuccessfulResponse(resp.StatusCode) && projection.kind != responseProjectionOpaque && len(bytes.TrimSpace(data)) > 0 {
+			s.writeResponseProjectionFailure(w, r, rel, session)
 			return
 		}
-		out := rewriteBytesWithSnapshot(data, session, upstream, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
-		setContentLength(header, int64(len(out)))
+		if err := validateCredentialSafeResponse(data, false, upstream); err != nil {
+			s.writeResponseProjectionFailure(w, r, rel, session)
+			return
+		}
+		setContentLength(header, int64(len(data)))
 		if !commit() {
 			return
 		}
 		w.WriteHeader(resp.StatusCode)
-		_, _ = countEgressWrite(w, s.meter, nil, out)
+		_, _ = countEgressWrite(w, s.meter, nil, data)
 		return
 	}
 
@@ -3651,8 +3682,6 @@ func copyResponseHeadersWithProjection(dst, src http.Header, rel string, session
 		for _, val := range vals {
 			if strings.EqualFold(k, "Location") || strings.EqualFold(k, "Content-Location") {
 				val = rewriteResponseLocation(val, rel, session, upstream, gatewayToken, publicGatewayBase, gatewayServerID)
-			} else if projection.kind == responseProjectionLegacyCompatibility {
-				val = rewriteStringWithSnapshot(val, session, upstream, gatewayToken, publicGatewayBase, gatewayServerID)
 			}
 			dst.Add(k, val)
 		}

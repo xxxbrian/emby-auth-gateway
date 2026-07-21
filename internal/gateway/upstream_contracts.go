@@ -14,7 +14,6 @@ const (
 	upstreamPurposeMedia
 	upstreamPurposeNegotiation
 	upstreamPurposeManagedAuth
-	upstreamPurposeLegacy
 )
 
 func (p upstreamPurpose) String() string {
@@ -27,8 +26,6 @@ func (p upstreamPurpose) String() string {
 		return "negotiation"
 	case upstreamPurposeManagedAuth:
 		return "managed_auth"
-	case upstreamPurposeLegacy:
-		return "legacy"
 	default:
 		return "unknown"
 	}
@@ -71,10 +68,6 @@ type negotiationUpstreamRequest struct {
 	upstreamHTTPRequest
 	SnapshotRef *upstreamRequestSnapshot
 }
-type legacyUpstreamRequest struct {
-	upstreamHTTPRequest
-	SnapshotRef *upstreamRequestSnapshot
-}
 
 // MetadataUpstream owns metadata GET/HEAD egress and its redirect policy.
 type MetadataUpstream interface {
@@ -109,9 +102,4 @@ type ManagedAuthUpstream interface {
 	Probe(managedAuthProbeRequest) (UpstreamServerInfoUpdate, error)
 	Login(managedAuthLoginRequest) (UpstreamAuthUpdate, error)
 	Logout(managedAuthLogoutRequest) error
-}
-
-// LegacyHTTPUpstream owns only requests classified as legacy HTTP egress.
-type LegacyHTTPUpstream interface {
-	RoundTripLegacy(legacyUpstreamRequest) (*http.Response, error)
 }

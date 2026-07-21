@@ -1,0 +1,322 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://emby-auth-gateway.local/routeclass/phase8/schema-v1.json",
+  "title": "Phase 8 route corpus schema v1",
+  "description": "Versioned shapes for official OpenAPI inventories plus future observed traffic and curated supported-route records. Official inventory fixtures use kind official-inventory. Observed and supported fixtures are reserved and not yet populated in this corpus slice.",
+  "oneOf": [
+    { "$ref": "#/$defs/officialInventoryDocument" },
+    { "$ref": "#/$defs/observedCorpusDocument" },
+    { "$ref": "#/$defs/supportedRoutesDocument" }
+  ],
+  "$defs": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "provenanceKind": {
+      "type": "string",
+      "enum": ["official", "observed", "curated", "maintained-client"]
+    },
+    "httpMethod": {
+      "type": "string",
+      "enum": ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE"]
+    },
+    "pathTemplate": {
+      "type": "string",
+      "description": "OpenAPI path template with original casing preserved (for example /Users/{UserId}/Items).",
+      "minLength": 1,
+      "pattern": "^/"
+    },
+    "queryNames": {
+      "type": "array",
+      "description": "Exact query parameter names as declared, sorted unique, casing preserved.",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "contentTypeList": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "securityRequirement": {
+      "type": "array",
+      "description": "Sorted OpenAPI security scheme names for one alternative requirement object.",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "officialProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "source",
+        "label",
+        "gitCommit",
+        "sourcePath",
+        "contentSha256",
+        "gitBlob",
+        "openapiVersion",
+        "infoVersion",
+        "authoritativeUrl",
+        "repositoryUrl"
+      ],
+      "properties": {
+        "kind": { "const": "official" },
+        "source": { "type": "string", "const": "MediaBrowser/Emby.SDK" },
+        "label": { "type": "string", "minLength": 1 },
+        "gitCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "sourcePath": { "type": "string", "const": "Resources/OpenApi/openapi_v3.json" },
+        "contentSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "gitBlob": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "openapiVersion": { "type": "string", "minLength": 1 },
+        "infoVersion": { "type": "string", "minLength": 1 },
+        "authoritativeUrl": { "type": "string", "format": "uri" },
+        "repositoryUrl": { "type": "string", "format": "uri" }
+      }
+    },
+    "officialOperationRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One OpenAPI operation. Curated ownership/operation/projection/egress remain null until a separate supported-routes decision.",
+      "required": [
+        "method",
+        "path",
+        "pathTemplate",
+        "operationId",
+        "tags",
+        "security",
+        "queryNames",
+        "requestContentTypes",
+        "responseContentTypes",
+        "responseContentTypesByStatus",
+        "ownership",
+        "operation",
+        "projection",
+        "egress",
+        "provenanceKind"
+      ],
+      "properties": {
+        "method": { "$ref": "#/$defs/httpMethod" },
+        "path": { "$ref": "#/$defs/pathTemplate" },
+        "pathTemplate": { "$ref": "#/$defs/pathTemplate" },
+        "operationId": { "type": "string" },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "security": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/securityRequirement" }
+        },
+        "queryNames": { "$ref": "#/$defs/queryNames" },
+        "requestContentTypes": { "$ref": "#/$defs/contentTypeList" },
+        "responseContentTypes": {
+          "allOf": [
+            { "$ref": "#/$defs/contentTypeList" },
+            {
+              "description": "Union of content types across all response statuses, sorted unique."
+            }
+          ]
+        },
+        "responseContentTypesByStatus": {
+          "type": "object",
+          "description": "Map of HTTP status string to sorted unique response content types.",
+          "additionalProperties": { "$ref": "#/$defs/contentTypeList" }
+        },
+        "ownership": {
+          "description": "Reserved for curated supported-routes; null in official inventory.",
+          "type": ["string", "null"]
+        },
+        "operation": {
+          "description": "Reserved for curated supported-routes operation family; null in official inventory.",
+          "type": ["string", "null"]
+        },
+        "projection": {
+          "description": "Reserved for curated response projection kind; null in official inventory.",
+          "type": ["string", "null"]
+        },
+        "egress": {
+          "description": "Reserved for curated allowed egress purpose; null in official inventory.",
+          "type": ["string", "null"]
+        },
+        "provenanceKind": {
+          "allOf": [
+            { "$ref": "#/$defs/provenanceKind" },
+            { "const": "official" }
+          ]
+        }
+      }
+    },
+    "officialInventoryDocument": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "provenance",
+        "pathCount",
+        "operationCount",
+        "operations"
+      ],
+      "properties": {
+        "schemaVersion": { "$ref": "#/$defs/schemaVersion" },
+        "kind": { "const": "official-inventory" },
+        "provenance": { "$ref": "#/$defs/officialProvenance" },
+        "pathCount": { "type": "integer", "minimum": 0 },
+        "operationCount": { "type": "integer", "minimum": 0 },
+        "operations": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/officialOperationRow" }
+        }
+      }
+    },
+    "observedRouteRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Future observed Web/client traffic record. Not populated in the official-inventory corpus slice.",
+      "required": [
+        "method",
+        "path",
+        "pathTemplate",
+        "queryNames",
+        "ownership",
+        "operation",
+        "projection",
+        "egress",
+        "provenanceKind",
+        "scenario",
+        "sequence",
+        "transport",
+        "status"
+      ],
+      "properties": {
+        "method": { "$ref": "#/$defs/httpMethod" },
+        "path": { "type": "string", "minLength": 1 },
+        "pathTemplate": { "$ref": "#/$defs/pathTemplate" },
+        "queryNames": { "$ref": "#/$defs/queryNames" },
+        "ownership": { "type": ["string", "null"] },
+        "operation": { "type": ["string", "null"] },
+        "projection": { "type": ["string", "null"] },
+        "egress": { "type": ["string", "null"] },
+        "provenanceKind": {
+          "allOf": [
+            { "$ref": "#/$defs/provenanceKind" },
+            { "const": "observed" }
+          ]
+        },
+        "scenario": { "type": "string", "minLength": 1 },
+        "sequence": { "type": "integer", "minimum": 0 },
+        "transport": {
+          "type": "string",
+          "enum": ["http", "websocket"]
+        },
+        "status": { "type": "integer", "minimum": 0 },
+        "requestContentTypes": { "$ref": "#/$defs/contentTypeList" },
+        "responseContentTypes": { "$ref": "#/$defs/contentTypeList" },
+        "initiator": { "type": "string" },
+        "bodyShapeHash": { "type": "string" },
+        "rangeBehavior": { "type": "string" },
+        "websocketFrameCategory": { "type": "string" }
+      }
+    },
+    "observedCorpusDocument": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Future observed-corpus envelope. Reserved; official inventory fixtures do not use this kind.",
+      "required": ["schemaVersion", "kind", "provenance", "records"],
+      "properties": {
+        "schemaVersion": { "$ref": "#/$defs/schemaVersion" },
+        "kind": { "const": "observed-corpus" },
+        "provenance": {
+          "type": "object",
+          "required": ["kind"],
+          "properties": {
+            "kind": { "const": "observed" },
+            "buildLabel": { "type": "string" },
+            "assetHashes": {
+              "type": "object",
+              "additionalProperties": { "type": "string" }
+            },
+            "browser": { "type": "string" },
+            "captureTool": { "type": "string" }
+          }
+        },
+        "records": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/observedRouteRecord" }
+        }
+      }
+    },
+    "supportedRouteRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Future curated supported-route authorization record. Separate from exhaustive official inventory; not an automatic OpenAPI admission.",
+      "required": [
+        "method",
+        "pathTemplate",
+        "queryNames",
+        "ownership",
+        "operation",
+        "projection",
+        "egress",
+        "provenanceKind"
+      ],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "method": { "$ref": "#/$defs/httpMethod" },
+        "path": { "$ref": "#/$defs/pathTemplate" },
+        "pathTemplate": { "$ref": "#/$defs/pathTemplate" },
+        "queryNames": { "$ref": "#/$defs/queryNames" },
+        "ownership": { "type": "string", "minLength": 1 },
+        "operation": { "type": "string", "minLength": 1 },
+        "projection": { "type": "string", "minLength": 1 },
+        "egress": { "type": "string", "minLength": 1 },
+        "provenanceKind": {
+          "allOf": [
+            { "$ref": "#/$defs/provenanceKind" },
+            { "const": "curated" }
+          ]
+        },
+        "workflowTags": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "authMode": { "type": "string" },
+        "expectedStatusClass": { "type": "string" },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["kind"],
+            "properties": {
+              "kind": { "$ref": "#/$defs/provenanceKind" },
+              "ref": { "type": "string" },
+              "notes": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "supportedRoutesDocument": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Future curated authorization set. Official OpenAPI presence alone must never populate this document.",
+      "required": ["schemaVersion", "kind", "routes"],
+      "properties": {
+        "schemaVersion": { "$ref": "#/$defs/schemaVersion" },
+        "kind": { "const": "supported-routes" },
+        "provenance": {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "curated" },
+            "notes": { "type": "string" }
+          }
+        },
+        "routes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/supportedRouteRecord" }
+        }
+      }
+    }
+  }
+}

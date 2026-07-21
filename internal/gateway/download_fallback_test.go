@@ -40,13 +40,13 @@ func TestDownloadForbiddenFallsBackToOfficialPlaybackInfoDirectStream(t *testing
 					ID:                   "source-1",
 					Name:                 "电影/标题",
 					Container:            "mkv",
-					DirectStreamURL:      "/Videos/item-1/original.mkv?MediaSourceId=source-1&PlaySessionId=play-session&sig=a%2Bb&api_key=backend-token",
+					DirectStreamURL:      "/Videos/item-1/stream?MediaSourceId=source-1&PlaySessionId=play-session&sig=a%2Bb&api_key=backend-token",
 					SupportsDirectPlay:   true,
 					SupportsDirectStream: true,
 					RequiredHTTPHeaders:  map[string]string{"X-Media-Source": "required", "Range": "bytes=0-3"},
 				}},
 			})
-		case "/emby/Videos/item-1/original.mkv":
+		case "/emby/Videos/item-1/stream":
 			mediaCalls++
 			if r.Method != http.MethodGet || r.Header.Get("X-Emby-Token") != "backend-token" || r.Header.Get("Range") != "bytes=0-" || r.Header.Get("If-Range") != `"tag"` || r.Header.Get("X-Media-Source") != "required" {
 				t.Fatalf("media method/headers = %s %#v", r.Method, r.Header)
@@ -102,13 +102,13 @@ func TestDownloadFallbackPreservesOriginalForbiddenWhenUnavailable(t *testing.T)
 		{
 			name: "missing requested source",
 			playback: embyPlaybackInfoResponseDTO{MediaSources: []embyMediaSourceInfoDTO{{
-				ID: "other", DirectStreamURL: "/Videos/item-1/original.mkv", SupportsDirectStream: true,
+				ID: "other", DirectStreamURL: "/Videos/item-1/stream", SupportsDirectStream: true,
 			}}},
 		},
 		{
 			name: "mismatched item url",
 			playback: embyPlaybackInfoResponseDTO{MediaSources: []embyMediaSourceInfoDTO{{
-				ID: "source-1", DirectStreamURL: "/Videos/item-2/original.mkv?MediaSourceId=source-1", SupportsDirectStream: true,
+				ID: "source-1", DirectStreamURL: "/Videos/item-2/stream?MediaSourceId=source-1", SupportsDirectStream: true,
 			}}},
 		},
 	}

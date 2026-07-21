@@ -28,9 +28,29 @@ func TestResourceCookieRouteAndCredentialPolicy(t *testing.T) {
 		{"item image index", http.MethodHead, "/Items/870258/Images/Primary/0", false, true},
 		{"user image", http.MethodGet, "/Users/u1/Images/Primary", false, true},
 		{"case insensitive", http.MethodGet, "/items/i/images/primary", false, true},
-		{"image metadata", http.MethodGet, "/Items/i/Images", false, false},
+		{"video stream", http.MethodGet, "/Videos/i/stream", false, true},
+		{"video stream container", http.MethodGet, "/Videos/i/stream.mp4", false, true},
+		{"video master m3u8", http.MethodGet, "/Videos/i/master.m3u8", false, true},
+		{"video main m3u8", http.MethodHead, "/Videos/i/main.m3u8", false, true},
+		{"video hls shallow", http.MethodGet, "/Videos/i/hls/seg0.ts", false, true},
+		{"video hls1 shallow", http.MethodGet, "/Videos/i/hls1/seg0.ts", false, true},
+		{"video hls nested", http.MethodGet, "/Videos/i/hls/pl/seg.ts", false, true},
+		{"video hls1 nested", http.MethodGet, "/Videos/i/hls1/pl/seg.ts", false, true},
+		{"video subtitle", http.MethodGet, "/Videos/i/ms/Subtitles/0/Stream.vtt", false, true},
+		{"video subtitle ticks", http.MethodGet, "/Videos/i/ms/Subtitles/0/1000/Stream.vtt", false, true},
+		{"items subtitle", http.MethodGet, "/Items/i/ms/Subtitles/1/Stream.srt", false, true},
+		{"items subtitle ticks", http.MethodHead, "/Items/i/ms/Subtitles/1/50/Stream.srt", false, true},
+		{"items download", http.MethodGet, "/Items/i/Download", false, true},
+		{"audio stream", http.MethodGet, "/Audio/i/stream", false, true},
+		{"audio stream container", http.MethodGet, "/Audio/i/stream.mp3", false, true},
+		// Denials: routeclass finite allowlists + exact segment counts.
+		{"image metadata list", http.MethodGet, "/Items/i/Images", false, false},
+		{"generic video filename", http.MethodGet, "/Videos/i/original.mkv", false, false},
+		{"hls bad extension", http.MethodGet, "/Videos/i/hls/seg0.bin", false, false},
+		{"stream unknown container", http.MethodGet, "/Videos/i/stream.unknowncontainer", false, false},
 		{"bare media", http.MethodGet, "/Videos/i", false, false},
 		{"non-decimal index", http.MethodGet, "/Items/i/Images/Primary/x", false, false},
+		{"admin scheduled tasks", http.MethodGet, "/ScheduledTasks", false, false},
 		{"post", http.MethodPost, "/Items/i/Images/Primary", false, false},
 		{"explicit invalid", http.MethodGet, "/Items/i/Images/Primary", true, false},
 	}
@@ -86,38 +106,65 @@ func TestResourceRouteClassifierCanonicalMediaScope(t *testing.T) {
 		want                 resourceRouteKind
 	}{
 		{"item image", http.MethodGet, "/Items/i/Images/Primary", resourceRouteImage},
+		{"item image index", http.MethodHead, "/Items/i/Images/Primary/0", resourceRouteImage},
 		{"user image index", http.MethodHead, "/users/u/images/primary/0", resourceRouteImage},
-		{"video lower", http.MethodGet, "/videos/470657/original.mkv", resourceRouteMedia},
-		{"audio descendant", http.MethodGet, "/Audio/a/subtitles/1", resourceRouteMedia},
+		{"video stream", http.MethodGet, "/Videos/470657/stream", resourceRouteMedia},
+		{"video stream container", http.MethodGet, "/videos/470657/stream.mkv", resourceRouteMedia},
+		{"video master", http.MethodGet, "/Videos/i/master.m3u8", resourceRouteMedia},
+		{"video main", http.MethodGet, "/Videos/i/main.m3u8", resourceRouteMedia},
+		{"video hls shallow", http.MethodGet, "/Videos/i/hls/seg0.ts", resourceRouteMedia},
+		{"video hls1 shallow", http.MethodGet, "/Videos/i/hls1/seg0.ts", resourceRouteMedia},
+		{"video hls nested", http.MethodGet, "/Videos/i/hls/pl/0.ts", resourceRouteMedia},
+		{"video hls1 nested", http.MethodGet, "/Videos/i/hls1/pl/seg.ts", resourceRouteMedia},
+		{"video subtitle", http.MethodGet, "/Videos/i/src/Subtitles/0/Stream.vtt", resourceRouteMedia},
+		{"video subtitle ticks", http.MethodGet, "/Videos/i/src/Subtitles/0/123/Stream.vtt", resourceRouteMedia},
+		{"items subtitle", http.MethodGet, "/Items/i/src/Subtitles/1/Stream.srt", resourceRouteMedia},
+		{"items subtitle ticks", http.MethodGet, "/Items/i/src/Subtitles/1/50/Stream.srt", resourceRouteMedia},
 		{"download", http.MethodGet, "/Items/i/Download", resourceRouteMedia},
+		{"audio stream", http.MethodGet, "/Audio/a/stream", resourceRouteMedia},
+		{"audio stream container", http.MethodGet, "/Audio/a/stream.mp3", resourceRouteMedia},
+		// Denials
+		{"images list", http.MethodGet, "/Items/i/Images", resourceRouteNone},
+		{"generic video filename", http.MethodGet, "/videos/470657/original.mkv", resourceRouteNone},
+		{"audio arbitrary descendant", http.MethodGet, "/Audio/a/subtitles/1", resourceRouteNone},
+		{"video subtitles short form", http.MethodGet, "/Videos/i/subtitles/1", resourceRouteNone},
 		{"bare video", http.MethodGet, "/Videos/i", resourceRouteNone},
 		{"ordinary item", http.MethodGet, "/Items/i", resourceRouteNone},
-		{"write", http.MethodPost, "/Videos/i/file", resourceRouteNone},
-		{"options", http.MethodOptions, "/Videos/i/file", resourceRouteNone},
-		{"dot", http.MethodGet, "/Videos/i/../file", resourceRouteNone},
+		{"admin path", http.MethodGet, "/ScheduledTasks", resourceRouteNone},
+		{"write", http.MethodPost, "/Videos/i/stream", resourceRouteNone},
+		{"options", http.MethodOptions, "/Videos/i/stream", resourceRouteNone},
+		{"dot", http.MethodGet, "/Videos/i/../stream", resourceRouteNone},
 		{"image dot widening", http.MethodGet, "/Items/foo/Images/..", resourceRouteNone},
-		{"repeat", http.MethodGet, "/Videos/i//file", resourceRouteNone},
-		{"trailing", http.MethodGet, "/Videos/i/file/", resourceRouteNone},
+		{"repeat", http.MethodGet, "/Videos/i//stream", resourceRouteNone},
+		{"trailing", http.MethodGet, "/Videos/i/stream/", resourceRouteNone},
 		{"encoded slash", http.MethodGet, "/Videos/i%2Ffile/stream", resourceRouteNone},
-		{"encoded dot", http.MethodGet, "/Videos/i/%2e/file", resourceRouteNone},
-		{"encoded backslash", http.MethodGet, "/Videos/i/%5c/file", resourceRouteNone},
+		{"encoded dot", http.MethodGet, "/Videos/i/%2e/stream", resourceRouteNone},
+		{"encoded backslash", http.MethodGet, "/Videos/i/%5c/stream", resourceRouteNone},
+		{"nondecimal subtitle index", http.MethodGet, "/Videos/i/src/Subtitles/x/Stream.vtt", resourceRouteNone},
+		{"nondecimal image index", http.MethodGet, "/Items/i/Images/Primary/x", resourceRouteNone},
+		{"hls bad extension", http.MethodGet, "/Videos/i/hls/seg0.bin", resourceRouteNone},
+		{"stream unknown container", http.MethodGet, "/Videos/i/stream.unknowncontainer", resourceRouteNone},
+		{"hls deep", http.MethodGet, "/Videos/i/hls/pl/a/seg.ts", resourceRouteNone},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest(tt.method, "http://gateway.test/emby"+tt.target, nil)
 			rel, ok := (&Server{cfg: Config{GatewayBasePath: "/emby"}}).relativePath(req.URL.Path)
 			if !ok {
-				t.Fatal("relative path unavailable")
+				if tt.want != resourceRouteNone {
+					t.Fatal("relative path unavailable")
+				}
+				return
 			}
 			if got := resourceRoute(req, rel); got != tt.want {
 				t.Fatalf("resourceRoute(%q) = %d, want %d", tt.target, got, tt.want)
 			}
 		})
 	}
-	upgrade := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Videos/i/file", nil)
+	upgrade := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Videos/i/stream", nil)
 	upgrade.Header.Set("Connection", "Upgrade")
 	upgrade.Header.Set("Upgrade", "websocket")
-	if got := resourceRoute(upgrade, "/Videos/i/file"); got != resourceRouteNone {
+	if got := resourceRoute(upgrade, "/Videos/i/stream"); got != resourceRouteNone {
 		t.Fatalf("websocket route = %d", got)
 	}
 }
@@ -212,11 +259,67 @@ func TestResourceCookieAuthenticatesImageWithoutForwardingCookie(t *testing.T) {
 	}
 }
 
+func TestResourceCookieWrappedEmptyBodyImageReachesBackend(t *testing.T) {
+	// PocketBase-mounted path: tokenless resource-cookie image GET with a wrapped
+	// empty body must not fail media body validation before dial.
+	var hits int
+	var got *http.Request
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		got = r.Clone(r.Context())
+		// image/gif is passthrough for stream validation (same as other resource-cookie tests).
+		w.Header().Set("Content-Type", "image/gif")
+		_, _ = w.Write([]byte("image"))
+	}))
+	defer backend.Close()
+
+	store := NewMemoryStore()
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
+	server := NewServer(Config{GatewayBasePath: "/emby", HTTPClient: backend.Client()}, store)
+
+	rawQuery := "maxHeight=360&maxWidth=640&tag=abc%2Bdef&quality=90"
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items/item-1/Images/Primary?"+rawQuery, nil)
+	req.AddCookie(&http.Cookie{Name: resourceCookieName, Value: "gateway-token"})
+	// Simulate PocketBase RereadableReadCloser around empty GET body.
+	req.Body = io.NopCloser(strings.NewReader(""))
+	req.ContentLength = 0
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%q", rec.Code, rec.Body.String())
+	}
+	if hits != 1 || got == nil {
+		t.Fatalf("backend hits=%d got=%v", hits, got)
+	}
+	if got.URL.Path != "/emby/Items/item-1/Images/Primary" {
+		t.Fatalf("backend path = %q", got.URL.Path)
+	}
+	q := got.URL.Query()
+	if q.Get("maxHeight") != "360" || q.Get("maxWidth") != "640" || q.Get("tag") != "abc+def" || q.Get("quality") != "90" {
+		t.Fatalf("neutral image query not preserved: %v", q)
+	}
+	if q.Get("api_key") != "backend-token" {
+		t.Fatalf("managed backend credential missing: %v", q)
+	}
+	if strings.Contains(got.URL.RawQuery, "gateway-token") || got.Header.Get("X-Emby-Token") != "backend-token" {
+		t.Fatalf("gateway token leaked or managed header wrong: raw=%q token=%q", got.URL.RawQuery, got.Header.Get("X-Emby-Token"))
+	}
+	if strings.Contains(got.Header.Get("Cookie"), "gateway-token") || strings.Contains(got.Header.Get("Cookie"), resourceCookieName) {
+		t.Fatalf("resource cookie egressed: %q", got.Header.Get("Cookie"))
+	}
+	// Empty negotiation selectors: no PlaySessionId/LiveStreamId lease required.
+	if q.Get("PlaySessionId") != "" || q.Get("LiveStreamId") != "" {
+		t.Fatalf("unexpected lease selectors on image: %v", q)
+	}
+}
+
 func TestResourceCookieAuthenticatesNativeMediaRange(t *testing.T) {
 	var hits int
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits++
-		if r.URL.Path != "/emby/videos/470657/original.mkv" || r.Header.Get("X-Emby-Token") != "backend-token" {
+		// Exact Phase 8 stream template (not generic original.mkv).
+		if r.URL.Path != "/emby/videos/470657/stream" || r.Header.Get("X-Emby-Token") != "backend-token" {
 			t.Fatalf("backend path/token = %s/%q", r.URL.Path, r.Header.Get("X-Emby-Token"))
 		}
 		if r.Header.Get("Range") != "bytes=0-" || r.Header.Get("If-Range") != `"tag"` || r.Header.Get("Cookie") != "" {
@@ -225,6 +328,10 @@ func TestResourceCookieAuthenticatesNativeMediaRange(t *testing.T) {
 		q := r.URL.Query()
 		if q.Get("MediaSourceId") != "source" || q.Get("Static") != "true" || q.Get("exp") != "1" || q.Get("sig") != "signed" {
 			t.Fatalf("backend query = %q", r.URL.RawQuery)
+		}
+		// Empty negotiation selectors: no PlaySessionId/LiveStreamId lease required.
+		if q.Get("PlaySessionId") != "" || q.Get("LiveStreamId") != "" {
+			t.Fatalf("unexpected lease selectors: %v", q)
 		}
 		w.Header().Set("Content-Range", "bytes 0-3/4")
 		w.Header().Set("Accept-Ranges", "bytes")
@@ -242,7 +349,7 @@ func TestResourceCookieAuthenticatesNativeMediaRange(t *testing.T) {
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
-	url := gw.URL + "/emby/videos/470657/original.mkv?MediaSourceId=source&Static=true&exp=1&sig=signed"
+	url := gw.URL + "/emby/videos/470657/stream?MediaSourceId=source&Static=true&exp=1&sig=signed"
 	req, _ := http.NewRequest(http.MethodGet, url, nil)
 	req.Header.Set("Range", "bytes=0-")
 	req.Header.Set("If-Range", `"tag"`)
@@ -316,7 +423,8 @@ func TestResourceCookieCachePolicy(t *testing.T) {
 
 func TestResourceCachePolicyAppliesToEveryCredentialSource(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "/forbidden") {
+		// Exact admitted stream template returning 403 (not a generic /forbidden filename).
+		if strings.HasSuffix(r.URL.Path, "/stream") && r.URL.Query().Get("deny") == "1" {
 			w.Header().Set("Cache-Control", "public, max-age=3600")
 			w.WriteHeader(http.StatusForbidden)
 			return
@@ -351,6 +459,8 @@ func TestResourceCachePolicyAppliesToEveryCredentialSource(t *testing.T) {
 		}{
 			{"/Items/item/Images/Primary", "private, no-store"},
 			{"/Videos/item/stream", "private"},
+			{"/Videos/item/hls/seg0.ts", "private"},
+			{"/Videos/item/hls1/pl/seg.ts", "private"},
 		} {
 			t.Run(auth.name+resource.path, func(t *testing.T) {
 				req := mustRequest(t, http.MethodGet, gw.URL+"/emby"+resource.path, nil)
@@ -375,7 +485,7 @@ func TestResourceCachePolicyAppliesToEveryCredentialSource(t *testing.T) {
 			t.Fatalf("unauthenticated %s status/cache = %d/%q", path, resp.StatusCode, resp.Header.Get("Cache-Control"))
 		}
 	}
-	forbidden := mustRequest(t, http.MethodGet, gw.URL+"/emby/Videos/item/forbidden?api_key=gateway-token", nil)
+	forbidden := mustRequest(t, http.MethodGet, gw.URL+"/emby/Videos/item/stream?api_key=gateway-token&deny=1", nil)
 	forbiddenResp := do(t, forbidden)
 	_ = forbiddenResp.Body.Close()
 	if forbiddenResp.StatusCode != http.StatusForbidden || forbiddenResp.Header.Get("Cache-Control") != "private, no-store" {
@@ -386,18 +496,26 @@ func TestResourceCachePolicyAppliesToEveryCredentialSource(t *testing.T) {
 func TestCookieOnlyManifestAndChildrenDoNotExposeTokens(t *testing.T) {
 	var backendURL string
 	var childHits int
+	var childPaths []string
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Emby-Token") != "backend-token" || r.Header.Get("Cookie") != "" {
 			t.Fatalf("backend auth/cookie = %q/%q", r.Header.Get("X-Emby-Token"), r.Header.Get("Cookie"))
+		}
+		if strings.Contains(r.URL.RawQuery, "gateway-token") || strings.Contains(r.Header.Get("Cookie"), resourceCookieName) {
+			t.Fatalf("gateway cookie/token egressed: raw=%q cookie=%q", r.URL.RawQuery, r.Header.Get("Cookie"))
 		}
 		switch r.URL.Path {
 		case "/emby/Videos/item/master.m3u8":
 			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 			w.Header().Set("Location", backendURL+"/emby/Videos/item/redirect?api_key=backend-token")
 			w.Header().Set("Content-Location", backendURL+"/emby/Videos/item/content?api_key=backend-token")
-			_, _ = w.Write([]byte(backendURL + "/emby/Videos/item/seg.ts?api_key=backend-token\n#EXT-X-KEY:URI=\"" + backendURL + "/emby/Videos/item/key?api_key=backend-token\"\n"))
-		case "/emby/Videos/item/seg.ts", "/emby/Videos/item/subtitles/1":
+			// Shallow + nested HLS forms admitted by routeclass; rewrite must strip URL tokens.
+			_, _ = w.Write([]byte(backendURL + "/emby/Videos/item/hls/seg0.ts?api_key=backend-token\n" +
+				backendURL + "/emby/Videos/item/hls1/pl/seg.ts?api_key=backend-token\n" +
+				"#EXT-X-KEY:URI=\"" + backendURL + "/emby/Videos/item/key?api_key=backend-token\"\n"))
+		case "/emby/Videos/item/hls/seg0.ts", "/emby/Videos/item/hls1/pl/seg.ts", "/emby/Items/item/ms/Subtitles/1/Stream.vtt":
 			childHits++
+			childPaths = append(childPaths, r.URL.Path)
 			_, _ = w.Write([]byte("child"))
 		default:
 			t.Fatalf("unexpected backend path %q", r.URL.Path)
@@ -408,7 +526,7 @@ func TestCookieOnlyManifestAndChildrenDoNotExposeTokens(t *testing.T) {
 	store := NewMemoryStore()
 	configureTestUpstream(store, backend.URL+"/emby")
 	store.Sessions[HashToken("gateway-token")] = testSession()
-	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby", PublicBaseURL: "https://media.example.com"}, store))
 	defer gw.Close()
 	manifestReq, _ := http.NewRequest(http.MethodGet, gw.URL+"/emby/Videos/item/master.m3u8", nil)
 	manifestReq.AddCookie(&http.Cookie{Name: resourceCookieName, Value: "gateway-token"})
@@ -418,17 +536,100 @@ func TestCookieOnlyManifestAndChildrenDoNotExposeTokens(t *testing.T) {
 	if manifestResp.StatusCode != http.StatusOK || strings.Contains(string(manifest), "backend-token") || strings.Contains(string(manifest), "gateway-token") || strings.Contains(manifestResp.Header.Get("Location"), "backend-token") || strings.Contains(manifestResp.Header.Get("Content-Location"), "backend-token") {
 		t.Fatalf("manifest/header leaked token: %q %#v", manifest, manifestResp.Header)
 	}
-	for _, child := range []string{"seg.ts?api_key=", "subtitles/1"} {
-		req, _ := http.NewRequest(http.MethodGet, gw.URL+"/emby/Videos/item/"+child, nil)
+	if !strings.Contains(string(manifest), "Videos/item/hls/seg0.ts") || !strings.Contains(string(manifest), "Videos/item/hls1/pl/seg.ts") {
+		t.Fatalf("manifest missing rewritten shallow/nested children: %s", manifest)
+	}
+	// Cookie-authenticated shallow HLS child + nested + Items subtitle alias.
+	for _, child := range []string{
+		"Videos/item/hls/seg0.ts?api_key=",
+		"Videos/item/hls1/pl/seg.ts",
+		"Items/item/ms/Subtitles/1/Stream.vtt",
+	} {
+		req, _ := http.NewRequest(http.MethodGet, gw.URL+"/emby/"+child, nil)
 		req.AddCookie(&http.Cookie{Name: resourceCookieName, Value: "gateway-token"})
 		resp := do(t, req)
 		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("child %q status=%d", child, resp.StatusCode)
 		}
+		if resp.Header.Get("Cache-Control") != "private" && resp.Header.Get("Cache-Control") != "private, no-store" {
+			// media OK → private; image-like subtitle may vary — require private*
+			if !strings.HasPrefix(resp.Header.Get("Cache-Control"), "private") {
+				t.Fatalf("child %q cache=%q", child, resp.Header.Get("Cache-Control"))
+			}
+		}
 	}
-	if childHits != 2 {
-		t.Fatalf("child hits = %d", childHits)
+	if childHits != 3 {
+		t.Fatalf("child hits = %d paths=%v", childHits, childPaths)
+	}
+}
+
+func TestResourceCookieShallowHLSTokenAuthCachePolicy(t *testing.T) {
+	// Token-authenticated shallow HLS must receive private media cache policy
+	// (same as nested forms) via routeclass-aligned resource recognition.
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/emby/Videos/item/hls/seg0.ts" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		if r.Header.Get("X-Emby-Token") != "backend-token" {
+			t.Fatalf("token = %q", r.Header.Get("X-Emby-Token"))
+		}
+		w.Header().Set("Content-Type", "video/mp2t")
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		_, _ = w.Write([]byte("seg"))
+	}))
+	defer backend.Close()
+	store := NewMemoryStore()
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	req := mustRequest(t, http.MethodGet, gw.URL+"/emby/Videos/item/hls/seg0.ts?api_key=gateway-token", nil)
+	resp := do(t, req)
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "seg" {
+		t.Fatalf("status/body = %d/%q", resp.StatusCode, body)
+	}
+	if resp.Header.Get("Cache-Control") != "private" || resp.Header.Get("Vary") != "Cookie" {
+		t.Fatalf("cache/vary = %q/%q", resp.Header.Get("Cache-Control"), resp.Header.Get("Vary"))
+	}
+}
+
+func TestResourceCookieItemsSubtitleAliasTokenless(t *testing.T) {
+	var hits int
+	var got *http.Request
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		got = r.Clone(r.Context())
+		w.Header().Set("Content-Type", "text/vtt")
+		_, _ = w.Write([]byte("WEBVTT\n"))
+	}))
+	defer backend.Close()
+	store := NewMemoryStore()
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	path := "/Items/item/ms/Subtitles/0/100/Stream.vtt"
+	req := mustRequest(t, http.MethodGet, gw.URL+"/emby"+path, nil)
+	req.AddCookie(&http.Cookie{Name: resourceCookieName, Value: "gateway-token"})
+	resp := do(t, req)
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "WEBVTT\n" {
+		t.Fatalf("status/body = %d/%q", resp.StatusCode, body)
+	}
+	if hits != 1 || got == nil || got.URL.Path != "/emby"+path {
+		t.Fatalf("hits=%d path=%v", hits, got)
+	}
+	if got.Header.Get("X-Emby-Token") != "backend-token" || strings.Contains(got.Header.Get("Cookie"), resourceCookieName) {
+		t.Fatalf("egress headers token=%q cookie=%q", got.Header.Get("X-Emby-Token"), got.Header.Get("Cookie"))
+	}
+	if got.URL.Query().Get("PlaySessionId") != "" || got.URL.Query().Get("LiveStreamId") != "" {
+		t.Fatalf("lease selectors present: %v", got.URL.Query())
 	}
 }
 

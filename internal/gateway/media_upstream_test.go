@@ -9,10 +9,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/xxxbrian/emby-auth-gateway/internal/observe"
 )
 
 func TestStreamingUpstreamsClearClientTimeoutAndPreserveCustomTransport(t *testing.T) {
@@ -24,11 +23,9 @@ func TestStreamingUpstreamsClearClientTimeoutAndPreserveCustomTransport(t *testi
 	})
 	base := &http.Client{Transport: transport, Timeout: time.Nanosecond}
 	media := newMediaUpstream(base, nil, nil, nil)
-	legacy := newLegacyHTTPUpstream(base, nil, nil, nil)
 	_, mediaCustom := media.client.Transport.(roundTripFunc)
-	_, legacyCustom := legacy.client.Transport.(roundTripFunc)
-	if media.client.Timeout != 0 || legacy.client.Timeout != 0 || !mediaCustom || !legacyCustom {
-		t.Fatalf("media/legacy clients = %#v / %#v", media.client, legacy.client)
+	if media.client.Timeout != 0 || !mediaCustom {
+		t.Fatalf("media client = %#v", media.client)
 	}
 	snapshot := testUpstreamSnapshot("http://backend.invalid")
 	mediaResp, err := media.RoundTripMedia(mediaUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: httptest.NewRequest(http.MethodGet, "http://gateway.test/Videos/item/stream", nil), Session: &Session{SyntheticUserID: "gateway-user"}, Snapshot: snapshot}})
@@ -38,14 +35,6 @@ func TestStreamingUpstreamsClearClientTimeoutAndPreserveCustomTransport(t *testi
 	defer mediaResp.Body.Close()
 	if body, err := io.ReadAll(mediaResp.Body); err != nil || string(body) != "stream" {
 		t.Fatalf("media body=%q err=%v", body, err)
-	}
-	legacyResp, err := legacy.RoundTripLegacy(legacyUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: httptest.NewRequest(http.MethodGet, "http://gateway.test/Unknown", nil), Session: &Session{SyntheticUserID: "gateway-user"}, Snapshot: snapshot}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer legacyResp.Body.Close()
-	if body, err := io.ReadAll(legacyResp.Body); err != nil || string(body) != "stream" {
-		t.Fatalf("legacy body=%q err=%v", body, err)
 	}
 }
 
@@ -366,15 +355,94 @@ func TestMediaUpstreamPreservesRawQueryAndPathSubstring(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer backend.Close()
-	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/Users/gateway-user/Images/gateway-user-copy?sig=a%2Bb&dup=one&dup=two+words&opaque=gateway-user&UserId=gateway-user", nil)
+	// Exact admitted binary image path; item id contains synthetic-user substring.
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/Items/gateway-user-copy/Images/Primary?sig=a%2Bb&dup=one&dup=two+words&opaque=gateway-user&UserId=gateway-user", nil)
 	resp, err := newMediaUpstream(backend.Client(), nil, nil, nil).RoundTripMedia(mediaUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: req, Session: &Session{SyntheticUserID: "gateway-user"}, Snapshot: testUpstreamSnapshot(backend.URL)}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	want := "/Users/backend-user/Images/gateway-user-copy?sig=a%2Bb&dup=one&dup=two+words&opaque=gateway-user&UserId=backend-user&api_key=backend-token"
+	want := "/Items/gateway-user-copy/Images/Primary?sig=a%2Bb&dup=one&dup=two+words&opaque=gateway-user&UserId=backend-user&api_key=backend-token"
 	if requestURI != want {
 		t.Fatalf("request URI=%q, want %q", requestURI, want)
+	}
+}
+
+func TestMediaUpstreamAcceptsWrappedZeroLengthBodyGETAndHEAD(t *testing.T) {
+	var dials atomic.Int32
+	var methods []string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dials.Add(1)
+		methods = append(methods, r.Method)
+		if r.URL.Path != "/Items/item/Images/Primary" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "image/gif")
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte("image"))
+		}
+	}))
+	defer backend.Close()
+	adapter := newMediaUpstream(backend.Client(), nil, nil, nil)
+	snapshot := testUpstreamSnapshot(backend.URL)
+	session := &Session{SyntheticUserID: "gateway-user", GatewayTokenHash: "owner"}
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		req := httptest.NewRequest(method, "http://gateway.test/Items/item/Images/Primary?maxHeight=360&maxWidth=640&tag=abc&quality=90", nil)
+		// PocketBase *router.RereadableReadCloser around an empty body.
+		req.Body = io.NopCloser(strings.NewReader(""))
+		req.ContentLength = 0
+		resp, err := adapter.RoundTripMedia(mediaUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: req, Session: session, Snapshot: snapshot}})
+		if err != nil {
+			t.Fatalf("%s: %v", method, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s status = %d", method, resp.StatusCode)
+		}
+	}
+	if dials.Load() != 2 || len(methods) != 2 || methods[0] != http.MethodGet || methods[1] != http.MethodHead {
+		t.Fatalf("dials=%d methods=%v", dials.Load(), methods)
+	}
+}
+
+func TestMediaUpstreamRejectsDeclaredBodiesBeforeDial(t *testing.T) {
+	var dials atomic.Int32
+	adapter := newMediaUpstream(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		dials.Add(1)
+		return nil, nil
+	})}, nil, nil, nil)
+	snapshot := testUpstreamSnapshot("http://backend.invalid")
+	session := &Session{SyntheticUserID: "gateway-user", GatewayTokenHash: "owner"}
+	tests := []struct {
+		name string
+		edit func(*http.Request)
+	}{
+		{"positive length", func(r *http.Request) {
+			r.Body = io.NopCloser(strings.NewReader("{}"))
+			r.ContentLength = 2
+		}},
+		{"unknown length", func(r *http.Request) {
+			r.Body = io.NopCloser(strings.NewReader(""))
+			r.ContentLength = -1
+		}},
+		{"chunked transfer encoding", func(r *http.Request) {
+			r.Body = io.NopCloser(strings.NewReader(""))
+			r.ContentLength = 0
+			r.TransferEncoding = []string{"chunked"}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "http://gateway.test/Items/item/Images/Primary", nil)
+			tt.edit(req)
+			_, err := adapter.RoundTripMedia(mediaUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: req, Session: session, Snapshot: snapshot}})
+			if !errors.Is(err, ErrMediaRequestRejected) {
+				t.Fatalf("error = %v, want ErrMediaRequestRejected", err)
+			}
+		})
+	}
+	if dials.Load() != 0 {
+		t.Fatalf("dials = %d, want 0", dials.Load())
 	}
 }
 
@@ -449,107 +517,6 @@ func TestMediaUpstreamRejectsForeignLeaseBeforeDial(t *testing.T) {
 		t.Fatalf("err=%v hits=%d", err, hits)
 	}
 }
-
-func TestLegacyUpstreamRequiresExactLegacyAndAuditsWithoutSecrets(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok")) }))
-	defer server.Close()
-	var audit AuditLog
-	adapter := newLegacyHTTPUpstream(server.Client(), func(_ context.Context, entry AuditLog) { audit = entry }, nil, nil)
-	snapshot := testUpstreamSnapshot(server.URL)
-	session := &Session{SyntheticUserID: "gateway-user"}
-	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/Unknown?token=client-token", nil)
-	resp, err := adapter.RoundTripLegacy(legacyUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: req, Session: session, Snapshot: snapshot}})
-	if err != nil || resp == nil || audit.Event != "legacy_proxy_request" || audit.Path != "/Unknown" || audit.Message != "" || strings.Contains(audit.Path, "client-token") {
-		t.Fatalf("resp=%v err=%v audit=%#v", resp, err, audit)
-	}
-	resp.Body.Close()
-	bad := httptest.NewRequest(http.MethodGet, "http://gateway.test/Videos/x/stream", nil)
-	if _, err := adapter.RoundTripLegacy(legacyUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: bad, Session: session, Snapshot: snapshot}}); !errors.Is(err, ErrForbidden) {
-		t.Fatalf("media route accepted by legacy adapter: %v", err)
-	}
-}
-
-func TestLegacyUpstreamRejectsRedirectAndRecordsOneAuditAndAttempt(t *testing.T) {
-	var targetHits int
-	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { targetHits++ }))
-	defer target.Close()
-	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, target.URL+"/secret?api_key=backend-token", http.StatusFound)
-	}))
-	defer origin.Close()
-	var audits []AuditLog
-	var events []observe.Event
-	adapter := newLegacyHTTPUpstream(origin.Client(), func(_ context.Context, entry AuditLog) { audits = append(audits, entry) }, nil, func(event observe.Event) { events = append(events, event) })
-	snapshot := testUpstreamSnapshot(origin.URL)
-	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/Unknown?api_key=gateway-token", nil)
-	resp, err := adapter.RoundTripLegacy(legacyUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: req, Session: &Session{SyntheticUserID: "gateway-user"}, Snapshot: snapshot}})
-	if resp != nil {
-		_ = resp.Body.Close()
-	}
-	if !errors.Is(err, ErrUpstreamRedirectRejected) || targetHits != 0 {
-		t.Fatalf("response=%v err=%v targetHits=%d", resp, err, targetHits)
-	}
-	if len(audits) != 1 || audits[0].Event != "legacy_proxy_request" || audits[0].Status != http.StatusFound || audits[0].ErrorKind != "error" || strings.Contains(audits[0].Path+audits[0].Message, "token") {
-		t.Fatalf("audits=%#v", audits)
-	}
-	if len(events) != 1 || events[0].ErrorKind != upstreamPurposeLegacy.String() || events[0].StatusClass != observe.Status3xx || events[0].Outcome != observe.OutcomeError {
-		t.Fatalf("events=%#v", events)
-	}
-}
-
-func TestLegacyStripsCredentialsAndBoundsReplayBodyBeforeDial(t *testing.T) {
-	var hits int
-	var captured *http.Request
-	var capturedBody []byte
-	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		hits++
-		captured = req.Clone(req.Context())
-		capturedBody, _ = io.ReadAll(req.Body)
-		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok")), ContentLength: 2, Request: req}, nil
-	})
-	adapter := newLegacyHTTPUpstream(&http.Client{Transport: transport, Timeout: time.Second}, nil, nil, nil)
-	snapshot := testUpstreamSnapshot("http://backend.invalid")
-	session := &Session{SyntheticUserID: "gateway-user"}
-	body := bytes.Repeat([]byte("x"), legacyRequestBodyLimit)
-	req := httptest.NewRequest(http.MethodPost, "http://gateway.test/Unknown?api_key=gateway-token&token=gateway-token&signature=gateway-token&keep=gateway-user", bytes.NewReader(body))
-	for name, value := range map[string]string{"Authorization": `Emby Token="gateway-token"`, "Proxy-Authorization": "proxy", "Cookie": "secret=1", "x-eMbY-custom": "secret", "X-MediaBrowser-Custom": "secret", "X-Keep": "ok"} {
-		req.Header.Set(name, value)
-	}
-	req.Header.Add("Connection", "X-Emby-Token, X-Hop")
-	req.Header.Add("Connection", "Keep-Alive")
-	req.Header.Set("X-Hop", "remove")
-	resp, err := adapter.RoundTripLegacy(legacyUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: req, Session: session, Snapshot: snapshot}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if hits != 1 || len(capturedBody) != legacyRequestBodyLimit || captured.Header.Get("X-Keep") != "ok" || captured.Header.Get("Authorization") != "" || captured.Header.Get("Proxy-Authorization") != "" || captured.Header.Get("Cookie") != "" || captured.Header.Get("x-eMbY-custom") != "" || captured.Header.Get("X-MediaBrowser-Custom") != "" || captured.Header.Get("Connection") != "" || captured.Header.Get("Keep-Alive") != "" || captured.Header.Get("X-Hop") != "" || captured.Header.Get("X-Emby-Token") != snapshot.token {
-		t.Fatalf("captured headers/body=%#v/%d hits=%d", captured.Header, len(capturedBody), hits)
-	}
-	if values := captured.URL.Query()["api_key"]; len(values) != 1 || values[0] != snapshot.token || captured.URL.Query().Get("token") != "" || captured.URL.Query().Get("signature") != "" || captured.URL.Query().Get("keep") != snapshot.userID {
-		t.Fatalf("legacy query=%v", captured.URL.Query())
-	}
-
-	hits = 0
-	oversize := httptest.NewRequest(http.MethodPost, "http://gateway.test/Unknown", bytes.NewReader(bytes.Repeat([]byte("x"), legacyRequestBodyLimit+1)))
-	_, err = adapter.RoundTripLegacy(legacyUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: oversize, Session: session, Snapshot: snapshot}})
-	if !errors.Is(err, ErrRequestBodyTooLarge) || hits != 0 {
-		t.Fatalf("oversize err=%v hits=%d", err, hits)
-	}
-
-	hits = 0
-	partialErr := errors.New("partial read")
-	partial := httptest.NewRequest(http.MethodPost, "http://gateway.test/Unknown", nil)
-	partial.Body = io.NopCloser(io.MultiReader(strings.NewReader("prefix"), errorReader{err: partialErr}))
-	_, err = adapter.RoundTripLegacy(legacyUpstreamRequest{upstreamHTTPRequest: upstreamHTTPRequest{Request: partial, Session: session, Snapshot: snapshot}})
-	if !errors.Is(err, partialErr) || hits != 0 {
-		t.Fatalf("partial err=%v hits=%d", err, hits)
-	}
-}
-
-type errorReader struct{ err error }
-
-func (r errorReader) Read([]byte) (int, error) { return 0, r.err }
 
 func TestSanitizeHopHeadersAndResponseCopy(t *testing.T) {
 	header := make(http.Header)

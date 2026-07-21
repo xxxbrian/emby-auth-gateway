@@ -391,7 +391,7 @@ func TestPersonalDomainTwoUserStateIsolationMatrix(t *testing.T) {
 		},
 	}
 	// Swap backend to return conflicting upstream UserData for neutral reads.
-	metaPath := "/emby/Items/" + itemID
+	metaPath := backendItemMetadataPath(itemID)
 	metaRecorder := newEgressRecorder(func(w http.ResponseWriter, r *http.Request) {
 		writeTestJSON(w, backendItem)
 	})
@@ -399,7 +399,8 @@ func TestPersonalDomainTwoUserStateIsolationMatrix(t *testing.T) {
 	defer metaBackend.Close()
 	configureTestUpstream(store, metaBackend.URL+"/emby")
 
-	userDataB := fetchDirectUserData(t, gw.URL+"/emby/Items/"+itemID+"?api_key="+tokenB)
+	// Phase 8: bare /Items/{id} is Unclassified; use curated user-scoped detail.
+	userDataB := fetchDirectUserData(t, gw.URL+"/emby/Users/gateway-user-b/Items/"+itemID+"?api_key="+tokenB)
 	if userDataB["Played"] != false || userDataB["IsFavorite"] != false || int(userDataB["PlaybackPositionTicks"].(float64)) != 0 {
 		t.Fatalf("user B observed foreign/upstream state: %#v", userDataB)
 	}
@@ -409,7 +410,7 @@ func TestPersonalDomainTwoUserStateIsolationMatrix(t *testing.T) {
 	metaRecorder.assertNeutralMetadataReads(t, tokenB, metaPath)
 
 	metaRecorder.reset()
-	userDataA := fetchDirectUserData(t, gw.URL+"/emby/Items/"+itemID+"?api_key="+tokenA)
+	userDataA := fetchDirectUserData(t, gw.URL+"/emby/Users/gateway-user-a/Items/"+itemID+"?api_key="+tokenA)
 	if userDataA["IsFavorite"] != true || int(userDataA["PlaybackPositionTicks"].(float64)) != 4321 {
 		t.Fatalf("user A lost own state: %#v", userDataA)
 	}
@@ -450,7 +451,8 @@ func TestPersonalDomainNeutralMetadataLocalUserDataWins(t *testing.T) {
 	const itemID = "movie-42"
 	const gatewayToken = "gateway-token"
 	const syntheticUserID = "gateway-user"
-	wantMetaPath := "/emby/Items/" + itemID
+	// Path-bound user item detail rewrites to backend user path on egress.
+	wantMetaPath := backendItemMetadataPath(itemID)
 
 	recorder := newEgressRecorder(func(w http.ResponseWriter, r *http.Request) {
 		writeTestJSON(w, map[string]any{
@@ -497,7 +499,8 @@ func TestPersonalDomainNeutralMetadataLocalUserDataWins(t *testing.T) {
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
-	req := mustRequest(t, http.MethodGet, gw.URL+"/emby/Items/"+itemID+"?api_key="+gatewayToken, nil)
+	// Phase 8: use curated user-scoped detail (bare /Items/{id} is Unclassified).
+	req := mustRequest(t, http.MethodGet, gw.URL+"/emby/Users/"+syntheticUserID+"/Items/"+itemID+"?api_key="+gatewayToken, nil)
 	resp := do(t, req)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {

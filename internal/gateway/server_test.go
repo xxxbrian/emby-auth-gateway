@@ -232,12 +232,13 @@ func TestGatewayMVPTokenMappingAndRewriting(t *testing.T) {
 			})
 
 		case r.Method == http.MethodGet && r.URL.Path == "/emby/Users/"+backendUserID+"/Items":
+			// pathBoundBaseItem: path identity rewritten; EnableUserData=false; no query UserId.
 			sawBackendUserInPath = true
-			if r.URL.Query().Get("api_key") == "" {
+			if r.URL.Query().Get("api_key") == "" && r.URL.Query().Get("EnableUserData") == "false" {
 				sawSanitizedMetadataQuery = true
 			}
-			if r.URL.Query().Get("UserId") != backendUserID {
-				t.Fatalf("expected backend UserId query, got %q", r.URL.Query().Get("UserId"))
+			if _, hasUserID := r.URL.Query()["UserId"]; hasUserID {
+				t.Fatalf("path-bound user Items must not include query UserId, got %q", r.URL.Query().Get("UserId"))
 			}
 			writeTestJSON(w, map[string]any{
 				"Items": []any{
@@ -696,6 +697,8 @@ func TestProxyDoesNotRetryWhenRefreshReturnsSameToken(t *testing.T) {
 }
 
 func TestProxyRetryRewritesBodyWithRefreshedToken(t *testing.T) {
+	// Admitted negotiation route: body identity is rewritten from the current
+	// snapshot on each attempt (including post-refresh retry).
 	const (
 		backendUserID   = "backend-user"
 		syntheticUserID = "gateway-user"
@@ -711,11 +714,11 @@ func TestProxyRetryRewritesBodyWithRefreshedToken(t *testing.T) {
 				"AccessToken": "backend-token-2",
 				"ServerId":    "backend-server",
 				"User": map[string]any{
-					"Id":   backendUserID,
+					"Id":   "backend-user-2",
 					"Name": "shared",
 				},
 			})
-		case r.Method == http.MethodPost && r.URL.Path == "/emby/System/Unknown":
+		case r.Method == http.MethodPost && r.URL.Path == "/emby/LiveStreams/Open":
 			postCount++
 			data, err := io.ReadAll(r.Body)
 			if err != nil {
@@ -723,17 +726,27 @@ func TestProxyRetryRewritesBodyWithRefreshedToken(t *testing.T) {
 			}
 			body := string(data)
 			wantToken := "backend-token-" + strconv.Itoa(postCount)
-			if r.Header.Get("X-Emby-Token") != wantToken || !strings.Contains(body, wantToken) {
-				t.Fatalf("request %d did not use %s in header/body: header=%q body=%s", postCount, wantToken, r.Header.Get("X-Emby-Token"), body)
+			wantUser := backendUserID
+			if postCount == 2 {
+				wantUser = "backend-user-2"
+			}
+			if r.Header.Get("X-Emby-Token") != wantToken {
+				t.Fatalf("request %d token header=%q want %s", postCount, r.Header.Get("X-Emby-Token"), wantToken)
+			}
+			if !strings.Contains(body, `"UserId":"`+wantUser+`"`) {
+				t.Fatalf("request %d body missing rewritten UserId %q: %s", postCount, wantUser, body)
+			}
+			if strings.Contains(body, syntheticUserID) {
+				t.Fatalf("request %d body leaked synthetic user: %s", postCount, body)
 			}
 			if postCount == 1 {
 				http.Error(w, "stale", http.StatusUnauthorized)
 				return
 			}
-			if strings.Contains(body, "backend-token-1") {
-				t.Fatalf("retry body still contained stale token: %s", body)
+			if strings.Contains(body, "backend-token-1") || strings.Contains(body, `"UserId":"`+backendUserID+`"`) {
+				t.Fatalf("retry body still used stale snapshot: %s", body)
 			}
-			writeTestJSON(w, map[string]any{"ok": true})
+			writeTestJSON(w, map[string]any{"PlaySessionId": "play-1"})
 		case r.Method == http.MethodGet && r.URL.Path == "/emby/System/Info":
 			if r.Header.Get("X-Emby-Token") == "backend-token-1" {
 				http.Error(w, "stale", http.StatusUnauthorized)
@@ -766,8 +779,8 @@ func TestProxyRetryRewritesBodyWithRefreshedToken(t *testing.T) {
 	source.BackendToken, source.BackendUserID = "backend-token-1", backendUserID
 	store.UpstreamSources["source"] = source
 
-	body := `{"Token":"` + gatewayToken + `","UserId":"` + syntheticUserID + `"}`
-	req := mustRequest(t, http.MethodPost, gw.URL+"/emby/System/Unknown", strings.NewReader(body))
+	body := `{"UserId":"` + syntheticUserID + `"}`
+	req := mustRequest(t, http.MethodPost, gw.URL+"/emby/LiveStreams/Open", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Emby-Token", gatewayToken)
 	resp := do(t, req)
@@ -1195,7 +1208,8 @@ func TestPathPolicyDenyAndDefaultAllow(t *testing.T) {
 	var openHits int
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/emby/Items/Open":
+		case "/emby/System/Info":
+			// Curated metadata path used for default-allow path-policy contract.
 			openHits++
 			writeTestJSON(w, map[string]any{"ok": true})
 		case "/emby/Items/Secret":
@@ -1213,12 +1227,13 @@ func TestPathPolicyDenyAndDefaultAllow(t *testing.T) {
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
-	openResp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Items/Open?api_key=gateway-token", nil))
+	openResp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/System/Info?api_key=gateway-token", nil))
 	_ = openResp.Body.Close()
 	if openResp.StatusCode != http.StatusOK || openHits != 1 {
 		t.Fatalf("default allow status = %d hits = %d, want 200/1", openResp.StatusCode, openHits)
 	}
 
+	// Path policy deny still precedes Unclassified 404 for uncurated paths.
 	deniedResp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Items/Secret?api_key=gateway-token", nil))
 	_ = deniedResp.Body.Close()
 	if deniedResp.StatusCode != http.StatusForbidden {
@@ -1630,9 +1645,9 @@ func TestUserDataVirtualizationIsGatewayUserScoped(t *testing.T) {
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
-	u1 := fetchUserData(t, gw.URL+"/emby/Items?api_key=token-u1")
-	u2 := fetchUserData(t, gw.URL+"/emby/Items?api_key=token-u2")
-	u3 := fetchUserData(t, gw.URL+"/emby/Items?api_key=token-u3")
+	u1 := fetchUserData(t, gw.URL+"/emby/Users/gateway-user/Items?api_key=token-u1")
+	u2 := fetchUserData(t, gw.URL+"/emby/Users/gateway-user-2/Items?api_key=token-u2")
+	u3 := fetchUserData(t, gw.URL+"/emby/Users/gateway-user-3/Items?api_key=token-u3")
 	if u1["Played"] != false || int(u1["PlaybackPositionTicks"].(float64)) != 4200 || u1["PlayedPercentage"].(float64) != 42 || int(u1["PlayCount"].(float64)) != 1 {
 		t.Fatalf("unexpected u1 user data: %#v", u1)
 	}
@@ -1674,7 +1689,7 @@ func TestCompressedJSONUserDataIsVirtualized(t *testing.T) {
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
-	req := mustRequest(t, http.MethodGet, gw.URL+"/emby/Shows/show-1/Episodes?api_key=gateway-token", nil)
+	req := mustRequest(t, http.MethodGet, gw.URL+"/emby/Users/gateway-user/Items?api_key=gateway-token", nil)
 	req.Header.Set("Accept-Encoding", "gzip")
 	resp := do(t, req)
 	defer resp.Body.Close()
@@ -1716,7 +1731,7 @@ func TestProxyUserDataOverlayUsesBatchLookup(t *testing.T) {
 	gateway := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gateway.Close()
 
-	resp := do(t, mustRequest(t, http.MethodGet, gateway.URL+"/emby/Shows/show-1/Episodes?api_key=gateway-token", nil))
+	resp := do(t, mustRequest(t, http.MethodGet, gateway.URL+"/emby/Users/gateway-user/Items?api_key=gateway-token", nil))
 	defer resp.Body.Close()
 	var body map[string]any
 	decodeJSON(t, resp.Body, &body)
@@ -1928,7 +1943,7 @@ func TestProxyUserDataOverlayIgnoresOrphanedState(t *testing.T) {
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
-	userData := fetchUserData(t, gw.URL+"/emby/Items?api_key=gateway-token")
+	userData := fetchUserData(t, gw.URL+"/emby/Users/gateway-user/Items?api_key=gateway-token")
 	if userData["Played"] != false || int(userData["PlaybackPositionTicks"].(float64)) != 0 {
 		t.Fatalf("orphaned state should not overlay backend data: %#v", userData)
 	}
@@ -2271,15 +2286,9 @@ func TestPersonalFiltersTranslateToBackendIDSets(t *testing.T) {
 }
 
 func TestPersonalFiltersApplyToNonUserItemLists(t *testing.T) {
-	var sawIDs string
-	var sawFilters string
+	// Phase 8 P1: Shows Episodes is Unclassified; personal filters no longer intercept.
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/emby/Users/backend-user/Items" {
-			t.Fatalf("unexpected backend request %s", r.URL.String())
-		}
-		sawIDs = r.URL.Query().Get("Ids")
-		sawFilters = r.URL.Query().Get("Filters")
-		writeTestJSON(w, map[string]any{"Items": []any{map[string]any{"Id": sawIDs, "Type": "Episode", "SeriesId": "show-1", "UserData": map[string]any{}}}, "TotalRecordCount": 1})
+		t.Fatalf("unclassified Shows Episodes must not reach backend: %s", r.URL.String())
 	}))
 	defer backend.Close()
 
@@ -2291,12 +2300,10 @@ func TestPersonalFiltersApplyToNonUserItemLists(t *testing.T) {
 	defer gw.Close()
 
 	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Shows/show-1/Episodes?api_key=gateway-token&UserId=gateway-user&Filters=IsPlayed", nil))
+	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("filtered episodes status = %d", resp.StatusCode)
-	}
-	if sawIDs != "ep-played" || sawFilters != "" {
-		t.Fatalf("backend query Ids=%q Filters=%q, want ep-played/no personal filter", sawIDs, sawFilters)
+	if resp.StatusCode != http.StatusNotFound || string(body) != "not found\n" {
+		t.Fatalf("filtered episodes status/body = %d/%q, want Unclassified 404", resp.StatusCode, body)
 	}
 }
 
@@ -2351,8 +2358,9 @@ func TestAggregatePersonalFilterEndpointIsRejected(t *testing.T) {
 
 	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Artists?api_key=gateway-token&Filters=IsFavorite", nil))
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("filtered artist status = %d, want 400", resp.StatusCode)
+	// Unclassified before personal-filter 400: exact route_not_found.
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("filtered artist status = %d, want 404", resp.StatusCode)
 	}
 }
 
@@ -2421,12 +2429,14 @@ func TestUnknownPersonalFilterPathIsRejected(t *testing.T) {
 
 	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/UnknownList?api_key=gateway-token&IsFavorite=true", nil))
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("unsupported personal filter status = %d, want 400", resp.StatusCode)
+	// Unclassified before personal-filter 400.
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("unsupported personal filter status = %d, want 404", resp.StatusCode)
 	}
 
 	resp = do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Users/gateway-user/Views?api_key=gateway-token&Filters=IsFavorite", nil))
 	_ = resp.Body.Close()
+	// Views is curated MetadataProxy but not a personal list path → 400.
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("unsupported user personal filter status = %d, want 400", resp.StatusCode)
 	}
@@ -2896,7 +2906,8 @@ func TestOversizedJSONDoesNotPassTruncatedBody(t *testing.T) {
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
-	req := mustRequest(t, http.MethodGet, gw.URL+"/emby/large?api_key=gateway-token", nil)
+	// Admitted metadata JSON route (not bare /large Unclassified).
+	req := mustRequest(t, http.MethodGet, gw.URL+"/emby/System/Info?api_key=gateway-token", nil)
 	resp := do(t, req)
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
@@ -2931,8 +2942,11 @@ func TestProxyBackendUnavailableIsAudited(t *testing.T) {
 func TestOctetStreamM3U8IsRewritten(t *testing.T) {
 	var backendURL string
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/emby/Videos/item/master.m3u8" {
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
 		w.Header().Set("Content-Type", "application/octet-stream")
-		_, _ = w.Write([]byte("#EXTM3U\n" + backendURL + "/emby/seg.ts?api_key=backend-token\n"))
+		_, _ = w.Write([]byte("#EXTM3U\n" + backendURL + "/emby/Videos/item/hls1/pl/seg.ts?api_key=backend-token\n"))
 	}))
 	defer backend.Close()
 	backendURL = backend.URL
@@ -2943,7 +2957,8 @@ func TestOctetStreamM3U8IsRewritten(t *testing.T) {
 	gw := httptest.NewServer(NewServer(Config{PublicBaseURL: "https://media.example.com", GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
-	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/master.m3u8?api_key=gateway-token", nil))
+	// Exact admitted master.m3u8 template (not bare /master.m3u8).
+	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Videos/item/master.m3u8?api_key=gateway-token", nil))
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	text := string(body)
@@ -2953,7 +2968,7 @@ func TestOctetStreamM3U8IsRewritten(t *testing.T) {
 	if strings.Contains(text, backend.URL) || strings.Contains(text, "backend-token") {
 		t.Fatalf("m3u8 leaked backend details: %s", text)
 	}
-	if !strings.Contains(text, "https://media.example.com/emby/seg.ts?api_key=gateway-token") {
+	if !strings.Contains(text, "https://media.example.com/emby/Videos/item/hls1/pl/seg.ts?api_key=gateway-token") {
 		t.Fatalf("m3u8 was not rewritten: %s", text)
 	}
 }
@@ -2973,7 +2988,8 @@ func TestOversizedM3U8DoesNotPassTruncatedBody(t *testing.T) {
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
-	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/large.m3u8?api_key=gateway-token", nil))
+	// Exact admitted master.m3u8 template (not bare /large.m3u8).
+	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Videos/item/master.m3u8?api_key=gateway-token", nil))
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusBadGateway {
@@ -3129,8 +3145,10 @@ func TestCredentialQueryNormalizationAndGuards(t *testing.T) {
 			wantFinds:       1,
 			checkUpstream: func(t *testing.T, c captured) {
 				t.Helper()
-				if c.query.Get("token") != "" || c.query.Get("signature") != "keep" {
-					t.Fatalf("metadata credentials not stripped: %v", c.query)
+				// /System/Info uses systemInfo policy: credentials and all other
+				// query pairs (including signature=keep) are dropped; RawQuery empty.
+				if len(c.query) != 0 || c.query.Get("token") != "" || c.query.Get("signature") != "" {
+					t.Fatalf("SystemInfo query must be empty after policy, got %v", c.query)
 				}
 			},
 		},
@@ -3836,7 +3854,8 @@ func TestProxyRefreshReportingUsesOriginatingRequestContext(t *testing.T) {
 
 		ctx, cancel := context.WithCancel(context.Background())
 		server.metadataUpstream = refreshReportingMetadataUpstream{result: upstreamRefreshResult{Confirmed: true, Err: context.Canceled}, cancel: cancel, status: http.StatusInternalServerError}
-		request := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items/item-1?api_key=gateway-token", nil).WithContext(ctx)
+		// Admitted metadata route (bare /Items/{id} is Unclassified).
+		request := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/System/Info?api_key=gateway-token", nil).WithContext(ctx)
 		response := httptest.NewRecorder()
 		server.ServeHTTP(response, request)
 
@@ -3861,7 +3880,7 @@ func TestProxyRefreshReportingUsesOriginatingRequestContext(t *testing.T) {
 		go registry.Start(registryCtx)
 		server := NewServer(Config{GatewayBasePath: "/emby", Emitter: em}, store)
 		server.metadataUpstream = refreshReportingMetadataUpstream{result: upstreamRefreshResult{Confirmed: true, Err: errors.New("refresh failed")}, status: http.StatusInternalServerError}
-		request := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/Items/item-1?api_key=gateway-token", nil)
+		request := httptest.NewRequest(http.MethodGet, "http://gateway.test/emby/System/Info?api_key=gateway-token", nil)
 		response := httptest.NewRecorder()
 		server.ServeHTTP(response, request)
 
@@ -3874,7 +3893,7 @@ func TestProxyRefreshReportingUsesOriginatingRequestContext(t *testing.T) {
 		if refreshAudit == nil {
 			t.Fatalf("missing refresh failure audit: %#v", store.AuditLogs)
 		}
-		if refreshAudit.Method != http.MethodGet || refreshAudit.Path != "/Items/item-1" || refreshAudit.RemoteIP != "192.0.2.1" || refreshAudit.GatewayUserID != session.GatewayUserID || refreshAudit.SyntheticUserID != session.SyntheticUserID {
+		if refreshAudit.Method != http.MethodGet || refreshAudit.Path != "/System/Info" || refreshAudit.RemoteIP != "192.0.2.1" || refreshAudit.GatewayUserID != session.GatewayUserID || refreshAudit.SyntheticUserID != session.SyntheticUserID {
 			t.Fatalf("refresh audit attribution = %#v", *refreshAudit)
 		}
 		status := waitForAuthState(t, registry, telemetry.AuthStateFailing)

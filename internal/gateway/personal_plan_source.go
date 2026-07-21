@@ -51,6 +51,9 @@ type personalPlanSource struct {
 	request      *http.Request
 	session      *Session
 	gatewayToken string
+	// latestBudget, when set, bounds adaptive Latest grouped discovery,
+	// parent resolution, and ParentId-scoped exact-count requests.
+	latestBudget *latestGroupedBudget
 }
 
 func newPersonalPlanSource(server *Server, request *http.Request, session *Session, gatewayToken string) (*personalPlanSource, error) {
@@ -83,8 +86,18 @@ func (p *personalPlanSource) fetchCandidatePage(ctx context.Context, plan person
 		if start != 0 {
 			return personalCandidatePage{}, fmt.Errorf("Latest candidate start must be zero")
 		}
+		// Clamp before reserve/network so client Limit/StartIndex amplification
+		// cannot produce an outbound Limit above scan/remaining candidate bounds.
+		clamped, err := clampLatestOutboundLimit(limit, p.latestBudget)
+		if err != nil {
+			return personalCandidatePage{}, err
+		}
+		limit = clamped
 	} else {
 		q.Set("StartIndex", strconv.Itoa(start))
+	}
+	if err := p.latestBudget.reserveRequest(); err != nil {
+		return personalCandidatePage{}, err
 	}
 	q.Set("Limit", strconv.Itoa(limit))
 	value, status, upstream, err := p.server.fetchBackendJSON(ctx, p.request, plan.Path, q.Encode(), p.session, p.gatewayToken)
@@ -96,6 +109,9 @@ func (p *personalPlanSource) fetchCandidatePage(ctx context.Context, plan person
 	}
 	items, returnedStart, total, err := strictPersonalPage(value, plan.Shape, start)
 	if err != nil {
+		return personalCandidatePage{}, err
+	}
+	if err := p.latestBudget.addCandidates(len(items)); err != nil {
 		return personalCandidatePage{}, err
 	}
 	rewritten := make([]map[string]any, len(items))
@@ -216,6 +232,9 @@ func (p *personalPlanSource) resolveIDs(ctx context.Context, plan personalPlan, 
 		}
 		batchQuery := cloneQuery(q)
 		batchQuery.Set("Ids", strings.Join(batchIDs, ","))
+		if err := p.latestBudget.reserveRequest(); err != nil {
+			return nil, err
+		}
 		value, status, upstream, err := p.server.fetchBackendJSON(ctx, p.request, "/Users/"+p.session.SyntheticUserID+"/Items", batchQuery.Encode(), p.session, p.gatewayToken)
 		if err != nil {
 			return nil, err
@@ -225,6 +244,9 @@ func (p *personalPlanSource) resolveIDs(ctx context.Context, plan personalPlan, 
 		}
 		items, _, _, err := strictPersonalPage(value, personalShapeQueryResult, 0)
 		if err != nil {
+			return nil, err
+		}
+		if err := p.latestBudget.addCandidates(len(items)); err != nil {
 			return nil, err
 		}
 		batchResult := make(map[string]map[string]any, len(items))

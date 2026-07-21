@@ -168,7 +168,8 @@ func TestSessionDeniedTargetedControlCorpus(t *testing.T) {
 	}
 }
 
-func TestSessionsXStillProxies(t *testing.T) {
+func TestSessionsXIsUnclassified404(t *testing.T) {
+	// Phase 8: non-session lookalikes are Unclassified 404.
 	var forwarded []string
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		forwarded = append(forwarded, r.Method+" "+r.URL.Path)
@@ -183,12 +184,19 @@ func TestSessionsXStillProxies(t *testing.T) {
 	defer gw.Close()
 
 	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/SessionsX?api_key=gateway-token", nil))
+	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	if resp.StatusCode != http.StatusNotFound || string(body) != "not found\n" {
+		t.Fatalf("status/body = %d/%q, want 404 not found", resp.StatusCode, body)
 	}
-	if len(forwarded) != 1 || forwarded[0] != "GET /emby/SessionsX" {
-		t.Fatalf("forwarded = %v, want SessionsX proxy", forwarded)
+	if resp.Header.Get("Cache-Control") != "no-store" || resp.Header.Get("Allow") != "" {
+		t.Fatalf("headers Cache-Control=%q Allow=%q", resp.Header.Get("Cache-Control"), resp.Header.Get("Allow"))
+	}
+	if len(forwarded) != 0 {
+		t.Fatalf("forwarded = %v, want zero dial", forwarded)
+	}
+	if !hasAuditEvent(store, "route_not_found") {
+		t.Fatalf("missing route_not_found audit: %#v", store.AuditLogs)
 	}
 }
 
@@ -436,30 +444,6 @@ func TestSessionLocalWrongMethod405(t *testing.T) {
 	}
 }
 
-func TestNonSessionLegacyProxyUnchanged(t *testing.T) {
-	var forwarded []string
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		forwarded = append(forwarded, r.Method+" "+r.URL.Path)
-		writeTestJSON(w, map[string]any{"ok": true})
-	}))
-	defer backend.Close()
-
-	store := NewMemoryStore()
-	configureTestUpstream(store, backend.URL+"/emby")
-	store.Sessions[HashToken("gateway-token")] = testSession()
-	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
-	defer gw.Close()
-
-	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/System/Info?api_key=gateway-token", nil))
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-	if len(forwarded) != 1 || forwarded[0] != "GET /emby/System/Info" {
-		t.Fatalf("forwarded = %v", forwarded)
-	}
-}
-
 // mustEncodedPathRequest builds a request whose path contains encoded characters.
 // net/http decodes into URL.Path; classification uses the decoded relative path.
 func mustEncodedPathRequest(t *testing.T, method, host, encodedPath, rawQuery string) *http.Request {
@@ -614,7 +598,7 @@ func TestSessionEncodedPathNeverProxies(t *testing.T) {
 }
 
 func TestAcceptedAuthenticatedRequestTelemetryUsesRouteClass(t *testing.T) {
-	// Cover current-user, local playback, and representative LegacyProxy/metadata.
+	// Cover current-user, local playback, and representative metadata.
 	type hit struct {
 		method string
 		path   string

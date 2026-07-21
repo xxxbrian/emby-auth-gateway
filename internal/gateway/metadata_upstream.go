@@ -90,7 +90,9 @@ func validateMetadataRequest(in metadataUpstreamRequest) error {
 	if in.Request.Method != http.MethodGet && in.Request.Method != http.MethodHead {
 		return fmt.Errorf("%w: metadata method not allowed", ErrBadRequest)
 	}
-	if in.Request.Body != nil && in.Request.Body != http.NoBody {
+	// PocketBase wraps empty GET/HEAD bodies in a rereadable closer. Accept only
+	// declared zero-length bodies with no transfer encoding; never read Body.
+	if requestDeclaresDisallowedBody(in.Request) {
 		return fmt.Errorf("%w: metadata body not allowed", ErrBadRequest)
 	}
 	if in.Public {
@@ -111,18 +113,112 @@ func validateMetadataRequest(in metadataUpstreamRequest) error {
 	return nil
 }
 
+// requestDeclaresDisallowedBody reports whether a GET/HEAD request declares a
+// body that must be rejected before dial. Shared by metadata and media adapters.
+// ContentLength == 0 with empty TransferEncoding is allowed even when Body is a
+// non-nil wrapper (PocketBase empty-body path). Positive length, unknown length
+// (ContentLength < 0), and any transfer encoding are rejected without reading Body.
+func requestDeclaresDisallowedBody(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if len(r.TransferEncoding) > 0 {
+		return true
+	}
+	return r.ContentLength != 0
+}
+
 func (m *metadataUpstream) doAttempt(in metadataUpstreamRequest, snapshot upstreamRequestSnapshot) (*http.Response, upstreamRequestSnapshot, error) {
 	rel := in.Request.URL.Path
 	rawQuery := ""
 	if !in.Public {
+		// Recompute policy from the original client request on every attempt
+		// (including auth refresh retry) so path selection stays stable while
+		// backend identity comes from the current snapshot.
+		policy := metadataQueryPolicyForRequest(in.Request.Method, in.Request.URL.Path)
 		var err error
-		rawQuery, err = sanitizeMetadataRawQuery(in.Request.URL.RawQuery, in.Session.SyntheticUserID, snapshot.userID, ExtractToken(in.Request))
+		rawQuery, err = sanitizeMetadataRawQueryWithPolicy(
+			in.Request.URL.RawQuery,
+			in.Session.SyntheticUserID,
+			snapshot.userID,
+			ExtractToken(in.Request),
+			policy,
+		)
 		if err != nil {
 			return nil, snapshot, err
 		}
 		rel = projectUserPath(rel, in.Session.SyntheticUserID, snapshot.userID)
 	}
 	return m.do(in.Request.Context(), snapshot, in.Request.Method, rel, rawQuery, in.Public)
+}
+
+// metadataQueryPolicyForRequest selects the frozen metadata query policy for a
+// metadata egress attempt. It is path/method selection only: it does not
+// authorize routes or broaden routeclass.
+func metadataQueryPolicyForRequest(method, path string) metadataQueryPolicy {
+	switch strings.ToUpper(method) {
+	case http.MethodGet, http.MethodHead:
+	default:
+		// Metadata adapter rejects non-GET/HEAD before dial; keep a safe default.
+		return metadataQueryPolicyNonBaseItem
+	}
+	parts := responseProjectionPathParts(path)
+	switch {
+	case len(parts) == 2 && parts[0] == "system" && parts[1] == "info":
+		return metadataQueryPolicySystemInfo
+	case isPathBoundNeutralMetadataRoute(parts):
+		return metadataQueryPolicyPathBoundNeutral
+	case isUserBoundBaseItemMetadataRoute(parts):
+		return metadataQueryPolicyPathBoundBaseItem
+	case isGlobalBaseItemMetadataRoute(parts):
+		return metadataQueryPolicyGlobalBaseItem
+	default:
+		// Exact /Items/{id}/Images, reserved opaque paths, and other non-BaseItem
+		// metadata fall through here. Specific opaque/static segments are already
+		// excluded from BaseItem classifiers before generic item/by-name matches.
+		return metadataQueryPolicyNonBaseItem
+	}
+}
+
+func isPathBoundNeutralMetadataRoute(parts []string) bool {
+	return len(parts) == 3 && parts[0] == "users" && parts[1] != "" &&
+		(parts[2] == "views" || parts[2] == "homesections")
+}
+
+// isUserBoundBaseItemMetadataRoute matches user-scoped BaseItem families that
+// currently project as BaseItem / envelope / array under /Users/{self}/...
+// Views and HomeSections are handled as path-bound neutral instead.
+func isUserBoundBaseItemMetadataRoute(parts []string) bool {
+	if len(parts) < 3 || parts[0] != "users" || parts[1] == "" {
+		return false
+	}
+	switch {
+	case len(parts) == 3 && (parts[2] == "items" || parts[2] == "suggestions"):
+		return true
+	case len(parts) == 4 && parts[2] == "items" && parts[3] != "":
+		// Direct item, Resume, Latest, and other single-segment Items children.
+		return true
+	case len(parts) == 5 && parts[2] == "sections" && parts[3] != "" && parts[4] == "items":
+		return true
+	case len(parts) == 5 && parts[2] == "items" && parts[3] != "" &&
+		(parts[4] == "intros" || parts[4] == "localtrailers" || parts[4] == "specialfeatures"):
+		return true
+	default:
+		return false
+	}
+}
+
+// isGlobalBaseItemMetadataRoute mirrors Phase 7 BaseItem projection families
+// that are not user-path-bound (global Items lists, by-name, similar, theme media).
+func isGlobalBaseItemMetadataRoute(parts []string) bool {
+	if len(parts) > 0 && parts[0] == "users" {
+		return false
+	}
+	return isBaseItemEnvelopeArrayRoute(parts) ||
+		isAllThemeMediaRoute(parts) ||
+		isDeclaredBaseItemArrayRoute(parts) ||
+		isBaseItemEnvelopeRoute(parts) ||
+		isDirectBaseItemRoute(parts)
 }
 
 func (m *metadataUpstream) do(ctx context.Context, snapshot upstreamRequestSnapshot, method, rel, rawQuery string, public bool) (*http.Response, upstreamRequestSnapshot, error) {

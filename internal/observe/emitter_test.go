@@ -156,7 +156,8 @@ func TestClassifyRoute(t *testing.T) {
 		{"GET", "/System/Info/Public", RouteMetadata},
 		{"GET", "/unknown/path", RouteOther},
 		// Compatibility: ClassifyRoute sanitizes query/fragment/whitespace before routeclass.
-		{"GET", "Items/x?api_key=secret", RouteMetadata},
+		// Bare /Items/{id} is not a curated template (Unclassified → RouteOther).
+		{"GET", "Items/x?api_key=secret", RouteOther},
 		{"POST", "/Sessions/Playing/Progress?api_key=secret#frag", RoutePlayback},
 		{"POST", "  /Sessions/Logout  ", RouteAuth},
 		{"GET", "/System/Info/Public?x=1", RouteMetadata},
@@ -205,7 +206,6 @@ func TestRouteClassOf(t *testing.T) {
 		{"personal", routeclass.Decision{Ownership: routeclass.LocalPersonal, Operation: routeclass.OperationPersonal}, RouteUserdata},
 		{"metadata", routeclass.Decision{Ownership: routeclass.MetadataProxy}, RouteMetadata},
 		{"media", routeclass.Decision{Ownership: routeclass.MediaProxy}, RouteMedia},
-		{"legacy", routeclass.Decision{Ownership: routeclass.LegacyProxy}, RouteOther},
 		{"public system", routeclass.Decision{Ownership: routeclass.LocalPublic, Operation: routeclass.OperationPublicSystemInfo}, RouteMetadata},
 	}
 	for _, tc := range cases {

@@ -26,7 +26,7 @@ var (
 )
 
 // RejectUpstreamRedirect is the fixed redirect callback for metadata,
-// negotiation, managed-auth, and legacy egress.
+// negotiation and managed-auth egress.
 func RejectUpstreamRedirect(*http.Request, []*http.Request) error {
 	return ErrUpstreamRedirectRejected
 }

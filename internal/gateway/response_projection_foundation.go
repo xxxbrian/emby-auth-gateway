@@ -7,7 +7,6 @@ type responseProjectionKind uint8
 
 const (
 	responseProjectionOpaque responseProjectionKind = iota + 1
-	responseProjectionLegacyCompatibility
 	responseProjectionBaseItem
 	responseProjectionBaseItemEnvelope
 	responseProjectionBaseItemArray

@@ -12,6 +12,26 @@ import (
 // not own. Callers should map this error without inspecting partial output.
 var ErrForbidden = errors.New("forbidden")
 
+// metadataQueryPolicy selects route-specific metadata egress query mutation.
+type metadataQueryPolicy uint8
+
+const (
+	// metadataQueryPolicySystemInfo validates then emits an empty query.
+	metadataQueryPolicySystemInfo metadataQueryPolicy = iota + 1
+	// metadataQueryPolicyPathBoundNeutral preserves sanitized neutral pairs and
+	// appends nothing (Views/HomeSections).
+	metadataQueryPolicyPathBoundNeutral
+	// metadataQueryPolicyPathBoundBaseItem preserves sanitized neutral pairs and
+	// appends only EnableUserData=false (no query UserId).
+	metadataQueryPolicyPathBoundBaseItem
+	// metadataQueryPolicyGlobalBaseItem preserves sanitized neutral pairs and
+	// appends EnableUserData=false plus backend UserId.
+	metadataQueryPolicyGlobalBaseItem
+	// metadataQueryPolicyNonBaseItem preserves sanitized neutral pairs and
+	// appends no user fields (image metadata and other non-BaseItem routes).
+	metadataQueryPolicyNonBaseItem
+)
+
 var metadataListPolicies = map[string]struct {
 	canonical string
 	personal  map[string]struct{}
@@ -40,6 +60,7 @@ var directPersonalMetadataKeys = foldedSet(
 
 // SanitizeMetadataQuery returns deterministic query text for metadata egress.
 // It never mutates input and binds all accepted UserId aliases to backendUserID.
+// Compatibility behavior matches global BaseItem policy.
 func SanitizeMetadataQuery(input url.Values, syntheticUserID, backendUserID string) (string, error) {
 	for key, values := range input {
 		if strings.EqualFold(key, "UserId") && len(values) == 0 {
@@ -49,9 +70,18 @@ func SanitizeMetadataQuery(input url.Values, syntheticUserID, backendUserID stri
 	return sanitizeMetadataRawQuery(input.Encode(), syntheticUserID, backendUserID, "")
 }
 
+// sanitizeMetadataRawQuery is the compatibility wrapper used by existing
+// metadata upstream paths. It applies global BaseItem policy.
 func sanitizeMetadataRawQuery(rawQuery, syntheticUserID, backendUserID, gatewayToken string) (string, error) {
-	if syntheticUserID == "" || backendUserID == "" {
-		return "", ErrForbidden
+	return sanitizeMetadataRawQueryWithPolicy(rawQuery, syntheticUserID, backendUserID, gatewayToken, metadataQueryPolicyGlobalBaseItem)
+}
+
+// sanitizeMetadataRawQueryWithPolicy sanitizes raw query text for metadata
+// egress under an explicit route policy. It preserves unrelated pair order,
+// duplicates, escaping, and raw bytes for kept pairs.
+func sanitizeMetadataRawQueryWithPolicy(rawQuery, syntheticUserID, backendUserID, gatewayToken string, policy metadataQueryPolicy) (string, error) {
+	if err := requireMetadataPolicyIdentity(policy, syntheticUserID, backendUserID); err != nil {
+		return "", err
 	}
 	pairs, err := parseRawQueryPairs(rawQuery)
 	if err != nil {
@@ -69,21 +99,53 @@ func sanitizeMetadataRawQuery(rawQuery, syntheticUserID, backendUserID, gatewayT
 			if !pair.hasEquals || pair.value != syntheticUserID {
 				return "", ErrForbidden
 			}
+			// Validated synthetic UserId never egresses; policies that need a
+			// backend UserId append it explicitly after the pass.
+			continue
 		case foldedKey == "enableuserdata" || foldedKey == "enableuserdatas":
 			continue
 		case containsFolded(directPersonalMetadataKeys, foldedKey):
 			continue
 		case metadataListPolicies[foldedKey].canonical != "":
-			policy := metadataListPolicies[foldedKey]
-			if sanitized, ok := sanitizeMetadataList(pair.value, policy.personal); ok {
-				out = append(out, url.QueryEscape(policy.canonical)+"="+url.QueryEscape(sanitized))
+			listPolicy := metadataListPolicies[foldedKey]
+			if sanitized, ok := sanitizeMetadataList(pair.value, listPolicy.personal); ok {
+				out = append(out, url.QueryEscape(listPolicy.canonical)+"="+url.QueryEscape(sanitized))
 			}
 		default:
 			out = append(out, pair.raw)
 		}
 	}
-	out = append(out, "EnableUserData=false", "UserId="+url.QueryEscape(backendUserID))
-	return strings.Join(out, "&"), nil
+	switch policy {
+	case metadataQueryPolicySystemInfo:
+		return "", nil
+	case metadataQueryPolicyPathBoundNeutral, metadataQueryPolicyNonBaseItem:
+		return strings.Join(out, "&"), nil
+	case metadataQueryPolicyPathBoundBaseItem:
+		out = append(out, "EnableUserData=false")
+		return strings.Join(out, "&"), nil
+	case metadataQueryPolicyGlobalBaseItem:
+		out = append(out, "EnableUserData=false", "UserId="+url.QueryEscape(backendUserID))
+		return strings.Join(out, "&"), nil
+	default:
+		return "", fmt.Errorf("%w: unknown metadata query policy", ErrBadRequest)
+	}
+}
+
+func requireMetadataPolicyIdentity(policy metadataQueryPolicy, syntheticUserID, backendUserID string) error {
+	switch policy {
+	case metadataQueryPolicyGlobalBaseItem:
+		if syntheticUserID == "" || backendUserID == "" {
+			return ErrForbidden
+		}
+		return nil
+	case metadataQueryPolicySystemInfo, metadataQueryPolicyPathBoundNeutral, metadataQueryPolicyPathBoundBaseItem, metadataQueryPolicyNonBaseItem:
+		// Synthetic is required only when a UserId pair is present (validated
+		// during the pair pass). Backend is required only when the policy
+		// appends backend UserId (global BaseItem).
+		return nil
+	default:
+		return fmt.Errorf("%w: unknown metadata query policy", ErrBadRequest)
+	}
 }
 
 func sanitizeMetadataList(value string, personal map[string]struct{}) (string, bool) {

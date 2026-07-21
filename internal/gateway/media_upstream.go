@@ -146,7 +146,9 @@ func validateMediaRequest(in mediaUpstreamRequest) error {
 	if in.Request.Method != http.MethodGet && in.Request.Method != http.MethodHead {
 		return fmt.Errorf("%w: method", ErrMediaRequestRejected)
 	}
-	if in.Request.Body != nil && in.Request.Body != http.NoBody {
+	// PocketBase wraps empty GET/HEAD bodies; accept declared zero-length with
+	// no transfer encoding without reading Body (parity with metadata adapter).
+	if requestDeclaresDisallowedBody(in.Request) {
 		return fmt.Errorf("%w: body", ErrMediaRequestRejected)
 	}
 	d := routeclass.Classify(in.Request.Method, in.Request.URL.Path)

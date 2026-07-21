@@ -16,7 +16,6 @@ func TestNonMediaPurposesRejectEveryRedirect(t *testing.T) {
 		upstreamPurposeMetadata,
 		upstreamPurposeNegotiation,
 		upstreamPurposeManagedAuth,
-		upstreamPurposeLegacy,
 		upstreamPurpose(0),
 	} {
 		if err := upstreamRedirectPolicy(purpose, "gateway", "backend")(next, via); !errors.Is(err, ErrUpstreamRedirectRejected) {

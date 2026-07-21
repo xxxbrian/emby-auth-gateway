@@ -37,9 +37,6 @@ func buildResponseHeaderPlan(dst, src http.Header, rel string, session *Session,
 				if err := validateCredentialSafeHeaderValue(value, upstream.token); err != nil {
 					return nil, fmt.Errorf("header %s: %w", name, err)
 				}
-				if projection.kind == responseProjectionLegacyCompatibility {
-					value = rewriteLegacyHeaderIdentity(value, session, upstream, gatewayServerID)
-				}
 			}
 			if strings.EqualFold(name, "Vary") {
 				mergeVaryValue(header, value)
@@ -57,19 +54,6 @@ func buildResponseHeaderPlan(dst, src http.Header, rel string, session *Session,
 		}
 	}
 	return &responseHeaderPlan{header: header}, nil
-}
-
-func rewriteLegacyHeaderIdentity(value string, session *Session, upstream upstreamRequestSnapshot, gatewayServerID string) string {
-	if session == nil {
-		return value
-	}
-	if upstream.userID != "" {
-		value = strings.ReplaceAll(value, upstream.userID, session.SyntheticUserID)
-	}
-	if upstream.serverID != "" {
-		value = strings.ReplaceAll(value, upstream.serverID, gatewayServerID)
-	}
-	return value
 }
 
 func (p *responseHeaderPlan) Commit(dst http.Header) {

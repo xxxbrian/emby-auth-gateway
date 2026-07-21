@@ -76,14 +76,14 @@ func TestLocalWebSocketSkeletonStatusesAndZeroUpstream(t *testing.T) {
 		},
 		{
 			name:       "metadata wrong method",
-			request:    websocketSkeletonRequest(http.MethodPost, "/Items/item", false),
+			request:    websocketSkeletonRequest(http.MethodPost, "/System/Info", false),
 			status:     http.StatusMethodNotAllowed,
 			allow:      "GET, HEAD",
 			wantNoLoad: true,
 		},
 		{
 			name:       "media wrong method",
-			request:    websocketSkeletonRequest(http.MethodPost, "/Videos/item/stream", false),
+			request:    websocketSkeletonRequest(http.MethodPost, "/Items/item/Images/Primary", false),
 			status:     http.StatusMethodNotAllowed,
 			allow:      "GET, HEAD",
 			wantNoLoad: true,
@@ -93,6 +93,12 @@ func TestLocalWebSocketSkeletonStatusesAndZeroUpstream(t *testing.T) {
 			request:    websocketSkeletonRequest(http.MethodDelete, "/Items/item/PlaybackInfo", false),
 			status:     http.StatusMethodNotAllowed,
 			allow:      "GET, POST",
+			wantNoLoad: true,
+		},
+		{
+			name:       "unclassified unknown",
+			request:    websocketSkeletonRequest(http.MethodGet, "/Unknown", false),
+			status:     http.StatusNotFound,
 			wantNoLoad: true,
 		},
 	}

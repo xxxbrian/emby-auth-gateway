@@ -58,7 +58,7 @@ func (s *downloadFallbackPortSpy) RoundTripNegotiation(in negotiationUpstreamReq
 		PlaySessionID: "play-1",
 		MediaSources: []embyMediaSourceInfoDTO{{
 			ID: "source-1", Name: "movie", Container: "mkv",
-			DirectStreamURL:      "/Videos/item-1/original.mkv?MediaSourceId=source-1&PlaySessionId=play-1&api_key=backend-token",
+			DirectStreamURL:      "/Videos/item-1/stream?MediaSourceId=source-1&PlaySessionId=play-1&api_key=backend-token",
 			SupportsDirectStream: true,
 			RequiredHTTPHeaders:  map[string]string{"X-Required": "yes", "Authorization": "forbidden"},
 		}},
@@ -78,7 +78,7 @@ func (s *downloadFallbackPortSpy) RoundTripMedia(in mediaUpstreamRequest) (*http
 	if s.mediaRefresh != nil {
 		in.notifyRefreshResult(*s.mediaRefresh)
 	}
-	if in.Request.URL.IsAbs() || in.Request.URL.Path != "/Videos/item-1/original.mkv" {
+	if in.Request.URL.IsAbs() || in.Request.URL.Path != "/Videos/item-1/stream" {
 		s.t.Fatalf("media URL = %q", in.Request.URL.String())
 	}
 	if in.Snapshot.token != "refreshed-token" {
@@ -323,7 +323,7 @@ func (p *failedDownloadFallbackPort) RoundTripNegotiation(in negotiationUpstream
 		PlaySessionID: "play-failed",
 		MediaSources: []embyMediaSourceInfoDTO{{
 			ID:                   "source-1",
-			DirectStreamURL:      "/Videos/item-1/original.mkv?MediaSourceId=source-1&PlaySessionId=play-failed",
+			DirectStreamURL:      "/Videos/item-1/stream?MediaSourceId=source-1&PlaySessionId=play-failed",
 			SupportsDirectStream: true,
 		}},
 	})

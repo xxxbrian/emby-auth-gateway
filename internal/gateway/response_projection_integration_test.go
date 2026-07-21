@@ -70,7 +70,8 @@ func TestResponseProjectionRoutePlan(t *testing.T) {
 		{"playback info", http.MethodPost, "/Items/item/PlaybackInfo", responseProjectionPlaybackInfo},
 		{"live stream response", http.MethodPost, "/LiveStreams/Open", responseProjectionLiveStreamResponse},
 		{"live stream media info", http.MethodPost, "/LiveStreams/MediaInfo", responseProjectionMediaSource},
-		{"legacy", http.MethodPost, "/Plugin/Unknown", responseProjectionLegacyCompatibility},
+		// Phase 8: unknown routes are Unclassified → opaque projection (not Legacy).
+		{"unclassified unknown", http.MethodPost, "/Plugin/Unknown", responseProjectionOpaque},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
