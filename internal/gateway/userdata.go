@@ -155,6 +155,21 @@ func (s *Server) handlePersonalStateWrite(w http.ResponseWriter, r *http.Request
 		return true
 	}
 
+	if len(parts) == 5 && strings.EqualFold(parts[2], "Items") && strings.EqualFold(parts[4], "HideFromResume") {
+		if r.Method != http.MethodPost {
+			return false
+		}
+		hide, ok := requestHide(r)
+		if !ok {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return true
+		}
+		writeState(parts[3], func(state *PlaybackState) {
+			state.HideFromResume = hide
+		})
+		return true
+	}
+
 	return false
 }
 
@@ -470,7 +485,7 @@ func statesMatchingFilter(states []PlaybackState, filter PlaybackStateFilter) []
 			continue
 		}
 		if filter.Resumable != nil {
-			resumable := state.PlaybackPositionTicks > 0 && !state.Played
+			resumable := state.IsResumable()
 			if resumable != *filter.Resumable {
 				continue
 			}
@@ -777,6 +792,18 @@ func requestLikes(r *http.Request) (bool, bool) {
 		return false, false
 	}
 	return boolField(body, "Likes")
+}
+
+func requestHide(r *http.Request) (bool, bool) {
+	raw := strings.TrimSpace(r.URL.Query().Get("Hide"))
+	if raw == "" {
+		return false, false
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, false
+	}
+	return v, true
 }
 
 func extractItems(value any) []map[string]any {

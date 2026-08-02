@@ -164,6 +164,7 @@ func TestSavePlaybackResolutionDoesNotClobberUserData(t *testing.T) {
 		PlaybackPositionTicks: 999,
 		Played:                true,
 		IsFavorite:            true,
+		HideFromResume:        true,
 		PlayCount:             4,
 		Fingerprint:           "type=Movie|name=Old Name",
 	}); err != nil {
@@ -196,7 +197,7 @@ func TestSavePlaybackResolutionDoesNotClobberUserData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FindPlaybackState: %v", err)
 	}
-	if !state.IsFavorite || !state.Played || state.PlaybackPositionTicks != 999 || state.PlayCount != 4 {
+	if !state.IsFavorite || !state.Played || state.PlaybackPositionTicks != 999 || state.PlayCount != 4 || !state.HideFromResume {
 		t.Fatalf("user data clobbered: %#v", state)
 	}
 	if state.ItemName != "New Name" || state.SeriesID != "series-1" || state.SeasonID != "season-1" || state.RunTimeTicks != 5000 || state.Fingerprint != "type=Movie|name=New Name" {

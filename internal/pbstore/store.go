@@ -635,7 +635,7 @@ func (s *Store) ListPlaybackStates(ctx context.Context, gatewayUserID string, fi
 			continue
 		}
 		if filter.Resumable != nil {
-			resumable := state.PlaybackPositionTicks > 0 && !state.Played
+			resumable := state.IsResumable()
 			if resumable != *filter.Resumable {
 				continue
 			}
@@ -707,6 +707,7 @@ func (s *Store) SavePlaybackState(ctx context.Context, state gateway.PlaybackSta
 		record.Set("likes", false)
 		record.Set("likes_set", false)
 	}
+	record.Set("hide_from_resume", state.HideFromResume)
 	record.Set("fingerprint", state.Fingerprint)
 	if state.OrphanedAt != nil {
 		record.Set("orphaned_at", *state.OrphanedAt)
@@ -1062,6 +1063,7 @@ func playbackStateFromRecord(record *core.Record) *gateway.PlaybackState {
 		PlayCount:             record.GetInt("play_count"),
 		IsFavorite:            record.GetBool("is_favorite"),
 		Likes:                 likes,
+		HideFromResume:        record.GetBool("hide_from_resume"),
 		Fingerprint:           record.GetString("fingerprint"),
 		OrphanedAt:            orphanedAt,
 		LastSeenAt:            lastSeenAt,

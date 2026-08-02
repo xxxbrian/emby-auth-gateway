@@ -118,7 +118,7 @@ func (pq personalQuery) matchesState(state PlaybackState) bool {
 	if pq.positive["favorite"] && !state.IsFavorite {
 		return false
 	}
-	if pq.positive["resumable"] && (state.Played || state.PlaybackPositionTicks <= 0) {
+	if pq.positive["resumable"] && !state.IsResumable() {
 		return false
 	}
 	if pq.negative["played"] && state.Played {
@@ -127,7 +127,7 @@ func (pq personalQuery) matchesState(state PlaybackState) bool {
 	if pq.negative["favorite"] && state.IsFavorite {
 		return false
 	}
-	if pq.negative["resumable"] && !state.Played && state.PlaybackPositionTicks > 0 {
+	if pq.negative["resumable"] && state.IsResumable() {
 		return false
 	}
 	return true
@@ -477,7 +477,7 @@ func excludeSetForNegativeQuery(states []PlaybackState, pq personalQuery) map[st
 		if pq.negative["favorite"] && state.IsFavorite {
 			exclude[state.ItemID] = true
 		}
-		if pq.negative["resumable"] && !state.Played && state.PlaybackPositionTicks > 0 {
+		if pq.negative["resumable"] && state.IsResumable() {
 			exclude[state.ItemID] = true
 		}
 	}
@@ -490,7 +490,7 @@ func estimateNegativeTotal(upstreamTotal int, states []PlaybackState, pq persona
 		if state.OrphanedAt != nil || !pq.matchesCompleteKnownStateStructure(state) {
 			continue
 		}
-		if (pq.negative["played"] && state.Played) || (pq.negative["favorite"] && state.IsFavorite) || (pq.negative["resumable"] && !state.Played && state.PlaybackPositionTicks > 0) {
+		if (pq.negative["played"] && state.Played) || (pq.negative["favorite"] && state.IsFavorite) || (pq.negative["resumable"] && state.IsResumable()) {
 			excluded++
 		}
 	}

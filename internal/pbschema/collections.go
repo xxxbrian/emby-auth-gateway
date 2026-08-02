@@ -96,6 +96,7 @@ func userData(uid string) *core.Collection {
 	dates(c)
 	c.Fields.Add(&core.TextField{Name: "season_id", Max: 80})
 	c.Fields.Add(&core.NumberField{Name: "run_time_ticks", OnlyInt: true})
+	c.Fields.Add(&core.BoolField{Name: "hide_from_resume"})
 	c.AddIndex("idx_user_item_data_gateway_item", true, "gateway_user, item_id", "")
 	c.AddIndex("idx_user_item_data_gateway_series", false, "gateway_user, series_id", "")
 	c.AddIndex("idx_user_item_data_gateway_season", false, "gateway_user, season_id", "")

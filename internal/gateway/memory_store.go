@@ -447,7 +447,7 @@ func (m *MemoryStore) ListPlaybackStates(ctx context.Context, gatewayUserID stri
 			continue
 		}
 		if filter.Resumable != nil {
-			resumable := state.PlaybackPositionTicks > 0 && !state.Played
+			resumable := state.IsResumable()
 			if resumable != *filter.Resumable {
 				continue
 			}

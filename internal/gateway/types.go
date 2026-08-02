@@ -51,7 +51,7 @@ type Store interface {
 	ListPlaybackStates(ctx context.Context, gatewayUserID string, filter PlaybackStateFilter) ([]PlaybackState, error)
 	SavePlaybackState(ctx context.Context, state PlaybackState) error
 	// SavePlaybackResolution persists metadata/orphan/last-seen fields for an item
-	// without overwriting user-data fields (played, position, favorite, likes, etc.).
+	// without overwriting user-data fields (played, position, favorite, likes, hide_from_resume, etc.).
 	// Creates a row if missing. Used by item resolution/repair paths.
 	SavePlaybackResolution(ctx context.Context, state PlaybackState) error
 	FindDisplayPreference(ctx context.Context, gatewayUserID, preferenceID, client string) (*DisplayPreference, error)
@@ -281,6 +281,7 @@ type PlaybackState struct {
 	PlayCount             int
 	IsFavorite            bool
 	Likes                 *bool
+	HideFromResume        bool
 	Fingerprint           string
 	OrphanedAt            *time.Time
 	LastSeenAt            *time.Time
@@ -294,6 +295,10 @@ type PlaybackStateFilter struct {
 	SeriesID        string
 	SeasonID        string
 	IncludeOrphaned bool
+}
+
+func (s PlaybackState) IsResumable() bool {
+	return s.PlaybackPositionTicks > 0 && !s.Played && !s.HideFromResume
 }
 
 type PlaybackAggregate struct {

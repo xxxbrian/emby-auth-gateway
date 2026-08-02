@@ -20,11 +20,13 @@ import (
 // v060DataFixture was created from v0.6.0 tag 39df68c7f2dd19c8a08cb4828ffdb577f6a45231
 // with PocketBase v0.39.6: real application migrations, canonical collection
 // allowlist cleanup, generic application bookkeeping rows, and VACUUM.
+// Schema contract bumps (e.g. user_item_data.hide_from_resume) update this
+// fixture deliberately; Ensure still never migrates existing production DBs.
 //
 //go:embed testdata/v060-final/v060-final.fixture
 var v060Fixture []byte
 
-const v060FixtureSHA256 = "c52199d57cf955616be85421738b07da2f1d65e46b556f59e766f4b02cbd2c9f"
+const v060FixtureSHA256 = "eda0d57dbdd7ff9fdc363002af773623b369f3bc6dd97bd915a6671338ee440e"
 
 func TestProductionBootstrapAcceptsFrozenExistingSchemaWithoutWrites(t *testing.T) {
 	previous, err := os.Getwd()

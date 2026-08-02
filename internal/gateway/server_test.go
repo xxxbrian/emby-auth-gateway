@@ -2406,6 +2406,7 @@ func TestPersonalStateWritesAreTerminatedAtGateway(t *testing.T) {
 		{http.MethodPost, "/Users/gateway-user/FavoriteItems/item-1", ""},
 		{http.MethodPost, "/Users/gateway-user/Items/item-1/Rating?Likes=true", ""},
 		{http.MethodPost, "/Users/gateway-user/Items/item-1/UserData", `{"PlaybackPositionTicks":321,"PlayedPercentage":33.3}`},
+		{http.MethodPost, "/Users/gateway-user/Items/item-1/HideFromResume?Hide=true", ""},
 	}
 	for _, tc := range requests {
 		req := mustRequest(t, tc.method, gw.URL+"/emby"+tc.path+"&api_key=gateway-token", strings.NewReader(tc.body))
@@ -2423,11 +2424,101 @@ func TestPersonalStateWritesAreTerminatedAtGateway(t *testing.T) {
 	if err != nil {
 		t.Fatalf("find item state: %v", err)
 	}
-	if !state.Played || !state.IsFavorite || state.Likes == nil || !*state.Likes || state.PlaybackPositionTicks != 321 || state.SeriesID != "show-1" || state.SeasonID != "season-1" || state.RunTimeTicks != 10000 {
+	if !state.Played || !state.IsFavorite || state.Likes == nil || !*state.Likes || state.PlaybackPositionTicks != 321 || !state.HideFromResume || state.SeriesID != "show-1" || state.SeasonID != "season-1" || state.RunTimeTicks != 10000 {
 		t.Fatalf("personal state not persisted: %#v", state)
 	}
 	if writeRequests != 0 || metadataRequests != len(requests) {
 		t.Fatalf("writeRequests=%d metadataRequests=%d, want 0/%d", writeRequests, metadataRequests, len(requests))
+	}
+}
+
+func TestHideFromResumeExcludesItemFromResumeWithoutClearingProgress(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/emby/Users/backend-user/Items/item-1":
+			writeTestJSON(w, map[string]any{"Id": "item-1", "Name": "Movie", "Type": "Movie", "MediaType": "Video", "RunTimeTicks": float64(10000)})
+			return
+		case r.Method == http.MethodGet && r.URL.Path == "/emby/Users/backend-user/Items":
+			writeTestJSON(w, map[string]any{"Items": []any{
+				map[string]any{"Id": "item-1", "Name": "Movie", "Type": "Movie", "MediaType": "Video", "UserData": map[string]any{}},
+			}})
+			return
+		default:
+			t.Fatalf("unexpected backend request %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer backend.Close()
+
+	store := NewMemoryStore()
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
+	pct := 42.0
+	_ = store.SavePlaybackState(context.Background(), PlaybackState{
+		GatewayUserID:         "u1",
+		SyntheticUserID:       "gateway-user",
+		ItemID:                "item-1",
+		PlaybackPositionTicks: 4200,
+		PlayedPercentage:      &pct,
+		RunTimeTicks:          10000,
+	})
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	for _, bad := range []string{
+		gw.URL + "/emby/Users/gateway-user/Items/item-1/HideFromResume?api_key=gateway-token",
+		gw.URL + "/emby/Users/gateway-user/Items/item-1/HideFromResume?Hide=maybe&api_key=gateway-token",
+	} {
+		resp := do(t, mustRequest(t, http.MethodPost, bad, nil))
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("invalid Hide request %q status = %d, want 400", bad, resp.StatusCode)
+		}
+	}
+
+	// Hide from resume: keep progress, drop from resume list.
+	hide := do(t, mustRequest(t, http.MethodPost, gw.URL+"/emby/Users/gateway-user/Items/item-1/HideFromResume?Hide=true&api_key=gateway-token", nil))
+	var hideBody map[string]any
+	decodeJSON(t, hide.Body, &hideBody)
+	_ = hide.Body.Close()
+	if hide.StatusCode != http.StatusOK {
+		t.Fatalf("hide status = %d", hide.StatusCode)
+	}
+	if int(hideBody["PlaybackPositionTicks"].(float64)) != 4200 {
+		t.Fatalf("hide response should preserve position: %#v", hideBody)
+	}
+	state, err := store.FindPlaybackState(context.Background(), "u1", "item-1")
+	if err != nil || !state.HideFromResume || state.PlaybackPositionTicks != 4200 || state.Played {
+		t.Fatalf("hide state = %#v err=%v", state, err)
+	}
+
+	resume := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Users/gateway-user/Items/Resume?api_key=gateway-token", nil))
+	var resumeBody map[string]any
+	decodeJSON(t, resume.Body, &resumeBody)
+	_ = resume.Body.Close()
+	if resume.StatusCode != http.StatusOK {
+		t.Fatalf("resume status = %d", resume.StatusCode)
+	}
+	if items := resumeBody["Items"].([]any); len(items) != 0 {
+		t.Fatalf("resume after hide = %#v, want empty", items)
+	}
+
+	// Unhide restores resume membership without changing progress.
+	unhide := do(t, mustRequest(t, http.MethodPost, gw.URL+"/emby/Users/gateway-user/Items/item-1/HideFromResume?Hide=false&api_key=gateway-token", nil))
+	_ = unhide.Body.Close()
+	if unhide.StatusCode != http.StatusOK {
+		t.Fatalf("unhide status = %d", unhide.StatusCode)
+	}
+	state, err = store.FindPlaybackState(context.Background(), "u1", "item-1")
+	if err != nil || state.HideFromResume || state.PlaybackPositionTicks != 4200 {
+		t.Fatalf("unhide state = %#v err=%v", state, err)
+	}
+
+	resume = do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Users/gateway-user/Items/Resume?api_key=gateway-token", nil))
+	decodeJSON(t, resume.Body, &resumeBody)
+	_ = resume.Body.Close()
+	items := resumeBody["Items"].([]any)
+	if len(items) != 1 || items[0].(map[string]any)["Id"] != "item-1" {
+		t.Fatalf("resume after unhide = %#v, want item-1", items)
 	}
 }
 

@@ -529,6 +529,7 @@ func TestSavePlaybackResolutionDoesNotClobberUserData(t *testing.T) {
 		PlaybackPositionTicks: 999,
 		Played:                true,
 		IsFavorite:            true,
+		HideFromResume:        true,
 		PlayCount:             4,
 		Fingerprint:           "type=Movie|name=Old Name",
 	}); err != nil {
@@ -566,7 +567,7 @@ func TestSavePlaybackResolutionDoesNotClobberUserData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FindPlaybackState: %v", err)
 	}
-	if !state.IsFavorite || !state.Played || state.PlaybackPositionTicks != 999 || state.PlayCount != 4 {
+	if !state.IsFavorite || !state.Played || state.PlaybackPositionTicks != 999 || state.PlayCount != 4 || !state.HideFromResume {
 		t.Fatalf("user data clobbered: %#v", state)
 	}
 	if state.ItemName != "New Name" || state.SeriesID != "series-1" || state.SeasonID != "season-1" || state.RunTimeTicks != 5000 || state.Fingerprint != "type=Movie|name=New Name" {
@@ -680,6 +681,7 @@ func TestUserItemDataFieldsAndDisplayPreferencesArePersisted(t *testing.T) {
 		PlaybackPositionTicks: 500,
 		IsFavorite:            true,
 		Likes:                 &likes,
+		HideFromResume:        true,
 		Fingerprint:           "type=Episode|name=Episode 1|seriesId=series-1",
 		LastSeenAt:            &lastSeen,
 	}); err != nil {
@@ -691,8 +693,16 @@ func TestUserItemDataFieldsAndDisplayPreferencesArePersisted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list favorite states: %v", err)
 	}
-	if len(states) != 1 || states[0].ItemName != "Episode 1" || states[0].SeriesID != "series-1" || states[0].SeasonID != "season-1" || states[0].RunTimeTicks != 1000 || states[0].Likes == nil || !*states[0].Likes || states[0].LastSeenAt == nil {
+	if len(states) != 1 || states[0].ItemName != "Episode 1" || states[0].SeriesID != "series-1" || states[0].SeasonID != "season-1" || states[0].RunTimeTicks != 1000 || states[0].Likes == nil || !*states[0].Likes || !states[0].HideFromResume || states[0].LastSeenAt == nil {
 		t.Fatalf("unexpected user item data: %#v", states)
+	}
+	resumable := true
+	resumeStates, err := store.ListPlaybackStates(context.Background(), userID, gateway.PlaybackStateFilter{Resumable: &resumable})
+	if err != nil {
+		t.Fatalf("list resumable states: %v", err)
+	}
+	if len(resumeStates) != 0 {
+		t.Fatalf("hide_from_resume item should not be resumable: %#v", resumeStates)
 	}
 
 	if err := store.SaveDisplayPreference(context.Background(), gateway.DisplayPreference{GatewayUserID: userID, SyntheticUserID: "gateway-user", PreferenceID: "home", Client: "web", PayloadJSON: `{"SortBy":"DateCreated"}`}); err != nil {
