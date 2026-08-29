@@ -336,34 +336,45 @@ func (s *Server) writeNextUpItems(w http.ResponseWriter, r *http.Request, sessio
 		http.Error(w, "next up unavailable", http.StatusInternalServerError)
 		return
 	}
+	seriesID := strings.TrimSpace(r.URL.Query().Get("SeriesId"))
+	if seriesID == "" {
+		states = s.repairIncompleteNextUpStates(r.Context(), r, session, gatewayToken, states)
+	}
 	series := recentlyActiveSeries(states)
-	if seriesID := strings.TrimSpace(r.URL.Query().Get("SeriesId")); seriesID != "" {
+	if seriesID != "" {
 		series = []string{seriesID}
 	}
 	maxSeries := intQuery(r.URL.Query(), "Limit", 20) + 20
 	if maxSeries > 0 && len(series) > maxSeries {
 		series = series[:maxSeries]
 	}
-	playedByID := playbackStateSet(filterStates(states, func(state PlaybackState) bool { return state.Played }))
 	items := make([]any, 0, len(series))
 	episodeQuery := queryForIDResolution(r.URL.Query())
-	for _, seriesID := range series {
-		episodeValue, status, upstream, err := s.fetchBackendJSON(r.Context(), r, "/Shows/"+seriesID+"/Episodes", episodeQuery.Encode(), session, gatewayToken)
-		if err != nil || status < 200 || status >= 300 {
+	now := time.Now().UTC()
+	explicitSeries := seriesID != ""
+	for _, id := range series {
+		episodes, complete, upstream, ok := s.fetchCompleteSeriesEpisodes(r.Context(), r, id, episodeQuery, session, gatewayToken)
+		if !ok {
 			continue
 		}
-		episodes := extractItems(episodeValue)
-		// Only cache when Emby reports a trusted total; len(episodes) may be a partial page.
-		if total, ok := totalRecordCount(episodeValue); ok && total > 0 {
-			_ = s.store.SaveItemChildCount(r.Context(), ItemChildCount{ItemID: seriesID, ChildCount: total})
+		if complete && len(episodes) > 0 {
+			_ = s.store.SaveItemChildCount(r.Context(), ItemChildCount{ItemID: id, ChildCount: len(episodes)})
 		}
 		sort.SliceStable(episodes, func(i, j int) bool {
 			return episodeOrderLess(episodes[i], episodes[j])
 		})
-		last := lastWatchedEpisodeIndex(states, seriesID)
+		states = s.applyResolvedItemsToStates(r.Context(), states, episodes, nil, false, now)
+		if !complete {
+			continue
+		}
+		if !explicitSeries && !seriesHasEligibleNextUpActivity(states, id) {
+			continue
+		}
+		last := lastWatchedEpisodeIndexFromItems(episodes, states)
+		playedByID := nextUpPlayedItemIDs(states)
 		for _, episode := range episodes {
-			id, _ := stringField(episode, "Id")
-			if id == "" || playedByID[id] || !episodeAfter(episode, last) {
+			episodeID, _ := stringField(episode, "Id")
+			if episodeID == "" || playedByID[episodeID] || !episodeAfter(episode, last) {
 				continue
 			}
 			rewritten := s.rewriteProxyJSONValueForRequestWithSnapshot(r.Context(), r, episode, session, upstream, gatewayToken, s.gatewayBaseForRequest(r))
@@ -376,6 +387,214 @@ func (s *Server) writeNextUpItems(w http.ResponseWriter, r *http.Request, sessio
 	total := len(items)
 	items = pageItems(items, r.URL.Query())
 	writeJSON(w, http.StatusOK, map[string]any{"Items": items, "TotalRecordCount": total, "StartIndex": intQuery(r.URL.Query(), "StartIndex", 0)})
+}
+
+func (s *Server) repairIncompleteNextUpStates(ctx context.Context, r *http.Request, session *Session, gatewayToken string, states []PlaybackState) []PlaybackState {
+	ids := newestIncompleteActiveItemIDs(states, personalIDBatchLimit)
+	if len(ids) == 0 {
+		return states
+	}
+	q := queryForIDResolution(r.URL.Query())
+	q.Set("Ids", strings.Join(ids, ","))
+	q.Set("Limit", strconv.Itoa(len(ids)))
+	q.Set("EnableTotalRecordCount", "true")
+	value, status, _, err := s.fetchBackendJSON(ctx, r, "/Users/"+session.SyntheticUserID+"/Items", q.Encode(), session, gatewayToken)
+	if err != nil || status < 200 || status >= 300 {
+		return states
+	}
+	items := extractItems(value)
+	requested := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		requested[id] = true
+	}
+	return s.applyResolvedItemsToStates(ctx, states, items, requested, idResolutionResponseComplete(value, requested, items), time.Now().UTC())
+}
+
+func (s *Server) fetchCompleteSeriesEpisodes(ctx context.Context, r *http.Request, seriesID string, baseQuery url.Values, session *Session, gatewayToken string) ([]map[string]any, bool, upstreamRequestSnapshot, bool) {
+	var (
+		all      []map[string]any
+		seen     = map[string]bool{}
+		upstream upstreamRequestSnapshot
+		total    = -1
+		start    = 0
+	)
+	for start < personalScanItemLimit {
+		q := cloneQuery(baseQuery)
+		q.Set("StartIndex", strconv.Itoa(start))
+		q.Set("Limit", strconv.Itoa(personalScanBatchLimit))
+		q.Set("EnableTotalRecordCount", "true")
+		value, status, snap, err := s.fetchBackendJSON(ctx, r, "/Shows/"+seriesID+"/Episodes", q.Encode(), session, gatewayToken)
+		if err != nil || status < 200 || status >= 300 {
+			if start == 0 {
+				return nil, false, snap, false
+			}
+			return all, false, upstream, true
+		}
+		if start == 0 {
+			upstream = snap
+		}
+		if n, ok := totalRecordCount(value); ok && total < 0 {
+			total = n
+		}
+		batch := extractItems(value)
+		newUnique := 0
+		for _, item := range batch {
+			id, _ := stringField(item, "Id")
+			if id == "" || seen[id] {
+				continue
+			}
+			seen[id] = true
+			all = append(all, item)
+			newUnique++
+		}
+		if total >= 0 && len(all) == total {
+			return all, true, upstream, true
+		}
+		if total >= 0 && len(all) > total {
+			return all, false, upstream, true
+		}
+		if newUnique == 0 {
+			break
+		}
+		start += personalScanBatchLimit
+		if len(batch) < personalScanBatchLimit {
+			break
+		}
+	}
+	if total >= 0 && len(all) == total {
+		return all, true, upstream, true
+	}
+	return all, false, upstream, true
+}
+
+func uniqueRequestedItemIDs(items []map[string]any, requested map[string]bool) map[string]bool {
+	seen := map[string]bool{}
+	for _, item := range items {
+		id, _ := stringField(item, "Id")
+		if id == "" || (requested != nil && !requested[id]) {
+			continue
+		}
+		seen[id] = true
+	}
+	return seen
+}
+
+func idResolutionResponseComplete(value any, requested map[string]bool, items []map[string]any) bool {
+	if requested == nil {
+		return false
+	}
+	total, ok := totalRecordCount(value)
+	if !ok {
+		return false
+	}
+	found := uniqueRequestedItemIDs(items, requested)
+	if len(found) != total || total > len(requested) {
+		return false
+	}
+	return true
+}
+
+func (s *Server) applyResolvedItemsToStates(ctx context.Context, states []PlaybackState, items []map[string]any, requested map[string]bool, orphanMissing bool, now time.Time) []PlaybackState {
+	byID := make(map[string]map[string]any, len(items))
+	for _, item := range items {
+		id, _ := stringField(item, "Id")
+		if id != "" {
+			byID[id] = item
+		}
+	}
+	for i := range states {
+		id := states[i].ItemID
+		if id == "" || (requested != nil && !requested[id]) {
+			continue
+		}
+		item, ok := byID[id]
+		before := states[i]
+		var outcome resolutionOutcome
+		if !ok {
+			if !orphanMissing {
+				continue
+			}
+			outcome = reconcileResolvedItem(&states[i], nil, false, now)
+		} else {
+			outcome = reconcileResolvedItem(&states[i], item, true, now)
+		}
+		if playbackResolutionShouldPersist(before, states[i], outcome) {
+			_ = s.store.SavePlaybackResolution(ctx, states[i])
+		}
+	}
+	return states
+}
+
+func playbackResolutionShouldPersist(before, after PlaybackState, outcome resolutionOutcome) bool {
+	if outcome != resolutionKeep {
+		return true
+	}
+	if before.OrphanedAt != nil && after.OrphanedAt == nil {
+		return true
+	}
+	return before.ItemName != after.ItemName ||
+		before.ItemType != after.ItemType ||
+		before.SeriesID != after.SeriesID ||
+		before.SeriesName != after.SeriesName ||
+		before.SeasonID != after.SeasonID ||
+		before.IndexNumber != after.IndexNumber ||
+		before.ParentIndexNumber != after.ParentIndexNumber ||
+		before.RunTimeTicks != after.RunTimeTicks ||
+		before.Fingerprint != after.Fingerprint
+}
+
+func seriesHasEligibleNextUpActivity(states []PlaybackState, seriesID string) bool {
+	if seriesID == "" {
+		return false
+	}
+	for _, state := range states {
+		if state.OrphanedAt != nil || state.SeriesID != seriesID {
+			continue
+		}
+		if state.Played || state.PlaybackPositionTicks > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func newestIncompleteActiveItemIDs(states []PlaybackState, limit int) []string {
+	if limit <= 0 {
+		return nil
+	}
+	type pair struct {
+		id string
+		t  time.Time
+	}
+	pairs := make([]pair, 0, len(states))
+	for i := range states {
+		state := &states[i]
+		if state.ItemID == "" || state.OrphanedAt != nil {
+			continue
+		}
+		if !state.Played && state.PlaybackPositionTicks == 0 {
+			continue
+		}
+		if !playbackStateNeedsMetadata(state) {
+			continue
+		}
+		pairs = append(pairs, pair{id: state.ItemID, t: stateRecency(*state)})
+	}
+	sort.SliceStable(pairs, func(i, j int) bool { return pairs[i].t.After(pairs[j].t) })
+	if len(pairs) > limit {
+		pairs = pairs[:limit]
+	}
+	ids := make([]string, 0, len(pairs))
+	for _, p := range pairs {
+		ids = append(ids, p.id)
+	}
+	return ids
+}
+
+func nextUpPlayedItemIDs(states []PlaybackState) map[string]bool {
+	return playbackStateSet(filterStates(states, func(state PlaybackState) bool {
+		return state.Played && state.OrphanedAt == nil
+	}))
 }
 
 func (s *Server) personalFilterIDs(ctx context.Context, gatewayUserID string, q url.Values) ([]string, bool, []string, error) {
@@ -882,7 +1101,27 @@ func mergeItemMetadata(state *PlaybackState, item map[string]any) {
 	if v, ok := int64Field(item, "RunTimeTicks"); ok {
 		state.RunTimeTicks = v
 	}
-	state.Fingerprint = itemFingerprint(item)
+	newFP := itemFingerprint(item)
+	if newFP == "" {
+		return
+	}
+	if state.Fingerprint == "" || fingerprintCovers(newFP, state.Fingerprint) {
+		state.Fingerprint = newFP
+	}
+}
+
+func fingerprintCovers(newFP, oldFP string) bool {
+	oldParts := fingerprintParts(oldFP)
+	if len(oldParts) == 0 {
+		return true
+	}
+	newParts := fingerprintParts(newFP)
+	for key := range oldParts {
+		if _, ok := newParts[key]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func itemFingerprint(item map[string]any) string {
@@ -1101,7 +1340,7 @@ type episodeIndex struct {
 func lastWatchedEpisodeIndex(states []PlaybackState, seriesID string) episodeIndex {
 	last := episodeIndex{}
 	for _, state := range states {
-		if state.SeriesID != seriesID || (!state.Played && state.PlaybackPositionTicks == 0) {
+		if state.SeriesID != seriesID || state.OrphanedAt != nil || (!state.Played && state.PlaybackPositionTicks == 0) {
 			continue
 		}
 		idx := episodeIndex{season: state.ParentIndexNumber, episode: state.IndexNumber, valid: true}
@@ -1110,6 +1349,38 @@ func lastWatchedEpisodeIndex(states []PlaybackState, seriesID string) episodeInd
 		}
 	}
 	return last
+}
+
+func lastWatchedEpisodeIndexFromItems(episodes []map[string]any, states []PlaybackState) episodeIndex {
+	active := make(map[string]bool, len(states))
+	for _, state := range states {
+		if state.ItemID == "" || state.OrphanedAt != nil {
+			continue
+		}
+		if !state.Played && state.PlaybackPositionTicks == 0 {
+			continue
+		}
+		active[state.ItemID] = true
+	}
+	last := episodeIndex{}
+	for _, episode := range episodes {
+		id, _ := stringField(episode, "Id")
+		if id == "" || !active[id] {
+			continue
+		}
+		idx := fetchedEpisodeIndex(episode)
+		if !idx.valid {
+			continue
+		}
+		if !last.valid || indexAfter(idx, last) {
+			last = idx
+		}
+	}
+	return last
+}
+
+func fetchedEpisodeIndex(item map[string]any) episodeIndex {
+	return itemEpisodeIndex(item)
 }
 
 func episodeAfter(item map[string]any, last episodeIndex) bool {
@@ -1123,12 +1394,21 @@ func episodeAfter(item map[string]any, last episodeIndex) bool {
 func episodeOrderLess(a, b map[string]any) bool {
 	ai := itemEpisodeIndex(a)
 	bi := itemEpisodeIndex(b)
+	if ai.valid != bi.valid {
+		return ai.valid && !bi.valid
+	}
+	if !ai.valid {
+		return false
+	}
 	return indexAfter(bi, ai)
 }
 
 func itemEpisodeIndex(item map[string]any) episodeIndex {
-	season, _ := int64Field(item, "ParentIndexNumber")
-	episode, _ := int64Field(item, "IndexNumber")
+	episode, epOK := int64Field(item, "IndexNumber")
+	season, seasonOK := int64Field(item, "ParentIndexNumber")
+	if !epOK || !seasonOK {
+		return episodeIndex{}
+	}
 	return episodeIndex{season: int(season), episode: int(episode), valid: true}
 }
 

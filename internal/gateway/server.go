@@ -1244,7 +1244,7 @@ func (s *Server) recordPlaybackRequest(r *http.Request, rel string, session *Ses
 		state.Played = *details.Played
 	}
 	if eventName == "stopped" {
-		if state.RunTimeTicks <= 0 {
+		if state.RunTimeTicks <= 0 || playbackStateNeedsMetadata(state) {
 			s.enrichPlaybackStateMetadata(r.Context(), r, session, gatewayToken, state)
 		}
 		applyStoppedPlaybackState(state, now, wasPlayed, s.resumePolicyForState(state))
@@ -1254,6 +1254,19 @@ func (s *Server) recordPlaybackRequest(r *http.Request, rel string, session *Ses
 		return err
 	}
 	return nil
+}
+
+func playbackStateNeedsMetadata(state *PlaybackState) bool {
+	if state == nil {
+		return false
+	}
+	if strings.TrimSpace(state.ItemName) == "" || strings.TrimSpace(state.ItemType) == "" {
+		return true
+	}
+	if strings.EqualFold(state.ItemType, "Episode") && strings.TrimSpace(state.SeriesID) == "" {
+		return true
+	}
+	return false
 }
 
 func playbackDetailsFromRequest(r *http.Request, data []byte) (playbackDetails, bool) {

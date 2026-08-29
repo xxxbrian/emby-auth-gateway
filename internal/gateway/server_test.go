@@ -1720,6 +1720,18 @@ func TestPlaybackReportsSucceedWhenBackendUnavailable(t *testing.T) {
 	if err != nil || state.PlaybackPositionTicks != 700 {
 		t.Fatalf("playback state = %#v err=%v", state, err)
 	}
+
+	stopped := mustRequest(t, http.MethodPost, gw.URL+"/emby/Sessions/Playing/Stopped?api_key=gateway-token", strings.NewReader(`{"ItemId":"item-2","PositionTicks":11070000000,"RunTimeTicks":11070000000}`))
+	stopped.Header.Set("Content-Type", "application/json")
+	resp = do(t, stopped)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("stopped status = %d, want 204", resp.StatusCode)
+	}
+	state, err = store.FindPlaybackState(context.Background(), "u1", "item-2")
+	if err != nil || !state.Played || state.RunTimeTicks != 11070000000 {
+		t.Fatalf("stopped state without backend = %#v err=%v", state, err)
+	}
 }
 
 func TestPlaybackPingAndCapabilitiesAreLocalOnly(t *testing.T) {
@@ -3098,13 +3110,11 @@ func TestNextUpUsesGatewaySeriesState(t *testing.T) {
 		if r.URL.Path != "/emby/Shows/show-1/Episodes" {
 			t.Fatalf("unexpected backend request %s", r.URL.String())
 		}
-		if r.URL.Query().Get("Limit") != "" || r.URL.Query().Get("StartIndex") != "" {
-			t.Fatalf("next up episode lookup should not forward pagination: %s", r.URL.RawQuery)
-		}
+		requireInternalEpisodePage(t, r, 0)
 		writeTestJSON(w, map[string]any{"Items": []any{
 			map[string]any{"Id": "ep-1", "Name": "Episode 1", "Type": "Episode", "SeriesId": "show-1", "ParentIndexNumber": 1, "IndexNumber": 1, "UserData": map[string]any{}},
 			map[string]any{"Id": "ep-2", "Name": "Episode 2", "Type": "Episode", "SeriesId": "show-1", "ParentIndexNumber": 1, "IndexNumber": 2, "UserData": map[string]any{}},
-		}})
+		}, "TotalRecordCount": 2})
 	}))
 	defer backend.Close()
 
@@ -3112,7 +3122,7 @@ func TestNextUpUsesGatewaySeriesState(t *testing.T) {
 	configureTestUpstream(store, backend.URL+"/emby")
 	store.Sessions[HashToken("gateway-token")] = testSession()
 	lastPlayed := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
-	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "ep-1", SeriesID: "show-1", ParentIndexNumber: 1, IndexNumber: 1, Played: true, LastPlayedDate: &lastPlayed})
+	_ = store.SavePlaybackState(context.Background(), PlaybackState{GatewayUserID: "u1", SyntheticUserID: "gateway-user", ItemID: "ep-1", ItemName: "Episode 1", ItemType: "Episode", SeriesID: "show-1", ParentIndexNumber: 1, IndexNumber: 1, Played: true, LastPlayedDate: &lastPlayed})
 	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
 	defer gw.Close()
 
@@ -3123,6 +3133,275 @@ func TestNextUpUsesGatewaySeriesState(t *testing.T) {
 	items := body["Items"].([]any)
 	if len(items) != 1 || items[0].(map[string]any)["Id"] != "ep-2" {
 		t.Fatalf("next up items = %#v, want ep-2", items)
+	}
+}
+
+func TestNextUpContinuesFromLatestWatchedNotFirstUnplayed(t *testing.T) {
+	episodes := make([]any, 0, 10)
+	for i := 1; i <= 10; i++ {
+		episodes = append(episodes, map[string]any{
+			"Id":                "ep-" + strconv.Itoa(i),
+			"Name":              "Episode " + strconv.Itoa(i),
+			"Type":              "Episode",
+			"SeriesId":          "show-1",
+			"ParentIndexNumber": 1,
+			"IndexNumber":       i,
+			"UserData":          map[string]any{},
+		})
+	}
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/emby/Shows/show-1/Episodes" {
+			t.Fatalf("unexpected backend request %s", r.URL.String())
+		}
+		if r.URL.Query().Get("Limit") != "" || r.URL.Query().Get("StartIndex") != "" {
+			requireInternalEpisodePage(t, r, 0)
+		}
+		writeTestJSON(w, map[string]any{"Items": episodes, "TotalRecordCount": 10})
+	}))
+	defer backend.Close()
+
+	store := NewMemoryStore()
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
+	basePlayed := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	for _, n := range []int{1, 2, 3, 6, 7, 8} {
+		playedAt := basePlayed.Add(time.Duration(n) * time.Hour)
+		_ = store.SavePlaybackState(context.Background(), PlaybackState{
+			GatewayUserID:     "u1",
+			SyntheticUserID:   "gateway-user",
+			ItemID:            "ep-" + strconv.Itoa(n),
+			SeriesID:          "show-1",
+			ParentIndexNumber: 1,
+			IndexNumber:       n,
+			Played:            true,
+			LastPlayedDate:    &playedAt,
+		})
+	}
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	resp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Shows/NextUp?api_key=gateway-token&SeriesId=show-1&Limit=1", nil))
+	defer resp.Body.Close()
+	var body map[string]any
+	decodeJSON(t, resp.Body, &body)
+	items := body["Items"].([]any)
+	if len(items) != 1 || items[0].(map[string]any)["Id"] != "ep-9" {
+		t.Fatalf("next up items = %#v, want ep-9 (not first unplayed ep-4)", items)
+	}
+
+	listResp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Shows/show-1/Episodes?api_key=gateway-token", nil))
+	defer listResp.Body.Close()
+	var listBody map[string]any
+	decodeJSON(t, listResp.Body, &listBody)
+	listItems := listBody["Items"].([]any)
+	if len(listItems) != 10 {
+		t.Fatalf("episode list len = %d, want 10", len(listItems))
+	}
+	wantPlayed := map[string]bool{"ep-1": true, "ep-2": true, "ep-3": true, "ep-6": true, "ep-7": true, "ep-8": true}
+	var firstUnplayed string
+	for _, item := range listItems {
+		m := item.(map[string]any)
+		id, _ := stringField(m, "Id")
+		userData, _ := m["UserData"].(map[string]any)
+		gotPlayed := userData["Played"] == true
+		if gotPlayed != wantPlayed[id] {
+			t.Fatalf("episode %s Played = %v, want %v (userData=%#v)", id, gotPlayed, wantPlayed[id], userData)
+		}
+		if firstUnplayed == "" && !gotPlayed {
+			firstUnplayed = id
+		}
+	}
+	if firstUnplayed != "ep-4" {
+		t.Fatalf("first unplayed episode = %q, want ep-4", firstUnplayed)
+	}
+}
+
+func TestPlaybackStateNeedsMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state *PlaybackState
+		want  bool
+	}{
+		{name: "nil", want: false},
+		{name: "blank identity", state: &PlaybackState{ItemID: "item-1", RunTimeTicks: 100}, want: true},
+		{name: "blank name", state: &PlaybackState{ItemType: "Movie"}, want: true},
+		{name: "blank type", state: &PlaybackState{ItemName: "Movie"}, want: true},
+		{name: "complete movie", state: &PlaybackState{ItemName: "Movie", ItemType: "Movie"}, want: false},
+		{name: "episode missing series", state: &PlaybackState{ItemName: "Ep 9", ItemType: "Episode", IndexNumber: 9, ParentIndexNumber: 1}, want: true},
+		{name: "episode with identity and series", state: &PlaybackState{ItemName: "Ep 9", ItemType: "Episode", SeriesID: "show-1"}, want: false},
+		{name: "complete episode", state: &PlaybackState{ItemName: "Ep 9", ItemType: "Episode", SeriesID: "show-1", IndexNumber: 9, ParentIndexNumber: 1}, want: false},
+		{name: "specials episode", state: &PlaybackState{ItemName: "Special", ItemType: "Episode", SeriesID: "show-1", IndexNumber: 1}, want: false},
+		{name: "populated s00e00", state: &PlaybackState{ItemName: "Special", ItemType: "Episode", SeriesID: "show-1", IndexNumber: 0, ParentIndexNumber: 0}, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := playbackStateNeedsMetadata(tc.state); got != tc.want {
+				t.Fatalf("playbackStateNeedsMetadata(%#v) = %v, want %v", tc.state, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestStoppedPlaybackEnrichesIncompleteEpisodeMetadataForNextUp(t *testing.T) {
+	const runTimeTicks int64 = 11070000000
+	episodes := make([]any, 0, 10)
+	for i := 1; i <= 10; i++ {
+		episodes = append(episodes, map[string]any{
+			"Id":                "ep-" + strconv.Itoa(i),
+			"Name":              "Episode " + strconv.Itoa(i),
+			"Type":              "Episode",
+			"SeriesId":          "show-1",
+			"SeasonId":          "season-1",
+			"ParentIndexNumber": 1,
+			"IndexNumber":       i,
+			"RunTimeTicks":      float64(runTimeTicks),
+			"UserData":          map[string]any{},
+		})
+	}
+	var itemLookups int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/emby/Users/backend-user/Items/ep-9":
+			itemLookups++
+			writeTestJSON(w, map[string]any{
+				"Id":                "ep-9",
+				"Name":              "Episode 9",
+				"Type":              "Episode",
+				"SeriesId":          "show-1",
+				"SeriesName":        "Show",
+				"SeasonId":          "season-1",
+				"ParentIndexNumber": 1,
+				"IndexNumber":       9,
+				"RunTimeTicks":      float64(runTimeTicks),
+			})
+		case "/emby/Shows/show-1/Episodes":
+			requireInternalEpisodePage(t, r, 0)
+			writeTestJSON(w, map[string]any{"Items": episodes, "TotalRecordCount": 10})
+		default:
+			t.Fatalf("unexpected backend request %s", r.URL.String())
+		}
+	}))
+	defer backend.Close()
+
+	store := NewMemoryStore()
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
+	basePlayed := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	for _, n := range []int{1, 2, 3} {
+		playedAt := basePlayed.Add(time.Duration(n) * time.Hour)
+		_ = store.SavePlaybackState(context.Background(), PlaybackState{
+			GatewayUserID:     "u1",
+			SyntheticUserID:   "gateway-user",
+			ItemID:            "ep-" + strconv.Itoa(n),
+			ItemName:          "Episode " + strconv.Itoa(n),
+			ItemType:          "Episode",
+			SeriesID:          "show-1",
+			SeasonID:          "season-1",
+			ParentIndexNumber: 1,
+			IndexNumber:       n,
+			Played:            true,
+			LastPlayedDate:    &playedAt,
+		})
+	}
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	stopped := mustRequest(t, http.MethodPost, gw.URL+"/emby/Sessions/Playing/Stopped?api_key=gateway-token", strings.NewReader(`{"ItemId":"ep-9","PositionTicks":11070000000,"RunTimeTicks":11070000000}`))
+	stopped.Header.Set("Content-Type", "application/json")
+	resp := do(t, stopped)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("stopped status = %d, want 204", resp.StatusCode)
+	}
+	state, err := store.FindPlaybackState(context.Background(), "u1", "ep-9")
+	if err != nil {
+		t.Fatalf("find stopped state: %v", err)
+	}
+	if !state.Played || state.ItemName != "Episode 9" || state.ItemType != "Episode" || state.SeriesID != "show-1" || state.SeasonID != "season-1" || state.ParentIndexNumber != 1 || state.IndexNumber != 9 || state.RunTimeTicks != runTimeTicks {
+		t.Fatalf("stopped state missing enriched episode metadata: %#v", state)
+	}
+	if itemLookups != 1 {
+		t.Fatalf("item lookups = %d, want 1", itemLookups)
+	}
+
+	stoppedAgain := mustRequest(t, http.MethodPost, gw.URL+"/emby/Sessions/Playing/Stopped?api_key=gateway-token", strings.NewReader(`{"ItemId":"ep-9","PositionTicks":11070000000,"RunTimeTicks":11070000000}`))
+	stoppedAgain.Header.Set("Content-Type", "application/json")
+	again := do(t, stoppedAgain)
+	_ = again.Body.Close()
+	if again.StatusCode != http.StatusNoContent {
+		t.Fatalf("repeat stopped status = %d, want 204", again.StatusCode)
+	}
+	if itemLookups != 1 {
+		t.Fatalf("complete state triggered extra item lookup: %d", itemLookups)
+	}
+
+	nextUp := do(t, mustRequest(t, http.MethodGet, gw.URL+"/emby/Shows/NextUp?api_key=gateway-token&SeriesId=show-1&Limit=1", nil))
+	defer nextUp.Body.Close()
+	var body map[string]any
+	decodeJSON(t, nextUp.Body, &body)
+	items := body["Items"].([]any)
+	if len(items) != 1 || items[0].(map[string]any)["Id"] != "ep-10" {
+		t.Fatalf("next up items = %#v, want ep-10 (not earlier unplayed ep-4)", items)
+	}
+}
+
+func TestStoppedPlaybackRetriesEnrichmentAfterTransientBackendFailure(t *testing.T) {
+	const runTimeTicks int64 = 11070000000
+	var itemLookups int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/emby/Users/backend-user/Items/ep-9" {
+			t.Fatalf("unexpected backend request %s", r.URL.String())
+		}
+		itemLookups++
+		if itemLookups == 1 {
+			http.Error(w, "upstream unavailable", http.StatusInternalServerError)
+			return
+		}
+		writeTestJSON(w, map[string]any{
+			"Id":                "ep-9",
+			"Name":              "Episode 9",
+			"Type":              "Episode",
+			"SeriesId":          "show-1",
+			"SeriesName":        "Show",
+			"SeasonId":          "season-1",
+			"ParentIndexNumber": 1,
+			"IndexNumber":       9,
+			"RunTimeTicks":      float64(runTimeTicks),
+		})
+	}))
+	defer backend.Close()
+
+	store := NewMemoryStore()
+	configureTestUpstream(store, backend.URL+"/emby")
+	store.Sessions[HashToken("gateway-token")] = testSession()
+	gw := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby"}, store))
+	defer gw.Close()
+
+	body := `{"ItemId":"ep-9","PositionTicks":11070000000,"RunTimeTicks":11070000000}`
+	first := mustRequest(t, http.MethodPost, gw.URL+"/emby/Sessions/Playing/Stopped?api_key=gateway-token", strings.NewReader(body))
+	first.Header.Set("Content-Type", "application/json")
+	resp := do(t, first)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("first stopped status = %d, want 204", resp.StatusCode)
+	}
+	state, err := store.FindPlaybackState(context.Background(), "u1", "ep-9")
+	if err != nil || !state.Played || state.RunTimeTicks != runTimeTicks || state.SeriesID != "" || state.ItemType != "" || state.IndexNumber != 0 {
+		t.Fatalf("first stopped should persist play without metadata: %#v err=%v", state, err)
+	}
+
+	second := mustRequest(t, http.MethodPost, gw.URL+"/emby/Sessions/Playing/Stopped?api_key=gateway-token", strings.NewReader(body))
+	second.Header.Set("Content-Type", "application/json")
+	resp = do(t, second)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("retry stopped status = %d, want 204", resp.StatusCode)
+	}
+	state, err = store.FindPlaybackState(context.Background(), "u1", "ep-9")
+	if err != nil || !state.Played || state.ItemName != "Episode 9" || state.ItemType != "Episode" || state.SeriesID != "show-1" || state.SeasonID != "season-1" || state.ParentIndexNumber != 1 || state.IndexNumber != 9 {
+		t.Fatalf("retry stopped should enrich despite positive runtime: %#v err=%v", state, err)
+	}
+	if itemLookups != 2 {
+		t.Fatalf("item lookups = %d, want 2", itemLookups)
 	}
 }
 
