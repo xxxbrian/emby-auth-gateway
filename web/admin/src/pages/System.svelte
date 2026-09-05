@@ -10,6 +10,11 @@
         SystemInfo,
         UpstreamBody,
         UpstreamDTO,
+        UpstreamEndpointDTO,
+        UpstreamEndpointBody,
+        RouteRuleDTO,
+        RouteRuleBody,
+        WebSocketProbeResult,
         UpstreamProbeResult,
         InstallDefaultsResponse,
     } from '../lib/types';
@@ -52,6 +57,32 @@
 
     let activeTab = $state<'runtime' | 'upstream' | 'policies'>('runtime');
 
+    // --- upstream endpoints ---
+    let endpoints = $state<UpstreamEndpointDTO[]>([]);
+    let showEndpointModal = $state(false);
+    let endpointError = $state<string | null>(null);
+    let endpointSaving = $state(false);
+    let probingEndpointID = $state<string | null>(null);
+    let endpointForm = $state<UpstreamEndpointBody & { id: string }>({
+        id: '', key: '', base_url: '', enabled: true, is_default: false,
+    });
+
+    // --- route rules ---
+    let routeRules = $state<RouteRuleDTO[]>([]);
+    let showRouteRuleModal = $state(false);
+    let routeRuleError = $state<string | null>(null);
+    let routeRuleSaving = $state(false);
+    let isEditingRouteRule = $state(false);
+    let routeRuleForm = $state<RouteRuleBody & { id: string }>({
+        id: '', method: '', path: '', transport: '', target: '', priority: 100, enabled: true, reason: '', updated: '',
+    });
+    let routePreviewMethod = $state('GET');
+    let routePreviewPath = $state('');
+    let routePreviewTransport = $state('');
+    let routePreviewResult = $state<{ target: string; rule_id?: string; reason?: string } | null>(null);
+    let routePreviewError = $state<string | null>(null);
+    let routePreviewing = $state(false);
+
     let probeForm = $state({
         emby_base_url: '',
         backend_username: '',
@@ -78,14 +109,18 @@
     async function loadData() {
         loading = true;
         try {
-            const [si, up, pol] = await Promise.all([
+            const [si, up, pol, eps, rr] = await Promise.all([
                 apiRequest<SystemInfo>('/system'),
                 apiRequest<UpstreamDTO>('/upstream'),
                 apiRequest<ItemsResponse<Policy>>('/path-policies'),
+                apiRequest<ItemsResponse<UpstreamEndpointDTO>>('/upstream/endpoints'),
+                apiRequest<ItemsResponse<RouteRuleDTO>>('/route-rules'),
             ]);
             sysInfo = si;
             upstream = up;
             policies = pol.items || [];
+            endpoints = eps.items || [];
+            routeRules = rr.items || [];
             
             if (up) {
                 probeForm.emby_base_url = up.base_url || '';
@@ -286,6 +321,157 @@
             previewError = err instanceof Error ? err.message : String(err);
         } finally {
             previewing = false;
+        }
+    }
+
+    // --- endpoint CRUD ---
+
+    function openNewEndpoint() {
+        endpointForm = { id: '', key: '', base_url: '', enabled: true, is_default: false };
+        endpointError = null;
+        showEndpointModal = true;
+    }
+
+    function openEditEndpoint(ep: UpstreamEndpointDTO) {
+        endpointForm = { id: ep.id, key: ep.key, base_url: ep.base_url, enabled: ep.enabled, is_default: ep.is_default };
+        endpointError = null;
+        showEndpointModal = true;
+    }
+
+    async function handleSaveEndpoint(e: Event) {
+        e.preventDefault();
+        endpointError = null;
+        endpointSaving = true;
+        try {
+            const body: UpstreamEndpointBody = {
+                key: endpointForm.key.trim(),
+                base_url: endpointForm.base_url.trim(),
+                enabled: endpointForm.enabled,
+                is_default: endpointForm.is_default,
+            };
+            if (endpointForm.id) {
+                await apiRequest(`/upstream/endpoints/${endpointForm.id}`, { method: 'PUT', body: JSON.stringify(body) });
+            } else {
+                await apiRequest('/upstream/endpoints', { method: 'POST', body: JSON.stringify(body) });
+            }
+            showEndpointModal = false;
+            await loadData();
+        } catch (err) {
+            endpointError = err instanceof Error ? err.message : String(err);
+        } finally {
+            endpointSaving = false;
+        }
+    }
+
+    async function handleDeleteEndpoint(id: string, key: string) {
+        if (!confirm(`Delete endpoint "${key}"?`)) return;
+        try {
+            await apiRequest(`/upstream/endpoints/${id}`, { method: 'DELETE' });
+            await loadData();
+        } catch (err) {
+            alert(err instanceof Error ? err.message : String(err));
+        }
+    }
+
+    async function handleProbeEndpointWS(id: string, key: string) {
+        probingEndpointID = id;
+        try {
+            const res = await apiRequest<WebSocketProbeResult>(`/upstream/endpoints/${id}/probe-ws`, { method: 'POST' });
+            if (res.websocket_capable) {
+                alert(`Endpoint "${key}" supports WebSocket (101 handshake OK).`);
+            } else {
+                alert(`Endpoint "${key}" does not support WebSocket: ${res.error || 'handshake failed'}`);
+            }
+            await loadData();
+        } catch (err) {
+            alert(err instanceof Error ? err.message : String(err));
+        } finally {
+            probingEndpointID = null;
+        }
+    }
+
+    async function setDefaultEndpoint(ep: UpstreamEndpointDTO) {
+        try {
+            await apiRequest(`/upstream/endpoints/${ep.id}`, {
+                method: 'PUT',
+                body: JSON.stringify({ key: ep.key, base_url: ep.base_url, enabled: ep.enabled, is_default: true }),
+            });
+            await loadData();
+        } catch (err) {
+            alert(err instanceof Error ? err.message : String(err));
+        }
+    }
+
+    // --- route rule CRUD ---
+
+    function openNewRouteRule() {
+        routeRuleForm = { id: '', method: '', path: '', transport: '', target: endpoints.find(e => e.is_default)?.key || '', priority: 100, enabled: true, reason: '', updated: '' };
+        isEditingRouteRule = false;
+        routeRuleError = null;
+        showRouteRuleModal = true;
+    }
+
+    function openEditRouteRule(r: RouteRuleDTO) {
+        routeRuleForm = {
+            id: r.id, method: r.method || '', path: r.path, transport: r.transport || '', target: r.target,
+            priority: r.priority, enabled: r.enabled, reason: r.reason || '', updated: r.updated || '',
+        };
+        isEditingRouteRule = true;
+        routeRuleError = null;
+        showRouteRuleModal = true;
+    }
+
+    async function handleSaveRouteRule(e: Event) {
+        e.preventDefault();
+        routeRuleError = null;
+        routeRuleSaving = true;
+        try {
+            const body: RouteRuleBody = { ...routeRuleForm };
+            if (isEditingRouteRule && routeRuleForm.updated) {
+                body.updated = routeRuleForm.updated;
+            }
+            const url = isEditingRouteRule && routeRuleForm.id
+                ? `/route-rules/${routeRuleForm.id}`
+                : '/route-rules';
+            await apiRequest(url, {
+                method: isEditingRouteRule && routeRuleForm.id ? 'PUT' : 'POST',
+                body: JSON.stringify(body),
+            });
+            showRouteRuleModal = false;
+            await loadData();
+        } catch (err) {
+            routeRuleError = err instanceof Error ? err.message : String(err);
+        } finally {
+            routeRuleSaving = false;
+        }
+    }
+
+    async function handleDeleteRouteRule(id: string) {
+        if (!confirm('Delete this route rule?')) return;
+        try {
+            await apiRequest(`/route-rules/${id}`, { method: 'DELETE' });
+            await loadData();
+        } catch (err) {
+            alert(err instanceof Error ? err.message : String(err));
+        }
+    }
+
+    async function handlePreviewRouteRule(e: Event) {
+        e.preventDefault();
+        routePreviewError = null;
+        routePreviewResult = null;
+        routePreviewing = true;
+        try {
+            const qs = new URLSearchParams({
+                method: routePreviewMethod,
+                path: routePreviewPath,
+                transport: routePreviewTransport,
+            });
+            routePreviewResult = await apiRequest<{ target: string; rule_id?: string; reason?: string }>(`/route-rules/preview?${qs}`);
+        } catch (err) {
+            routePreviewError = err instanceof Error ? err.message : String(err);
+        } finally {
+            routePreviewing = false;
         }
     }
 
@@ -504,10 +690,171 @@
                             <input type="text" id="backend_authorization_version" bind:value={probeForm.backend_authorization_version} />
                         </div>
                     </div>
+                    <p class="text-sm text-secondary mt-2">
+                        Credentials are shared by all endpoints. Saving credentials applies to the default endpoint.
+                    </p>
                     <div class="mt-4 flex justify-end">
                         <button type="submit" disabled={probing}>{probing ? 'Probing...' : 'Probe (validates credentials)'}</button>
                     </div>
                 </form>
+            </div>
+
+            <div class="panel">
+                <div class="flex justify-between items-center mb-4">
+                    <div class="metric-label" style="margin:0">Upstream Endpoints</div>
+                    <button type="button" class="secondary" onclick={openNewEndpoint}>Add Endpoint</button>
+                </div>
+                <p class="text-sm text-secondary mb-2">
+                    Endpoints are CDN/ingress URLs that share the single upstream credential.
+                    The default endpoint serves traffic with no matching rule; WebSocket
+                    capability is set by probing each endpoint.
+                </p>
+                <div class="table-container" style="max-height: 320px;">
+                    <table style="min-width: 760px;">
+                        <thead>
+                            <tr>
+                                <th>Key</th>
+                                <th>Base URL</th>
+                                <th>Default</th>
+                                <th>WebSocket</th>
+                                <th style="text-align: right;">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {#if endpoints.length === 0}
+                                <tr>
+                                    <td colspan="5" class="text-secondary text-center" style="padding: 1.5rem;">No upstream endpoints configured.</td>
+                                </tr>
+                            {/if}
+                            {#each endpoints as ep}
+                                <tr>
+                                    <td>
+                                        <strong class="mono">{ep.key}</strong>
+                                        {#if !ep.enabled}
+                                            <span class="text-secondary">(disabled)</span>
+                                        {/if}
+                                    </td>
+                                    <td class="mono truncate" style="max-width: 280px;">{ep.base_url}</td>
+                                    <td>
+                                        {#if ep.is_default}
+                                            <span class="status-ok">default</span>
+                                        {:else}
+                                            <button class="secondary text-xs" onclick={() => setDefaultEndpoint(ep)}>Make default</button>
+                                        {/if}
+                                    </td>
+                                    <td>
+                                        {#if ep.websocket_capable}
+                                            <span class="status-ok">capable</span>
+                                        {:else if ep.websocket_probed_at}
+                                            <span class="status-err">not capable</span>
+                                        {:else}
+                                            <span class="text-secondary">unprobed</span>
+                                        {/if}
+                                        {#if ep.websocket_probe_error}
+                                            <div class="text-xs text-secondary" title={ep.websocket_probe_error}>{ep.websocket_probe_error}</div>
+                                        {/if}
+                                    </td>
+                                    <td>
+                                        <div class="flex gap-2 justify-end">
+                                            <button class="secondary text-xs" disabled={probingEndpointID === ep.id} onclick={() => handleProbeEndpointWS(ep.id, ep.key)}>
+                                                {probingEndpointID === ep.id ? 'Probing...' : 'Probe WS'}
+                                            </button>
+                                            <button class="secondary text-xs" onclick={() => openEditEndpoint(ep)}>Edit</button>
+                                            <button class="danger text-xs" onclick={() => handleDeleteEndpoint(ep.id, ep.key)}>Del</button>
+                                        </div>
+                                    </td>
+                                </tr>
+                            {/each}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="panel">
+                <div class="flex justify-between items-center mb-4">
+                    <div class="metric-label" style="margin:0">Route Rules</div>
+                    <button type="button" onclick={openNewRouteRule}>Add Rule</button>
+                </div>
+                <p class="text-sm text-secondary mb-2">
+                    Route rules send matching requests to a specific endpoint key. Leave method empty for any
+                    method; transport can be <span class="mono">websocket</span> (WebSocket Upgrades only),
+                    <span class="mono">http</span>, or empty (all). Higher priority wins. Unmatched requests use the default endpoint.
+                </p>
+                <form class="flex gap-2 items-end flex-wrap" onsubmit={handlePreviewRouteRule}>
+                    <div>
+                        <label class="text-sm text-secondary block mb-1">Method</label>
+                        <select bind:value={routePreviewMethod}>
+                            <option value="GET">GET</option>
+                            <option value="POST">POST</option>
+                            <option value="PUT">PUT</option>
+                            <option value="DELETE">DELETE</option>
+                            <option value="">* (Any)</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="text-sm text-secondary block mb-1">Transport</label>
+                        <select bind:value={routePreviewTransport}>
+                            <option value="">Any</option>
+                            <option value="websocket">websocket</option>
+                            <option value="http">http</option>
+                        </select>
+                    </div>
+                    <div style="flex: 1; min-width: 180px;">
+                        <label class="text-sm text-secondary block mb-1" for="rr_preview_path">Path</label>
+                        <input type="text" id="rr_preview_path" class="mono" bind:value={routePreviewPath} placeholder="/embywebsocket" />
+                    </div>
+                    <button type="submit" class="secondary" disabled={routePreviewing}>{routePreviewing ? 'Checking...' : 'Preview'}</button>
+                </form>
+                {#if routePreviewError}
+                    <div class="error-message mt-2">{routePreviewError}</div>
+                {/if}
+                {#if routePreviewResult}
+                    <div class="text-sm mt-2">
+                        Result:
+                        <span class="mono">{routePreviewResult.target || '(default endpoint)'}</span>
+                        {#if routePreviewResult.reason}
+                            <span class="text-secondary"> — {routePreviewResult.reason}</span>
+                        {/if}
+                    </div>
+                {/if}
+                <div class="table-container" style="max-height: 320px; margin-top: 1rem;">
+                    <table style="min-width: 800px;">
+                        <thead>
+                            <tr>
+                                <th style="width: 8%">Pri</th>
+                                <th style="width: 10%">Method</th>
+                                <th style="width: 10%">Transport</th>
+                                <th style="width: 30%">Path</th>
+                                <th style="width: 12%">Target</th>
+                                <th style="width: 5%">On</th>
+                                <th style="width: 25%; text-align: right;">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {#if routeRules.length === 0}
+                                <tr>
+                                    <td colspan="7" class="text-secondary text-center" style="padding: 1.5rem;">No route rules configured.</td>
+                                </tr>
+                            {/if}
+                            {#each routeRules as r}
+                                <tr>
+                                    <td>{r.priority}</td>
+                                    <td class="mono">{r.method || '*'}</td>
+                                    <td class="mono">{r.transport || 'any'}</td>
+                                    <td class="mono">{r.path}</td>
+                                    <td class="mono"><span class="status-ok">{r.target}</span></td>
+                                    <td>{r.enabled ? 'Yes' : 'No'}</td>
+                                    <td>
+                                        <div class="flex gap-2 justify-end">
+                                            <button class="secondary text-xs" onclick={() => openEditRouteRule(r)}>Edit</button>
+                                            <button class="danger text-xs" onclick={() => handleDeleteRouteRule(r.id)}>Del</button>
+                                        </div>
+                                    </td>
+                                </tr>
+                            {/each}
+                        </tbody>
+                    </table>
+                </div>
             </div>
         {/if}
 
@@ -724,6 +1071,116 @@
             <div class="drawer-footer">
                 <button class="secondary" onclick={() => showPolicyModal = false}>Cancel</button>
                 <button type="submit" form="policy-form" disabled={policySaving}>{policySaving ? 'Saving...' : 'Save Policy'}</button>
+            </div>
+        </div>
+    </div>
+{/if}
+
+{#if showEndpointModal}
+    <div class="overlay" onclick={() => showEndpointModal = false}>
+        <div class="drawer" style="width: 480px;" onclick={(e) => e.stopPropagation()}>
+            <div class="drawer-header">
+                <h3 class="drawer-title">{endpointForm.id ? 'Edit Endpoint' : 'Add Endpoint'}</h3>
+                <button class="icon" onclick={() => showEndpointModal = false}>✕</button>
+            </div>
+            <div class="drawer-body">
+                {#if endpointError}
+                    <div class="error-message">{endpointError}</div>
+                {/if}
+                <form id="endpoint-form" onsubmit={handleSaveEndpoint}>
+                    <div class="mb-4">
+                        <label class="text-sm text-secondary block mb-1" for="ep_key">Key</label>
+                        <input type="text" id="ep_key" bind:value={endpointForm.key} required class="mono" placeholder="primary / cf / hk ..." />
+                        <p class="text-sm text-secondary mt-1">Unique name for this endpoint; route rules reference it.</p>
+                    </div>
+                    <div class="mb-4">
+                        <label class="text-sm text-secondary block mb-1" for="ep_url">Base URL</label>
+                        <input type="url" id="ep_url" bind:value={endpointForm.base_url} required placeholder="https://cdn.example.com/emby" />
+                    </div>
+                    <div class="mb-4 flex items-center gap-4">
+                        <label class="flex items-center gap-2 text-sm">
+                            <input type="checkbox" bind:checked={endpointForm.enabled} style="width:auto" />
+                            Enabled
+                        </label>
+                        <label class="flex items-center gap-2 text-sm">
+                            <input type="checkbox" bind:checked={endpointForm.is_default} style="width:auto" />
+                            Default endpoint
+                        </label>
+                    </div>
+                    <p class="text-sm text-secondary">
+                        Exactly one endpoint must be the enabled default. Disabling or removing the default
+                        promotes another enabled endpoint.
+                    </p>
+                </form>
+            </div>
+            <div class="drawer-footer">
+                <button class="secondary" onclick={() => showEndpointModal = false}>Cancel</button>
+                <button type="submit" form="endpoint-form" disabled={endpointSaving}>{endpointSaving ? 'Saving...' : 'Save Endpoint'}</button>
+            </div>
+        </div>
+    </div>
+{/if}
+
+{#if showRouteRuleModal}
+    <div class="overlay" onclick={() => showRouteRuleModal = false}>
+        <div class="drawer" style="width: 480px;" onclick={(e) => e.stopPropagation()}>
+            <div class="drawer-header">
+                <h3 class="drawer-title">{isEditingRouteRule ? 'Edit Route Rule' : 'Add Route Rule'}</h3>
+                <button class="icon" onclick={() => showRouteRuleModal = false}>✕</button>
+            </div>
+            <div class="drawer-body">
+                {#if routeRuleError}
+                    <div class="error-message">{routeRuleError}</div>
+                {/if}
+                <form id="route-rule-form" onsubmit={handleSaveRouteRule}>
+                    <div class="mb-4">
+                        <label class="text-sm text-secondary block mb-1" for="rr_path">Path</label>
+                        <input type="text" id="rr_path" bind:value={routeRuleForm.path} required class="mono" placeholder="/embywebsocket" />
+                        <p class="text-sm text-secondary mt-1">Exact path, trailing <span class="mono">*</span> prefix, or <span class="mono">/Items/{'{id}'}</span> params.</p>
+                    </div>
+                    <div class="mb-4">
+                        <label class="text-sm text-secondary block mb-1" for="rr_method">Method</label>
+                        <select id="rr_method" bind:value={routeRuleForm.method}>
+                            <option value="">* (Any)</option>
+                            <option value="GET">GET</option>
+                            <option value="POST">POST</option>
+                            <option value="PUT">PUT</option>
+                            <option value="DELETE">DELETE</option>
+                        </select>
+                    </div>
+                    <div class="mb-4">
+                        <label class="text-sm text-secondary block mb-1" for="rr_transport">Transport</label>
+                        <select id="rr_transport" bind:value={routeRuleForm.transport}>
+                            <option value="">Any</option>
+                            <option value="websocket">WebSocket</option>
+                            <option value="http">HTTP only</option>
+                        </select>
+                    </div>
+                    <div class="mb-4">
+                        <label class="text-sm text-secondary block mb-1" for="rr_target">Target endpoint key</label>
+                        <select id="rr_target" bind:value={routeRuleForm.target} required>
+                            {#each endpoints.filter(e => e.enabled) as ep}
+                                <option value={ep.key}>{ep.key}{ep.is_default ? ' (default)' : ''}</option>
+                            {/each}
+                        </select>
+                    </div>
+                    <div class="mb-4">
+                        <label class="text-sm text-secondary block mb-1" for="rr_priority">Priority (higher wins)</label>
+                        <input type="number" id="rr_priority" bind:value={routeRuleForm.priority} />
+                    </div>
+                    <div class="mb-4">
+                        <label class="text-sm text-secondary block mb-1" for="rr_reason">Reason (optional)</label>
+                        <input type="text" id="rr_reason" bind:value={routeRuleForm.reason} />
+                    </div>
+                    <div class="mb-4 flex items-center gap-2">
+                        <input type="checkbox" id="rr_enabled" bind:checked={routeRuleForm.enabled} style="width:auto" />
+                        <label class="text-sm text-secondary" for="rr_enabled">Enabled</label>
+                    </div>
+                </form>
+            </div>
+            <div class="drawer-footer">
+                <button class="secondary" onclick={() => showRouteRuleModal = false}>Cancel</button>
+                <button type="submit" form="route-rule-form" disabled={routeRuleSaving}>{routeRuleSaving ? 'Saving...' : 'Save Rule'}</button>
             </div>
         </div>
     </div>

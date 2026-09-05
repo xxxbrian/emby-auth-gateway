@@ -105,6 +105,35 @@ func (s *Server) handleListRouteRules(e *core.RequestEvent) error {
 	return e.JSON(http.StatusOK, map[string]any{"items": items})
 }
 
+func (s *Server) handlePreviewRouteRule(e *core.RequestEvent) error {
+	q := e.Request.URL.Query()
+	req := routepolicy.Request{
+		Method:    q.Get("method"),
+		Path:      q.Get("path"),
+		Transport: q.Get("transport"),
+	}
+	if req.Path == "" {
+		return e.BadRequestError("path is required", nil)
+	}
+	items, err := controlplane.ListRouteRules(e.Request.Context(), e.App)
+	if err != nil {
+		return e.InternalServerError("route rule preview failed", err)
+	}
+	rules := make([]routepolicy.Rule, 0, len(items))
+	for _, item := range items {
+		rules = append(rules, routepolicy.Rule{
+			ID: item.ID, Method: item.Method, Path: item.Path, Transport: item.Transport,
+			Target: item.Target, Priority: item.Priority, Enabled: item.Enabled, Reason: item.Reason,
+		})
+	}
+	target := routepolicy.Select(rules, req)
+	resp := map[string]any{"target": target}
+	if target == "" {
+		resp["reason"] = "no rule matches; default endpoint will be used"
+	}
+	return e.JSON(http.StatusOK, resp)
+}
+
 type routeRuleBody struct {
 	Method    string `json:"method"`
 	Path      string `json:"path"`

@@ -296,6 +296,58 @@ export interface UpstreamProbeResult {
   latency_ms: number;
 }
 
+// --- Upstream endpoints (controlplane.EndpointDTO) ---
+
+export interface UpstreamEndpointDTO {
+  id: string;
+  key: string;
+  base_url: string;
+  enabled: boolean;
+  is_default: boolean;
+  websocket_capable: boolean;
+  websocket_probed_at?: string;
+  websocket_probe_error?: string;
+  updated?: string;
+}
+
+export interface UpstreamEndpointBody {
+  key: string;
+  base_url: string;
+  enabled: boolean;
+  is_default: boolean;
+}
+
+// --- Route rules (controlplane.RouteRuleDTO) ---
+
+export interface RouteRuleDTO {
+  id: string;
+  method?: string;
+  path: string;
+  transport?: string;
+  target: string;
+  priority: number;
+  enabled: boolean;
+  reason?: string;
+  updated?: string;
+}
+
+export interface RouteRuleBody {
+  method: string;
+  path: string;
+  transport: string;
+  target: string;
+  priority: number;
+  enabled: boolean;
+  reason: string;
+  /** Optional optimistic concurrency token (RFC3339). */
+  updated?: string;
+}
+
+export interface WebSocketProbeResult {
+  websocket_capable: boolean;
+  error?: string;
+}
+
 export interface PolicyPreviewResult {
   Allowed?: boolean;
   Action?: string;

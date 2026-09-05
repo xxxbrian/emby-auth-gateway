@@ -123,6 +123,7 @@ func (s *Server) Mount(r *router.Router[*core.RequestEvent]) {
 	g.POST("/upstream/endpoints/{id}/probe-ws", s.withAuthWrite(s.handleProbeEndpointWebSocket))
 
 	g.GET("/route-rules", s.withAuth(s.handleListRouteRules))
+	g.GET("/route-rules/preview", s.withAuth(s.handlePreviewRouteRule))
 	g.POST("/route-rules", s.withAuthWrite(s.handleCreateRouteRule))
 	g.PUT("/route-rules/{id}", s.withAuthWrite(s.handleUpdateRouteRule))
 	g.DELETE("/route-rules/{id}", s.withAuthWrite(s.handleDeleteRouteRule))
