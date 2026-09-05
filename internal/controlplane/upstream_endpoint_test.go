@@ -214,6 +214,39 @@ func TestDeleteEndpointRejectsWhenTargetedByEnabledRule(t *testing.T) {
 	}
 }
 
+func TestUpsertEndpointDisableRejectsWhenTargetedByEnabledRule(t *testing.T) {
+	app := seedEndpointTestApp(t)
+	cf, err := UpsertEndpoint(context.Background(), app, EndpointUpsertInput{Key: "cf", BaseURL: "https://cf.example", Enabled: true, IsDefault: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UpsertRouteRule(context.Background(), app, routepolicy.Rule{
+		Method: "", Path: "/embywebsocket", Transport: routepolicy.TransportWebSocket, Target: "cf", Priority: 10, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Disabling cf while an enabled rule targets it must be refused.
+	if _, err := UpsertEndpoint(context.Background(), app, EndpointUpsertInput{ID: cf.ID, Key: "cf", BaseURL: "https://cf.example", Enabled: false, IsDefault: false}); !errors.Is(err, ErrEndpointInvalid) || !strings.Contains(err.Error(), "route rule") {
+		t.Fatalf("disable rule-targeted endpoint error = %v", err)
+	}
+	// After the rule is disabled, disabling the endpoint is allowed.
+	rules, err := ListRouteRules(context.Background(), app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rules) != 1 {
+		t.Fatalf("rules = %d", len(rules))
+	}
+	if _, err := UpsertRouteRule(context.Background(), app, routepolicy.Rule{
+		ID: rules[0].ID, Method: "", Path: "/embywebsocket", Transport: routepolicy.TransportWebSocket, Target: "cf", Priority: 10, Enabled: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UpsertEndpoint(context.Background(), app, EndpointUpsertInput{ID: cf.ID, Key: "cf", BaseURL: "https://cf.example", Enabled: false, IsDefault: false}); err != nil {
+		t.Fatalf("disable after disabling rule: %v", err)
+	}
+}
+
 func TestRecordWebSocketProbeResult(t *testing.T) {
 	app := seedEndpointTestApp(t)
 	primary := endpointByKey(t, app, "primary")

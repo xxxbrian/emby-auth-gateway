@@ -132,6 +132,21 @@ func UpsertEndpoint(ctx context.Context, app core.App, in EndpointUpsertInput) (
 		}
 		record.Set("key", key)
 		record.Set("base_url", baseURL)
+		// Disabling an endpoint that enabled route rules still target would
+		// silently strand that traffic on the default endpoint (the gateway
+		// falls back without an operator signal). Refuse the disable so the
+		// operator retargets/disables the rules first — same invariant as the
+		// delete guard.
+		wasEnabled := record.GetBool("enabled")
+		if wasEnabled && !in.Enabled {
+			rules, err := txApp.FindRecordsByFilter("route_rules", "target = {:key} && enabled = true", "", 0, 0, map[string]any{"key": key})
+			if err != nil {
+				return err
+			}
+			if len(rules) > 0 {
+				return fmt.Errorf("%w: endpoint %q is targeted by %d enabled route rule(s); disable or retarget them first", ErrEndpointInvalid, key, len(rules))
+			}
+		}
 		record.Set("enabled", in.Enabled)
 		// When this row becomes the default, clear competing defaults BEFORE
 		// saving it (the partial unique index on is_default=1 forbids two rows
