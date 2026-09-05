@@ -218,7 +218,11 @@ type upstreamLoginResult struct {
 
 func (a *upstreamAuthenticator) login(ctx context.Context, runtime *UpstreamRuntime, deviceID string) (upstreamLoginResult, error) {
 	var result upstreamLoginResult
-	u, err := backendURL(runtime.Endpoint.BaseURL, "/Users/AuthenticateByName")
+	endpoint, err := runtime.DefaultEndpoint()
+	if err != nil {
+		return result, err
+	}
+	u, err := backendURL(endpoint.BaseURL, "/Users/AuthenticateByName")
 	if err != nil {
 		return result, err
 	}
@@ -323,7 +327,11 @@ func (a *upstreamAuthenticator) cleanupInvocationWithCurrent(ctx context.Context
 	if result.Token == "" || runtime == nil || current == nil || result.Token == runtime.Source.BackendToken || current.Source.BackendToken == result.Token {
 		return
 	}
-	a.logout(ctx, runtime.Endpoint, runtime.Source.ClientIdentity, deviceID, result.UserID, result.Token)
+	endpoint, err := runtime.DefaultEndpoint()
+	if err != nil {
+		return
+	}
+	a.logout(ctx, *endpoint, runtime.Source.ClientIdentity, deviceID, result.UserID, result.Token)
 }
 
 func (a *upstreamAuthenticator) retireOld(runtime *UpstreamRuntime) {
@@ -336,7 +344,11 @@ func (a *upstreamAuthenticator) retireOld(runtime *UpstreamRuntime) {
 	if err != nil || current.Source.BackendToken == runtime.Source.BackendToken {
 		return
 	}
-	a.logout(ctx, runtime.Endpoint, runtime.Source.ClientIdentity, runtime.Source.ClientIdentity.DeviceID, runtime.Source.BackendUserID, runtime.Source.BackendToken)
+	endpoint, err := runtime.DefaultEndpoint()
+	if err != nil {
+		return
+	}
+	a.logout(ctx, *endpoint, runtime.Source.ClientIdentity, runtime.Source.ClientIdentity.DeviceID, runtime.Source.BackendUserID, runtime.Source.BackendToken)
 }
 
 func (a *upstreamAuthenticator) logout(ctx context.Context, endpoint UpstreamEndpoint, identity BackendClientIdentity, deviceID, userID, token string) {

@@ -89,12 +89,81 @@ type UpstreamEndpoint struct {
 	SourceID string
 	Key      string
 	BaseURL  string
-	Active   bool
+	Enabled  bool
+	Default  bool
+	// WebSocketCapable reflects the last admin-plane probe of this endpoint.
+	WebSocketCapable    bool
+	WebSocketProbedAt   *time.Time
+	WebSocketProbeError string
+}
+
+// UpstreamEndpoints is the set of endpoints that belong to a source.
+type UpstreamEndpoints []UpstreamEndpoint
+
+// Default returns the fallback endpoint, or nil when missing.
+func (eps UpstreamEndpoints) Default() *UpstreamEndpoint {
+	for i := range eps {
+		if eps[i].Default {
+			return &eps[i]
+		}
+	}
+	return nil
+}
+
+// ByKey returns the endpoint with key, or nil.
+func (eps UpstreamEndpoints) ByKey(key string) *UpstreamEndpoint {
+	for i := range eps {
+		if eps[i].Key == key {
+			return &eps[i]
+		}
+	}
+	return nil
+}
+
+// Enabled returns endpoints that participate in routing.
+func (eps UpstreamEndpoints) Enabled() []UpstreamEndpoint {
+	var out []UpstreamEndpoint
+	for _, ep := range eps {
+		if ep.Enabled {
+			out = append(out, ep)
+		}
+	}
+	return out
+}
+
+// EnabledByKey returns an enabled endpoint by key, or nil.
+func (eps UpstreamEndpoints) EnabledByKey(key string) *UpstreamEndpoint {
+	for i := range eps {
+		if eps[i].Enabled && eps[i].Key == key {
+			return &eps[i]
+		}
+	}
+	return nil
 }
 
 type UpstreamRuntime struct {
-	Source   UpstreamSource
-	Endpoint UpstreamEndpoint
+	Source    UpstreamSource
+	Endpoints UpstreamEndpoints
+}
+
+// DefaultEndpoint returns the default fallback endpoint of the runtime.
+func (r *UpstreamRuntime) DefaultEndpoint() (*UpstreamEndpoint, error) {
+	if r == nil {
+		return nil, invalidUpstreamTopology("missing runtime")
+	}
+	ep := r.Endpoints.Default()
+	if ep == nil || !ep.Enabled {
+		return nil, invalidUpstreamTopology("missing enabled default endpoint")
+	}
+	return ep, nil
+}
+
+// EndpointForKey returns the enabled endpoint with key, or nil.
+func (r *UpstreamRuntime) EndpointForKey(key string) *UpstreamEndpoint {
+	if r == nil {
+		return nil
+	}
+	return r.Endpoints.EnabledByKey(key)
 }
 
 type UpstreamAuthUpdate struct {
@@ -141,11 +210,38 @@ func ValidateUpstreamRuntime(runtime UpstreamRuntime) error {
 			return err
 		}
 	}
-	if !runtime.Endpoint.Active {
-		return invalidUpstreamTopology("invalid active endpoint")
-	}
-	if err := ValidateUpstreamEndpoint(source.ID, runtime.Endpoint); err != nil {
+	if err := ValidateUpstreamEndpoints(source.ID, runtime.Endpoints); err != nil {
 		return err
+	}
+	return nil
+}
+
+// ValidateUpstreamEndpoints enforces the routing topology contract:
+//   - every endpoint must reference the source and be structurally valid;
+//   - at least one enabled default endpoint must exist;
+//   - unknown-role endpoint keys may exist only when disabled (enabled entries
+//     must be resolvable route targets).
+func ValidateUpstreamEndpoints(sourceID string, endpoints UpstreamEndpoints) error {
+	if len(endpoints) == 0 {
+		return invalidUpstreamTopology("no endpoints")
+	}
+	defaults := 0
+	for _, endpoint := range endpoints {
+		if err := ValidateUpstreamEndpoint(sourceID, endpoint); err != nil {
+			return err
+		}
+		if endpoint.Default {
+			defaults++
+		}
+	}
+	if defaults == 0 {
+		return invalidUpstreamTopology("missing default endpoint")
+	}
+	if defaults > 1 {
+		return invalidUpstreamTopology("multiple default endpoints")
+	}
+	if d := endpoints.Default(); d == nil || !d.Enabled {
+		return invalidUpstreamTopology("default endpoint is disabled")
 	}
 	return nil
 }

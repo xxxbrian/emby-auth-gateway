@@ -29,7 +29,11 @@ func (s *Server) probeUpstreamPublic(ctx context.Context, runtime *UpstreamRunti
 	if err := ValidateUpstreamRuntime(*runtime); err != nil {
 		return publicInfoMetadata{}, errors.New("public upstream probe unavailable")
 	}
-	u, err := backendURL(runtime.Endpoint.BaseURL, "/System/Info/Public")
+	endpoint, err := runtime.DefaultEndpoint()
+	if err != nil {
+		return publicInfoMetadata{}, errors.New("public upstream probe unavailable")
+	}
+	u, err := backendURL(endpoint.BaseURL, "/System/Info/Public")
 	if err != nil {
 		return publicInfoMetadata{}, errors.New("public upstream probe unavailable")
 	}

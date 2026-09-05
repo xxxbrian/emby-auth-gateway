@@ -21,7 +21,7 @@ var errPhysicalSchemaMismatch = errors.New("physical schema mismatch")
 
 var requiredNames = []string{
 	"gateway_sessions", "audit_logs", "playback_events", "user_item_data",
-	"item_child_counts", "display_preferences", "path_policies", "upstream_sources", "upstream_endpoints",
+	"item_child_counts", "display_preferences", "path_policies", "route_rules", "upstream_sources", "upstream_endpoints",
 }
 
 // Ensure initializes a pristine PocketBase database or validates an existing
@@ -66,7 +66,7 @@ func Ensure(app core.App) error {
 			ids := map[string]string{"users": users.Id}
 			// Save and refetch each collection before using its generated ID in a relation.
 			reserved := freshReservedNames(snapshot)
-			for _, collection := range []*core.Collection{childCounts(), policies(), sources()} {
+			for _, collection := range []*core.Collection{childCounts(), policies(), routeRules(), sources()} {
 				assignFreshID(collection, reserved)
 				if err := tx.Save(collection); err != nil {
 					return err

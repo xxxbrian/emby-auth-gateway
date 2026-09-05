@@ -141,7 +141,8 @@ func genConcurrentSetupState(t *testing.T, app core.App, url string) upstreamOpt
 	endpoint.Set("source", source.Id)
 	endpoint.Set("key", primaryEndpointKey)
 	endpoint.Set("base_url", url)
-	endpoint.Set("active", true)
+	endpoint.Set("enabled", true)
+	endpoint.Set("is_default", true)
 	if err := app.Save(endpoint); err != nil {
 		t.Fatal(err)
 	}

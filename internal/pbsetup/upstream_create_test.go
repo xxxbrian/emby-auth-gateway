@@ -153,7 +153,7 @@ func TestUpstreamCreateProbesAndPersistsThenNoops(t *testing.T) {
 		t.Fatalf("source was not fully persisted: %#v", source)
 	}
 	endpoint, err := app.FindFirstRecordByData(upstreamEndpoints, "source", source.Id)
-	if err != nil || endpoint.GetString("base_url") != server.URL+"/emby" || endpoint.GetString("key") != primaryEndpointKey || !endpoint.GetBool("active") {
+	if err != nil || endpoint.GetString("base_url") != server.URL+"/emby" || endpoint.GetString("key") != primaryEndpointKey || !endpoint.GetBool("enabled") || !endpoint.GetBool("is_default") {
 		t.Fatalf("endpoint persistence: %#v, %v", endpoint, err)
 	}
 	deviceID := source.GetString("backend_authorization_device_id")
@@ -191,7 +191,8 @@ func TestUpstreamCreateRejectsPublicIDBeforeAuthentication(t *testing.T) {
 	endpoint.Set("source", source.Id)
 	endpoint.Set("key", primaryEndpointKey)
 	endpoint.Set("base_url", server.URL)
-	endpoint.Set("active", true)
+	endpoint.Set("enabled", true)
+	endpoint.Set("is_default", true)
 	if err := app.Save(endpoint); err != nil {
 		t.Fatal(err)
 	}

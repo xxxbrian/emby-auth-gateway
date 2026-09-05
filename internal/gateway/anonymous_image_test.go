@@ -401,7 +401,7 @@ func TestAnonymousItemImageUsesOnlySelectedIngress(t *testing.T) {
 	defer selected.Close()
 	defer other.Close()
 	store := anonymousImageTestStore(selected.URL+"/emby", namespace)
-	store.UpstreamEndpoints["inactive"] = UpstreamEndpoint{ID: "inactive", SourceID: "source", Key: "secondary", BaseURL: other.URL + "/emby", Active: false}
+	store.UpstreamEndpoints["inactive"] = UpstreamEndpoint{ID: "inactive", SourceID: "source", Key: "secondary", BaseURL: other.URL + "/emby", Enabled: false}
 	server := NewServer(Config{}, store)
 	if err := server.ValidateAnonymousImageNamespace(context.Background()); err != nil {
 		t.Fatal(err)

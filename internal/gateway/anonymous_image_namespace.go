@@ -52,11 +52,19 @@ func anonymousImageNamespaceKeyFor(runtime *UpstreamRuntime) (anonymousImageName
 	if runtime == nil || ValidateUpstreamRuntime(*runtime) != nil {
 		return anonymousImageNamespaceKey{}, errors.New("invalid singleton upstream topology")
 	}
+	endpoint, err := runtime.DefaultEndpoint()
+	if err != nil {
+		return anonymousImageNamespaceKey{}, errors.New("invalid singleton upstream topology")
+	}
 	i := runtime.Source.ClientIdentity
-	return anonymousImageNamespaceKey{runtime.Source.ID, runtime.Source.ServerID, runtime.Endpoint.ID, runtime.Endpoint.BaseURL, i.UserAgent, i.Client, i.Device, i.DeviceID, i.Version}, nil
+	return anonymousImageNamespaceKey{runtime.Source.ID, runtime.Source.ServerID, endpoint.ID, endpoint.BaseURL, i.UserAgent, i.Client, i.Device, i.DeviceID, i.Version}, nil
 }
 func anonymousImageOriginFor(runtime *UpstreamRuntime) AnonymousImageOrigin {
-	return AnonymousImageOrigin{BaseURL: runtime.Endpoint.BaseURL, ClientIdentity: runtime.Source.ClientIdentity, BackendServerID: runtime.Source.ServerID}
+	endpoint, err := runtime.DefaultEndpoint()
+	if err != nil {
+		return AnonymousImageOrigin{}
+	}
+	return AnonymousImageOrigin{BaseURL: endpoint.BaseURL, ClientIdentity: runtime.Source.ClientIdentity, BackendServerID: runtime.Source.ServerID}
 }
 
 func (s *Server) ValidateAnonymousImageNamespace(ctx context.Context) error {

@@ -13,15 +13,19 @@ import (
 func TestMemoryStoreUpstreamRuntimeAndAuthCAS(t *testing.T) {
 	store := NewMemoryStore()
 	store.UpstreamSources["source"] = validMemoryUpstreamSource()
-	store.UpstreamEndpoints["active"] = UpstreamEndpoint{ID: "active", SourceID: "source", Key: "primary", BaseURL: "https://emby.example", Active: true}
-	store.UpstreamEndpoints["inactive"] = UpstreamEndpoint{ID: "inactive", SourceID: "source", Key: "backup", BaseURL: "http://backup.example/base", Active: false}
+	store.UpstreamEndpoints["active"] = UpstreamEndpoint{ID: "active", SourceID: "source", Key: "primary", BaseURL: "https://emby.example", Enabled: true, Default: true}
+	store.UpstreamEndpoints["inactive"] = UpstreamEndpoint{ID: "inactive", SourceID: "source", Key: "backup", BaseURL: "http://backup.example/base", Enabled: false}
 
 	runtime, err := store.LoadDefaultUpstreamRuntime(context.Background())
 	if err != nil {
 		t.Fatalf("load runtime: %v", err)
 	}
-	if runtime.Source.AuthGenerationID != "" || runtime.Endpoint.ID != "active" {
+	if runtime.Source.AuthGenerationID != "" {
 		t.Fatalf("unexpected runtime: %#v", runtime)
+	}
+	defaultEP, err := runtime.DefaultEndpoint()
+	if err != nil || defaultEP.ID != "active" {
+		t.Fatalf("unexpected default endpoint: %v (%#v)", err, runtime)
 	}
 	at := time.Date(2026, 7, 16, 12, 0, 0, 0, time.FixedZone("offset", 3600))
 	update := UpstreamAuthUpdate{SourceID: "source", GenerationID: "generation-1", DeviceID: "device-2", BackendUserID: "backend-user", BackendToken: "token", AuthenticatedAt: at}
@@ -47,7 +51,7 @@ func TestMemoryStoreUpstreamCASConflictAndValidationDoNotMutate(t *testing.T) {
 	source.TokenUpdatedAt = &now
 	source.LastLoginAt = &now
 	store.UpstreamSources["source"] = source
-	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: "source", Key: "primary", BaseURL: "https://emby.example", Active: true}
+	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: "source", Key: "primary", BaseURL: "https://emby.example", Enabled: true, Default: true}
 	before := store.UpstreamSources["source"]
 	update := UpstreamAuthUpdate{SourceID: "source", ExpectedGenerationID: "stale", GenerationID: "new", DeviceID: "device", BackendUserID: "user", BackendToken: "token", AuthenticatedAt: time.Now()}
 	if err := store.CompareAndSwapUpstreamAuth(context.Background(), update); !errors.Is(err, ErrUpstreamAuthConflict) {
@@ -69,7 +73,7 @@ func TestMemoryStoreUpstreamCASConflictAndValidationDoNotMutate(t *testing.T) {
 func TestMemoryStoreUpstreamCASHasOneConcurrentWinner(t *testing.T) {
 	store := NewMemoryStore()
 	store.UpstreamSources["source"] = validMemoryUpstreamSource()
-	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: "source", Key: "primary", BaseURL: "https://emby.example", Active: true}
+	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: "source", Key: "primary", BaseURL: "https://emby.example", Enabled: true, Default: true}
 	var winners int
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -96,7 +100,7 @@ func TestMemoryStoreUpstreamCASHasOneConcurrentWinner(t *testing.T) {
 func TestMemoryStoreUpstreamTopologyAndCanceledContext(t *testing.T) {
 	store := NewMemoryStore()
 	store.UpstreamSources["source"] = validMemoryUpstreamSource()
-	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: "other", Key: "primary", BaseURL: "https://emby.example", Active: true}
+	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: "other", Key: "primary", BaseURL: "https://emby.example", Enabled: true, Default: true}
 	if _, err := store.LoadDefaultUpstreamRuntime(context.Background()); !errors.Is(err, ErrInvalidUpstreamTopology) {
 		t.Fatalf("orphan endpoint error = %v", err)
 	}
@@ -113,12 +117,12 @@ func TestMemoryStoreValidatesEveryEndpointAndReturnsDetachedSnapshot(t *testing.
 	now := time.Now()
 	source.TokenUpdatedAt = &now
 	store.UpstreamSources["source"] = source
-	store.UpstreamEndpoints["active"] = UpstreamEndpoint{ID: "active", SourceID: "source", Key: "primary", BaseURL: "https://emby.example", Active: true}
-	store.UpstreamEndpoints["inactive"] = UpstreamEndpoint{ID: "inactive", SourceID: "source", Key: "backup", BaseURL: "https://backup.example?", Active: false}
+	store.UpstreamEndpoints["active"] = UpstreamEndpoint{ID: "active", SourceID: "source", Key: "primary", BaseURL: "https://emby.example", Enabled: true, Default: true}
+	store.UpstreamEndpoints["inactive"] = UpstreamEndpoint{ID: "inactive", SourceID: "source", Key: "backup", BaseURL: "https://backup.example?", Enabled: false}
 	if _, err := store.LoadDefaultUpstreamRuntime(context.Background()); !errors.Is(err, ErrInvalidUpstreamTopology) {
 		t.Fatalf("malformed inactive endpoint error = %v", err)
 	}
-	store.UpstreamEndpoints["inactive"] = UpstreamEndpoint{ID: "inactive", SourceID: "source", Key: "backup", BaseURL: "https://backup.example", Active: false}
+	store.UpstreamEndpoints["inactive"] = UpstreamEndpoint{ID: "inactive", SourceID: "source", Key: "backup", BaseURL: "https://backup.example", Enabled: false}
 	runtime, err := store.LoadDefaultUpstreamRuntime(context.Background())
 	if err != nil {
 		t.Fatalf("load runtime: %v", err)
@@ -135,7 +139,7 @@ func TestMemoryStoreAcceptsStalePreContractAuthAndRejectsMalformedManagedAuth(t 
 	source.BackendUserID = "stale-user"
 	source.BackendToken = "stale-token"
 	store.UpstreamSources["source"] = source
-	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: "source", Key: "primary", BaseURL: "https://emby.example", Active: true}
+	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: "source", Key: "primary", BaseURL: "https://emby.example", Enabled: true, Default: true}
 	if _, err := store.LoadDefaultUpstreamRuntime(context.Background()); err != nil {
 		t.Fatalf("pre-contract runtime: %v", err)
 	}
@@ -167,7 +171,7 @@ func TestMemoryStoreUpstreamAuthUpdateRejectsInvalidFieldsWithoutMutation(t *tes
 
 func TestMemoryStoreNoSourceWithEndpointIsTopologyError(t *testing.T) {
 	store := NewMemoryStore()
-	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: "missing", Key: "primary", BaseURL: "https://emby.example", Active: true}
+	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: "missing", Key: "primary", BaseURL: "https://emby.example", Enabled: true, Default: true}
 	if _, err := store.LoadDefaultUpstreamRuntime(context.Background()); !errors.Is(err, ErrInvalidUpstreamTopology) {
 		t.Fatalf("endpoint without source error = %v", err)
 	}
@@ -176,12 +180,12 @@ func TestMemoryStoreNoSourceWithEndpointIsTopologyError(t *testing.T) {
 func TestMemoryStoreRejectsMapIdentityMismatches(t *testing.T) {
 	store := NewMemoryStore()
 	store.UpstreamSources["wrong-key"] = validMemoryUpstreamSource()
-	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: "source", Key: "primary", BaseURL: "https://emby.example", Active: true}
+	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: "source", Key: "primary", BaseURL: "https://emby.example", Enabled: true, Default: true}
 	if _, err := store.LoadDefaultUpstreamRuntime(context.Background()); !errors.Is(err, ErrInvalidUpstreamTopology) {
 		t.Fatalf("source identity error = %v", err)
 	}
 	store.UpstreamSources = map[string]UpstreamSource{"source": validMemoryUpstreamSource()}
-	store.UpstreamEndpoints = map[string]UpstreamEndpoint{"wrong-key": {ID: "endpoint", SourceID: "source", Key: "primary", BaseURL: "https://emby.example", Active: true}}
+	store.UpstreamEndpoints = map[string]UpstreamEndpoint{"wrong-key": {ID: "endpoint", SourceID: "source", Key: "primary", BaseURL: "https://emby.example", Enabled: true, Default: true}}
 	if err := store.CompareAndSwapUpstreamAuth(context.Background(), UpstreamAuthUpdate{SourceID: "source", ExpectedGenerationID: "stale", GenerationID: "generation", DeviceID: "device", BackendUserID: "user", BackendToken: "token", AuthenticatedAt: time.Now()}); !errors.Is(err, ErrInvalidUpstreamTopology) {
 		t.Fatalf("endpoint identity CAS error = %v", err)
 	}
@@ -190,7 +194,7 @@ func TestMemoryStoreRejectsMapIdentityMismatches(t *testing.T) {
 func TestMemoryStoreUpstreamCASMatchesPocketBaseBeforeTopologyValidation(t *testing.T) {
 	store := NewMemoryStore()
 	store.UpstreamSources["source"] = validMemoryUpstreamSource()
-	store.UpstreamEndpoints["wrong-key"] = UpstreamEndpoint{ID: "endpoint", SourceID: "source", Key: "primary", BaseURL: "https://emby.example", Active: true}
+	store.UpstreamEndpoints["wrong-key"] = UpstreamEndpoint{ID: "endpoint", SourceID: "source", Key: "primary", BaseURL: "https://emby.example", Enabled: true, Default: true}
 
 	update := UpstreamAuthUpdate{SourceID: "source", GenerationID: "generation", DeviceID: "device", BackendUserID: "user", BackendToken: "token", AuthenticatedAt: time.Now()}
 	if err := store.CompareAndSwapUpstreamAuth(context.Background(), update); err != nil {
@@ -209,7 +213,7 @@ func TestMemoryStoreUpdateUpstreamServerInfo(t *testing.T) {
 	source.AuthGenerationID = "old-generation"
 	source.BackendToken = "old-token"
 	store.UpstreamSources[source.ID] = source
-	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: source.ID, Key: "primary", BaseURL: "https://emby.example", Active: true}
+	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: source.ID, Key: "primary", BaseURL: "https://emby.example", Enabled: true, Default: true}
 	at := time.Date(2026, 7, 16, 12, 0, 0, 123456789, time.FixedZone("offset", 3600))
 	if err := store.UpdateUpstreamServerInfo(context.Background(), UpstreamServerInfoUpdate{SourceID: source.ID, ServerID: source.ServerID, ServerName: "new name", CheckedAt: at}); err != nil {
 		t.Fatalf("update name: %v", err)
@@ -260,7 +264,7 @@ func TestMemoryStoreUpdateUpstreamServerInfoErrorsDoNotMutate(t *testing.T) {
 	store := NewMemoryStore()
 	source := validMemoryUpstreamSource()
 	store.UpstreamSources[source.ID] = source
-	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: source.ID, Key: "primary", BaseURL: "https://emby.example", Active: true}
+	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: source.ID, Key: "primary", BaseURL: "https://emby.example", Enabled: true, Default: true}
 	before := store.UpstreamSources[source.ID]
 	for _, update := range []UpstreamServerInfoUpdate{
 		{SourceID: " source", ServerID: source.ServerID, CheckedAt: time.Now()},
@@ -304,8 +308,8 @@ func TestMemoryStoreMetadataAndAuthCASPreserveEachOther(t *testing.T) {
 	source.ServerVersion = "old version"
 	source.LastLoginError = "old error"
 	store.UpstreamSources[source.ID] = source
-	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: source.ID, Key: "primary", BaseURL: "https://emby.example", Active: true}
-	store.UpstreamEndpoints["backup"] = UpstreamEndpoint{ID: "backup", SourceID: source.ID, Key: "backup", BaseURL: "https://backup.example", Active: false}
+	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: source.ID, Key: "primary", BaseURL: "https://emby.example", Enabled: true, Default: true}
+	store.UpstreamEndpoints["backup"] = UpstreamEndpoint{ID: "backup", SourceID: source.ID, Key: "backup", BaseURL: "https://backup.example", Enabled: false}
 	endpointsBefore := make(map[string]UpstreamEndpoint, len(store.UpstreamEndpoints))
 	for id, endpoint := range store.UpstreamEndpoints {
 		endpointsBefore[id] = endpoint

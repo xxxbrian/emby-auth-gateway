@@ -147,6 +147,6 @@ func anonymousImageTestStore(baseURL, backendServerID string) *MemoryStore {
 	store := NewMemoryStore()
 	identity := BackendClientIdentity{DeviceID: "device"}.WithDefaults()
 	store.UpstreamSources["source"] = UpstreamSource{ID: "source", Key: "default", ServerID: backendServerID, BackendUsername: "backend", BackendPassword: "password", ClientIdentity: identity}
-	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: "source", Key: "primary", BaseURL: baseURL, Active: true}
+	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: "source", Key: "primary", BaseURL: baseURL, Enabled: true, Default: true}
 	return store
 }

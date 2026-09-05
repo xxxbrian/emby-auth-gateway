@@ -18,7 +18,7 @@ func TestUpstreamAuthenticatorEnsureManagedSkipsHTTPAndCAS(t *testing.T) {
 	store := &fakeUpstreamAuthStore{runtime: managedRuntime("old-token")}
 	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("unexpected HTTP") }))
 	defer server.Close()
-	store.runtime.Endpoint.BaseURL = server.URL
+	store.setRuntimeEndpointBaseURL(server.URL)
 	auth := newUpstreamAuthenticator(store, server.Client())
 	runtime, err := auth.Ensure(context.Background())
 	if err != nil || runtime.Source.BackendToken != "old-token" || store.casCalls != 0 {
@@ -41,7 +41,7 @@ func TestUpstreamAuthenticatorPreContractRotatesWithFreshIdentity(t *testing.T) 
 		_, _ = w.Write([]byte(`{"AccessToken":"new-token","ServerId":"server","User":{"Id":"new-user"}}`))
 	}))
 	defer server.Close()
-	store.runtime.Endpoint.BaseURL = server.URL
+	store.setRuntimeEndpointBaseURL(server.URL)
 	auth := newUpstreamAuthenticator(store, server.Client())
 	auth.deviceID = func() (string, error) { return "NEW-DEVICE", nil }
 	auth.generation = func() (string, error) { return "new-generation", nil }
@@ -62,7 +62,7 @@ func TestUpstreamAuthenticatorRefreshSkipsChangedTokenAndRotatesMatchingToken(t 
 		_, _ = w.Write([]byte(`{"AccessToken":"new","ServerId":"server","User":{"Id":"user"}}`))
 	}))
 	defer server.Close()
-	store.runtime.Endpoint.BaseURL = server.URL
+	store.setRuntimeEndpointBaseURL(server.URL)
 	auth := newUpstreamAuthenticator(store, server.Client())
 	auth.deviceID = func() (string, error) { return "NEW", nil }
 	auth.generation = func() (string, error) { return "next", nil }
@@ -89,7 +89,7 @@ func TestUpstreamAuthenticatorConcurrentEnsureUsesOneLoginAndCAS(t *testing.T) {
 		_, _ = w.Write([]byte(`{"AccessToken":"new","ServerId":"server","User":{"Id":"user"}}`))
 	}))
 	defer server.Close()
-	store.runtime.Endpoint.BaseURL = server.URL
+	store.setRuntimeEndpointBaseURL(server.URL)
 	auth := newUpstreamAuthenticator(store, server.Client())
 	auth.deviceID = func() (string, error) { return "NEW", nil }
 	auth.generation = func() (string, error) { return "next", nil }
@@ -131,7 +131,7 @@ func TestUpstreamAuthenticatorCanceledWaiterAndLeaderRetry(t *testing.T) {
 		_, _ = w.Write([]byte(`{"AccessToken":"new","ServerId":"server","User":{"Id":"user"}}`))
 	}))
 	defer server.Close()
-	store.runtime.Endpoint.BaseURL = server.URL
+	store.setRuntimeEndpointBaseURL(server.URL)
 	auth := newUpstreamAuthenticator(store, server.Client())
 	auth.deviceID = func() (string, error) { return "NEW", nil }
 	auth.generation = func() (string, error) { return "next", nil }
@@ -171,7 +171,7 @@ func TestUpstreamAuthenticatorRejectsCollisionAndDoesNotLeakSecrets(t *testing.T
 		_, _ = w.Write([]byte(`{"AccessToken":"old-token","ServerId":"server","User":{"Id":"user"}}`))
 	}))
 	defer server.Close()
-	store.runtime.Endpoint.BaseURL = server.URL
+	store.setRuntimeEndpointBaseURL(server.URL)
 	auth := newUpstreamAuthenticator(store, server.Client())
 	auth.deviceID = func() (string, error) { return "NEW", nil }
 	auth.generation = func() (string, error) { return "next", nil }
@@ -192,7 +192,7 @@ func TestUpstreamAuthenticatorChildTimeoutDoesNotRetryFlight(t *testing.T) {
 		<-r.Context().Done()
 		return nil, r.Context().Err()
 	})}
-	store.runtime.Endpoint.BaseURL = "http://upstream.test"
+	store.setRuntimeEndpointBaseURL("http://upstream.test")
 	auth := newUpstreamAuthenticator(store, client)
 	auth.authTimeout = 10 * time.Millisecond
 	auth.deviceID = func() (string, error) { return "NEW", nil }
@@ -224,7 +224,7 @@ func TestUpstreamAuthenticatorClientDoesNotShareCookies(t *testing.T) {
 	u, _ := url.Parse(server.URL)
 	jar.SetCookies(u, []*http.Cookie{{Name: "ambient", Value: "cookie"}})
 	client := &http.Client{Jar: jar}
-	store.runtime.Endpoint.BaseURL = server.URL
+	store.setRuntimeEndpointBaseURL(server.URL)
 	auth := newUpstreamAuthenticator(store, client)
 	auth.deviceID = func() (string, error) { return "NEW", nil }
 	auth.generation = func() (string, error) { return "next", nil }
@@ -250,7 +250,7 @@ func TestUpstreamAuthenticatorAcceptsNewerWinnerAfterCASSuccess(t *testing.T) {
 		_, _ = w.Write([]byte(`{"AccessToken":"new","ServerId":"server","User":{"Id":"user"}}`))
 	}))
 	defer server.Close()
-	store.runtime.Endpoint.BaseURL = server.URL
+	store.setRuntimeEndpointBaseURL(server.URL)
 	auth := newUpstreamAuthenticator(store, server.Client())
 	auth.deviceID = func() (string, error) { return "NEW", nil }
 	auth.generation = func() (string, error) { return "submitted", nil }
@@ -280,7 +280,7 @@ func TestUpstreamAuthenticatorRedirectDoesNotLeakLocation(t *testing.T) {
 		http.Redirect(w, r, "/next?username=sentinel-user&password=sentinel-password&token=sentinel-token", http.StatusFound)
 	}))
 	defer server.Close()
-	store.runtime.Endpoint.BaseURL = server.URL
+	store.setRuntimeEndpointBaseURL(server.URL)
 	auth := configuredAuth(store, server.Client())
 	_, err := auth.Ensure(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "302") {
@@ -318,7 +318,7 @@ func TestUpstreamAuthenticatorFailureTokensAreGuardedlyLoggedOut(t *testing.T) {
 				_, _ = w.Write([]byte(tc.body))
 			}))
 			defer server.Close()
-			store.runtime.Endpoint.BaseURL = server.URL
+			store.setRuntimeEndpointBaseURL(server.URL)
 			auth := configuredAuth(store, server.Client())
 			if _, err := auth.Ensure(context.Background()); err == nil {
 				t.Fatal("expected authentication failure")
@@ -344,7 +344,7 @@ func TestUpstreamAuthenticatorCASConflictAndAmbiguousOwnership(t *testing.T) {
 		var logout string
 		server := lifecycleServer(t, &logout)
 		defer server.Close()
-		store.runtime.Endpoint.BaseURL = server.URL
+		store.setRuntimeEndpointBaseURL(server.URL)
 		if runtime, err := configuredAuth(store, server.Client()).Ensure(context.Background()); err != nil || runtime.Source.BackendToken != "winner" || logout != "new" {
 			t.Fatalf("conflict runtime=%#v err=%v logout=%q", runtime, err, logout)
 		}
@@ -354,7 +354,7 @@ func TestUpstreamAuthenticatorCASConflictAndAmbiguousOwnership(t *testing.T) {
 		var logout string
 		server := lifecycleServer(t, &logout)
 		defer server.Close()
-		store.runtime.Endpoint.BaseURL = server.URL
+		store.setRuntimeEndpointBaseURL(server.URL)
 		if runtime, err := configuredAuth(store, server.Client()).Ensure(context.Background()); err != nil || runtime.Source.BackendToken != "new" || logout != "" {
 			t.Fatalf("ambiguous runtime=%#v err=%v logout=%q", runtime, err, logout)
 		}
@@ -375,7 +375,7 @@ func TestUpstreamAuthenticatorRetiresOnlyManagedOldIdentity(t *testing.T) {
 		_, _ = w.Write([]byte(`{"AccessToken":"new","ServerId":"server","User":{"Id":"new-user"}}`))
 	}))
 	defer server.Close()
-	store.runtime.Endpoint.BaseURL = server.URL
+	store.setRuntimeEndpointBaseURL(server.URL)
 	auth := configuredAuth(store, server.Client())
 	if _, err := auth.Refresh(context.Background(), "old"); err != nil {
 		t.Fatal(err)
@@ -404,7 +404,7 @@ func TestUpstreamAuthenticatorCASLoserEqualWinnerSkipsLogout(t *testing.T) {
 	var logout string
 	server := lifecycleServer(t, &logout)
 	defer server.Close()
-	store.runtime.Endpoint.BaseURL = server.URL
+	store.setRuntimeEndpointBaseURL(server.URL)
 	// The login token deliberately equals the winner token.
 	auth := configuredAuth(store, server.Client())
 	auth.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -424,7 +424,7 @@ func TestUpstreamAuthenticatorCASReconciliationLoadFailureFailsClosed(t *testing
 	var logout string
 	server := lifecycleServer(t, &logout)
 	defer server.Close()
-	store.runtime.Endpoint.BaseURL = server.URL
+	store.setRuntimeEndpointBaseURL(server.URL)
 	_, err := configuredAuth(store, server.Client()).Ensure(context.Background())
 	if !errors.Is(err, ErrStoreUnavailable) || logout != "" {
 		t.Fatalf("error=%v logout=%q", err, logout)
@@ -439,7 +439,7 @@ func TestUpstreamAuthenticatorPreContractStaleTokenIsNotRetired(t *testing.T) {
 	var logout string
 	server := lifecycleServer(t, &logout)
 	defer server.Close()
-	store.runtime.Endpoint.BaseURL = server.URL
+	store.setRuntimeEndpointBaseURL(server.URL)
 	if _, err := configuredAuth(store, server.Client()).Ensure(context.Background()); err != nil || logout != "" {
 		t.Fatalf("error=%v logout=%q", err, logout)
 	}
@@ -458,7 +458,7 @@ func TestUpstreamAuthenticatorCleanupFailureAndTimeoutKeepPrimaryError(t *testin
 				_, _ = w.Write([]byte(`{"AccessToken":"invoke","ServerId":`))
 			}))
 			defer server.Close()
-			store.runtime.Endpoint.BaseURL = server.URL
+			store.setRuntimeEndpointBaseURL(server.URL)
 			auth := configuredAuth(store, server.Client())
 			auth.cleanupTimeout = timeout
 			if _, err := auth.Ensure(context.Background()); err == nil || !strings.Contains(err.Error(), "malformed") {
@@ -479,7 +479,7 @@ func TestUpstreamAuthenticatorTerminalReadErrorAfterTokenCleansWithoutCAS(t *tes
 		}
 		return &http.Response{StatusCode: http.StatusOK, Body: &tokenThenErrorReader{data: []byte(`{"AccessToken":"invoke","ServerId":"server"}`), err: errors.New("read failure")}, Header: make(http.Header), Request: r}, nil
 	})}
-	store.runtime.Endpoint.BaseURL = "http://upstream.test"
+	store.setRuntimeEndpointBaseURL("http://upstream.test")
 	if _, err := configuredAuth(store, client).Ensure(context.Background()); err == nil || store.casCalls != 0 || logout != "invoke" {
 		t.Fatalf("error=%v CAS=%d logout=%q", err, store.casCalls, logout)
 	}
@@ -586,7 +586,10 @@ func (s *fakeUpstreamAuthStore) CompareAndSwapUpstreamAuth(ctx context.Context, 
 }
 
 func preContractRuntime() *UpstreamRuntime {
-	return &UpstreamRuntime{Source: UpstreamSource{ID: "source", Key: "default", ServerID: "server", BackendUsername: "backend", BackendPassword: "password", ClientIdentity: BackendClientIdentity{UserAgent: "agent", Client: "client", Device: "device", DeviceID: "OLD", Version: "1"}}, Endpoint: UpstreamEndpoint{ID: "endpoint", SourceID: "source", Key: "primary", BaseURL: "http://invalid", Active: true}}
+	return &UpstreamRuntime{
+		Source:    UpstreamSource{ID: "source", Key: "default", ServerID: "server", BackendUsername: "backend", BackendPassword: "password", ClientIdentity: BackendClientIdentity{UserAgent: "agent", Client: "client", Device: "device", DeviceID: "OLD", Version: "1"}},
+		Endpoints: UpstreamEndpoints{{ID: "endpoint", SourceID: "source", Key: "primary", BaseURL: "http://invalid", Enabled: true, Default: true}},
+	}
 }
 
 func managedRuntime(token string) *UpstreamRuntime {
@@ -598,6 +601,17 @@ func managedRuntime(token string) *UpstreamRuntime {
 	runtime.Source.TokenUpdatedAt = &now
 	runtime.Source.LastLoginAt = &now
 	return runtime
+}
+
+func (s *fakeUpstreamAuthStore) setRuntimeEndpointBaseURL(url string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.runtime.Endpoints {
+		if s.runtime.Endpoints[i].Default {
+			s.runtime.Endpoints[i].BaseURL = url
+			return
+		}
+	}
 }
 
 var _ upstreamAuthStore = (*fakeUpstreamAuthStore)(nil)

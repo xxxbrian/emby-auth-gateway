@@ -26,7 +26,7 @@ import (
 //go:embed testdata/v060-final/v060-final.fixture
 var v060Fixture []byte
 
-const v060FixtureSHA256 = "eda0d57dbdd7ff9fdc363002af773623b369f3bc6dd97bd915a6671338ee440e"
+const v060FixtureSHA256 = "105f94a11c7ea603e51f59d46dd323bf83e9d17d8f373ce202d5f1d9d7200b5e"
 
 func TestProductionBootstrapAcceptsFrozenExistingSchemaWithoutWrites(t *testing.T) {
 	previous, err := os.Getwd()
@@ -109,7 +109,7 @@ func seedFrozenState(t *testing.T, app core.App) {
 		"backend_user_agent": "fixture-agent", "backend_authorization_client": "fixture-client", "backend_authorization_device": "fixture-device", "backend_authorization_device_id": "fixture-device-id", "backend_authorization_version": "1",
 	})
 	saveFixtureRecord(t, app, source)
-	saveFixtureRecord(t, app, fixtureRecord(t, app, "upstream_endpoints", map[string]any{"id": "fixtureendpoint", "source": source.Id, "key": "primary", "base_url": "https://fixture.example", "active": true}))
+	saveFixtureRecord(t, app, fixtureRecord(t, app, "upstream_endpoints", map[string]any{"id": "fixtureendpoint", "source": source.Id, "key": "primary", "base_url": "https://fixture.example", "enabled": true, "is_default": true}))
 	saveFixtureRecord(t, app, fixtureRecord(t, app, "user_item_data", map[string]any{"id": "fixtureitemdata", "gateway_user": user.Id, "synthetic_user_id": "fixture-user", "item_id": "fixture-item", "item_name": "Fixture Item"}))
 	saveFixtureRecord(t, app, fixtureRecord(t, app, "playback_events", map[string]any{"id": "fixtureplayback", "gateway_user": user.Id, "item_id": "fixture-item", "event": "progress", "occurred_at": time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}))
 	saveFixtureRecord(t, app, fixtureRecord(t, app, "display_preferences", map[string]any{"id": "fixturedisplay1", "gateway_user": user.Id, "preference_id": "home", "client": "fixture", "payload_json": "{}"}))
@@ -224,7 +224,7 @@ func assertApplicationCollectionSet(t *testing.T, app core.App) {
 		}
 	}
 	sort.Strings(got)
-	want := []string{"audit_logs", "display_preferences", "gateway_sessions", "item_child_counts", "path_policies", "playback_events", "upstream_endpoints", "upstream_sources", "user_item_data", "users"}
+	want := []string{"audit_logs", "display_preferences", "gateway_sessions", "item_child_counts", "path_policies", "playback_events", "route_rules", "upstream_endpoints", "upstream_sources", "user_item_data", "users"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("application collections = %v, want %v", got, want)
 	}

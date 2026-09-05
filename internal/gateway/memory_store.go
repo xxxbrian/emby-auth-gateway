@@ -70,7 +70,7 @@ func loadMemoryDefaultUpstreamRuntime(sources map[string]UpstreamSource, endpoin
 		}
 		source, sourceKey = candidate, key
 	}
-	var active []UpstreamEndpoint
+	var all []UpstreamEndpoint
 	for key, endpoint := range endpoints {
 		if key != endpoint.ID {
 			return nil, "", invalidUpstreamTopology("endpoint map identity mismatch")
@@ -78,14 +78,12 @@ func loadMemoryDefaultUpstreamRuntime(sources map[string]UpstreamSource, endpoin
 		if err := ValidateUpstreamEndpoint(source.ID, endpoint); err != nil {
 			return nil, "", err
 		}
-		if endpoint.Active {
-			active = append(active, endpoint)
-		}
+		all = append(all, endpoint)
 	}
-	if len(active) != 1 {
-		return nil, "", invalidUpstreamTopology("expected one active endpoint")
+	if err := ValidateUpstreamEndpoints(source.ID, all); err != nil {
+		return nil, "", err
 	}
-	runtime := &UpstreamRuntime{Source: cloneUpstreamSource(source), Endpoint: active[0]}
+	runtime := &UpstreamRuntime{Source: cloneUpstreamSource(source), Endpoints: all}
 	if err := ValidateUpstreamRuntime(*runtime); err != nil {
 		return nil, "", err
 	}

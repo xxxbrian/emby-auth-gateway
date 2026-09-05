@@ -23,9 +23,9 @@ const (
 
 // Querier runs bounded admin reads.
 type Querier struct {
-	app  core.App
-	sem  chan struct{}
-	now  func() time.Time
+	app core.App
+	sem chan struct{}
+	now func() time.Time
 }
 
 // New creates a Querier with max concurrent queries.
@@ -89,21 +89,21 @@ type SessionDTO struct {
 
 // AuditDTO is a redacted audit log row.
 type AuditDTO struct {
-	ID              string    `json:"id"`
-	GatewayUserID   string    `json:"gateway_user_id,omitempty"`
-	SyntheticUserID string    `json:"synthetic_user_id,omitempty"`
-	Event           string    `json:"event"`
-	Message         string    `json:"message,omitempty"`
-	Method          string    `json:"method,omitempty"`
-	Path            string    `json:"path,omitempty"`
-	Status          int       `json:"status,omitempty"`
-	RemoteIP        string    `json:"remote_ip,omitempty"`
-	Created         time.Time `json:"created"`
-	ErrorKind       string    `json:"error_kind,omitempty"`
-	Direction       string    `json:"direction,omitempty"`
-	BytesTransferred int64    `json:"bytes_transferred,omitempty"`
-	DurationMS      int64     `json:"duration_ms,omitempty"`
-	UpstreamStatus  int       `json:"upstream_status,omitempty"`
+	ID               string    `json:"id"`
+	GatewayUserID    string    `json:"gateway_user_id,omitempty"`
+	SyntheticUserID  string    `json:"synthetic_user_id,omitempty"`
+	Event            string    `json:"event"`
+	Message          string    `json:"message,omitempty"`
+	Method           string    `json:"method,omitempty"`
+	Path             string    `json:"path,omitempty"`
+	Status           int       `json:"status,omitempty"`
+	RemoteIP         string    `json:"remote_ip,omitempty"`
+	Created          time.Time `json:"created"`
+	ErrorKind        string    `json:"error_kind,omitempty"`
+	Direction        string    `json:"direction,omitempty"`
+	BytesTransferred int64     `json:"bytes_transferred,omitempty"`
+	DurationMS       int64     `json:"duration_ms,omitempty"`
+	UpstreamStatus   int       `json:"upstream_status,omitempty"`
 }
 
 // UpstreamDTO is a redacted upstream configuration view.
@@ -258,10 +258,10 @@ func (q *Querier) GetUpstream(ctx context.Context) (UpstreamDTO, error) {
 		tt := t.Time().UTC()
 		dto.LastLoginAt = &tt
 	}
-	if active, err := activeEndpoint(state.Endpoints); err == nil && active != nil {
-		dto.BaseURL = active.GetString("base_url")
-		dto.EndpointKey = active.GetString("key")
-		dto.EndpointActive = active.GetBool("active")
+	if defaultEP, err := defaultEndpoint(state.Endpoints); err == nil && defaultEP != nil {
+		dto.BaseURL = defaultEP.GetString("base_url")
+		dto.EndpointKey = defaultEP.GetString("key")
+		dto.EndpointActive = defaultEP.GetBool("enabled")
 	}
 	return dto, nil
 }
@@ -406,15 +406,15 @@ func auditFromRecord(r *core.Record) AuditDTO {
 	return dto
 }
 
-func activeEndpoint(endpoints []*core.Record) (*core.Record, error) {
-	var active *core.Record
+func defaultEndpoint(endpoints []*core.Record) (*core.Record, error) {
+	var defaultEP *core.Record
 	for _, ep := range endpoints {
-		if ep.GetBool("active") {
-			if active != nil {
-				return nil, fmt.Errorf("multiple active endpoints")
+		if ep.GetBool("is_default") {
+			if defaultEP != nil {
+				return nil, fmt.Errorf("multiple default endpoints")
 			}
-			active = ep
+			defaultEP = ep
 		}
 	}
-	return active, nil
+	return defaultEP, nil
 }

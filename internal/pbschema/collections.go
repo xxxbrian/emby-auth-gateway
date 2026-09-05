@@ -3,7 +3,7 @@ package pbschema
 import "github.com/pocketbase/pocketbase/core"
 
 func collections(ids map[string]string) []*core.Collection {
-	return []*core.Collection{sessions(ids["users"]), audit(ids["users"]), playback(ids["users"]), userData(ids["users"]), childCounts(), preferences(ids["users"]), policies(), sources(), endpoints(ids["upstream_sources"])}
+	return []*core.Collection{sessions(ids["users"]), audit(ids["users"]), playback(ids["users"]), userData(ids["users"]), childCounts(), preferences(ids["users"]), policies(), routeRules(), sources(), endpoints(ids["upstream_sources"])}
 }
 func base(name string) *core.Collection { c := core.NewBaseCollection(name); lock(c); return c }
 func dates(c *core.Collection) {
@@ -164,10 +164,35 @@ func endpoints(sourceID string) *core.Collection {
 	c.Fields.Add(rel("source", sourceID, true))
 	c.Fields.Add(&core.TextField{Name: "key", Required: true, Max: 80})
 	c.Fields.Add(&core.URLField{Name: "base_url", Required: true})
-	c.Fields.Add(&core.BoolField{Name: "active"})
+	// enabled marks the endpoint as participating in routing. It replaced the
+	// single-active model: multiple endpoints may be enabled at once.
+	c.Fields.Add(&core.BoolField{Name: "enabled"})
+	// is_default marks the fallback endpoint for requests no rule matches.
+	// At most one endpoint per source may be the default (partial unique index).
+	c.Fields.Add(&core.BoolField{Name: "is_default"})
+	// WebSocket capability probe results, refreshed by the admin plane.
+	c.Fields.Add(&core.BoolField{Name: "websocket_capable"})
+	c.Fields.Add(&core.DateField{Name: "websocket_probed_at"})
+	c.Fields.Add(&core.TextField{Name: "websocket_probe_error", Max: 512})
 	dates(c)
 	c.AddIndex("idx_upstream_endpoints_source_key", true, "source, key", "")
 	c.AddIndex("idx_upstream_endpoints_source_base_url", true, "source, base_url", "")
-	c.AddIndex("idx_upstream_endpoints_active_source", true, "source", "active = 1")
+	// One default endpoint per source replaces the old single-active index.
+	c.AddIndex("idx_upstream_endpoints_default_source", true, "source", "is_default = 1")
+	return c
+}
+
+// routeRules stores upstream routing rules (method/path/transport -> endpoint key).
+func routeRules() *core.Collection {
+	c := base("route_rules")
+	c.Fields.Add(&core.TextField{Name: "method", Max: 32})
+	c.Fields.Add(&core.TextField{Name: "path", Required: true, Max: 512})
+	c.Fields.Add(&core.TextField{Name: "transport", Max: 32})
+	c.Fields.Add(&core.TextField{Name: "target", Required: true, Max: 80})
+	c.Fields.Add(&core.NumberField{Name: "priority", OnlyInt: true})
+	c.Fields.Add(&core.TextField{Name: "reason", Max: 255})
+	c.Fields.Add(&core.BoolField{Name: "enabled"})
+	dates(c)
+	c.AddIndex("idx_route_rules_enabled_priority", false, "enabled, priority", "")
 	return c
 }

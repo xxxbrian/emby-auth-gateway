@@ -67,7 +67,8 @@ func TestUpstreamRuntimeLoadAndAuthCAS(t *testing.T) {
 	endpoint.Set("source", source.Id)
 	endpoint.Set("key", "primary")
 	endpoint.Set("base_url", "https://emby.example")
-	endpoint.Set("active", true)
+	endpoint.Set("enabled", true)
+	endpoint.Set("is_default", true)
 	if err := app.Save(endpoint); err != nil {
 		t.Fatalf("save endpoint: %v", err)
 	}
@@ -75,7 +76,8 @@ func TestUpstreamRuntimeLoadAndAuthCAS(t *testing.T) {
 	inactive.Set("source", source.Id)
 	inactive.Set("key", "backup")
 	inactive.Set("base_url", "https://backup.example")
-	inactive.Set("active", false)
+	inactive.Set("enabled", false)
+	inactive.Set("is_default", false)
 	if err := app.Save(inactive); err != nil {
 		t.Fatalf("save inactive endpoint: %v", err)
 	}
@@ -86,7 +88,8 @@ func TestUpstreamRuntimeLoadAndAuthCAS(t *testing.T) {
 	}
 
 	runtime, err := store.LoadDefaultUpstreamRuntime(context.Background())
-	if err != nil || runtime.Source.ID != source.Id || runtime.Endpoint.ID != endpoint.Id {
+	defaultEP, depErr := runtime.DefaultEndpoint()
+	if err != nil || runtime.Source.ID != source.Id || depErr != nil || defaultEP.ID != endpoint.Id {
 		t.Fatalf("load runtime = %#v, %v", runtime, err)
 	}
 	at := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
@@ -217,7 +220,11 @@ func TestUpstreamAuthCASConcurrentOneWinner(t *testing.T) {
 		t.Fatalf("concurrent CAS winners = %d, want 1", winners)
 	}
 	runtime, err := store.LoadDefaultUpstreamRuntime(context.Background())
-	if err != nil || (runtime.Source.AuthGenerationID != "generation-a" && runtime.Source.AuthGenerationID != "generation-b") || runtime.Endpoint.BaseURL != "https://emby.example" || runtime.Source.ServerID != "server" {
+	if err != nil || (runtime.Source.AuthGenerationID != "generation-a" && runtime.Source.AuthGenerationID != "generation-b") {
+		t.Fatalf("unexpected post-concurrent runtime %#v, %v", runtime, err)
+	}
+	defaultEP, depErr := runtime.DefaultEndpoint()
+	if depErr != nil || defaultEP.BaseURL != "https://emby.example" || runtime.Source.ServerID != "server" {
 		t.Fatalf("unexpected post-concurrent runtime %#v, %v", runtime, err)
 	}
 }
@@ -454,11 +461,23 @@ func TestUpstreamRuntimeReadIsCoherentDuringTransactionUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("concurrent loader: %v", err)
 	}
-	old := runtime.Source.ServerName == "old-server" && runtime.Endpoint.BaseURL == "https://old.example"
-	new := runtime.Source.ServerName == "new-server" && runtime.Endpoint.BaseURL == "https://new.example"
+	old := runtime.Source.ServerName == "old-server" && defaultBaseURL(runtime) == "https://old.example"
+	new := runtime.Source.ServerName == "new-server" && defaultBaseURL(runtime) == "https://new.example"
 	if !old && !new {
 		t.Fatalf("mixed runtime snapshot: %#v", runtime)
 	}
+}
+
+// defaultBaseURL returns the default endpoint base URL of a runtime, or "".
+func defaultBaseURL(runtime *gateway.UpstreamRuntime) string {
+	if runtime == nil {
+		return ""
+	}
+	ep, err := runtime.DefaultEndpoint()
+	if err != nil {
+		return ""
+	}
+	return ep.BaseURL
 }
 
 func createUpstreamSource(t *testing.T, app core.App) *core.Record {
@@ -490,7 +509,8 @@ func createUpstreamEndpoint(t *testing.T, app core.App, sourceID, key, baseURL s
 	record.Set("source", sourceID)
 	record.Set("key", key)
 	record.Set("base_url", baseURL)
-	record.Set("active", active)
+	record.Set("enabled", active)
+	record.Set("is_default", active)
 	if err := app.Save(record); err != nil {
 		t.Fatalf("save endpoint: %v", err)
 	}

@@ -4653,7 +4653,7 @@ func configureTestUpstream(store *MemoryStore, backendBaseURL string) {
 		BackendUserID: "backend-user", BackendToken: "backend-token", AuthGenerationID: "generation", TokenUpdatedAt: &now, LastLoginAt: &now,
 		ClientIdentity: backendIdentityForTest("backend-device"),
 	}
-	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: "source", Key: "default", BaseURL: backendBaseURL, Active: true}
+	store.UpstreamEndpoints["endpoint"] = UpstreamEndpoint{ID: "endpoint", SourceID: "source", Key: "default", BaseURL: backendBaseURL, Enabled: true, Default: true}
 }
 
 func backendIdentityForTest(deviceID string) BackendClientIdentity {

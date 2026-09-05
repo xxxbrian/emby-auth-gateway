@@ -80,7 +80,7 @@ func ResolveBackendPassword(app core.App, password, targetBaseURL string) (strin
 	if err != nil {
 		return "", err
 	}
-	// Prefer active endpoint base_url; fall back to any endpoint.
+	// Prefer default endpoint base_url; fall back to any endpoint.
 	var configured string
 	for _, ep := range state.Endpoints {
 		if ep == nil {
@@ -90,10 +90,10 @@ func ResolveBackendPassword(app core.App, password, targetBaseURL string) (strin
 		if base == "" {
 			continue
 		}
-		if ep.GetBool("active") || configured == "" {
+		if ep.GetBool("is_default") || configured == "" {
 			configured = base
 		}
-		if ep.GetBool("active") {
+		if ep.GetBool("is_default") {
 			break
 		}
 	}

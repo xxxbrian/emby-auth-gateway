@@ -179,7 +179,7 @@ func UpstreamFingerprint(state UpstreamState) string {
 	}
 	type endpointSnapshot struct {
 		ID, Source, Key, BaseURL, Updated string
-		Active                            bool
+		Enabled, Default                  bool
 	}
 	type snapshot struct {
 		Source    *sourceSnapshot
@@ -190,27 +190,42 @@ func UpstreamFingerprint(state UpstreamState) string {
 		s.Source = &sourceSnapshot{state.Source.Id, state.Source.GetString("key"), state.Source.GetString("server_id"), state.Source.GetString("server_name"), state.Source.GetString("server_version"), state.Source.GetDateTime("version_checked_at").String(), state.Source.GetString("backend_username"), state.Source.GetString("backend_password"), state.Source.GetString("backend_user_id"), state.Source.GetString("backend_token"), state.Source.GetString("auth_generation_id"), state.Source.GetDateTime("token_updated_at").String(), state.Source.GetDateTime("last_login_at").String(), state.Source.GetString("last_login_error"), state.Source.GetString("backend_user_agent"), state.Source.GetString("backend_authorization_client"), state.Source.GetString("backend_authorization_device"), state.Source.GetString("backend_authorization_device_id"), state.Source.GetString("backend_authorization_version"), state.Source.GetDateTime("updated").String()}
 	}
 	for _, endpoint := range state.AllEndpoints {
-		s.Endpoints = append(s.Endpoints, endpointSnapshot{endpoint.Id, endpoint.GetString("source"), endpoint.GetString("key"), endpoint.GetString("base_url"), endpoint.GetDateTime("updated").String(), endpoint.GetBool("active")})
+		s.Endpoints = append(s.Endpoints, endpointSnapshot{endpoint.Id, endpoint.GetString("source"), endpoint.GetString("key"), endpoint.GetString("base_url"), endpoint.GetDateTime("updated").String(), endpoint.GetBool("enabled"), endpoint.GetBool("is_default")})
 	}
 	sort.Slice(s.Endpoints, func(i, j int) bool { return s.Endpoints[i].ID < s.Endpoints[j].ID })
 	data, _ := json.Marshal(s)
 	return fmt.Sprintf("%x", sha256.Sum256(data))
 }
 
-func activeEndpoint(endpoints []*core.Record) (*core.Record, error) {
-	var active *core.Record
+// defaultEndpointRecord returns the default endpoint record of a source:
+// exactly one endpoint must be marked is_default (and it should be enabled).
+func defaultEndpointRecord(endpoints []*core.Record) (*core.Record, error) {
+	var found *core.Record
 	for _, endpoint := range endpoints {
-		if endpoint.GetBool("active") {
-			if active != nil {
-				return nil, fmt.Errorf("refusing setup: source has multiple active endpoints")
+		if endpoint.GetBool("is_default") {
+			if found != nil {
+				return nil, fmt.Errorf("refusing setup: source has multiple default endpoints")
 			}
-			active = endpoint
+			found = endpoint
 		}
 	}
-	if active == nil {
-		return nil, fmt.Errorf("refusing setup: source has no active endpoint")
+	if found == nil {
+		return nil, fmt.Errorf("refusing setup: source has no default endpoint")
 	}
-	return active, nil
+	if !found.GetBool("enabled") {
+		return nil, fmt.Errorf("refusing setup: default endpoint is disabled")
+	}
+	return found, nil
+}
+
+// endpointRecordByKey returns an enabled endpoint record by key, or nil.
+func endpointRecordByKey(endpoints []*core.Record, key string) *core.Record {
+	for _, endpoint := range endpoints {
+		if endpoint.GetString("key") == key && endpoint.GetBool("enabled") {
+			return endpoint
+		}
+	}
+	return nil
 }
 
 // ReconfigureUpstream creates or updates the singleton upstream configuration.
@@ -243,11 +258,11 @@ func ReconfigureUpstream(parent context.Context, app core.App, opts UpstreamReco
 	opts.BackendPassword = resolvedPassword
 	identity := opts.identity()
 	var deviceID string
-	var active *core.Record
+	var defaultEP *core.Record
 	var oldToken, oldURL, oldUserID, oldDeviceID, oldGeneration string
 	var oldIdentity gateway.BackendClientIdentity
 	if state.Source != nil {
-		active, err = activeEndpoint(state.Endpoints)
+		defaultEP, err = defaultEndpointRecord(state.Endpoints)
 		if err != nil {
 			return result, err
 		}
@@ -255,13 +270,13 @@ func ReconfigureUpstream(parent context.Context, app core.App, opts UpstreamReco
 		if deviceID == "" {
 			return result, fmt.Errorf("refusing setup: stored source has no device ID")
 		}
-		oldToken, oldURL, oldUserID, oldDeviceID, oldGeneration = state.Source.GetString("backend_token"), active.GetString("base_url"), state.Source.GetString("backend_user_id"), state.Source.GetString("backend_authorization_device_id"), state.Source.GetString("auth_generation_id")
+		oldToken, oldURL, oldUserID, oldDeviceID, oldGeneration = state.Source.GetString("backend_token"), defaultEP.GetString("base_url"), state.Source.GetString("backend_user_id"), state.Source.GetString("backend_authorization_device_id"), state.Source.GetString("auth_generation_id")
 		oldIdentity = gateway.BackendClientIdentity{UserAgent: state.Source.GetString("backend_user_agent"), Client: state.Source.GetString("backend_authorization_client"), Device: state.Source.GetString("backend_authorization_device"), Version: state.Source.GetString("backend_authorization_version")}.WithDefaults()
 		if err := rejectEndpointCollision(app, baseURL, state.Source); err != nil {
 			return result, err
 		}
 	}
-	exactNoop := state.Source != nil && completeNoop(state.Source, active, baseURL, opts, identity)
+	exactNoop := state.Source != nil && completeNoop(state.Source, defaultEP, baseURL, opts, identity)
 	if state.Source == nil {
 		if err := rejectEndpointCollision(app, baseURL, nil); err != nil {
 			return result, err
@@ -343,9 +358,11 @@ func ReconfigureUpstream(parent context.Context, app core.App, opts UpstreamReco
 			}
 			endpoint = core.NewRecord(endpointCollection)
 			endpoint.Set("key", PrimaryEndpointKey)
+			endpoint.Set("enabled", true)
+			endpoint.Set("is_default", true)
 		} else {
 			source = current.Source
-			endpoint, err = activeEndpoint(current.Endpoints)
+			endpoint, err = defaultEndpointRecord(current.Endpoints)
 			if err != nil {
 				return err
 			}
@@ -386,7 +403,8 @@ func ReconfigureUpstream(parent context.Context, app core.App, opts UpstreamReco
 		}
 		endpoint.Set("source", source.Id)
 		endpoint.Set("base_url", baseURL)
-		endpoint.Set("active", true)
+		endpoint.Set("enabled", true)
+		endpoint.Set("is_default", true)
 		return txApp.Save(endpoint)
 	})
 	if err != nil {
@@ -420,7 +438,7 @@ func rejectEndpointCollision(app core.App, baseURL string, source *core.Record) 
 		return err
 	}
 	for _, record := range records {
-		if source == nil || record.GetString("source") != source.Id || !record.GetBool("active") {
+		if source == nil || record.GetString("source") != source.Id || !record.GetBool("enabled") {
 			return fmt.Errorf("refusing setup: target URL is owned by another endpoint")
 		}
 	}

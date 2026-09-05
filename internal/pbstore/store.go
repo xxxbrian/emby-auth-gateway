@@ -162,11 +162,11 @@ func loadDefaultUpstreamRuntime(ctx context.Context, app core.App) (*gateway.Ups
 	if err != nil {
 		return nil, fmt.Errorf("%w: load upstream sources: %w", gateway.ErrStoreUnavailable, err)
 	}
-	endpoints, err := app.FindAllRecords("upstream_endpoints")
+	endpointRecords, err := app.FindAllRecords("upstream_endpoints")
 	if err != nil {
 		return nil, fmt.Errorf("%w: load upstream endpoints: %w", gateway.ErrStoreUnavailable, err)
 	}
-	if len(sources) == 0 && len(endpoints) == 0 {
+	if len(sources) == 0 && len(endpointRecords) == 0 {
 		return nil, gateway.ErrUpstreamNotFound
 	}
 	if len(sources) == 0 {
@@ -176,20 +176,31 @@ func loadDefaultUpstreamRuntime(ctx context.Context, app core.App) (*gateway.Ups
 		return nil, fmt.Errorf("%w: expected one source", gateway.ErrInvalidUpstreamTopology)
 	}
 	source := upstreamSourceFromRecord(sources[0])
-	var active []gateway.UpstreamEndpoint
-	for _, record := range endpoints {
-		endpoint := gateway.UpstreamEndpoint{ID: record.Id, SourceID: record.GetString("source"), Key: record.GetString("key"), BaseURL: record.GetString("base_url"), Active: record.GetBool("active")}
+	endpoints := make(gateway.UpstreamEndpoints, 0, len(endpointRecords))
+	for _, record := range endpointRecords {
+		endpoint := gateway.UpstreamEndpoint{
+			ID:                  record.Id,
+			SourceID:            record.GetString("source"),
+			Key:                 record.GetString("key"),
+			BaseURL:             record.GetString("base_url"),
+			Enabled:             record.GetBool("enabled"),
+			Default:             record.GetBool("is_default"),
+			WebSocketCapable:    record.GetBool("websocket_capable"),
+			WebSocketProbeError: record.GetString("websocket_probe_error"),
+		}
+		if probedAt := record.GetDateTime("websocket_probed_at"); !probedAt.IsZero() {
+			t := probedAt.Time()
+			endpoint.WebSocketProbedAt = &t
+		}
 		if err := gateway.ValidateUpstreamEndpoint(source.ID, endpoint); err != nil {
 			return nil, err
 		}
-		if endpoint.Active {
-			active = append(active, endpoint)
-		}
+		endpoints = append(endpoints, endpoint)
 	}
-	if len(active) != 1 {
-		return nil, fmt.Errorf("%w: expected one active endpoint", gateway.ErrInvalidUpstreamTopology)
+	if err := gateway.ValidateUpstreamEndpoints(source.ID, endpoints); err != nil {
+		return nil, err
 	}
-	runtime := &gateway.UpstreamRuntime{Source: source, Endpoint: active[0]}
+	runtime := &gateway.UpstreamRuntime{Source: source, Endpoints: endpoints}
 	if err := gateway.ValidateUpstreamRuntime(*runtime); err != nil {
 		return nil, err
 	}
