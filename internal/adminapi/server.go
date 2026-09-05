@@ -116,6 +116,16 @@ func (s *Server) Mount(r *router.Router[*core.RequestEvent]) {
 	g.GET("/path-policies", s.withAuth(s.handleListPolicies))
 	g.GET("/path-policies/preview", s.withAuth(s.handlePreviewPolicy))
 	g.GET("/upstream", s.withAuth(s.handleGetUpstream))
+	g.GET("/upstream/endpoints", s.withAuth(s.handleListEndpoints))
+	g.POST("/upstream/endpoints", s.withAuthWrite(s.handleCreateEndpoint))
+	g.PUT("/upstream/endpoints/{id}", s.withAuthWrite(s.handleUpdateEndpoint))
+	g.DELETE("/upstream/endpoints/{id}", s.withAuthWrite(s.handleDeleteEndpoint))
+	g.POST("/upstream/endpoints/{id}/probe-ws", s.withAuthWrite(s.handleProbeEndpointWebSocket))
+
+	g.GET("/route-rules", s.withAuth(s.handleListRouteRules))
+	g.POST("/route-rules", s.withAuthWrite(s.handleCreateRouteRule))
+	g.PUT("/route-rules/{id}", s.withAuthWrite(s.handleUpdateRouteRule))
+	g.DELETE("/route-rules/{id}", s.withAuthWrite(s.handleDeleteRouteRule))
 
 	g.POST("/users", s.withAuthWrite(s.handleCreateUser))
 	g.POST("/users/{id}/enable", s.withAuthWrite(s.handleEnableUser))
