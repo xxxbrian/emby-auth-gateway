@@ -303,6 +303,31 @@ func (s *Store) CheckPathPolicy(ctx context.Context, method, relativePath string
 	return gateway.DecidePathPolicy(policies, method, relativePath), nil
 }
 
+// ListRouteRules returns enabled upstream routing rules.
+func (s *Store) ListRouteRules(ctx context.Context) ([]gateway.RouteRule, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	records, err := s.app.FindRecordsByFilter("route_rules", "enabled = true", "-priority", 0, 0)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]gateway.RouteRule, 0, len(records))
+	for _, record := range records {
+		out = append(out, gateway.RouteRule{
+			ID:        record.Id,
+			Method:    record.GetString("method"),
+			Path:      record.GetString("path"),
+			Transport: record.GetString("transport"),
+			Target:    record.GetString("target"),
+			Priority:  record.GetInt("priority"),
+			Enabled:   record.GetBool("enabled"),
+			Reason:    record.GetString("reason"),
+		})
+	}
+	return out, nil
+}
+
 func (s *Store) RecordPlaybackEvent(ctx context.Context, event gateway.PlaybackEvent) error {
 	collection, err := s.app.FindCollectionByNameOrId("playback_events")
 	if err != nil {

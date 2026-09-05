@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/xxxbrian/emby-auth-gateway/internal/observe"
+	"github.com/xxxbrian/emby-auth-gateway/internal/routepolicy"
 	"github.com/xxxbrian/emby-auth-gateway/internal/telemetry"
 	"github.com/xxxbrian/emby-auth-gateway/internal/version"
 )
@@ -557,7 +558,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 		http.Error(w, "backend authentication failed", http.StatusBadGateway)
 		return
 	}
-	upstream, err := upstreamRequestSnapshotFromRuntime(runtime)
+	upstream, err := s.selectUpstreamSnapshot(r.Context(), runtime, r, rel)
 	if err != nil {
 		http.Error(w, "backend authentication failed", http.StatusBadGateway)
 		return
@@ -847,7 +848,9 @@ func (s *Server) refreshAfterUnauthorized(ctx context.Context, upstream upstream
 	if err != nil {
 		return upstream, true, err
 	}
-	refreshed, err := upstreamRequestSnapshotFromRuntime(runtime)
+	// Preserve the endpoint this request was routed to: the refreshed token is
+	// shared across endpoints, but the request must continue on its endpoint.
+	refreshed, err := upstreamRequestSnapshotFromRuntimeEndpoint(runtime, upstream.endpointKey)
 	if err != nil {
 		return upstream, true, err
 	}
@@ -1037,6 +1040,40 @@ func (s *Server) emitAuthUnavailable(session *Session) {
 	})
 }
 
+// selectUpstreamSnapshot projects the runtime onto the endpoint chosen for
+// this request: WebSocket Upgrades and method/path rules may select a
+// non-default endpoint; anything else falls back to the default endpoint.
+// A rule whose target endpoint is unavailable falls back to the default
+// endpoint so a stale/misconfigured rule can never break proxying.
+func (s *Server) selectUpstreamSnapshot(ctx context.Context, runtime *UpstreamRuntime, r *http.Request, rel string) (upstreamRequestSnapshot, error) {
+	transport := routepolicy.TransportHTTP
+	if isUpgradeRequest(r) {
+		transport = routepolicy.TransportWebSocket
+	}
+	rules, err := s.store.ListRouteRules(ctx)
+	if err != nil {
+		return upstreamRequestSnapshot{}, err
+	}
+	endpointKey := ""
+	if len(rules) > 0 {
+		converted := make([]routepolicy.Rule, 0, len(rules))
+		for _, rule := range rules {
+			converted = append(converted, routepolicy.Rule{
+				ID: rule.ID, Method: rule.Method, Path: rule.Path, Transport: rule.Transport,
+				Target: rule.Target, Priority: rule.Priority, Enabled: rule.Enabled, Reason: rule.Reason,
+			})
+		}
+		endpointKey = routepolicy.Select(converted, routepolicy.Request{Method: r.Method, Path: rel, Transport: transport})
+		if endpointKey != "" && runtime.Endpoints.EnabledByKey(endpointKey) == nil {
+			// Stale rule: target endpoint is disabled or missing. Fall back to
+			// the default endpoint (audit below via the caller is not required).
+			endpointKey = ""
+		}
+	}
+	return upstreamRequestSnapshotFromRuntimeEndpoint(runtime, endpointKey)
+}
+
+// proxyURL builds the upstream URL for the snapshot's endpoint.
 func (s *Server) proxyURL(upstream upstreamRequestSnapshot, session *Session, rel, rawQuery, gatewayToken string) (*url.URL, error) {
 	backend, err := backendURL(upstream.baseURL, rel)
 	if err != nil {

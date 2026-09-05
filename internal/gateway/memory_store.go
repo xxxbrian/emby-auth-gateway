@@ -18,6 +18,7 @@ type MemoryStore struct {
 	DisplayPreferences map[string]*DisplayPreference
 	UpstreamSources    map[string]UpstreamSource
 	UpstreamEndpoints  map[string]UpstreamEndpoint
+	RouteRules         []RouteRule
 }
 
 type MemoryUser struct {
@@ -238,6 +239,22 @@ func (m *MemoryStore) CheckPathPolicy(ctx context.Context, method, relativePath 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return DecidePathPolicy(m.PathPolicies, method, relativePath), nil
+}
+
+// ListRouteRules returns enabled routing rules.
+func (m *MemoryStore) ListRouteRules(ctx context.Context) ([]RouteRule, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]RouteRule, 0, len(m.RouteRules))
+	for _, rule := range m.RouteRules {
+		if rule.Enabled {
+			out = append(out, rule)
+		}
+	}
+	return out, nil
 }
 
 func (m *MemoryStore) RecordPlaybackEvent(ctx context.Context, event PlaybackEvent) error {

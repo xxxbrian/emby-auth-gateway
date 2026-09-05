@@ -39,6 +39,9 @@ type Store interface {
 	FindUserBySyntheticID(ctx context.Context, syntheticID string) (*GatewayUser, error)
 	RecordAudit(ctx context.Context, entry AuditLog) error
 	CheckPathPolicy(ctx context.Context, method, relativePath string) (PathPolicyDecision, error)
+	// ListRouteRules returns enabled upstream routing rules for request-level
+	// endpoint selection (method/path/transport -> endpoint key).
+	ListRouteRules(ctx context.Context) ([]RouteRule, error)
 	RecordPlaybackEvent(ctx context.Context, event PlaybackEvent) error
 	FindPlaybackState(ctx context.Context, gatewayUserID, itemID string) (*PlaybackState, error)
 	ListPlaybackStatesByItemIDs(ctx context.Context, gatewayUserID string, itemIDs []string) (map[string]*PlaybackState, error)
@@ -342,6 +345,19 @@ type AuditLog struct {
 
 type PathPolicy = pathpolicy.Policy
 type PathPolicyDecision = pathpolicy.Decision
+
+// RouteRule maps a method/path/transport request to an upstream endpoint key.
+type RouteRule struct {
+	ID        string
+	Method    string // "" or "*" = any
+	Path      string // pathpolicy syntax
+	Transport string // routepolicy.TransportAny/HTTP/WebSocket
+	Target    string // endpoint key
+	Priority  int
+	Enabled   bool
+	Reason    string
+	Updated   time.Time
+}
 
 type PlaybackEvent struct {
 	ID               string
