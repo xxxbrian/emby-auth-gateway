@@ -426,7 +426,8 @@
         routeRuleError = null;
         routeRuleSaving = true;
         try {
-            const body: RouteRuleBody = { ...routeRuleForm };
+            const { id: _formId, updated: _formUpdated, ...rest } = routeRuleForm;
+            const body: RouteRuleBody = { ...rest };
             if (isEditingRouteRule && routeRuleForm.updated) {
                 body.updated = routeRuleForm.updated;
             }
