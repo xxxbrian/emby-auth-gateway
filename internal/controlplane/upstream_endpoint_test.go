@@ -11,6 +11,7 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tests"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pbschema"
+	"github.com/xxxbrian/emby-auth-gateway/internal/routepolicy"
 )
 
 // seedEndpointTestApp creates a test app with the canonical schema and seeds a
@@ -148,6 +149,12 @@ func TestDeleteEndpointProtectsDefaultAndOnlyEndpoint(t *testing.T) {
 func TestProbeEndpointWebSocket(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Upgrade") == "websocket" {
+			// Tokenless probes may still be answered 101 by permissive
+			// ingress; require a token here to model credential-gated CDNs.
+			if r.Header.Get("X-Emby-Token") == "" && r.URL.Query().Get("api_key") == "" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
 			w.Header().Set("Connection", "Upgrade")
 			w.Header().Set("Upgrade", "websocket")
 			w.WriteHeader(http.StatusSwitchingProtocols)
@@ -156,16 +163,54 @@ func TestProbeEndpointWebSocket(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
-	if err := ProbeEndpointWebSocket(context.Background(), server.URL, "agent"); err != nil {
-		t.Fatalf("websocket probe failed: %v", err)
+	// Anonymous probe fails against a credential-gated endpoint.
+	if err := ProbeEndpointWebSocket(context.Background(), server.URL, "agent", ""); err == nil {
+		t.Fatalf("anonymous probe unexpectedly succeeded")
+	}
+	// Token probe succeeds.
+	if err := ProbeEndpointWebSocket(context.Background(), server.URL, "agent", "backend-token"); err != nil {
+		t.Fatalf("token websocket probe failed: %v", err)
 	}
 
 	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer plain.Close()
-	if err := ProbeEndpointWebSocket(context.Background(), plain.URL, "agent"); err == nil || !strings.Contains(err.Error(), "101") {
+	if err := ProbeEndpointWebSocket(context.Background(), plain.URL, "agent", "token"); err == nil || !strings.Contains(err.Error(), "101") {
 		t.Fatalf("expected non-websocket probe to fail with 101 hint, got %v", err)
+	}
+}
+
+func TestDeleteEndpointRejectsWhenTargetedByEnabledRule(t *testing.T) {
+	app := seedEndpointTestApp(t)
+	cf, err := UpsertEndpoint(context.Background(), app, EndpointUpsertInput{Key: "cf", BaseURL: "https://cf.example", Enabled: true, IsDefault: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Add an enabled rule targeting cf.
+	if _, err := UpsertRouteRule(context.Background(), app, routepolicy.Rule{
+		Method: "", Path: "/embywebsocket", Transport: routepolicy.TransportWebSocket, Target: "cf", Priority: 10, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteEndpoint(context.Background(), app, cf.ID); !errors.Is(err, ErrEndpointInvalid) || !strings.Contains(err.Error(), "route rule") {
+		t.Fatalf("delete rule-targeted endpoint error = %v", err)
+	}
+	// Disabling the rule allows deletion.
+	rules, err := ListRouteRules(context.Background(), app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rules) != 1 {
+		t.Fatalf("rules = %d", len(rules))
+	}
+	if _, err := UpsertRouteRule(context.Background(), app, routepolicy.Rule{
+		ID: rules[0].ID, Method: "", Path: "/embywebsocket", Transport: routepolicy.TransportWebSocket, Target: "cf", Priority: 10, Enabled: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteEndpoint(context.Background(), app, cf.ID); err != nil {
+		t.Fatalf("delete after disabling rule: %v", err)
 	}
 }
 

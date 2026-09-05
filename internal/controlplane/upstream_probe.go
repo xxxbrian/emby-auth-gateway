@@ -3,6 +3,8 @@ package controlplane
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -282,11 +284,11 @@ const wsProbeTimeout = 10 * time.Second
 
 // ProbeEndpointWebSocket performs a real WebSocket Upgrade handshake against
 // the Emby WebSocket path of baseURL. A 101 Switching Protocols response means
-// the endpoint supports WebSocket transport. The probe uses an anonymous
-// connection (no managed credentials) because capability is a property of the
-// ingress/CDN, not of the account session; it closes the connection right
-// after the handshake and never exchanges frames.
-func ProbeEndpointWebSocket(ctx context.Context, baseURL, userAgent string) error {
+// the endpoint supports WebSocket transport. When token is non-empty it is
+// presented as X-Emby-Token (matching real Emby clients); without a token the
+// probe is anonymous. The probe closes the connection right after the
+// handshake and never exchanges frames.
+func ProbeEndpointWebSocket(ctx context.Context, baseURL, userAgent, token string) error {
 	probeCtx, cancel := context.WithTimeout(ctx, wsProbeTimeout)
 	defer cancel()
 	baseURL = strings.TrimRight(baseURL, "/")
@@ -305,8 +307,22 @@ func ProbeEndpointWebSocket(ctx context.Context, baseURL, userAgent string) erro
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
 	req.Header.Set("Sec-WebSocket-Version", "13")
-	// RFC 6455 requires a fresh, nonce-like key; the value is opaque to servers.
-	req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	// RFC 6455 requires a fresh nonce-like key; generate one per probe so
+	// strict servers cannot reject a cached constant.
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err == nil {
+		req.Header.Set("Sec-WebSocket-Key", base64.StdEncoding.EncodeToString(nonce))
+	} else {
+		req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	}
+	if strings.TrimSpace(token) != "" {
+		req.Header.Set("X-Emby-Token", token)
+		// Emby also accepts the token as api_key on the query string for WS.
+		q := u.Query()
+		q.Set("api_key", token)
+		u.RawQuery = q.Encode()
+		req.URL = u
+	}
 
 	client := &http.Client{
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },

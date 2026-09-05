@@ -229,6 +229,16 @@ func DeleteEndpoint(ctx context.Context, app core.App, id string) error {
 			}
 			return fmt.Errorf("%w: the only endpoint cannot be deleted", ErrEndpointInvalid)
 		}
+		// Refuse to delete an endpoint still targeted by enabled route rules;
+		// a dangling rule would silently divert traffic to the default
+		// endpoint with no operator signal.
+		rules, err := txApp.FindRecordsByFilter("route_rules", "target = {:key} && enabled = true", "", 0, 0, map[string]any{"key": record.GetString("key")})
+		if err != nil {
+			return err
+		}
+		if len(rules) > 0 {
+			return fmt.Errorf("%w: endpoint %q is targeted by %d enabled route rule(s); disable or retarget them first", ErrEndpointInvalid, record.GetString("key"), len(rules))
+		}
 		return txApp.Delete(record)
 	})
 }

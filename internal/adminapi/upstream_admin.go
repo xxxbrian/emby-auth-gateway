@@ -77,7 +77,14 @@ func (s *Server) handleProbeEndpointWebSocket(e *core.RequestEvent) error {
 	if err != nil {
 		return e.BadRequestError("endpoint not found", err)
 	}
-	probeErr := controlplane.ProbeEndpointWebSocket(e.Request.Context(), endpoint.BaseURL, "")
+	// Probe as a real Emby client would: present the shared backend token.
+	// Anonymous probes can falsely report "not capable" on ingress/CDN layers
+	// that require credentials before the WebSocket upgrade succeeds.
+	token := ""
+	if source, err := controlplane.LoadUpstreamState(e.App); err == nil && source.Source != nil {
+		token = source.Source.GetString("backend_token")
+	}
+	probeErr := controlplane.ProbeEndpointWebSocket(e.Request.Context(), endpoint.BaseURL, "", token)
 	capable := probeErr == nil
 	if recordErr := controlplane.RecordWebSocketProbeResult(e.Request.Context(), e.App, id, capable, probeErr); recordErr != nil {
 		return e.InternalServerError("record probe result failed", recordErr)

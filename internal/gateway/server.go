@@ -839,11 +839,38 @@ func (s *Server) prepareBackendUpgrade(ctx context.Context, r *http.Request, rel
 // refreshAfterUnauthorized confirms that a route-specific 401 reflects shared
 // source credentials before rotating them. Probe failures deliberately leave
 // the original response in place, since they do not establish global expiry.
+//
+// The 401 was observed on the endpoint the request was routed to. When that
+// endpoint is the default endpoint (where the shared token was issued and
+// ordinary REST traffic is served), a literal 401 is global expiry. When the
+// request was routed to a non-default endpoint (e.g. a WS-only CDN that may
+// 401 REST paths such as /System/Info), the default endpoint is probed first:
+// only its 401 justifies rotating the shared token for everyone.
 func (s *Server) refreshAfterUnauthorized(ctx context.Context, upstream upstreamRequestSnapshot) (upstreamRequestSnapshot, bool, error) {
-	unauthorized, err := s.upstreamSnapshotUnauthorized(ctx, upstream)
+	// Fast path: routed endpoint IS the default endpoint (endpointKey is empty
+	// or equals the default key) — the probe of that endpoint is authoritative.
+	confirm := upstream
+	if upstream.endpointKey != "" {
+		runtime, err := s.store.LoadDefaultUpstreamRuntime(ctx)
+		if err != nil {
+			return upstream, false, err
+		}
+		defaultSnapshot, err := upstreamRequestSnapshotFromRuntime(runtime)
+		if err != nil {
+			return upstream, false, err
+		}
+		if defaultSnapshot.baseURL != upstream.baseURL {
+			confirm = defaultSnapshot
+		}
+	}
+	unauthorized, err := s.upstreamSnapshotUnauthorized(ctx, confirm)
 	if err != nil || !unauthorized {
+		// The authoritative endpoint is healthy with this token: the routed
+		// endpoint's 401 is endpoint-specific, not global expiry. Keep the
+		// original response and do NOT rotate the shared token.
 		return upstream, false, err
 	}
+	// Authoritative endpoint confirms the shared token is expired. Refresh it.
 	runtime, err := s.upstreamAuth.Refresh(ctx, upstream.token)
 	if err != nil {
 		return upstream, true, err

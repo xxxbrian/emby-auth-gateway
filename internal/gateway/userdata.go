@@ -15,6 +15,13 @@ import (
 	"time"
 )
 
+// handlePersonalDataRequest serves resume/favorites/latest/next-up style
+// local fusion requests before rule-based endpoint selection. These handlers
+// merge gateway-local user data with upstream metadata, so they deliberately
+// always fetch from the DEFAULT endpoint: under the multi-endpoint model
+// endpoints are CDN/ingress aliases of one Emby server, and any endpoint
+// would return the same library. Fetching from a rule-selected endpoint here
+// could mix libraries if that assumption is ever violated.
 func (s *Server) handlePersonalDataRequest(w http.ResponseWriter, r *http.Request, rel string, session *Session, gatewayToken string) bool {
 	if s.handleLocalSessionStateRequest(w, r, rel, session, gatewayToken) {
 		return true
