@@ -277,6 +277,52 @@ func decodeUpstreamAuth(raw json.RawMessage) (upstreamProbeResult, upstreamAuthI
 	return result, auth, nil
 }
 
+// wsProbeTimeout bounds a WebSocket capability probe handshake.
+const wsProbeTimeout = 10 * time.Second
+
+// ProbeEndpointWebSocket performs a real WebSocket Upgrade handshake against
+// the Emby WebSocket path of baseURL. A 101 Switching Protocols response means
+// the endpoint supports WebSocket transport. The probe uses an anonymous
+// connection (no managed credentials) because capability is a property of the
+// ingress/CDN, not of the account session; it closes the connection right
+// after the handshake and never exchanges frames.
+func ProbeEndpointWebSocket(ctx context.Context, baseURL, userAgent string) error {
+	probeCtx, cancel := context.WithTimeout(ctx, wsProbeTimeout)
+	defer cancel()
+	baseURL = strings.TrimRight(baseURL, "/")
+	u, err := url.Parse(baseURL + "/embywebsocket")
+	if err != nil {
+		return fmt.Errorf("invalid websocket probe url: %w", err)
+	}
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return fmt.Errorf("websocket probe request: %w", err)
+	}
+	if strings.TrimSpace(userAgent) == "" {
+		userAgent = gateway.DefaultBackendClientIdentity().UserAgent
+	}
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Sec-WebSocket-Version", "13")
+	// RFC 6455 requires a fresh, nonce-like key; the value is opaque to servers.
+	req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+
+	client := &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		Timeout:       wsProbeTimeout,
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("websocket probe request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		return fmt.Errorf("websocket probe: unexpected HTTP status %d (a 101 Switching Protocols response is required)", resp.StatusCode)
+	}
+	return nil
+}
+
 // UpstreamRequest performs an Emby HTTP request (exported for tests via pbsetup wrappers).
 func UpstreamRequest(ctx context.Context, client *http.Client, method, endpoint string, body []byte, identity gateway.BackendClientIdentity, deviceID, userID, token string, output any, allowEmptySuccess bool) error {
 	reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
