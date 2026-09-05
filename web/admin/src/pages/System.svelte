@@ -1160,10 +1160,16 @@
                     <div class="mb-4">
                         <label class="text-sm text-secondary block mb-1" for="rr_target">Target endpoint key</label>
                         <select id="rr_target" bind:value={routeRuleForm.target} required>
+                            {#if routeRuleForm.target && !endpoints.some(e => e.enabled && e.key === routeRuleForm.target)}
+                                <option value={routeRuleForm.target} disabled>{routeRuleForm.target} (disabled/missing)</option>
+                            {/if}
                             {#each endpoints.filter(e => e.enabled) as ep}
                                 <option value={ep.key}>{ep.key}{ep.is_default ? ' (default)' : ''}</option>
                             {/each}
                         </select>
+                        {#if routeRuleForm.target && !endpoints.some(e => e.enabled && e.key === routeRuleForm.target)}
+                            <p class="text-sm text-secondary mt-1">Current target is disabled or no longer exists — choose another enabled endpoint before saving.</p>
+                        {/if}
                     </div>
                     <div class="mb-4">
                         <label class="text-sm text-secondary block mb-1" for="rr_priority">Priority (higher wins)</label>
