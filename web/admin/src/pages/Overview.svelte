@@ -3,6 +3,7 @@
     import { apiRequest } from '../lib/api';
     import type { Snapshot, UpstreamStatus, BufferAggregate } from '../lib/types';
     import LineChart from '../lib/LineChart.svelte';
+    import TranscodingSummary from '../lib/TranscodingSummary.svelte';
 
     let data = $state<Snapshot | null>(null);
     let error = $state<string | null>(null);
@@ -164,6 +165,7 @@
     {/if}
 
     {#if data}
+        <TranscodingSummary value={data.transcoding} />
         <div class="panel">
             <div class="data-grid" style="grid-template-columns: repeat(4, 1fr);">
                 <div class="metric-box">

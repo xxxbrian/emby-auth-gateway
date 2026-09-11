@@ -193,7 +193,7 @@
                             <td><strong>{p.username || p.user_id || '-'}</strong></td>
                             <td class="truncate" style="max-width: 200px;" title={p.item_name || p.item_id}>{p.item_name || p.item_id || '-'}</td>
                             <td>{p.device || '-'}</td>
-                            <td><span class={p.is_paused ? 'status-warn' : 'status-ok'}>{p.is_paused ? 'Paused' : 'Playing'}</span></td>
+                            <td><span class={p.is_paused ? 'status-warn' : 'status-ok'}>{p.is_paused ? 'Paused' : 'Playing'}</span>{#if p.transcoding}<div class="text-xs"><a href={`#/transcoding?job=${encodeURIComponent(p.transcoding.job_id)}&boot=${encodeURIComponent(p.transcoding.boot_id)}`}>Audio conversion →</a></div>{/if}</td>
                             <td>{fmtTime(p.started_at)}</td>
                             <td>{fmtTime(p.last_seen)}</td>
                         </tr>

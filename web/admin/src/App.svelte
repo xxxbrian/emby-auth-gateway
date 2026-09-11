@@ -7,6 +7,7 @@
     import Users from './pages/Users.svelte';
     import Activity from './pages/Activity.svelte';
     import Buffer from './pages/Buffer.svelte';
+    import Transcoding from './pages/Transcoding.svelte';
     import Traffic from './pages/Traffic.svelte';
     import System from './pages/System.svelte';
 
@@ -17,6 +18,7 @@
         '/users': Users,
         '/activity': Activity,
         '/buffer': Buffer,
+        '/transcoding': Transcoding,
         '/traffic': Traffic,
         '/system': System,
         '*': Overview
@@ -54,6 +56,7 @@
                 <a href="#/users" class="nav-link {currentPath === '/users' ? 'active' : ''}">Users</a>
                 <a href="#/activity" class="nav-link {currentPath === '/activity' ? 'active' : ''}">Activity</a>
                 <a href="#/buffer" class="nav-link {currentPath === '/buffer' ? 'active' : ''}">Buffer</a>
+                <a href="#/transcoding" class="nav-link {currentPath === '/transcoding' ? 'active' : ''}">Transcoding</a>
                 <a href="#/traffic" class="nav-link {currentPath === '/traffic' ? 'active' : ''}">Traffic</a>
                 <a href="#/system" class="nav-link {currentPath === '/system' ? 'active' : ''}">System</a>
             </nav>

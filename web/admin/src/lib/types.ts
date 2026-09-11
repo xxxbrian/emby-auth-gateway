@@ -90,6 +90,69 @@ export interface Snapshot {
   runtime: RuntimeStatus;
   series?: SeriesData;
   media_buffer?: BufferAggregate;
+  transcoding?: TranscodingAggregate;
+}
+
+export interface TranscodingAggregate {
+  enabled: boolean;
+  ffmpeg_version: string;
+  worker_limit: number;
+  running: number;
+  queued: number;
+  ready: number;
+  preparing: number;
+  failed: number;
+  cache_bytes: number;
+  cache_budget_bytes: number;
+  reserved_bytes: number;
+  pinned_bytes: number;
+  cache_hits: number;
+  cache_misses: number;
+  cache_evictions: number;
+}
+
+export interface TranscodingJob {
+	playback_id: string;
+  id: string;
+  user_id: string;
+  username: string;
+  device: string;
+  item_id: string;
+  item_name: string;
+  source_name: string;
+  audio_source: string;
+  audio_source_channels: number;
+  audio_output: string;
+  audio_output_channels: number;
+  video_codec: string;
+  video_mode: string;
+  reason: string;
+  state: string;
+  failure: string;
+  position_ticks: number | null;
+  position_at: string | null;
+  paused: boolean | null;
+  requested_ticks: number;
+  produced_ticks: number;
+  duration_ticks: number;
+  runs: number;
+  speed: number | null;
+  rss_bytes: number | null;
+  cpu_percent: number | null;
+  cache_bytes: number;
+  cached_segments: number;
+  ranges: { start_ticks: number; end_ticks: number }[];
+  ranges_truncated: boolean;
+  created_at: string;
+  last_seen: string;
+}
+
+export interface TranscodingPage {
+  boot_id: string;
+  at: string;
+  aggregate: TranscodingAggregate;
+  items: TranscodingJob[];
+  next_cursor: string;
 }
 
 // --- adminquery DTOs ---
@@ -166,6 +229,7 @@ export interface UpstreamDTO {
 // --- Activity (telemetry) ---
 
 export interface Playback {
+  transcoding?: { boot_id: string; job_id: string };
   session_id: string;
   user_id: string;
   username: string;
