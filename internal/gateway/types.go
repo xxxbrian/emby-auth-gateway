@@ -13,6 +13,7 @@ import (
 	"github.com/xxxbrian/emby-auth-gateway/internal/observe"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pathpolicy"
 	"github.com/xxxbrian/emby-auth-gateway/internal/telemetry"
+	"github.com/xxxbrian/emby-auth-gateway/internal/transcode"
 )
 
 type Config struct {
@@ -27,6 +28,7 @@ type Config struct {
 	Meter                    TrafficMeter                       // optional live bandwidth meter; nil = no-op
 	MediaBuffer              *MediaBuffer                       // optional; nil preserves synchronous media copying
 	MediaBufferLive          *telemetry.MediaBufferLiveRegistry // optional live observation; nil disables observation
+	Transcoder               *transcode.Manager                 // optional local audio conversion
 }
 
 type Store interface {

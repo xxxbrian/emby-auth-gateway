@@ -103,4 +103,5 @@ type Event struct {
 	PositionTicks int64
 	IsPaused      bool
 	PlaybackEvent string // playing|progress|stopped
+	PlaySessionID string // verified local conversion playback identity, never a token
 }

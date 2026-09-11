@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/xxxbrian/emby-auth-gateway/internal/observe"
+	"github.com/xxxbrian/emby-auth-gateway/internal/transcode"
 )
 
 const (
@@ -63,6 +64,8 @@ type Registry struct {
 	mediaTicker        func() (<-chan time.Time, func())
 	mediaLatest        MediaBufferAggregate
 	mediaLatestPresent bool
+	transcodeMu        sync.RWMutex
+	transcodeProvider  func() transcode.Observation
 }
 
 // New creates a Registry bound to emitter. A nil emitter is allowed.
@@ -332,6 +335,7 @@ func (r *Registry) SnapshotWindow(window SeriesWindow) Snapshot {
 	}
 	window = ParseSeriesWindow(string(window))
 	now := r.now()
+	audio := r.TranscodingSnapshot().Aggregate
 
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
@@ -385,7 +389,8 @@ func (r *Registry) SnapshotWindow(window SeriesWindow) Snapshot {
 			Goroutines: goroutines,
 			HeapBytes:  ms.HeapAlloc,
 		},
-		Series: r.buildSeriesLocked(now, window),
+		Series:      r.buildSeriesLocked(now, window),
+		Transcoding: audio,
 	}
 	return snap
 }
@@ -687,6 +692,10 @@ func (r *Registry) recordPlaybackLocked(at time.Time, ev observe.Event) {
 		p.PositionTicks = ev.PositionTicks
 	}
 	p.IsPaused = ev.IsPaused
+	p.Transcoding = nil
+	if ev.PlaySessionID != "" {
+		p.Transcoding = &TranscodingReference{BootID: r.bootID, JobID: ev.PlaySessionID}
+	}
 	p.LastSeen = at
 
 	if ev.SessionID != "" {

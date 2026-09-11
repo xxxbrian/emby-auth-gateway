@@ -1,6 +1,9 @@
 package telemetry
 
-import "time"
+import (
+	"github.com/xxxbrian/emby-auth-gateway/internal/transcode"
+	"time"
+)
 
 // Snapshot is a JSON-friendly operational metrics view.
 type Snapshot struct {
@@ -8,13 +11,14 @@ type Snapshot struct {
 	BootID    string    `json:"boot_id"`
 	UptimeSec int64     `json:"uptime_sec"`
 
-	Upstream    UpstreamStatus    `json:"upstream"`
-	Capacity    CapacityStatus    `json:"capacity"`
-	Traffic     TrafficStatus     `json:"traffic"`
-	Reliability ReliabilityStatus `json:"reliability"`
-	Runtime     RuntimeStatus     `json:"runtime"`
-	Series      SeriesData        `json:"series"`
-	MediaBuffer MediaBufferStatus `json:"media_buffer"`
+	Upstream    UpstreamStatus      `json:"upstream"`
+	Capacity    CapacityStatus      `json:"capacity"`
+	Traffic     TrafficStatus       `json:"traffic"`
+	Reliability ReliabilityStatus   `json:"reliability"`
+	Runtime     RuntimeStatus       `json:"runtime"`
+	Series      SeriesData          `json:"series"`
+	MediaBuffer MediaBufferStatus   `json:"media_buffer"`
+	Transcoding transcode.Aggregate `json:"transcoding"`
 }
 
 // MediaBufferStatus is the bounded aggregate state of adaptive media buffering.
@@ -125,16 +129,22 @@ type SeriesPoint struct {
 
 // Playback is an active playback session (current-state map entry).
 type Playback struct {
-	SessionID     string    `json:"session_id"`
-	UserID        string    `json:"user_id"`
-	Username      string    `json:"username"`
-	Device        string    `json:"device"`
-	ItemID        string    `json:"item_id"`
-	ItemName      string    `json:"item_name,omitempty"`
-	PositionTicks int64     `json:"position_ticks"`
-	IsPaused      bool      `json:"is_paused"`
-	LastSeen      time.Time `json:"last_seen"`
-	StartedAt     time.Time `json:"started_at"`
+	Transcoding   *TranscodingReference `json:"transcoding,omitempty"`
+	SessionID     string                `json:"session_id"`
+	UserID        string                `json:"user_id"`
+	Username      string                `json:"username"`
+	Device        string                `json:"device"`
+	ItemID        string                `json:"item_id"`
+	ItemName      string                `json:"item_name,omitempty"`
+	PositionTicks int64                 `json:"position_ticks"`
+	IsPaused      bool                  `json:"is_paused"`
+	LastSeen      time.Time             `json:"last_seen"`
+	StartedAt     time.Time             `json:"started_at"`
+}
+
+type TranscodingReference struct {
+	BootID string `json:"boot_id"`
+	JobID  string `json:"job_id"`
 }
 
 // Transfer is an open media transfer (current-state map entry).

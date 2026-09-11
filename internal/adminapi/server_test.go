@@ -100,6 +100,9 @@ func TestAuthzMatrixNoCookie(t *testing.T) {
 		"/admin/api/v1/media-buffer/streams/1?boot_id=x",
 		"/admin/api/v1/media-buffer/series",
 		"/admin/api/v1/media-buffer/recent",
+		"/admin/api/v1/transcoding/jobs",
+		"/admin/api/v1/transcoding/jobs/example",
+		"/admin/api/v1/transcoding/recent",
 		"/admin/api/v1/users",
 		"/admin/api/v1/system",
 	}

@@ -15,6 +15,7 @@ import (
 	"github.com/xxxbrian/emby-auth-gateway/internal/pbsetup"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pbstore"
 	"github.com/xxxbrian/emby-auth-gateway/internal/telemetry"
+	"github.com/xxxbrian/emby-auth-gateway/internal/transcode"
 	"github.com/xxxbrian/emby-auth-gateway/internal/version"
 
 	"github.com/pocketbase/pocketbase"
@@ -235,6 +236,25 @@ func newGatewayApp() *pocketbase.PocketBase {
 		startedAt := time.Now().UTC()
 		emitter := observe.NewEmitter(1024)
 		registry := telemetry.New(emitter)
+		audioCfg, audioEnabled, err := audioTranscodeConfig(os.LookupEnv, registry.BootID())
+		if err != nil {
+			return err
+		}
+		var audio *transcode.Manager
+		if audioEnabled {
+			audio, err = transcode.New(context.Background(), audioCfg)
+			if err != nil {
+				return err
+			}
+			registry.SetTranscodingProvider(audio.Snapshot)
+			e.App.OnTerminate().BindFunc(func(event *core.TerminateEvent) error { return errors.Join(audio.Close(), event.Next()) })
+		}
+		mounted := false
+		defer func() {
+			if audio != nil && !mounted {
+				_ = audio.Close()
+			}
+		}()
 
 		gw := newGatewayServerForServe(gateway.Config{
 			PublicBaseURL:            strings.TrimRight(os.Getenv("GATEWAY_PUBLIC_URL"), "/"),
@@ -247,6 +267,7 @@ func newGatewayApp() *pocketbase.PocketBase {
 			Meter:                    registry.Meter(),
 			MediaBuffer:              mediaBuffer,
 			MediaBufferLive:          registry.MediaBufferLive(),
+			Transcoder:               audio,
 		}, pbstore.New(e.App))
 		registry.SetMediaBufferProvider(gw.MediaBufferControllerSnapshot)
 		// Telemetry consumer is best-effort; never block gateway start.
@@ -265,6 +286,9 @@ func newGatewayApp() *pocketbase.PocketBase {
 		// force=false fails immediately if copies or playbacks are active;
 		// force=true waits for copies to drain (playbacks are not waited on).
 		acquireReconfigure := func(force bool) (func(), error) {
+			if !force && audio != nil && audio.HasActiveWork() {
+				return nil, gateway.ErrActiveMedia
+			}
 			if !force && registry != nil && len(registry.ActivePlaybacks()) > 0 {
 				return nil, gateway.ErrActiveMedia
 			}
@@ -304,6 +328,7 @@ func newGatewayApp() *pocketbase.PocketBase {
 			return err
 		}
 		wrapServerHandler(e.Server)
+		mounted = true
 		return nil
 	})
 
