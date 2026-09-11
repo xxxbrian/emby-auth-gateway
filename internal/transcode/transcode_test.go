@@ -36,7 +36,7 @@ func TestChooseAudioCapabilities(t *testing.T) {
 		{name: "video profile constraint", request: func(r *Request) {
 			r.Profile.CodecProfiles = []CodecProfile{{Type: "Video", Codec: "h264", Conditions: []Condition{{Property: "Width", Condition: "LessThanEqual", Value: "1280", IsRequired: true}}}}
 		}, rejected: true},
-		{name: "bandwidth requires video encoding", request: func(r *Request) { r.MaxStreamingBitrate = 1_000_000 }, rejected: true},
+		{name: "bandwidth keeps audio-only copy", request: func(r *Request) { r.MaxStreamingBitrate = 1_000_000 }, channels: 2},
 		{name: "client refuses aac", request: func(r *Request) { r.Profile.TranscodingProfiles[0].AudioCodec = "opus" }, rejected: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -68,6 +68,23 @@ func TestChooseAudioCapabilities(t *testing.T) {
 				t.Fatalf("unexpected plan %+v", plan)
 			}
 		})
+	}
+}
+
+func TestChooseCopiesHEVCWhenHLSProfileListsServerEncoders(t *testing.T) {
+	source := testMedia()
+	source.MediaStreams[0].Codec = "hevc"
+	source.Bitrate = 12_573_135
+	profile := testProfile("2")
+	profile.DirectPlayProfiles[0].VideoCodec = "h264,av1"
+	profile.TranscodingProfiles[0].VideoCodec = "h264,av1"
+
+	plan, err := Choose(source, Request{Profile: profile, MaxStreamingBitrate: 7_000_000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan == nil || plan.AudioCodec != "aac" || plan.AudioChannels != 2 || !strings.EqualFold(plan.Video.Codec, "hevc") {
+		t.Fatalf("expected audio-only HEVC copy plan, got %+v", plan)
 	}
 }
 

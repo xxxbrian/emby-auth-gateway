@@ -97,7 +97,10 @@ planner. Conflicting inputs must not silently change the chosen source or user.
 The planner evaluates container, protocol, video profile/level/bit depth, audio
 codec/layout, subtitles, and bandwidth constraints. Codec-name membership alone
 is insufficient. Evaluate the original source and the selected output container
-separately; file playback support does not imply HLS/MSE support.
+separately; file playback support does not imply HLS/MSE support. An audio-only
+plan copies video, so `MaxStreamingBitrate` cannot be enforced without adding a
+video encoder; when the copied source exceeds that advisory value, the plan
+still preserves the video stream and leaves bandwidth handling to the client.
 
 Prefer, in order, a compatible original stream, a compatible upstream result,
 local remuxing, and local audio conversion. Local conversion remains possible

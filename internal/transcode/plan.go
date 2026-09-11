@@ -80,7 +80,7 @@ func Choose(source MediaSource, req Request) (*Plan, error) {
 		}
 	}
 	for _, p := range req.Profile.TranscodingProfiles {
-		if p.Type != "Video" || p.Context != "" && p.Context != "Streaming" || p.Protocol != "hls" || !matches(p.VideoCodec, video.Codec) {
+		if p.Type != "Video" || p.Context != "" && p.Context != "Streaming" || p.Protocol != "hls" || !copyableVideoProfile(p.VideoCodec, video.Codec) {
 			continue
 		}
 		container := "mp4"
@@ -133,16 +133,24 @@ func Choose(source MediaSource, req Request) (*Plan, error) {
 				continue
 			}
 		}
-		outputBitrate := bitrate
-		if plan.AudioCodec != "copy" && audio.BitRate > 0 {
-			outputBitrate += plan.AudioBitrate - audio.BitRate
-		}
-		if maxBitrate > 0 && (outputBitrate <= 0 || outputBitrate > maxBitrate) {
-			continue
-		}
+		// This path deliberately copies video. A MaxStreamingBitrate value can
+		// only be honored by re-encoding video, which this audio-only runtime
+		// does not do; rejecting the plan would leave an otherwise playable
+		// source without any media URL.
 		return plan, nil
 	}
 	return nil, ErrUnsupported
+}
+
+// copyableVideoProfile permits audio-only conversion to retain an H.264 or
+// HEVC video stream even when Emby's profile lists only codecs it would encode
+// on the server. This path never selects a video encoder; the browser still
+// receives the source video codec verbatim.
+func copyableVideoProfile(profileCodecs, sourceCodec string) bool {
+	if matches(profileCodecs, sourceCodec) {
+		return true
+	}
+	return strings.EqualFold(sourceCodec, "h264") || strings.EqualFold(sourceCodec, "hevc")
 }
 
 func minPositive(a, b int64) int64 {
