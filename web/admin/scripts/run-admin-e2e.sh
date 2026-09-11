@@ -97,7 +97,7 @@ build_fresh_gateway() {
   GATEWAY_BIN="${TMP_BIN_DIR}/gateway"
   echo "=== Building fresh gateway binary at ${GATEWAY_BIN} ==="
   if command -v mise >/dev/null 2>&1; then
-    (cd "${ROOT}" && mise exec -- go build -o "${GATEWAY_BIN}" ./cmd/gateway)
+    (cd "${ROOT}" && mise exec "go@$(sed -n 's/^go //p' go.mod)" -- go build -o "${GATEWAY_BIN}" ./cmd/gateway)
   else
     (cd "${ROOT}" && go build -o "${GATEWAY_BIN}" ./cmd/gateway)
   fi

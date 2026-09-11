@@ -80,8 +80,15 @@ jobs:
           print("ok: TestSyntheticReadyDeploymentSmoke ran and passed")
           PY
 
+      - name: Install audio conversion test runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
       - name: Test
         run: go test ./...
+        env:
+          GATEWAY_REQUIRE_FFMPEG_TESTS: "1"
 
       - name: Vet
         run: go vet ./...
@@ -557,3 +564,14 @@ jobs:
           bash web/admin/scripts/run-admin-e2e.sh
         env:
           CI: "true"
+
+      - name: Install audio test runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Native Emby Web audio conversion
+        run: bash web/admin/scripts/run-audio-e2e.sh
+        env:
+          CI: "true"
+          SKIP_BROWSER_INSTALL: "1"
