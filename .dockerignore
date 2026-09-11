@@ -1,6 +1,11 @@
 .git
 .github
 .opencode
+.slim
+.codex
+.agents
+web/admin/node_modules
+web/admin/test-results
 .env
 .env.*
 !.env.example

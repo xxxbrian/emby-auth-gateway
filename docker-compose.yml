@@ -9,6 +9,10 @@ services:
       - GATEWAY_SERVER_ID=${GATEWAY_SERVER_ID:-emby-auth-gateway-dev}
       - GATEWAY_MEDIA_BUFFER_ENABLED=${GATEWAY_MEDIA_BUFFER_ENABLED:-false}
       - GATEWAY_MEDIA_BUFFER_BUDGET
+      - GATEWAY_AUDIO_TRANSCODING_ENABLED=${GATEWAY_AUDIO_TRANSCODING_ENABLED:-false}
+      - GATEWAY_AUDIO_TRANSCODING_WORKERS=${GATEWAY_AUDIO_TRANSCODING_WORKERS:-4}
+      - GATEWAY_AUDIO_CACHE_BUDGET=${GATEWAY_AUDIO_CACHE_BUDGET:-4GiB}
+      - GATEWAY_AUDIO_CACHE_DIR=${GATEWAY_AUDIO_CACHE_DIR:-/tmp/emby-gateway-audio-cache}
       # Opt-in Web serving. Blank (default) keeps API-only mode.
       # Point at a directory that already contains Emby Web files (web root).
       # With docker-compose.web.yml, set GATEWAY_WEB_ASSETS_HOST on the host and

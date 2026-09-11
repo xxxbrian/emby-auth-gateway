@@ -48,6 +48,61 @@ Anonymous item-image origin always derives from the configured singleton upstrea
 
 Anonymous image validation is best-effort at startup and during metadata refresh. A missing, malformed, mismatched, or temporarily unavailable singleton endpoint does not block authenticated service; anonymous item images return `503 no-store` until a successful validation publishes the active origin.
 
+## Optional audio conversion
+
+The gateway can convert incompatible audio locally while copying the original
+video. This is useful when a browser cannot decode EAC3/DTS and the upstream
+does not provide conversion. Output is negotiated from the client's Emby device
+profile, including channel limits: six-channel AAC is preserved when supported,
+and stereo is selected when requested. Video encoding is not implemented.
+
+Docker images include FFmpeg. Enable the feature in your deployment:
+
+```sh
+GATEWAY_AUDIO_TRANSCODING_ENABLED=true
+GATEWAY_AUDIO_TRANSCODING_WORKERS=4
+GATEWAY_AUDIO_CACHE_BUDGET=4GiB
+```
+
+Standalone binary deployments need `ffmpeg` on PATH, or an explicit
+`GATEWAY_FFMPEG_PATH`. The gateway validates the runtime when conversion is
+enabled and fails startup if required capabilities are unavailable.
+
+The initial input contract is finite, seekable MKV/MP4 with a valid video seek
+index and client-compatible H.264/HEVC video. HLS output uses the negotiated
+MPEG-TS or fragmented MP4 container. Compatible original playback remains direct. Audio/source selection,
+pause/resume, and seek are handled through the existing Emby protocol.
+
+`GATEWAY_AUDIO_CACHE_DIR` defaults to a dedicated directory under the system
+temporary directory. It must be empty on first use or already gateway-owned;
+never point it at PocketBase data or a general-purpose directory. Cache bytes
+are reserved before writing, complete segments can be evicted and regenerated,
+and pinned readers are protected. An exclusive directory lock prevents two
+gateways from sharing mutable cache ownership. Restart clears this disposable
+cache without changing playback history.
+
+Worker slots default to 4 (configurable from 1 to 32), with a bounded lookahead
+of four media segments. Registered playback plans can survive idle pauses for
+up to six hours; an idle plan consumes no FFmpeg process. The cache defaults to
+4 GiB and requires at least 16 MiB. The existing adaptive media buffer has its
+own separate RAM budget.
+
+`/admin` provides a Transcoding page with active/recent tasks, negotiated audio,
+retained media intervals, resource use, and failure reasons. Generated-media
+position does not update watched/resume state. Video conversion, tone mapping,
+and subtitle burn-in remain outside this feature.
+
+Run the complete native-player and Admin conversion regression with:
+
+```sh
+bash web/admin/scripts/run-audio-e2e.sh
+```
+
+It generates local media, builds a fresh gateway with temporary PocketBase data,
+verifies a pinned original Emby Web package, and tests seeking, audio switching,
+three independent users, continuous playback, and Admin layouts. An existing
+prepared asset tree can be supplied with `EMBY_WEB_TEST_ASSETS`.
+
 ## Local Compose
 
 Copy `.env.example` to your own local `.env`. The base compose file starts only the gateway; add `docker-compose.dev.yml` when you want the local Emby container.

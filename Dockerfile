@@ -23,6 +23,7 @@ LABEL org.opencontainers.image.revision="${REVISION}"
 
 COPY --from=runtime-assets /etc/ssl/certs/ /etc/ssl/certs/
 COPY --from=runtime-assets /usr/share/zoneinfo/ /usr/share/zoneinfo/
+RUN apk add --no-cache ffmpeg
 WORKDIR /app
 
 EXPOSE 8090
