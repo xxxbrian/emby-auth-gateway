@@ -103,6 +103,97 @@ verifies a pinned original Emby Web package, and tests seeking, audio switching,
 three independent users, continuous playback, and Admin layouts. An existing
 prepared asset tree can be supplied with `EMBY_WEB_TEST_ASSETS`.
 
+## Optional Web subtitle recovery
+
+This opt-in feature prepares deliverable subtitles for the gateway-hosted
+`/emby/web/` player. It requires both a valid signed Web context cookie and an
+authenticated `Emby Web` session. Native clients, unidentified clients, the
+ordinary media proxy, and adaptive media buffering keep their existing paths.
+Native-only use starts no subtitle probes, extraction jobs, or source-cache work.
+
+```sh
+GATEWAY_WEB_SUBTITLES_ENABLED=true
+GATEWAY_SUBTITLE_CACHE_BUDGET=128MiB
+GATEWAY_SUBTITLE_SOURCE_CACHE_BUDGET=256MiB
+```
+
+Valid upstream ASS, SRT, and WebVTT documents are validated and cached. When an
+embedded SubRip/SRT delivery is empty, the gateway can use a suitable Matroska
+subtitle index and a current strong source ETag to extract that track into
+WebVTT using bounded Range reads. Missing or weak validators disable local
+extraction and leave the unrecovered track hidden; a prefix hash is insufficient
+to validate the complete source.
+Only ready tracks appear in Web subtitle choices. Failed, unsupported, pending,
+or resource-limited tracks are hidden; a missing default becomes subtitles Off
+so subtitle failure alone does not reject otherwise playable audio/video.
+
+The first visit may therefore show fewer subtitle choices. An explicit detail or
+playback request can prepare the default/selected candidate within a small
+budget. Later completion becomes visible when playback information is loaded
+again; the original Web player's open menu does not receive a live update.
+Refreshing `/emby/web/` also renews its context after a gateway restart.
+
+The deployment uses one subtitle worker, independent of audio workers. A Web
+response waits at most two seconds across its sources. Normal preparation has
+a 30-second deadline and indexed reads are limited to 32 MiB and 512 requests;
+detail-preview extraction is further limited to five seconds, 8 MiB, and 128
+requests. These are admission limits, not a promise that every track can be
+recovered. Full-file scanning, MP4 subtitle extraction, embedded ASS recovery,
+PGS/VobSub conversion, OCR, and subtitle burn-in are not implemented. A 50 GB
+file is never downloaded in full by this feature just to find a subtitle.
+
+`GATEWAY_SUBTITLE_CACHE_DIR` defaults to
+`<system temp>/emby-gateway-subtitles` for a standalone binary. Compose instead
+uses the separate `gateway_subtitle_cache` volume at `/app/subtitle_cache`.
+Changing that path in Compose requires a matching volume mount. Each budget
+accepts an integer with `B`, `KiB`, `MiB`, or `GiB`, from 1 MiB through 16 GiB.
+Keep the directory separate from PocketBase and the audio cache.
+
+The cache owns two marked, locked subdirectories. Extracted results with a
+validated strong source ETag can be reused across restarts while retained;
+startup discards artifact files older than seven days, and capacity can evict
+unused files earlier. Valid upstream-delivered documents are scoped to the
+current process. Raw source ranges are disposable and cleared at startup. Requests for
+different languages reuse retained source ranges where they overlap; subtitle
+results are independent of raw-video retention. The raw cache has a separate
+4096-entry limit, so its 64 KiB playback-capture pages retain at most 256 MiB even
+when a larger byte budget is configured.
+
+Only confirmed Web audio-conversion reads with a current strong ETag can
+opportunistically populate the raw cache. Capture reads no extra source bytes;
+normal native and direct-play streams are not wrapped. A bounded asynchronous
+queue keeps disk I/O off the playback read path; a busy/full queue, cache pressure,
+or write failure drops this optional capture. Its memory is bounded to 1 MiB of
+queued pages, one 64 KiB writer page, and 64 KiB per active captured reader.
+There is no guarantee against rereading
+an evicted range, and increasing the cache budget does not enable whole-file
+scanning. With the defaults, the new caches add at most 384 MiB of managed disk
+data, separate from the existing audio disk cache and media-buffer RAM budget.
+
+Invalid subtitle settings, cache startup failure, or unavailable local Web assets
+disable this optional runtime without stopping the existing audio/video service.
+If Web context verification is available, unavailable subtitle tracks stay
+hidden in confirmed Web responses. `/admin` → **Web subtitles** shows the status
+and reason, source sizes, byte budgets, cache reuse, preparation modes, and each
+track's availability and reuse across restarts. Admin reads never start work.
+Turning `GATEWAY_WEB_SUBTITLES_ENABLED=false` restores the original Web subtitle
+metadata path; no database migration or vendor JavaScript change is involved.
+
+Run the isolated browser closure with:
+
+```sh
+bash web/admin/scripts/run-subtitle-e2e.sh
+```
+
+The runner uses generated media, temporary PocketBase data, and pinned,
+unmodified Emby Web assets. It exercises native-client isolation alongside Web
+subtitle rendering, seeking, language switching, and Admin visibility.
+`EMBY_WEB_TEST_ASSETS` can reuse an existing asset tree. Large-file unit tests
+use sparse/logical 50–64 GiB fixtures; they are not full-movie production
+performance measurements. See [ADR 0005](docs/adr/0005-web-subtitles.md) and the
+[design and evidence notes](docs/design/shared-source-cache-and-subtitles.md)
+for the implementation boundary and deferred extensions.
+
 ## Local Compose
 
 Copy `.env.example` to your own local `.env`. The base compose file starts only the gateway; add `docker-compose.dev.yml` when you want the local Emby container.

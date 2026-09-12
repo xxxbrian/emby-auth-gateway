@@ -13,6 +13,10 @@ services:
       - GATEWAY_AUDIO_TRANSCODING_WORKERS=${GATEWAY_AUDIO_TRANSCODING_WORKERS:-4}
       - GATEWAY_AUDIO_CACHE_BUDGET=${GATEWAY_AUDIO_CACHE_BUDGET:-4GiB}
       - GATEWAY_AUDIO_CACHE_DIR=${GATEWAY_AUDIO_CACHE_DIR:-/tmp/emby-gateway-audio-cache}
+      - GATEWAY_WEB_SUBTITLES_ENABLED=${GATEWAY_WEB_SUBTITLES_ENABLED:-false}
+      - GATEWAY_SUBTITLE_CACHE_BUDGET=${GATEWAY_SUBTITLE_CACHE_BUDGET:-128MiB}
+      - GATEWAY_SUBTITLE_SOURCE_CACHE_BUDGET=${GATEWAY_SUBTITLE_SOURCE_CACHE_BUDGET:-256MiB}
+      - GATEWAY_SUBTITLE_CACHE_DIR=${GATEWAY_SUBTITLE_CACHE_DIR:-/app/subtitle_cache}
       # Opt-in Web serving. Blank (default) keeps API-only mode.
       # Point at a directory that already contains Emby Web files (web root).
       # With docker-compose.web.yml, set GATEWAY_WEB_ASSETS_HOST on the host and
@@ -21,6 +25,9 @@ services:
     command: ["serve", "--http=0.0.0.0:8090"]
     volumes:
       - gateway_pb_data:/app/pb_data
+      # Dedicated subtitle artifacts; never share PocketBase's data directory.
+      - gateway_subtitle_cache:/app/subtitle_cache
 
 volumes:
   gateway_pb_data:
+  gateway_subtitle_cache:
