@@ -9,5 +9,5 @@
     "skipLibCheck": true,
     "types": ["node", "@playwright/test"]
   },
-  "include": ["e2e/**/*.ts", "audio-e2e/**/*.ts"]
+  "include": ["e2e/**/*.ts", "audio-e2e/**/*.ts", "subtitle-e2e/**/*.ts"]
 }

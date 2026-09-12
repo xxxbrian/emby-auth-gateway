@@ -575,3 +575,10 @@ jobs:
         env:
           CI: "true"
           SKIP_BROWSER_INSTALL: "1"
+
+      - name: Web subtitle recovery and native-client isolation
+        run: bash web/admin/scripts/run-subtitle-e2e.sh
+        env:
+          CI: "true"
+          SKIP_BROWSER_INSTALL: "1"
+          SUBTITLE_E2E_SKIP_ADMIN_BUILD: "1"
