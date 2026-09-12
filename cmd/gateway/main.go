@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -14,9 +15,11 @@ import (
 	"github.com/xxxbrian/emby-auth-gateway/internal/pbschema"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pbsetup"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pbstore"
+	"github.com/xxxbrian/emby-auth-gateway/internal/subtitles"
 	"github.com/xxxbrian/emby-auth-gateway/internal/telemetry"
 	"github.com/xxxbrian/emby-auth-gateway/internal/transcode"
 	"github.com/xxxbrian/emby-auth-gateway/internal/version"
+	"github.com/xxxbrian/emby-auth-gateway/internal/webcontext"
 
 	"github.com/pocketbase/pocketbase"
 	pbcmd "github.com/pocketbase/pocketbase/cmd"
@@ -250,11 +253,48 @@ func newGatewayApp() *pocketbase.PocketBase {
 			e.App.OnTerminate().BindFunc(func(event *core.TerminateEvent) error { return errors.Join(audio.Close(), event.Next()) })
 		}
 		mounted := false
+		var captions *subtitles.Manager
 		defer func() {
 			if audio != nil && !mounted {
 				_ = audio.Close()
 			}
+			if captions != nil && !mounted {
+				_ = captions.Close()
+			}
 		}()
+		web, err := newEmbyWebServer(webAssetsDirFromEnv(), os.Getenv("GATEWAY_PUBLIC_URL"))
+		if err != nil {
+			return err
+		}
+		webReady := webReadyForRootRedirect(web)
+		captionCfg, captionEnabled, captionErr := subtitleConfig(os.LookupEnv, registry.BootID())
+		var webMarker *webcontext.Manager
+		captionReason := ""
+		if captionEnabled && webReady {
+			webMarker, err = webcontext.New()
+			if err != nil {
+				captionReason = "context_unavailable"
+			}
+		}
+		if captionErr != nil {
+			captionReason = "invalid_configuration"
+		} else if captionEnabled && !webReady {
+			captionReason = "web_unavailable"
+		} else if captionEnabled && webMarker != nil {
+			captions, err = subtitles.New(captionCfg)
+			if err != nil {
+				captionReason = "cache_unavailable"
+			} else {
+				e.App.OnTerminate().BindFunc(func(event *core.TerminateEvent) error { return errors.Join(captions.Close(), event.Next()) })
+				registry.SetSubtitlesProvider(captions.Snapshot)
+			}
+		}
+		if captionReason != "" {
+			e.App.Logger().Warn("Web subtitle recovery unavailable; existing playback services continue", "reason", captionReason)
+			registry.SetSubtitlesProvider(func() subtitles.Snapshot {
+				return subtitles.Snapshot{BootID: registry.BootID(), Reason: captionReason, Jobs: []subtitles.JobView{}}
+			})
+		}
 
 		gw := newGatewayServerForServe(gateway.Config{
 			PublicBaseURL:            strings.TrimRight(os.Getenv("GATEWAY_PUBLIC_URL"), "/"),
@@ -268,17 +308,18 @@ func newGatewayApp() *pocketbase.PocketBase {
 			MediaBuffer:              mediaBuffer,
 			MediaBufferLive:          registry.MediaBufferLive(),
 			Transcoder:               audio,
+			Subtitles:                captions,
+			WebContext:               webMarker,
+			WebSubtitlesEnabled:      captionEnabled,
 		}, pbstore.New(e.App))
 		registry.SetMediaBufferProvider(gw.MediaBufferControllerSnapshot)
 		// Telemetry consumer is best-effort; never block gateway start.
 		startTelemetryForServe(registry)
-		web, err := newEmbyWebServer(webAssetsDirFromEnv(), os.Getenv("GATEWAY_PUBLIC_URL"))
-		if err != nil {
-			return err
+		var webHandler http.Handler = web
+		if webMarker != nil {
+			webHandler = webMarker.Wrap(web)
 		}
-
-		webReady := webReadyForRootRedirect(web)
-		mountGatewayRoutesForServe(e.Router, web, gw, webReady)
+		mountGatewayRoutesForServe(e.Router, webHandler, gw, webReady)
 
 		adminCfg := adminConfigFromEnv()
 		adminCfg.MediaBufferEnabled = func() bool { return mediaBuffer != nil }
@@ -286,6 +327,9 @@ func newGatewayApp() *pocketbase.PocketBase {
 		// force=false fails immediately if copies or playbacks are active;
 		// force=true waits for copies to drain (playbacks are not waited on).
 		acquireReconfigure := func(force bool) (func(), error) {
+			if !force && captions != nil && captions.HasActiveWork() {
+				return nil, gateway.ErrActiveMedia
+			}
 			if !force && audio != nil && audio.HasActiveWork() {
 				return nil, gateway.ErrActiveMedia
 			}

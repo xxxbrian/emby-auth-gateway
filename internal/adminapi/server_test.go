@@ -103,6 +103,7 @@ func TestAuthzMatrixNoCookie(t *testing.T) {
 		"/admin/api/v1/transcoding/jobs",
 		"/admin/api/v1/transcoding/jobs/example",
 		"/admin/api/v1/transcoding/recent",
+		"/admin/api/v1/subtitles",
 		"/admin/api/v1/users",
 		"/admin/api/v1/system",
 	}

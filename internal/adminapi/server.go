@@ -114,6 +114,7 @@ func (s *Server) Mount(r *router.Router[*core.RequestEvent]) {
 	g.GET("/transcoding/jobs", s.withAuth(s.handleTranscodingJobs))
 	g.GET("/transcoding/jobs/{job_id}", s.withAuth(s.handleTranscodingJob))
 	g.GET("/transcoding/recent", s.withAuth(s.handleTranscodingRecent))
+	g.GET("/subtitles", s.withAuth(s.handleSubtitles))
 	g.GET("/audit", s.withAuth(s.handleAudit))
 	g.GET("/system", s.withAuth(s.handleSystem))
 	g.GET("/path-policies", s.withAuth(s.handleListPolicies))

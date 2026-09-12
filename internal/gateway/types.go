@@ -12,8 +12,10 @@ import (
 
 	"github.com/xxxbrian/emby-auth-gateway/internal/observe"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pathpolicy"
+	"github.com/xxxbrian/emby-auth-gateway/internal/subtitles"
 	"github.com/xxxbrian/emby-auth-gateway/internal/telemetry"
 	"github.com/xxxbrian/emby-auth-gateway/internal/transcode"
+	"github.com/xxxbrian/emby-auth-gateway/internal/webcontext"
 )
 
 type Config struct {
@@ -29,6 +31,9 @@ type Config struct {
 	MediaBuffer              *MediaBuffer                       // optional; nil preserves synchronous media copying
 	MediaBufferLive          *telemetry.MediaBufferLiveRegistry // optional live observation; nil disables observation
 	Transcoder               *transcode.Manager                 // optional local audio conversion
+	Subtitles                *subtitles.Manager                 // optional Web-only subtitle recovery
+	WebContext               *webcontext.Manager                // proof of entry through the local Web surface
+	WebSubtitlesEnabled      bool                               // preserves Web filtering if optional runtime startup fails
 }
 
 type Store interface {

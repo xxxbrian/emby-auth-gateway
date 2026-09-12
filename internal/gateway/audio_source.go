@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xxxbrian/emby-auth-gateway/internal/subtitles"
 	"github.com/xxxbrian/emby-auth-gateway/internal/transcode"
 )
 
@@ -29,10 +30,36 @@ type audioSourceAccess struct {
 }
 
 func (s *Server) audioSource(r *http.Request, session *Session, upstream upstreamRequestSnapshot, token, itemID string, media transcode.MediaSource) transcode.Source {
+	access := s.newAudioSourceAccess(r, session, upstream, token, itemID, media)
+	open := access.open
+	if s.cfg.Subtitles != nil && s.isSubtitleWebRequest(r, session) {
+		// Optional capture consumes exactly what the existing audio worker
+		// reads. Native and feature-disabled source readers remain unchanged.
+		open = func(ctx context.Context, offset, length int64) (io.ReadCloser, error) {
+			body, err := access.open(ctx, offset, length)
+			if err != nil {
+				return nil, err
+			}
+			current, _ := body.(*audioSourceBody)
+			etag := ""
+			if current != nil {
+				etag = current.etag
+			}
+			if strings.HasPrefix(etag, "\"") && strings.HasSuffix(etag, "\"") {
+				key := subtitles.SourceGenerationKey(subtitleSourceKey(upstream, itemID, media), etag)
+				return s.cfg.Subtitles.CaptureSource(key, offset, body), nil
+			}
+			return body, nil
+		}
+	}
+	return transcode.Source{Media: media, Open: open, Valid: access.valid}
+}
+
+func (s *Server) newAudioSourceAccess(r *http.Request, session *Session, upstream upstreamRequestSnapshot, token, itemID string, media transcode.MediaSource) *audioSourceAccess {
 	access := &audioSourceAccess{server: s, session: *session, request: r.Clone(context.Background()), upstream: upstream, token: token, itemID: itemID, media: media, headers: media.RequiredHTTPHeaders}
 	access.request.Body = nil
 	access.reference = rewriteMediaReference(media.DirectStreamURL, session, upstream, token, s.gatewayBaseForRequest(r), s.cfg.GatewayServerID, false)
-	return transcode.Source{Media: media, Open: access.open, Valid: access.valid}
+	return access
 }
 
 func (a *audioSourceAccess) valid(ctx context.Context) bool {
@@ -177,7 +204,7 @@ func (a *audioSourceAccess) open(ctx context.Context, offset, length int64) (io.
 			return nil, transcode.ErrSource
 		}
 		ownsGate = false
-		return &audioSourceBody{Reader: io.LimitReader(response.Body, length), body: response.Body, release: a.server.endMediaCopy, meter: a.server.meter}, nil
+		return &audioSourceBody{Reader: io.LimitReader(response.Body, length), body: response.Body, release: a.server.endMediaCopy, meter: a.server.meter, etag: etag}, nil
 	}
 	return nil, transcode.ErrSource
 }
@@ -189,6 +216,7 @@ type audioSourceBody struct {
 	meter   TrafficMeter
 	once    sync.Once
 	err     error
+	etag    string // validator on this response, not the access object's retained validator
 }
 
 func (b *audioSourceBody) Read(p []byte) (int, error) {

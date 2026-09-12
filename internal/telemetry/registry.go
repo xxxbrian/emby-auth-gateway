@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/xxxbrian/emby-auth-gateway/internal/observe"
+	"github.com/xxxbrian/emby-auth-gateway/internal/subtitles"
 	"github.com/xxxbrian/emby-auth-gateway/internal/transcode"
 )
 
@@ -66,6 +67,8 @@ type Registry struct {
 	mediaLatestPresent bool
 	transcodeMu        sync.RWMutex
 	transcodeProvider  func() transcode.Observation
+	subtitleMu         sync.RWMutex
+	subtitleProvider   func() subtitles.Snapshot
 }
 
 // New creates a Registry bound to emitter. A nil emitter is allowed.

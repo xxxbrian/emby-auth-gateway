@@ -5,6 +5,8 @@ import (
 	"path"
 	"strings"
 	"time"
+
+	"github.com/xxxbrian/emby-auth-gateway/internal/webcontext"
 )
 
 const resourceCookieName = "__Secure-EmbyGatewayResource"
@@ -256,7 +258,7 @@ func stripResourceCookie(h http.Header) {
 	for _, value := range values {
 		for _, part := range strings.Split(value, ";") {
 			name, _, found := strings.Cut(strings.TrimSpace(part), "=")
-			if found && name == resourceCookieName {
+			if found && (name == resourceCookieName || name == webcontext.CookieName) {
 				continue
 			}
 			if strings.TrimSpace(part) != "" {

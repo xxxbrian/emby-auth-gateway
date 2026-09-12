@@ -540,6 +540,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 		return
 	}
 	playbackItemID, isPlaybackInfo := playbackInfoItemID(r.Method, rel)
+	if s.cfg.Subtitles != nil || s.cfg.WebSubtitlesEnabled {
+		if s.handleWebSubtitleRoute(w, r, rel, session) {
+			return
+		}
+		if isPlaybackInfo && s.isSubtitleWebRequest(r, session) {
+			r = withOptionalSubtitleNegotiation(r)
+		}
+	}
 	if s.cfg.Transcoder != nil {
 		if s.handleAudioRoute(w, r, rel, session, gatewayToken) {
 			return
@@ -1236,6 +1244,7 @@ func (s *Server) recordPlaybackRequest(r *http.Request, rel string, session *Ses
 		return nil
 	}
 	eventName := playbackEventName(rel)
+	s.noteWebSubtitlePlayback(r, rel, session, data)
 	audioPlayID, audioPaused := s.noteAudioPlayback(rel, session, data, details.ItemID)
 	s.emit(observe.Event{
 		Kind:          observe.KindPlayback,
@@ -1667,9 +1676,21 @@ func (s *Server) writeProxyResponseWithSnapshot(w http.ResponseWriter, r *http.R
 		}
 		var value any
 		if looksLikeJSON(data) && json.Unmarshal(data, &value) == nil {
+			oldPlayID := ""
+			if s.isSubtitleWebRequest(r, session) {
+				oldPlayID = subtitlePlaybackID(value)
+				s.filterWebSubtitles(r.Context(), r, value, session, upstream, gatewayToken, true)
+				r = r.WithContext(context.WithValue(r.Context(), subtitlesFilteredKey{}, true))
+			}
 			if err := s.negotiateAudioResponse(r, value, session, upstream, gatewayToken); err != nil {
 				writeAudioError(w, err)
 				return
+			}
+			if next := subtitlePlaybackID(value); s.cfg.Subtitles != nil && oldPlayID != "" && next != "" && next != oldPlayID {
+				s.cfg.Subtitles.MovePlayback(session.GatewayTokenHash, oldPlayID, next)
+				if n, _ := r.Context().Value(audioNegotiationKey{}).(*audioNegotiation); n != nil && n.previousID != "" && n.previousID != next {
+					s.cfg.Subtitles.MovePlayback(session.GatewayTokenHash, n.previousID, next)
+				}
 			}
 			if s.meter != nil && len(data) > 0 {
 				s.meter.AddIngress(int64(len(data)))
@@ -2082,6 +2103,9 @@ func (s *Server) rewriteProxyJSONValueForRequestWithSnapshot(ctx context.Context
 	rewritten := rewriteJSONValueWithSnapshot(v, session, upstream, gatewayToken, publicGatewayBase, s.cfg.GatewayServerID)
 	if session == nil {
 		return rewritten
+	}
+	if filtered, _ := ctx.Value(subtitlesFilteredKey{}).(bool); !filtered && s.isSubtitleWebRequest(r, session) {
+		s.filterWebSubtitles(ctx, r, rewritten, session, upstream, gatewayToken, false)
 	}
 	items := selectBaseItems(rewritten)
 	itemIDs := itemIDsFromBaseItems(items)
