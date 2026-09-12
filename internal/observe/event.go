@@ -95,6 +95,7 @@ type Event struct {
 	SessionID string
 	Device    string
 	ItemID    string
+	SourceRef string // immutable, credential-free media source identity
 	ItemName  string // optional; telemetry must not put this in series labels
 
 	BytesIn       int64

@@ -9,6 +9,7 @@ import (
 
 // TransferMeta describes an in-flight proxy body transfer for the admin UI.
 type TransferMeta struct {
+	SourceRef   string
 	SessionID   string
 	UserID      string
 	Username    string
@@ -219,6 +220,7 @@ func (m *ByteMeter) ActiveTransfers() []Transfer {
 			Username:    tr.meta.Username,
 			Device:      tr.meta.Device,
 			ItemID:      tr.meta.ItemID,
+			SourceRef:   tr.meta.SourceRef,
 			MediaMode:   tr.meta.MediaMode,
 			BytesIn:     tr.ingress.Load(),
 			BytesOut:    tr.egress.Load(),

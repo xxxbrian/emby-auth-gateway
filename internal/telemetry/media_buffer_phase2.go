@@ -153,6 +153,7 @@ type MediaBufferStream struct {
 	Username          *string                  `json:"username"`
 	Device            *string                  `json:"device"`
 	ItemID            *string                  `json:"item_id"`
+	SourceRef         *string                  `json:"source_ref"`
 	MediaMode         MediaBufferMediaMode     `json:"media_mode"`
 	State             MediaBufferLifecycleName `json:"state"`
 	ProducerState     MediaBufferProducerName  `json:"producer_state"`
@@ -183,6 +184,7 @@ type MediaBufferCompletionDTO struct {
 	Username               *string                  `json:"username"`
 	Device                 *string                  `json:"device"`
 	ItemID                 *string                  `json:"item_id"`
+	SourceRef              *string                  `json:"source_ref"`
 	MediaMode              MediaBufferMediaMode     `json:"media_mode"`
 	FinalState             MediaBufferLifecycleName `json:"final_state"`
 	FinalProducerState     MediaBufferProducerName  `json:"final_producer_state"`
@@ -297,7 +299,7 @@ func mediaBufferStreamDTO(boot string, s MediaBufferLiveSnapshot, bytesRead, byt
 		v := idString(s.TransferID)
 		transferID = &v
 	}
-	return MediaBufferStream{BootID: boot, StreamID: idString(s.StreamID), TransferID: transferID, UserID: sanitizeMediaBufferString(s.UserID), Username: sanitizeMediaBufferString(s.Username), Device: sanitizeMediaBufferString(s.Device), ItemID: sanitizeMediaBufferString(s.ItemID), MediaMode: finiteMediaMode(s.MediaMode), State: lifecycleName(s.Lifecycle.Value), ProducerState: producerName(s.Producer.Value), ConsumerState: consumerName(s.Consumer.Value), AllocationBlocker: blockerName(s.Blocker.Value), TargetBytes: nonNegative(s.TargetBytes), OwnedBytes: nonNegative(s.OwnedBytes), DebtBytes: nonNegative(s.DebtBytes), PrivateBaseBytes: nonNegative(s.PrivateBaseBytes), QueuedBytes: nonNegative(s.QueuedBytes), WritingBytes: nonNegative(s.WritingBytes), BytesRead: nonNegative(bytesRead), BytesWritten: nonNegative(bytesWritten), WaitCondition: condition, WaitStartedAt: waitStarted, WaitDurationMS: waitDuration, Health: streamHealth(s, now), HealthReasons: streamReasons(s, now), StartedAt: s.StartedAt.UTC(), AgeMS: nonNegative(age)}
+	return MediaBufferStream{BootID: boot, StreamID: idString(s.StreamID), TransferID: transferID, UserID: sanitizeMediaBufferString(s.UserID), Username: sanitizeMediaBufferString(s.Username), Device: sanitizeMediaBufferString(s.Device), ItemID: sanitizeMediaBufferString(s.ItemID), SourceRef: sanitizeMediaBufferString(s.SourceRef), MediaMode: finiteMediaMode(s.MediaMode), State: lifecycleName(s.Lifecycle.Value), ProducerState: producerName(s.Producer.Value), ConsumerState: consumerName(s.Consumer.Value), AllocationBlocker: blockerName(s.Blocker.Value), TargetBytes: nonNegative(s.TargetBytes), OwnedBytes: nonNegative(s.OwnedBytes), DebtBytes: nonNegative(s.DebtBytes), PrivateBaseBytes: nonNegative(s.PrivateBaseBytes), QueuedBytes: nonNegative(s.QueuedBytes), WritingBytes: nonNegative(s.WritingBytes), BytesRead: nonNegative(bytesRead), BytesWritten: nonNegative(bytesWritten), WaitCondition: condition, WaitStartedAt: waitStarted, WaitDurationMS: waitDuration, Health: streamHealth(s, now), HealthReasons: streamReasons(s, now), StartedAt: s.StartedAt.UTC(), AgeMS: nonNegative(age)}
 }
 func finiteMediaMode(v string) MediaBufferMediaMode {
 	switch strings.ToLower(v) {

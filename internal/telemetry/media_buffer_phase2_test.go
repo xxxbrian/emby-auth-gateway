@@ -268,10 +268,10 @@ func TestMediaBufferSamplerCompactsTerminalAndSanitizesDTO(t *testing.T) {
 	r := New(nil)
 	base := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 	r.now = func() time.Time { return base.Add(3 * time.Second) }
-	state := &testMediaBufferLiveState{id: 1, snapshot: MediaBufferLiveSnapshot{StartedAt: base, AgeMS: 3000, TransferID: 42, UserID: "  user\x00\x01 ", Username: strings.Repeat("x", 300), MediaMode: "arbitrary", TargetBytes: -1, Producer: MediaBufferTimedValue{Value: uint8(MediaBufferProducerWaitingForBuffer)}}}
+	state := &testMediaBufferLiveState{id: 1, snapshot: MediaBufferLiveSnapshot{StartedAt: base, AgeMS: 3000, TransferID: 42, SourceRef: " source-proof\x00 ", UserID: "  user\x00\x01 ", Username: strings.Repeat("x", 300), MediaMode: "arbitrary", TargetBytes: -1, Producer: MediaBufferTimedValue{Value: uint8(MediaBufferProducerWaitingForBuffer)}}}
 	r.mediaBufferLive.Register(state)
 	detail, ok := r.MediaBufferStreamDetail(1)
-	if !ok || detail.StreamID != "1" || detail.TransferID == nil || *detail.TransferID != "42" || detail.MediaMode != "unknown" || detail.TargetBytes != 0 || detail.UserID == nil || strings.ContainsRune(*detail.UserID, '\x00') || len(*detail.Username) > 256 {
+	if !ok || detail.StreamID != "1" || detail.TransferID == nil || *detail.TransferID != "42" || detail.MediaMode != "unknown" || detail.TargetBytes != 0 || detail.SourceRef == nil || *detail.SourceRef != "source-proof" || detail.UserID == nil || strings.ContainsRune(*detail.UserID, '\x00') || len(*detail.Username) > 256 {
 		t.Fatalf("detail=%+v ok=%v", detail, ok)
 	}
 	state.snapshot.Terminal = true

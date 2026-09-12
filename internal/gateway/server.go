@@ -587,6 +587,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 	if isUpgradeRequest(r) {
 		upstream = s.prepareBackendUpgrade(r.Context(), r, rel, session, upstream)
 	}
+	r = withObservedMediaSource(r, upstream)
 	proxyURL, err := s.proxyURL(upstream, session, rel, r.URL.RawQuery, gatewayToken)
 	if err != nil {
 		if errors.Is(err, errMalformedQuery) || errors.Is(err, errCredentialConflict) || errors.Is(err, errCredentialStore) {
@@ -636,6 +637,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 	if resp.StatusCode == http.StatusUnauthorized && replayable {
 		if refreshed, confirmed, refreshErr := s.refreshAfterUnauthorized(r.Context(), upstream); confirmed && refreshErr == nil {
 			upstream = refreshed
+			r = withObservedMediaSource(r, upstream)
 			s.auditBackendTokenRefresh(r, rel, session, "backend_token_refresh", "backend token refreshed after unauthorized response", http.StatusOK)
 			_ = resp.Body.Close()
 			retryURL, retryErr := s.proxyURL(upstream, session, rel, r.URL.RawQuery, gatewayToken)
@@ -1246,6 +1248,10 @@ func (s *Server) recordPlaybackRequest(r *http.Request, rel string, session *Ses
 	eventName := playbackEventName(rel)
 	s.noteWebSubtitlePlayback(r, rel, session, data)
 	audioPlayID, audioPaused := s.noteAudioPlayback(rel, session, data, details.ItemID)
+	sourceRef := s.localMediaSource(r.Context())
+	if audioPlayID != "" && s.cfg.Transcoder != nil {
+		sourceRef = s.cfg.Transcoder.SourceRef(session.GatewayTokenHash, audioPlayID)
+	}
 	s.emit(observe.Event{
 		Kind:          observe.KindPlayback,
 		Outcome:       observe.OutcomeOK,
@@ -1255,6 +1261,7 @@ func (s *Server) recordPlaybackRequest(r *http.Request, rel string, session *Ses
 		SessionID:     session.GatewayTokenHash,
 		Device:        session.Device,
 		ItemID:        details.ItemID,
+		SourceRef:     sourceRef,
 		ItemName:      details.ItemName,
 		PositionTicks: details.PositionTicks,
 		PlaybackEvent: eventName,
@@ -1895,10 +1902,12 @@ func (s *Server) copyBufferedMediaResponseOrAbort(w http.ResponseWriter, r *http
 		method = r.Method
 	}
 
-	request, live := s.registerMediaBufferRequest(rel, session, mediaMode)
+	request, live := s.registerMediaBufferRequest(rel, session, mediaMode, observedMediaSource(r))
 	var handle *telemetry.TransferHandle
 	if s.meter != nil {
 		meta := telemetry.TransferMeta{
+			ItemID:    mediaItemIDForRequest(rel),
+			SourceRef: observedMediaSource(r),
 			SessionID: sessionTokenHash(session),
 			UserID:    sessionGatewayUserID(session),
 			Username:  sessionUsername(session),
@@ -1960,9 +1969,13 @@ func (s *Server) copyBufferedMediaResponseOrAbort(w http.ResponseWriter, r *http
 	panic(http.ErrAbortHandler)
 }
 
-func (s *Server) registerMediaBufferRequest(rel string, session *Session, mediaMode string) (*mediaBufferRequest, *mediaBufferLiveState) {
+func (s *Server) registerMediaBufferRequest(rel string, session *Session, mediaMode string, sourceRefs ...string) (*mediaBufferRequest, *mediaBufferLiveState) {
 	if s.mediaBufferLive == nil {
 		return s.mediaBuffer.register(), nil
+	}
+	var sourceRef string
+	if len(sourceRefs) > 0 {
+		sourceRef = sourceRefs[0]
 	}
 	s.mediaBufferLiveMu.Lock()
 	request := s.mediaBuffer.register()
@@ -1973,6 +1986,7 @@ func (s *Server) registerMediaBufferRequest(rel string, session *Session, mediaM
 		Username:  sessionUsername(session),
 		Device:    sessionDevice(session),
 		ItemID:    mediaItemIDForRequest(rel),
+		SourceRef: sourceRef,
 		MediaMode: mediaMode,
 	}, nil)
 	if s.mediaBufferHooks != nil && s.mediaBufferHooks.beforeLiveRegister != nil {
@@ -2007,6 +2021,8 @@ func (s *Server) copyMediaReaderOrAbort(w http.ResponseWriter, r *http.Request, 
 	var copyErr error
 	if s.meter != nil {
 		handle = s.meter.BeginTransfer(telemetry.TransferMeta{
+			ItemID:    mediaItemIDForRequest(rel),
+			SourceRef: observedMediaSource(r),
 			SessionID: sessionID,
 			UserID:    userID,
 			Username:  username,

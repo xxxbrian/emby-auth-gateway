@@ -89,21 +89,24 @@ type SessionDTO struct {
 
 // AuditDTO is a redacted audit log row.
 type AuditDTO struct {
-	ID               string    `json:"id"`
-	GatewayUserID    string    `json:"gateway_user_id,omitempty"`
-	SyntheticUserID  string    `json:"synthetic_user_id,omitempty"`
-	Event            string    `json:"event"`
-	Message          string    `json:"message,omitempty"`
-	Method           string    `json:"method,omitempty"`
-	Path             string    `json:"path,omitempty"`
-	Status           int       `json:"status,omitempty"`
-	RemoteIP         string    `json:"remote_ip,omitempty"`
-	Created          time.Time `json:"created"`
-	ErrorKind        string    `json:"error_kind,omitempty"`
-	Direction        string    `json:"direction,omitempty"`
-	BytesTransferred int64     `json:"bytes_transferred,omitempty"`
-	DurationMS       int64     `json:"duration_ms,omitempty"`
-	UpstreamStatus   int       `json:"upstream_status,omitempty"`
+	ID                string    `json:"id"`
+	GatewayUserID     string    `json:"gateway_user_id,omitempty"`
+	SyntheticUserID   string    `json:"synthetic_user_id,omitempty"`
+	Event             string    `json:"event"`
+	Message           string    `json:"message,omitempty"`
+	Method            string    `json:"method,omitempty"`
+	Path              string    `json:"path,omitempty"`
+	Status            int       `json:"status,omitempty"`
+	RemoteIP          string    `json:"remote_ip,omitempty"`
+	Created           time.Time `json:"created"`
+	ErrorKind         string    `json:"error_kind,omitempty"`
+	Direction         string    `json:"direction,omitempty"`
+	BytesTransferred  int64     `json:"bytes_transferred,omitempty"`
+	DurationMS        int64     `json:"duration_ms,omitempty"`
+	UpstreamStatus    int       `json:"upstream_status,omitempty"`
+	ResponseCommitted bool      `json:"response_committed"`
+	IsError           bool      `json:"is_error"`
+	Severity          string    `json:"severity"`
 }
 
 // UpstreamDTO is a redacted upstream configuration view.
@@ -266,78 +269,10 @@ func (q *Querier) GetUpstream(ctx context.Context) (UpstreamDTO, error) {
 	return dto, nil
 }
 
-// ListAudit returns audit rows in [from,to] with hard max window 24h and limit<=100.
-// Cursor is an opaque created timestamp (RFC3339Nano) for keyset pagination (created < cursor).
-//
-// The concurrency semaphore is held until the DB query finishes, even if the HTTP
-// timeout fires first, so a timed-out request cannot free a slot while the query still runs.
+// ListAudit preserves the legacy bounded list interface. New callers use ListAuditPage.
 func (q *Querier) ListAudit(ctx context.Context, from, to time.Time, limit int, cursor string) ([]AuditDTO, error) {
-	if err := q.acquire(ctx); err != nil {
-		return nil, err
-	}
-
-	if from.IsZero() || to.IsZero() {
-		q.release()
-		return nil, fmt.Errorf("from and to are required")
-	}
-	from = from.UTC()
-	to = to.UTC()
-	if !to.After(from) {
-		q.release()
-		return nil, fmt.Errorf("to must be after from")
-	}
-	if to.Sub(from) > MaxAuditWindow {
-		q.release()
-		return nil, fmt.Errorf("audit window must be <= 24h")
-	}
-	if limit <= 0 || limit > MaxAuditLimit {
-		limit = MaxAuditLimit
-	}
-
-	filter := "created >= {:from} && created <= {:to}"
-	params := dbx.Params{"from": from, "to": to}
-	if c := strings.TrimSpace(cursor); c != "" {
-		ct, err := time.Parse(time.RFC3339Nano, c)
-		if err != nil {
-			// try RFC3339
-			ct, err = time.Parse(time.RFC3339, c)
-			if err != nil {
-				q.release()
-				return nil, fmt.Errorf("invalid cursor")
-			}
-		}
-		filter += " && created < {:cursor}"
-		params["cursor"] = ct.UTC()
-	}
-
-	qctx, cancel := context.WithTimeout(ctx, AuditQueryTimeout)
-	defer cancel()
-
-	// PocketBase FindRecordsByFilter does not take context; honor timeout around the call.
-	// The goroutine owns semaphore release so a timeout cannot free the slot early.
-	type result struct {
-		records []*core.Record
-		err     error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		defer q.release()
-		recs, err := q.app.FindRecordsByFilter("audit_logs", filter, "-created", limit, 0, params)
-		ch <- result{recs, err}
-	}()
-	select {
-	case <-qctx.Done():
-		return nil, qctx.Err()
-	case res := <-ch:
-		if res.err != nil {
-			return nil, res.err
-		}
-		out := make([]AuditDTO, 0, len(res.records))
-		for _, r := range res.records {
-			out = append(out, auditFromRecord(r))
-		}
-		return out, nil
-	}
+	page, err := q.ListAuditPage(ctx, AuditFilter{From: from, To: to, Limit: limit, Cursor: cursor})
+	return page.Items, err
 }
 
 func userFromRecord(r *core.Record) UserDTO {
@@ -385,25 +320,26 @@ func sessionFromRecord(r *core.Record, now time.Time) SessionDTO {
 
 func auditFromRecord(r *core.Record) AuditDTO {
 	dto := AuditDTO{
-		ID:               r.Id,
-		GatewayUserID:    r.GetString("gateway_user"),
-		SyntheticUserID:  r.GetString("synthetic_user_id"),
-		Event:            r.GetString("event"),
-		Message:          r.GetString("message"),
-		Method:           r.GetString("method"),
-		Path:             r.GetString("path"),
-		Status:           r.GetInt("status"),
-		RemoteIP:         r.GetString("remote_ip"),
-		ErrorKind:        r.GetString("error_kind"),
-		Direction:        r.GetString("direction"),
-		BytesTransferred: int64(r.GetInt("bytes_transferred")),
-		DurationMS:       int64(r.GetInt("duration_ms")),
-		UpstreamStatus:   r.GetInt("upstream_status"),
+		ID:                r.Id,
+		GatewayUserID:     r.GetString("gateway_user"),
+		SyntheticUserID:   r.GetString("synthetic_user_id"),
+		Event:             r.GetString("event"),
+		Message:           r.GetString("message"),
+		Method:            r.GetString("method"),
+		Path:              r.GetString("path"),
+		Status:            r.GetInt("status"),
+		RemoteIP:          r.GetString("remote_ip"),
+		ErrorKind:         r.GetString("error_kind"),
+		Direction:         r.GetString("direction"),
+		BytesTransferred:  int64(r.GetInt("bytes_transferred")),
+		DurationMS:        int64(r.GetInt("duration_ms")),
+		UpstreamStatus:    r.GetInt("upstream_status"),
+		ResponseCommitted: r.GetBool("response_committed"),
 	}
 	if t := r.GetDateTime("created"); !t.IsZero() {
 		dto.Created = t.Time().UTC()
 	}
-	return dto
+	return sanitizeAudit(dto)
 }
 
 func defaultEndpoint(endpoints []*core.Record) (*core.Record, error) {

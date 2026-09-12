@@ -217,6 +217,7 @@ func (s *Server) negotiateAudioResponse(r *http.Request, value any, session *Ses
 	itemID, _ := playbackInfoItemID(r.Method, strings.TrimPrefix(r.URL.Path, s.cfg.GatewayBasePath))
 	source := s.audioSource(r, session, upstream, gatewayToken, itemID, media)
 	identity := transcode.Identity{Owner: session.GatewayTokenHash, UserID: session.GatewayUserID, Username: session.GatewayUsername, Device: session.Device, ItemID: itemID}
+	identity.SourceRef = MediaSourceRef(upstream.serverID, upstream.userID)
 	nameCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	if value, status, _, err := s.fetchBackendJSON(nameCtx, r, "/Users/"+session.SyntheticUserID+"/Items/"+url.PathEscape(itemID), "", session, gatewayToken); err == nil && status == http.StatusOK {
 		if item, ok := value.(map[string]any); ok {
@@ -329,6 +330,7 @@ func (s *Server) handleAudioRoute(w http.ResponseWriter, r *http.Request, rel st
 	var transfer *telemetry.TransferHandle
 	if s.meter != nil {
 		transfer = s.meter.BeginTransfer(telemetry.TransferMeta{
+			SourceRef: m.SourceRef(session.GatewayTokenHash, id),
 			SessionID: session.GatewayTokenHash, UserID: session.GatewayUserID, Username: session.GatewayUsername,
 			Device: session.Device, ItemID: parts[1], MediaMode: observe.MediaHLS, Method: r.Method,
 		})

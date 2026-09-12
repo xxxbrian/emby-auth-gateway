@@ -96,6 +96,12 @@ func TestAuthzMatrixNoCookie(t *testing.T) {
 	paths := []string{
 		"/admin/api/v1/session",
 		"/admin/api/v1/overview",
+		"/admin/api/v1/audit",
+		"/admin/api/v1/audit/example",
+		"/admin/api/v1/users/example/media",
+		"/admin/api/v1/media/items?ids=example",
+		"/admin/api/v1/media/items/example",
+		"/admin/api/v1/media/items/example/images/Primary",
 		"/admin/api/v1/media-buffer/streams",
 		"/admin/api/v1/media-buffer/streams/1?boot_id=x",
 		"/admin/api/v1/media-buffer/series",

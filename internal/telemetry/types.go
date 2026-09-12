@@ -129,6 +129,7 @@ type SeriesPoint struct {
 
 // Playback is an active playback session (current-state map entry).
 type Playback struct {
+	SourceRef     string                `json:"source_ref,omitempty"`
 	Transcoding   *TranscodingReference `json:"transcoding,omitempty"`
 	SessionID     string                `json:"session_id"`
 	UserID        string                `json:"user_id"`
@@ -149,6 +150,7 @@ type TranscodingReference struct {
 
 // Transfer is an open media transfer (current-state map entry).
 type Transfer struct {
+	SourceRef   string                `json:"source_ref,omitempty"`
 	SessionID   string                `json:"session_id"`
 	UserID      string                `json:"user_id"`
 	Username    string                `json:"username"`

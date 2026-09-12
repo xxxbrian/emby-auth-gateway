@@ -69,6 +69,7 @@ type mediaBufferLiveIdentity struct {
 	UserID    string
 	Username  string
 	Device    string
+	SourceRef string
 	ItemID    string
 	MediaMode string
 }
@@ -111,6 +112,7 @@ func newMediaBufferLiveState(identity mediaBufferLiveIdentity, clock *mediaBuffe
 	identity.Username = sanitizeMediaBufferIdentity(identity.Username)
 	identity.Device = sanitizeMediaBufferIdentity(identity.Device)
 	identity.ItemID = sanitizeMediaBufferIdentity(identity.ItemID)
+	identity.SourceRef = sanitizeMediaBufferIdentity(identity.SourceRef)
 	identity.MediaMode = sanitizeMediaBufferIdentity(identity.MediaMode)
 	now := clock.nowMS()
 	state := &mediaBufferLiveState{identity: identity, clock: clock, startedAt: clock.origin}
@@ -219,6 +221,7 @@ func (s *mediaBufferLiveState) mediaBufferLiveSnapshotAt(age int64) telemetry.Me
 		Username:         s.identity.Username,
 		Device:           s.identity.Device,
 		ItemID:           s.identity.ItemID,
+		SourceRef:        s.identity.SourceRef,
 		MediaMode:        s.identity.MediaMode,
 		StartedAt:        s.startedAt,
 		AgeMS:            age,

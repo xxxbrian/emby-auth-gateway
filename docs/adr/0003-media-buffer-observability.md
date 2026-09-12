@@ -12,6 +12,15 @@ copy correctness, configuration, rollout, and rollback.
 This ADR uses RFC 2119 meanings for normative `MUST`, `MUST NOT`, `SHOULD`, and
 `MAY` terms.
 
+## September 2026 media catalog references
+
+Live and completed media references may carry a nullable `source_ref`, an
+opaque, bounded digest of the captured server and backend-user identity.
+Capture happens before I/O; ordinary token refresh preserves it. The reference
+contains no URL or credential and is used only by independent Admin metadata
+reads. It never changes buffering or infers stream identity. Unknown legacy
+sources remain unknown; serialization applies the existing identity sanitation.
+
 ## Decision Summary
 
 The gateway MUST provide bounded operational visibility into adaptive media

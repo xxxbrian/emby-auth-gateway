@@ -11,6 +11,7 @@ import (
 
 	"github.com/xxxbrian/emby-auth-gateway/internal/adminapi"
 	"github.com/xxxbrian/emby-auth-gateway/internal/adminauth"
+	"github.com/xxxbrian/emby-auth-gateway/internal/adminmedia"
 	"github.com/xxxbrian/emby-auth-gateway/internal/adminquery"
 	"github.com/xxxbrian/emby-auth-gateway/internal/adminui"
 	"github.com/xxxbrian/emby-auth-gateway/internal/telemetry"
@@ -24,6 +25,8 @@ import (
 // Admin is always mounted. CSRF uses same-origin checks (request Origin vs Host),
 // so no fixed GATEWAY_ADMIN_ORIGIN is required at startup.
 type adminConfig struct {
+	Media              *adminmedia.Service
+	MatchMediaIdentity func(stored, itemType, name, seriesID string) bool
 	AuditRetentionDays int
 	MediaBufferEnabled func() bool
 }
@@ -80,6 +83,8 @@ func mountAdmin(
 
 	api, err := newAdminAPIForMount(adminapi.Config{
 		App:                 app,
+		Media:               cfg.Media,
+		MatchMediaIdentity:  cfg.MatchMediaIdentity,
 		Sessions:            adminauth.NewStore(adminauth.DefaultMaxSessions),
 		Query:               adminquery.New(app, adminquery.DefaultConcurrency),
 		Telemetry:           registry,

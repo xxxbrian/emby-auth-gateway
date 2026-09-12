@@ -172,10 +172,11 @@ type Config struct {
 }
 
 type Identity struct {
-	Owner    string // login token hash; never exposed through observation
-	UserID   string
-	Username string
-	Device   string
-	ItemID   string
-	ItemName string
+	SourceRef string // credential-free source captured when the job is created
+	Owner     string // login token hash; never exposed through observation
+	UserID    string
+	Username  string
+	Device    string
+	ItemID    string
+	ItemName  string
 }

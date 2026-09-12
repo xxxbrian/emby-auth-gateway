@@ -15,6 +15,7 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/router"
 	"github.com/xxxbrian/emby-auth-gateway/internal/adminauth"
+	"github.com/xxxbrian/emby-auth-gateway/internal/adminmedia"
 	"github.com/xxxbrian/emby-auth-gateway/internal/adminquery"
 	"github.com/xxxbrian/emby-auth-gateway/internal/controlplane"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pathpolicy"
@@ -36,6 +37,10 @@ type Config struct {
 	Sessions            *adminauth.Store
 	Query               *adminquery.Querier
 	Telemetry           *telemetry.Registry // optional
+	Media               *adminmedia.Service
+	MatchMediaIdentity  func(stored, itemType, name, seriesID string) bool
+	MediaLimit          *adminauth.RateLimiter
+	ImageLimit          *adminauth.RateLimiter
 	MediaBufferSnapshot func() telemetry.MediaBufferStatus
 	// MediaBufferEnabled reports whether media buffering is configured and
 	// expected. False is the intentional disabled mode; true requires a
@@ -76,6 +81,12 @@ func New(cfg Config) (*Server, error) {
 	if cfg.APILimit == nil {
 		cfg.APILimit = adminauth.NewRateLimiter(120, time.Minute)
 	}
+	if cfg.MediaLimit == nil {
+		cfg.MediaLimit = adminauth.NewRateLimiter(240, time.Minute)
+	}
+	if cfg.ImageLimit == nil {
+		cfg.ImageLimit = adminauth.NewRateLimiter(600, time.Minute)
+	}
 	if cfg.StartedAt.IsZero() {
 		cfg.StartedAt = time.Now().UTC()
 	}
@@ -104,6 +115,10 @@ func (s *Server) Mount(r *router.Router[*core.RequestEvent]) {
 	g.GET("/metrics/stream", s.withAuth(s.handleMetricsStream))
 	g.GET("/users", s.withAuth(s.handleListUsers))
 	g.GET("/users/{id}", s.withAuth(s.handleGetUser))
+	g.GET("/users/{id}/media", s.withAuth(s.handleUserMedia))
+	g.GET("/media/items", s.withMediaAuth(s.handleMediaItems, false))
+	g.GET("/media/items/{id}", s.withMediaAuth(s.handleMediaItem, false))
+	g.GET("/media/items/{id}/images/{type}", s.withMediaAuth(s.handleMediaImage, true))
 	g.GET("/sessions", s.withAuth(s.handleListSessions))
 	g.GET("/activity/playbacks", s.withAuth(s.handlePlaybacks))
 	g.GET("/activity/transfers", s.withAuth(s.handleTransfers))
@@ -116,6 +131,7 @@ func (s *Server) Mount(r *router.Router[*core.RequestEvent]) {
 	g.GET("/transcoding/recent", s.withAuth(s.handleTranscodingRecent))
 	g.GET("/subtitles", s.withAuth(s.handleSubtitles))
 	g.GET("/audit", s.withAuth(s.handleAudit))
+	g.GET("/audit/{id}", s.withAuth(s.handleAuditDetail))
 	g.GET("/system", s.withAuth(s.handleSystem))
 	g.GET("/path-policies", s.withAuth(s.handleListPolicies))
 	g.GET("/path-policies/preview", s.withAuth(s.handlePreviewPolicy))
@@ -539,11 +555,14 @@ func (s *Server) handleAudit(e *core.RequestEvent) error {
 		}
 		limit = n
 	}
-	items, err := s.cfg.Query.ListAudit(e.Request.Context(), from, to, limit, q.Get("cursor"))
+	page, err := s.cfg.Query.ListAuditPage(e.Request.Context(), adminquery.AuditFilter{
+		From: from, To: to, Limit: limit, Cursor: q.Get("cursor"), View: q.Get("view"),
+		Event: q.Get("event"), ErrorKind: q.Get("error_kind"), Direction: q.Get("direction"), UserID: q.Get("user_id"),
+	})
 	if err != nil {
 		return e.BadRequestError(err.Error(), err)
 	}
-	return e.JSON(http.StatusOK, map[string]any{"items": items})
+	return e.JSON(http.StatusOK, page)
 }
 
 func (s *Server) handleSystem(e *core.RequestEvent) error {

@@ -29,6 +29,7 @@ type Interval struct {
 	EndTicks   int64 `json:"end_ticks"`
 }
 type JobView struct {
+	SourceRef           string     `json:"source_ref,omitempty"`
 	PlaybackID          string     `json:"playback_id"`
 	ID                  string     `json:"id"`
 	UserID              string     `json:"user_id"`
@@ -97,6 +98,7 @@ func (m *Manager) jobView(j *job, entries map[string]int64) JobView {
 		view.AudioOutput = j.plan.Audio.Codec
 	}
 	view.PlaybackID = j.playbackID
+	view.SourceRef = j.identity.SourceRef
 	if j.running && j.produced > j.runStartTicks {
 		speed := float64(j.produced-j.runStartTicks) / float64(TicksPerSecond) / time.Since(j.runStarted).Seconds()
 		view.Speed = &speed

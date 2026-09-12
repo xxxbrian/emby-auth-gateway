@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/xxxbrian/emby-auth-gateway/internal/adminmedia"
 	"github.com/xxxbrian/emby-auth-gateway/internal/gateway"
 	"github.com/xxxbrian/emby-auth-gateway/internal/observe"
 	"github.com/xxxbrian/emby-auth-gateway/internal/pbschema"
@@ -322,6 +323,8 @@ func newGatewayApp() *pocketbase.PocketBase {
 		mountGatewayRoutesForServe(e.Router, webHandler, gw, webReady)
 
 		adminCfg := adminConfigFromEnv()
+		adminCfg.Media = adminmedia.New(gw)
+		adminCfg.MatchMediaIdentity = gateway.MediaFingerprintMatches
 		adminCfg.MediaBufferEnabled = func() bool { return mediaBuffer != nil }
 		// Exclusive reconfigure gate: media copies (RWMutex) + active playbacks.
 		// force=false fails immediately if copies or playbacks are active;

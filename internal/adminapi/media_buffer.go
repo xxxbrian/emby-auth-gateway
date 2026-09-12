@@ -34,6 +34,7 @@ type adminTransfer struct {
 	Username    string                          `json:"username"`
 	Device      string                          `json:"device"`
 	ItemID      string                          `json:"item_id"`
+	SourceRef   string                          `json:"source_ref"`
 	MediaMode   string                          `json:"media_mode"`
 	BytesIn     int64                           `json:"bytes_in"`
 	BytesOut    int64                           `json:"bytes_out"`
@@ -43,7 +44,7 @@ type adminTransfer struct {
 }
 
 func newAdminTransfer(v telemetry.Transfer) adminTransfer {
-	return adminTransfer{SessionID: v.SessionID, UserID: v.UserID, Username: v.Username, Device: v.Device, ItemID: v.ItemID, MediaMode: v.MediaMode, BytesIn: v.BytesIn, BytesOut: v.BytesOut, StartedAt: v.StartedAt, LastSeen: v.LastSeen, MediaBuffer: v.MediaBuffer}
+	return adminTransfer{SessionID: v.SessionID, UserID: v.UserID, Username: v.Username, Device: v.Device, ItemID: v.ItemID, SourceRef: v.SourceRef, MediaMode: v.MediaMode, BytesIn: v.BytesIn, BytesOut: v.BytesOut, StartedAt: v.StartedAt, LastSeen: v.LastSeen, MediaBuffer: v.MediaBuffer}
 }
 
 func (s *Server) mediaBufferAggregate() telemetry.MediaBufferAggregate {

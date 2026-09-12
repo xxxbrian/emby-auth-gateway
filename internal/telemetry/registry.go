@@ -675,6 +675,7 @@ func (r *Registry) recordPlaybackLocked(at time.Time, ev observe.Event) {
 	p := r.playbacks[key]
 	if p == nil {
 		p = &playbackState{Playback: Playback{
+			SourceRef: ev.SourceRef,
 			SessionID: ev.SessionID,
 			UserID:    ev.UserID,
 			Username:  ev.Username,
@@ -745,6 +746,7 @@ func (r *Registry) recordTransferLocked(at time.Time, ev observe.Event) {
 	tr := r.transfers[key]
 	if tr == nil {
 		tr = &transferState{Transfer: Transfer{
+			SourceRef: ev.SourceRef,
 			SessionID: ev.SessionID,
 			UserID:    ev.UserID,
 			Username:  ev.Username,

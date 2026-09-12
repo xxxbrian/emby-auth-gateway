@@ -29,6 +29,7 @@ func TestMediaBufferLivePackedWordsIdentityAndFakeClock(t *testing.T) {
 		Username:  strings.Repeat("x", 300),
 		Device:    " device\tname ",
 		ItemID:    " item ",
+		SourceRef: " source-proof\x00 ",
 		MediaMode: " direct ",
 	}, clock)
 	live.projectAllocation(3*mediaBufferChunkSize, 2*mediaBufferChunkSize, mediaBufferChunkSize)
@@ -44,7 +45,7 @@ func TestMediaBufferLivePackedWordsIdentityAndFakeClock(t *testing.T) {
 	live.bindTransferID(12)
 
 	snapshot := live.MediaBufferLiveSnapshot()
-	if snapshot.BootID != "boot" || snapshot.StreamID != 7 || snapshot.TransferID != 11 || snapshot.UserID != "user id" || snapshot.Device != "device name" || snapshot.ItemID != "item" {
+	if snapshot.BootID != "boot" || snapshot.StreamID != 7 || snapshot.TransferID != 11 || snapshot.UserID != "user id" || snapshot.Device != "device name" || snapshot.ItemID != "item" || snapshot.SourceRef != "source-proof" {
 		t.Fatalf("identity snapshot=%+v", snapshot)
 	}
 	if len(snapshot.Username) != 256 {

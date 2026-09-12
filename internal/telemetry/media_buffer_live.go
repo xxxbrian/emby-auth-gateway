@@ -67,6 +67,7 @@ type MediaBufferLiveSnapshot struct {
 	UserID     string
 	Username   string
 	Device     string
+	SourceRef  string
 	ItemID     string
 	MediaMode  string
 	StartedAt  time.Time
