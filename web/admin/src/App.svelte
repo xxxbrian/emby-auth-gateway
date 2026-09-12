@@ -1,7 +1,8 @@
 <script lang="ts">
-    import { onMount } from 'svelte';
+    import { onMount, tick } from 'svelte';
     import Router from 'svelte-spa-router';
     import { session, initialized, checkSession, logout } from './lib/api';
+    import MediaItemDrawer from './lib/MediaItemDrawer.svelte';
     import Login from './pages/Login.svelte';
     import Overview from './pages/Overview.svelte';
     import Users from './pages/Users.svelte';
@@ -32,7 +33,10 @@
         let hash = window.location.hash;
         if (hash.startsWith('#')) hash = hash.substring(1);
         if (hash.includes('?')) hash = hash.split('?')[0];
-        currentPath = hash || '/';
+        const nextPath = hash || '/';
+        const changed = currentPath !== nextPath;
+        currentPath = nextPath;
+        if (changed) tick().then(() => document.querySelectorAll<HTMLElement>('.main-content, .page-body').forEach(element => element.scrollTo(0, 0)));
     }
 
     onMount(() => {
@@ -73,4 +77,5 @@
             <Router {routes} />
         </main>
     </div>
+    <MediaItemDrawer />
 {/if}

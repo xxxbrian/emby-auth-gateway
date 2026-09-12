@@ -112,6 +112,7 @@ export interface TranscodingAggregate {
 }
 
 export interface TranscodingJob {
+  source_ref?: string | null;
 	playback_id: string;
   id: string;
   user_id: string;
@@ -184,6 +185,9 @@ export interface SessionDTO {
 }
 
 export interface AuditDTO {
+  response_committed?: boolean;
+  is_error?: boolean;
+  severity?: 'error' | 'warning' | 'info';
   id: string;
   gateway_user_id?: string;
   synthetic_user_id?: string;
@@ -229,6 +233,7 @@ export interface UpstreamDTO {
 // --- Activity (telemetry) ---
 
 export interface Playback {
+  source_ref?: string | null;
   transcoding?: { boot_id: string; job_id: string };
   session_id: string;
   user_id: string;
@@ -243,6 +248,7 @@ export interface Playback {
 }
 
 export interface Transfer {
+  source_ref?: string | null;
   session_id: string;
   user_id: string;
   username: string;
@@ -495,6 +501,7 @@ export interface BufferAggregate {
 
 /** Live stream DTO from /media-buffer/streams or /media-buffer/streams/:id. */
 export interface BufferStream {
+  source_ref?: string | null;
   boot_id: string;
   stream_id: string;
   transfer_id: string | null;
@@ -547,6 +554,8 @@ export interface WaitDuration {
 
 /** Completed stream summary from /media-buffer/recent. */
 export interface BufferCompletion {
+  completion_id: string;
+  source_ref?: string | null;
   boot_id: string;
   stream_id: string;
   transfer_id: string | null;
@@ -582,8 +591,9 @@ export interface BufferCompletion {
 
 /** Recent completions response. */
 export interface BufferRecentResponse {
-  boot_id: string;
-  items: BufferCompletion[];
+  boot_id: string; items: BufferCompletion[]; next_cursor: string | null; has_more: boolean;
+  available_from: string | null; oldest_retained_at: string | null; capacity: number; retained_count: number;
+  evicted_count: number; retention_seconds: number; started_at: string;
 }
 
 /** Coherence domains descriptor for a series point. */
@@ -594,6 +604,7 @@ export interface BufferSeriesDomains {
 
 /** Historical series point with presence. */
 export interface BufferSeriesPoint {
+  peaks?: Partial<BufferAggregate> | null;
   t: string;
   present: boolean;
   domains: BufferSeriesDomains | null;
@@ -602,6 +613,8 @@ export interface BufferSeriesPoint {
 
 /** Series response from /media-buffer/series. */
 export interface BufferSeriesResponse {
+  started_at?: string;
+  available_from?: string | null;
   boot_id: string;
   window: string;
   interval: string;
@@ -618,3 +631,16 @@ export interface TransferBufferLink {
 export interface TransferWithBuffer extends Transfer {
   media_buffer?: TransferBufferLink | null;
 }
+
+// Shared metadata is source-bound and contains no upstream personal UserData.
+export interface MediaItem {
+  id: string; source_ref: string; status: 'available' | 'missing' | 'unavailable' | 'source_changed';
+  stale?: boolean; fetched_at?: string; type?: string; name?: string; series_name?: string;
+  season_number?: number; episode_number?: number; production_year?: number; runtime_ticks?: number; image?: string;
+  overview?: string; genres?: string[]; community_rating?: number; official_rating?: string; container?: string;
+  media_streams?: { type: string; codec?: string; language?: string; title?: string; width?: number; height?: number; channels?: number; is_default?: boolean; is_external?: boolean }[];
+}
+export interface MediaLocalState {
+  position_ticks?: number; runtime_ticks?: number; played?: boolean; is_favorite?: boolean; last_played_at?: string | null;
+}
+export interface BufferCurrentResponse { boot_id: string; now: string; started_at: string; media_buffer: BufferAggregate }

@@ -1,4 +1,5 @@
 <script lang="ts">
+    import MediaItemCell from '../lib/MediaItemCell.svelte';
     import { onMount, onDestroy } from 'svelte';
     import { apiRequest } from '../lib/api';
     import type { ItemsResponse, Playback, SessionDTO, TransferWithBuffer } from '../lib/types';
@@ -25,6 +26,7 @@
     };
 
     async function loadData() {
+        if(document.hidden) return;
         currentAbort?.abort();
         const ctrl = new AbortController();
         currentAbort = ctrl;
@@ -52,6 +54,8 @@
     function switchTab(tab: ActivityTab) {
         if (tab === activeTab) return;
         activeTab = tab;
+        const [route,query]=window.location.hash.split('?'); const params=new URLSearchParams(query); params.set('tab',tab); params.delete('buffer');
+        window.history.replaceState(null,'',`${route}?${params}`);
         data = [];
         highlightBuffer = null;
         highlightMissing = false;
@@ -75,11 +79,7 @@
             highlightMissing = false;
         }
 
-        // Strip query from hash to keep URL clean
-        const cleaned = hash.replace(/\?[^]*$/, '');
-        if (cleaned !== hash) {
-            window.history.replaceState(null, '', cleaned || '#/activity');
-        }
+
     }
 
     /** Stable pair key from a transfer's media_buffer link. */
@@ -103,7 +103,10 @@
         return bufferPairKey(t) === highlightBuffer;
     }
 
+    let scrolledPair = '';
     function scrollToRow(pairKey: string) {
+        if(scrolledPair===pairKey || document.querySelector('dialog[open]')) return;
+        scrolledPair=pairKey;
         setTimeout(() => {
             const safeId = `transfer-row-${pairKey.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
             const row = document.getElementById(safeId);
@@ -191,7 +194,7 @@
                         {@const p = asPlayback(item)}
                         <tr>
                             <td><strong>{p.username || p.user_id || '-'}</strong></td>
-                            <td class="truncate" style="max-width: 200px;" title={p.item_name || p.item_id}>{p.item_name || p.item_id || '-'}</td>
+                            <td><MediaItemCell itemId={p.item_id} fallbackName={p.item_name} sourceRef={p.source_ref} at={p.last_seen} userId={p.user_id} localState={{ position_ticks: p.position_ticks }} /></td>
                             <td>{p.device || '-'}</td>
                             <td><span class={p.is_paused ? 'status-warn' : 'status-ok'}>{p.is_paused ? 'Paused' : 'Playing'}</span>{#if p.transcoding}<div class="text-xs"><a href={`#/transcoding?job=${encodeURIComponent(p.transcoding.job_id)}&boot=${encodeURIComponent(p.transcoding.boot_id)}`}>Audio conversion →</a></div>{/if}</td>
                             <td>{fmtTime(p.started_at)}</td>
@@ -203,7 +206,7 @@
                 <thead>
                     <tr>
                         <th style="width: 17%">User</th>
-                        <th style="width: 22%">Item ID</th>
+                        <th style="width: 22%">Media</th>
                         <th style="width: 10%">Mode</th>
                         <th style="width: 10%">Bytes Out</th>
                         <th style="width: 10%">Buffer</th>
@@ -219,7 +222,7 @@
                         {@const t = asTransfer(item)}
                         <tr id={transferRowId(t)} class={isHighlighted(t) ? 'row-highlighted' : ''} tabindex={isHighlighted(t) ? 0 : -1} aria-selected={isHighlighted(t)}>
                             <td><strong>{t.username || t.user_id || '-'}</strong></td>
-                            <td class="mono truncate" style="max-width: 200px;" title={t.item_id}>{t.item_id || '-'}</td>
+                            <td><MediaItemCell itemId={t.item_id} sourceRef={t.source_ref} at={t.started_at} /></td>
                             <td>{t.media_mode || '-'}</td>
                             <td class="mono">{t.bytes_out ?? 0}</td>
                             <td class="mono">

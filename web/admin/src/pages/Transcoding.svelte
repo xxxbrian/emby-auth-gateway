@@ -1,4 +1,5 @@
 <script lang="ts">
+    import MediaItemCell from '../lib/MediaItemCell.svelte';
     import { onMount, onDestroy } from 'svelte';
     import { apiRequest, ApiError } from '../lib/api';
     import type { TranscodingPage, TranscodingJob } from '../lib/types';
@@ -128,7 +129,7 @@
                         <thead><tr><th>Playback</th><th>User / device</th><th>Audio</th><th>State</th><th>Cached</th><th></th></tr></thead>
                         <tbody>{#each rows as job (job.id)}
                             <tr class:selected-row={selectedId === job.id}>
-                                <td><strong>{job.item_name || job.item_id}</strong><div class="text-xs text-secondary source-name">{job.source_name}</div></td>
+                                <td><MediaItemCell itemId={job.item_id} fallbackName={job.item_name} sourceRef={job.source_ref} at={job.created_at} /><div class="text-xs text-secondary source-name">{job.source_name}</div></td>
                                 <td>{job.username || job.user_id}<div class="text-xs text-secondary">{job.device}</div></td>
                                 <td><span class="mono">{job.audio_source.toUpperCase()} {channels(job.audio_source_channels)}</span><div class="text-xs">→ {job.audio_output.toUpperCase()} {channels(job.audio_output_channels)}</div></td>
                                 <td><span class:status-err={job.state === 'failed'} class:status-ok={job.state === 'producing'}>{stateNames[job.state] || job.state}</span>{#if job.paused}<div class="text-xs text-secondary">Playback paused</div>{/if}</td>
@@ -145,7 +146,7 @@
             {#if detailError}<div class="error-message" role="alert">{detailError}</div>{/if}
             {#if selected}
                 <section class="panel" aria-label="Conversion task details">
-                    <div class="detail-heading"><div><h2>{selected.item_name || selected.item_id}</h2><p class="text-secondary text-sm">{reasons[selected.reason] || selected.reason}</p></div><button class="secondary" onclick={() => { selectedId = null; selected = null; }}>Close details</button></div>
+                    <div class="detail-heading"><div><MediaItemCell itemId={selected.item_id} fallbackName={selected.item_name} sourceRef={selected.source_ref} at={selected.created_at} /><p class="text-secondary text-sm">{reasons[selected.reason] || selected.reason}</p></div><button class="secondary" onclick={() => { selectedId = null; selected = null; }}>Close details</button></div>
                     {#if selected.failure}<div class="error-message">{reasons[selected.failure] || selected.failure}</div>{/if}
                     <div class="details-grid">
                         <div><span class="metric-label">Reported playback position</span><strong class="mono">{clock(selected.position_ticks)}</strong><small>Reported at {timestamp(selected.position_at)}</small></div>
