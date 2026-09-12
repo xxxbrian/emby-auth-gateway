@@ -94,7 +94,7 @@ func TestMediaBufferDisabledAndProviderUnavailable(t *testing.T) {
 		return telemetry.MediaBufferControllerSnapshot{Available: true, Enabled: false}
 	})
 	h, cookie := buildPhase2Handler(t, disabled, nil)
-	for _, path := range []string{"/admin/api/v1/media-buffer/streams", "/admin/api/v1/media-buffer/streams/1?boot_id=" + disabled.BootID(), "/admin/api/v1/media-buffer/series?window=1h", "/admin/api/v1/media-buffer/recent"} {
+	for _, path := range []string{"/admin/api/v1/media-buffer", "/admin/api/v1/media-buffer/recent/1?boot_id=" + disabled.BootID(), "/admin/api/v1/media-buffer/streams", "/admin/api/v1/media-buffer/streams/1?boot_id=" + disabled.BootID(), "/admin/api/v1/media-buffer/series?window=1h", "/admin/api/v1/media-buffer/recent"} {
 		rr := phase2Get(t, h, cookie, path)
 		if rr.Code != http.StatusOK {
 			t.Fatalf("disabled %s: %d %s", path, rr.Code, rr.Body.String())
@@ -106,7 +106,7 @@ func TestMediaBufferDisabledAndProviderUnavailable(t *testing.T) {
 
 	unavailable := telemetry.New(nil)
 	h, cookie = buildPhase2Handler(t, unavailable, func() bool { return true })
-	for _, path := range []string{"/admin/api/v1/media-buffer/streams", "/admin/api/v1/media-buffer/streams/1", "/admin/api/v1/media-buffer/series", "/admin/api/v1/media-buffer/recent"} {
+	for _, path := range []string{"/admin/api/v1/media-buffer", "/admin/api/v1/media-buffer/recent/1", "/admin/api/v1/media-buffer/streams", "/admin/api/v1/media-buffer/streams/1", "/admin/api/v1/media-buffer/series", "/admin/api/v1/media-buffer/recent"} {
 		rr := phase2Get(t, h, cookie, path)
 		if rr.Code != http.StatusServiceUnavailable || !strings.Contains(rr.Body.String(), `"error":"provider_unavailable"`) {
 			t.Fatalf("unavailable %s: %d %s", path, rr.Code, rr.Body.String())

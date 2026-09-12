@@ -2,10 +2,11 @@ package telemetry
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
-const mediaBufferRecentAge = 15 * time.Minute
+const mediaBufferRecentAge = 24 * time.Hour
 
 // MediaBufferAggregate is the complete bounded aggregate contract.
 type MediaBufferAggregate struct {
@@ -43,23 +44,72 @@ type MediaBufferDomains struct {
 	Pool    string `json:"pool"`
 	Sidecar string `json:"sidecar"`
 }
+
+// MediaBufferPeaks contains independent maxima from committed cycles in a bucket.
+// It is never a coherent allocation composition or a simultaneous population.
+type MediaBufferPeaks struct {
+	Health                  MediaBufferHealth `json:"health"`
+	ActiveRequests          int               `json:"active_requests"`
+	PoolContentionCount     int               `json:"pool_contention_count"`
+	ConsumerStarvationCount int               `json:"consumer_starvation_count"`
+	UpstreamStallCount      int               `json:"upstream_stall_count"`
+	DownstreamStallCount    int               `json:"downstream_stall_count"`
+	CloseJoinStallCount     int               `json:"close_join_stall_count"`
+	WarningStreams          int               `json:"warning_streams"`
+	CriticalStreams         int               `json:"critical_streams"`
+}
+
+func (p *MediaBufferPeaks) observe(a MediaBufferAggregate) {
+	if healthRank(a.Health) > healthRank(p.Health) {
+		p.Health = a.Health
+	}
+	p.ActiveRequests = max(p.ActiveRequests, a.ActiveRequests)
+	p.PoolContentionCount = max(p.PoolContentionCount, a.PoolContentionCount)
+	p.ConsumerStarvationCount = max(p.ConsumerStarvationCount, a.ConsumerStarvationCount)
+	p.UpstreamStallCount = max(p.UpstreamStallCount, a.UpstreamStallCount)
+	p.DownstreamStallCount = max(p.DownstreamStallCount, a.DownstreamStallCount)
+	p.CloseJoinStallCount = max(p.CloseJoinStallCount, a.CloseJoinStallCount)
+	p.WarningStreams = max(p.WarningStreams, a.WarningStreams)
+	p.CriticalStreams = max(p.CriticalStreams, a.CriticalStreams)
+}
+func healthRank(h MediaBufferHealth) int {
+	switch h {
+	case MediaBufferHealthCritical:
+		return 5
+	case MediaBufferHealthWarning:
+		return 4
+	case MediaBufferHealthHealthy:
+		return 3
+	case MediaBufferHealthIdle:
+		return 2
+	case MediaBufferHealthDisabled:
+		return 1
+	default:
+		return 0
+	}
+}
+
 type MediaBufferSeriesPoint struct {
 	T         time.Time             `json:"t"`
 	Present   bool                  `json:"present"`
 	Domains   *MediaBufferDomains   `json:"domains"`
 	Aggregate *MediaBufferAggregate `json:"aggregate"`
+	Peaks     *MediaBufferPeaks     `json:"peaks,omitempty"`
 }
 type MediaBufferSeries struct {
-	BootID   string                   `json:"boot_id"`
-	Window   string                   `json:"window"`
-	Interval string                   `json:"interval"`
-	Points   []MediaBufferSeriesPoint `json:"points"`
+	BootID        string                   `json:"boot_id"`
+	StartedAt     time.Time                `json:"started_at"`
+	AvailableFrom *time.Time               `json:"available_from"`
+	Window        string                   `json:"window"`
+	Interval      string                   `json:"interval"`
+	Points        []MediaBufferSeriesPoint `json:"points"`
 }
 
 type mediaBufferGaugeSlot struct {
 	unit      int64
 	present   bool
 	aggregate MediaBufferAggregate
+	peaks     MediaBufferPeaks
 }
 type mediaBufferGaugeRing struct {
 	interval time.Duration
@@ -79,7 +129,12 @@ func (r *mediaBufferGaugeRing) unit(t time.Time) int64 {
 func (r *mediaBufferGaugeRing) put(t time.Time, a MediaBufferAggregate) {
 	u := r.unit(t)
 	i := int(u % int64(len(r.slots)))
-	r.slots[i] = mediaBufferGaugeSlot{unit: u, present: true, aggregate: cloneAggregate(a)}
+	var peaks MediaBufferPeaks
+	if r.slots[i].present && r.slots[i].unit == u {
+		peaks = r.slots[i].peaks
+	}
+	peaks.observe(a)
+	r.slots[i] = mediaBufferGaugeSlot{unit: u, present: true, aggregate: cloneAggregate(a), peaks: peaks}
 }
 func cloneAggregate(a MediaBufferAggregate) MediaBufferAggregate {
 	if len(a.HealthReasons) > 0 {
@@ -105,6 +160,10 @@ func (r *mediaBufferGaugeRing) series(now time.Time, n int) []MediaBufferSeriesP
 			p.Present = true
 			p.Domains = &MediaBufferDomains{Pool: "coherent", Sidecar: "eventual"}
 			p.Aggregate = &a
+			if r.interval >= time.Minute {
+				peaks := slot.peaks
+				p.Peaks = &peaks
+			}
 		}
 		out = append(out, p)
 	}
@@ -117,25 +176,52 @@ type retainedMediaBufferCompletion struct {
 	value       MediaBufferCompletionDTO
 }
 type mediaBufferCompletionRing struct {
-	slots        []retainedMediaBufferCompletion
-	start, count int
-	next         uint64
+	slots           []retainedMediaBufferCompletion
+	start, count    int
+	next            uint64
+	evicted         uint64
+	evictedThrough  uint64
+	evictedLatestAt time.Time
+	nextExpiry      time.Time
 }
 
 func newMediaBufferCompletionRing() *mediaBufferCompletionRing {
 	return &mediaBufferCompletionRing{slots: make([]retainedMediaBufferCompletion, MediaBufferCompletionCapacity)}
 }
-func (r *mediaBufferCompletionRing) expire(now time.Time) {
-	cutoff := now.Add(-mediaBufferRecentAge)
-	for r.count > 0 {
-		x := r.slots[r.start]
-		if !x.completedAt.Before(cutoff) {
-			break
-		}
-		r.slots[r.start] = retainedMediaBufferCompletion{}
-		r.start = (r.start + 1) % len(r.slots)
-		r.count--
+func (r *mediaBufferCompletionRing) evict(v retainedMediaBufferCompletion) {
+	r.evicted++
+	r.evictedThrough = max(r.evictedThrough, v.sequence)
+	if v.completedAt.After(r.evictedLatestAt) {
+		r.evictedLatestAt = v.completedAt
 	}
+}
+func (r *mediaBufferCompletionRing) expire(now time.Time) {
+	if r.nextExpiry.IsZero() || !now.After(r.nextExpiry) {
+		return
+	}
+	r.nextExpiry = time.Time{}
+	cutoff := now.Add(-mediaBufferRecentAge)
+	// Completion offers can arrive out of completion-time order. Compact all
+	// expired entries, keeping sequence order in the same fixed backing slice.
+	kept := 0
+	for i := 0; i < r.count; i++ {
+		idx := (r.start + i) % len(r.slots)
+		x := r.slots[idx]
+		if x.completedAt.Before(cutoff) {
+			r.evict(x)
+			continue
+		}
+		r.slots[(r.start+kept)%len(r.slots)] = x
+		expires := x.completedAt.Add(mediaBufferRecentAge)
+		if r.nextExpiry.IsZero() || expires.Before(r.nextExpiry) {
+			r.nextExpiry = expires
+		}
+		kept++
+	}
+	for i := kept; i < r.count; i++ {
+		r.slots[(r.start+i)%len(r.slots)] = retainedMediaBufferCompletion{}
+	}
+	r.count = kept
 }
 func (r *mediaBufferCompletionRing) add(now time.Time, v MediaBufferCompletionDTO) {
 	r.expire(now)
@@ -143,33 +229,107 @@ func (r *mediaBufferCompletionRing) add(now time.Time, v MediaBufferCompletionDT
 	if r.next == 0 {
 		r.next++
 	}
+	v.CompletionID = idString(r.next)
 	x := retainedMediaBufferCompletion{sequence: r.next, completedAt: v.CompletedAt, value: v}
+	if v.CompletedAt.Before(now.Add(-mediaBufferRecentAge)) {
+		r.evict(x)
+		return
+	}
+	expires := v.CompletedAt.Add(mediaBufferRecentAge)
+	if r.nextExpiry.IsZero() || expires.Before(r.nextExpiry) {
+		r.nextExpiry = expires
+	}
 	if r.count == len(r.slots) {
+		r.evict(r.slots[r.start])
 		r.slots[r.start] = x
 		r.start = (r.start + 1) % len(r.slots)
 		return
 	}
-	i := (r.start + r.count) % len(r.slots)
-	r.slots[i] = x
+	r.slots[(r.start+r.count)%len(r.slots)] = x
 	r.count++
 }
-func (r *mediaBufferCompletionRing) recent(now time.Time, limit int) []MediaBufferCompletionDTO {
+
+// MediaBufferRecentQuery is evaluated only against the fixed 2,048-entry ring.
+// Before is an exclusive completion sequence; zero means the newest page.
+type MediaBufferRecentQuery struct {
+	Before     uint64
+	From, To   time.Time
+	Outcome    MediaBufferOutcome
+	ErrorsOnly bool
+	Limit      int
+}
+
+var ErrMediaBufferCursorExpired = errors.New("media buffer completion cursor expired")
+var ErrMediaBufferCompletionExpired = errors.New("media buffer completion expired")
+var ErrMediaBufferCompletionNotFound = errors.New("media buffer completion not found")
+
+func (r *mediaBufferCompletionRing) page(now, started time.Time, q MediaBufferRecentQuery) (MediaBufferRecentPage, error) {
 	r.expire(now)
+	p := MediaBufferRecentPage{Items: []MediaBufferCompletionDTO{}, StartedAt: started, AvailableFrom: now.Add(-mediaBufferRecentAge), Capacity: len(r.slots), RetainedCount: r.count, EvictedCount: r.evicted, RetentionSeconds: int64(mediaBufferRecentAge / time.Second)}
+	if p.AvailableFrom.Before(started) {
+		p.AvailableFrom = started
+	}
+	if p.AvailableFrom.Before(r.evictedLatestAt) {
+		p.AvailableFrom = r.evictedLatestAt
+	}
+	for i := 0; i < r.count; i++ {
+		at := r.slots[(r.start+i)%len(r.slots)].completedAt
+		if p.OldestRetainedAt == nil || at.Before(*p.OldestRetainedAt) {
+			t := at
+			p.OldestRetainedAt = &t
+		}
+	}
+	if q.Before != 0 && (q.Before > r.next || q.Before <= r.evictedThrough) {
+		return p, ErrMediaBufferCursorExpired
+	}
+	limit := q.Limit
 	if limit <= 0 {
 		limit = 50
 	}
 	if limit > 200 {
 		limit = 200
 	}
-	if limit > r.count {
-		limit = r.count
+	p.Items = make([]MediaBufferCompletionDTO, 0, min(limit, r.count))
+	for i := r.count - 1; i >= 0; i-- {
+		x := r.slots[(r.start+i)%len(r.slots)]
+		if q.Before != 0 && x.sequence >= q.Before {
+			continue
+		}
+		if !q.From.IsZero() && x.completedAt.Before(q.From) {
+			continue
+		}
+		if !q.To.IsZero() && x.completedAt.After(q.To) {
+			continue
+		}
+		if q.Outcome != "" && x.value.Outcome != q.Outcome {
+			continue
+		}
+		if q.ErrorsOnly && !x.value.InvariantObserved && (x.value.Outcome == OutcomeSuccess || x.value.Outcome == OutcomeCanceled) {
+			continue
+		}
+		if len(p.Items) == limit {
+			p.HasMore = true
+			break
+		}
+		p.Items = append(p.Items, x.value)
 	}
-	out := make([]MediaBufferCompletionDTO, 0, limit)
-	for i := 0; i < limit; i++ {
-		idx := (r.start + r.count - 1 - i) % len(r.slots)
-		out = append(out, r.slots[idx].value)
+	if p.HasMore {
+		p.NextCursor = p.Items[len(p.Items)-1].CompletionID
 	}
-	return out
+	return p, nil
+}
+func (r *mediaBufferCompletionRing) detail(now time.Time, id uint64) (MediaBufferCompletionDTO, error) {
+	r.expire(now)
+	for i := 0; i < r.count; i++ {
+		x := r.slots[(r.start+i)%len(r.slots)]
+		if x.sequence == id {
+			return x.value, nil
+		}
+	}
+	if id > 0 && id <= r.next {
+		return MediaBufferCompletionDTO{}, ErrMediaBufferCompletionExpired
+	}
+	return MediaBufferCompletionDTO{}, ErrMediaBufferCompletionNotFound
 }
 
 // SetMediaBufferProvider installs the controller's O(1) snapshot callback.
@@ -253,7 +413,7 @@ func (r *Registry) SampleMediaBufferOnce(at time.Time) bool {
 }
 
 func (r *Registry) drainMediaBufferCompletions(now time.Time) {
-	for {
+	for i := 0; i < MediaBufferCompletionCapacity; i++ {
 		c, ok := r.mediaBufferLive.TryCompletion()
 		if !ok {
 			break
@@ -379,7 +539,7 @@ func (r *Registry) MediaBufferSeries(window SeriesWindow) MediaBufferSeries {
 	window = ParseSeriesWindow(string(window))
 	r.mediaMu.Lock()
 	defer r.mediaMu.Unlock()
-	out := MediaBufferSeries{BootID: r.bootID, Window: string(window), Interval: "1m"}
+	out := MediaBufferSeries{BootID: r.bootID, StartedAt: r.started, Window: string(window), Interval: "1m"}
 	now := r.now()
 	switch window {
 	case Window1h:
@@ -391,6 +551,13 @@ func (r *Registry) MediaBufferSeries(window SeriesWindow) MediaBufferSeries {
 	default:
 		out.Interval = "1s"
 		out.Points = r.mediaSec.series(now, series15mSec)
+	}
+	for _, point := range out.Points {
+		if point.Present {
+			t := point.T
+			out.AvailableFrom = &t
+			break
+		}
 	}
 	return out
 }
@@ -436,16 +603,37 @@ func (r *Registry) MediaBufferStreamDetail(streamID uint64) (MediaBufferStream, 
 	}
 	return mediaBufferStreamDTO(r.bootID, s, bytesRead, bytesWritten, r.now(), r.started), true
 }
-func (r *Registry) MediaBufferRecent(limit int) MediaBufferRecentPage {
+func (r *Registry) MediaBufferStartedAt() time.Time {
 	if r == nil {
-		return MediaBufferRecentPage{}
+		return time.Time{}
+	}
+	return r.started
+}
+func (r *Registry) MediaBufferRecent(limit int) MediaBufferRecentPage {
+	p, _ := r.MediaBufferRecentPage(MediaBufferRecentQuery{Limit: limit})
+	return p
+}
+func (r *Registry) MediaBufferRecentPage(q MediaBufferRecentQuery) (MediaBufferRecentPage, error) {
+	if r == nil {
+		return MediaBufferRecentPage{}, nil
 	}
 	now := r.now()
 	r.drainMediaBufferCompletions(now)
 	r.mediaMu.Lock()
-	items := r.mediaRecent.recent(now, limit)
+	p, err := r.mediaRecent.page(now, r.started, q)
 	r.mediaMu.Unlock()
-	return MediaBufferRecentPage{BootID: r.bootID, Items: items}
+	p.BootID = r.bootID
+	return p, err
+}
+func (r *Registry) MediaBufferCompletionDetail(id uint64) (MediaBufferCompletionDTO, error) {
+	if r == nil {
+		return MediaBufferCompletionDTO{}, ErrMediaBufferCompletionNotFound
+	}
+	now := r.now()
+	r.drainMediaBufferCompletions(now)
+	r.mediaMu.Lock()
+	defer r.mediaMu.Unlock()
+	return r.mediaRecent.detail(now, id)
 }
 
 func completionDTO(boot string, c MediaBufferCompletion, now time.Time) MediaBufferCompletionDTO {

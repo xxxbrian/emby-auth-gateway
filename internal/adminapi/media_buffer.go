@@ -3,6 +3,7 @@ package adminapi
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -247,17 +248,143 @@ func (s *Server) handleMediaBufferSeries(e *core.RequestEvent) error {
 	return writeBoundedJSON(e, http.StatusOK, s.cfg.Telemetry.MediaBufferSeries(window))
 }
 
+// handleMediaBufferAggregate keeps current polling independent of traffic history.
+func (s *Server) handleMediaBufferAggregate(e *core.RequestEvent) error {
+	boot, _, err := s.mediaBufferReady(e)
+	if err != nil {
+		return err
+	}
+	var started time.Time
+	if s.cfg.Telemetry != nil {
+		started = s.cfg.Telemetry.MediaBufferStartedAt()
+	}
+	return writeBoundedJSON(e, http.StatusOK, map[string]any{"boot_id": boot, "now": time.Now().UTC(), "started_at": started, "media_buffer": s.mediaBufferAggregate()})
+}
+
+type mediaBufferRecentCursor struct {
+	BootID   string    `json:"boot_id"`
+	Sequence uint64    `json:"sequence"`
+	From     time.Time `json:"from"`
+	To       time.Time `json:"to"`
+	Outcome  string    `json:"outcome"`
+}
+
+func encodeMediaBufferRecentCursor(c mediaBufferRecentCursor) string {
+	b, _ := json.Marshal(c)
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+func decodeMediaBufferRecentCursor(raw string) (mediaBufferRecentCursor, bool) {
+	var c mediaBufferRecentCursor
+	if len(raw) > 1024 {
+		return c, false
+	}
+	b, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return c, false
+	}
+	if json.Unmarshal(b, &c) != nil || c.BootID == "" || c.Sequence == 0 || c.From.IsZero() || c.To.IsZero() || c.From.After(c.To) || c.To.Sub(c.From) > 24*time.Hour {
+		return c, false
+	}
+	if c.Outcome != "" && c.Outcome != "errors" && !telemetry.MediaBufferOutcome(c.Outcome).Valid() {
+		return c, false
+	}
+	return c, true
+}
 func (s *Server) handleMediaBufferRecent(e *core.RequestEvent) error {
-	limit, err := parseMediaBufferLimit(e.Request.URL.Query().Get("limit"))
+	values := e.Request.URL.Query()
+	limit, err := parseMediaBufferLimit(values.Get("limit"))
 	if err != nil {
 		return mediaBufferError(e, http.StatusBadRequest, "invalid_limit", "limit must be between 1 and 200")
+	}
+	var cursor mediaBufferRecentCursor
+	rawCursor := values.Get("cursor")
+	if rawCursor != "" {
+		var ok bool
+		cursor, ok = decodeMediaBufferRecentCursor(rawCursor)
+		if !ok {
+			return mediaBufferError(e, http.StatusBadRequest, "invalid_cursor", "invalid completion cursor")
+		}
+	}
+	to := time.Now().UTC()
+	if rawCursor != "" {
+		to = cursor.To
+	}
+	if v := values.Get("to"); v != "" {
+		to, err = time.Parse(time.RFC3339Nano, v)
+		if err != nil {
+			return mediaBufferError(e, http.StatusBadRequest, "invalid_window", "to must be RFC3339")
+		}
+	}
+	from := to.Add(-24 * time.Hour)
+	if rawCursor != "" {
+		from = cursor.From
+	}
+	if v := values.Get("from"); v != "" {
+		from, err = time.Parse(time.RFC3339Nano, v)
+		if err != nil {
+			return mediaBufferError(e, http.StatusBadRequest, "invalid_window", "from must be RFC3339")
+		}
+	}
+	if from.After(to) || to.Sub(from) > 24*time.Hour {
+		return mediaBufferError(e, http.StatusBadRequest, "invalid_window", "time window must be at most 24 hours")
+	}
+	outcome := values.Get("outcome")
+	if rawCursor != "" && !values.Has("outcome") {
+		outcome = cursor.Outcome
+	}
+	if outcome != "" && outcome != "errors" && !telemetry.MediaBufferOutcome(outcome).Valid() {
+		return mediaBufferError(e, http.StatusBadRequest, "invalid_outcome", "unknown completion outcome")
+	}
+	if rawCursor != "" && (!from.Equal(cursor.From) || !to.Equal(cursor.To) || outcome != cursor.Outcome) {
+		return mediaBufferError(e, http.StatusBadRequest, "invalid_cursor", "cursor filters differ from request")
 	}
 	boot, state, err := s.mediaBufferReady(e)
 	if err != nil {
 		return err
 	}
-	if state < 0 || s.cfg.Telemetry == nil {
-		return writeBoundedJSON(e, http.StatusOK, telemetry.MediaBufferRecentPage{BootID: boot, Items: []telemetry.MediaBufferCompletionDTO{}})
+	if rawCursor != "" && cursor.BootID != boot {
+		return mediaBufferError(e, http.StatusConflict, "stale_cursor", "cursor belongs to another boot")
 	}
-	return writeBoundedJSON(e, http.StatusOK, s.cfg.Telemetry.MediaBufferRecent(limit))
+	if state < 0 || s.cfg.Telemetry == nil {
+		return writeBoundedJSON(e, http.StatusOK, telemetry.MediaBufferRecentPage{BootID: boot, Items: []telemetry.MediaBufferCompletionDTO{}, Capacity: telemetry.MediaBufferCompletionCapacity, RetentionSeconds: 86400})
+	}
+	q := telemetry.MediaBufferRecentQuery{Before: cursor.Sequence, From: from, To: to, Limit: limit, ErrorsOnly: outcome == "errors"}
+	if !q.ErrorsOnly {
+		q.Outcome = telemetry.MediaBufferOutcome(outcome)
+	}
+	page, err := s.cfg.Telemetry.MediaBufferRecentPage(q)
+	if errors.Is(err, telemetry.ErrMediaBufferCursorExpired) {
+		return mediaBufferError(e, http.StatusGone, "expired_cursor", "completion history has expired; reload the newest page")
+	}
+	if err != nil {
+		return mediaBufferError(e, http.StatusInternalServerError, "history_unavailable", "completion history unavailable")
+	}
+	if page.HasMore {
+		page.NextCursor = encodeMediaBufferRecentCursor(mediaBufferRecentCursor{BootID: boot, Sequence: mustUint(page.NextCursor), From: from, To: to, Outcome: outcome})
+	}
+	return writeBoundedJSON(e, http.StatusOK, page)
+}
+func (s *Server) handleMediaBufferRecentDetail(e *core.RequestEvent) error {
+	id, err := strconv.ParseUint(e.Request.PathValue("completion_id"), 10, 64)
+	if err != nil || id == 0 {
+		return mediaBufferError(e, http.StatusBadRequest, "invalid_completion_id", "completion_id must be an unsigned decimal")
+	}
+	boot, state, err := s.mediaBufferReady(e)
+	if err != nil {
+		return err
+	}
+	if requested := e.Request.URL.Query().Get("boot_id"); requested != "" && requested != boot {
+		return mediaBufferError(e, http.StatusConflict, "stale_boot", "boot_id is stale")
+	}
+	if state < 0 || s.cfg.Telemetry == nil {
+		return writeBoundedJSON(e, http.StatusOK, map[string]any{"boot_id": boot, "item": nil})
+	}
+	item, err := s.cfg.Telemetry.MediaBufferCompletionDetail(id)
+	if errors.Is(err, telemetry.ErrMediaBufferCompletionExpired) {
+		return mediaBufferError(e, http.StatusGone, "completion_expired", "completion is no longer retained")
+	}
+	if err != nil {
+		return mediaBufferError(e, http.StatusNotFound, "completion_not_found", "completion not found")
+	}
+	return writeBoundedJSON(e, http.StatusOK, map[string]any{"boot_id": boot, "item": item})
 }

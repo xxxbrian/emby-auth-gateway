@@ -12,14 +12,13 @@ copy correctness, configuration, rollout, and rollback.
 This ADR uses RFC 2119 meanings for normative `MUST`, `MUST NOT`, `SHOULD`, and
 `MAY` terms.
 
-## September 2026 media catalog references
+## September 2026 Admin visibility extension
 
-Live and completed media references may carry a nullable `source_ref`, an
-opaque, bounded digest of the captured server and backend-user identity.
-Capture happens before I/O; ordinary token refresh preserves it. The reference
-contains no URL or credential and is used only by independent Admin metadata
-reads. It never changes buffering or infers stream identity. Unknown legacy
-sources remain unknown; serialization applies the existing identity sanitation.
+The accepted contract is extended narrowly with a captured, credential-free
+`source_ref` on media references, a current-only aggregate endpoint, completion
+history browsing, and independent minute peaks. This extension changes no
+buffering mechanics, copy-loop operations, outcome precedence, or cleanup path.
+All fixed capacities and response-size limits below remain mandatory.
 
 ## Decision Summary
 
@@ -164,6 +163,14 @@ as unsigned base-10 JSON strings. The stable stream identity is exactly:
 `stream_id` MUST be monotonic and never reused during a boot. A new boot MUST
 never be inferred to continue an old stream or transfer.
 
+Each live/completed media reference MAY additionally carry a nullable
+`source_ref`: an opaque, bounded digest of the captured upstream server and
+backend-user identity. It MUST be captured before I/O with the request identity,
+remain stable across ordinary token refresh, and contain no URL or credential.
+It is used only by independent Admin metadata reads, never to infer a stream
+identity or influence copying. Missing source evidence MUST NOT be filled from
+a newly configured upstream. DTO serialization sanitizes it again.
+
 At the pre-I/O lifecycle boundary, registration MUST capture every immutable
 bounded identity field except `transfer_id`. It MUST append the stream to the
 live registry before I/O, as specified below. Existing server orchestration MUST
@@ -175,7 +182,7 @@ atomic/CAS bind MUST write `transfer_id` before counted I/O and before header
 commitment. The transfer handle MUST retain that identity until
 `TransferHandle.End`.
 
-The authoritative transfer DTO carries only the nullable identity linkage:
+The authoritative transfer DTO carries only this nullable buffer identity linkage:
 
 ```text
 media_buffer: { boot_id, stream_id }
@@ -541,6 +548,7 @@ The active stream DTO MUST contain only these operator-actionable fields:
 | `username` | string or null | Sanitized known gateway username. |
 | `device` | string or null | Sanitized known device. |
 | `item_id` | string or null | Sanitized known Emby item ID. |
+| `source_ref` | string or null | Captured opaque upstream catalog identity. |
 | `media_mode` | required enum | `direct`, `hls`, `range`, or `unknown`. |
 | `state` | required enum | Lifecycle state. |
 | `producer_state` | required enum | Producer state. |
@@ -579,6 +587,8 @@ The completed summary contract is exactly:
 | `transfer_id` | string or null | Direct boot-scoped transfer ID. |
 | `user_id`, `username`, `device` | string or null | Capture-sanitized identity. |
 | `item_id` | string or null | Capture-sanitized Emby item ID. |
+| `source_ref` | string or null | Captured opaque upstream catalog identity. |
+| `completion_id` | required unsigned decimal string | Boot-scoped retention sequence, assigned after offer. |
 | `media_mode` | required enum | Final known media mode. |
 | `final_state` | required enum | `closing`. |
 | `final_producer_state` | required enum | `done` after producer join. |
@@ -650,8 +660,14 @@ Completion ordering MUST be:
 
 The media gate MUST always be released by the existing copy cleanup path even if
 the completion ring is full or unavailable. Completion retention is in memory,
-bounded to 2,048 entries or 15 minutes, whichever is reached first, and resets
-on boot. Eviction is deterministic by completion sequence.
+bounded to 2,048 entries or 24 hours, whichever is reached first, and resets
+on boot. Capacity eviction is deterministic by completion sequence. Age expiry
+uses completion timestamps and handles out-of-order offers with bounded in-place
+compaction on the sampler/API side; it never runs on the media path. Accepted
+records receive a monotonic boot-scoped `completion_id` at retention, distinct
+from `stream_id`. Eviction counts are distinct from terminal-offer drops.
+Each drain handles at most 2,048 offers, even if concurrent producers refill the
+queue. Retention checks skip scans until the earliest retained expiry is due.
 
 Registration and the terminal nonblocking completion offer are the only two
 request-lifecycle observer interactions on the request path. Neither appears in
@@ -719,13 +735,14 @@ are bucket starts, points are oldest first, and a point is emitted only from the
 latest complete gauge cycle in that bucket. A bucket without a complete cycle is
 an explicit `present=false` gap. There is no carry-forward.
 
-Each historical point has exactly this shape:
+Each historical point has this bounded shape:
 
 ```text
 t: RFC3339Nano UTC bucket-start timestamp
 present: boolean
 domains: { pool: "coherent", sidecar: "eventual" } or null for a gap
 aggregate: exact aggregate media-buffer object or null for a gap
+peaks: independent minute maxima (omitted for second buckets and gaps)
 ```
 
 For `present=true`, `aggregate` includes health, health reasons, queued/writing,
@@ -739,6 +756,15 @@ eventual values from the latest complete cycle's anchored subset. For
 `present=false`, `domains`
 and `aggregate` are null and no zero value is presented as observed data.
 
+Minute `peaks` contain maximum observed health severity, active requests,
+each of the five sustained alert-condition counts, and warning/critical
+stream counts across committed cycles. They preserve short faults without
+replacing the latest aggregate snapshot. Maxima MUST NOT be added together or
+presented as a simultaneous pool composition. New buckets reset peaks, and gaps
+never receive carry-forward peaks. A series additionally reports process
+`started_at` and nullable `available_from` for its first actual present bucket.
+The maximal 1,440-point response, including peaks, remains below 2 MiB.
+
 ## API And Error Contract
 
 All new routes remain under the existing superuser-authenticated Admin API and
@@ -749,6 +775,10 @@ retain session, CSRF, same-origin, and rate-limit behavior.
 `/admin/api/v1/overview` and `/admin/api/v1/metrics/stream` remain aggregate-only.
 They MUST use the exact aggregate contract above and MUST NOT contain stream IDs,
 labels, completions, or per-stream history.
+
+`GET /admin/api/v1/media-buffer` returns only `boot_id`, `now`, `started_at`,
+and `media_buffer` for frequent current polling, without unrelated traffic
+series. It uses the same provider/disabled status behavior.
 
 ### Active stream list
 
@@ -812,7 +842,8 @@ performs an inferred join.
 
 ```text
 GET /admin/api/v1/media-buffer/series?window=15m|1h|6h|24h
-GET /admin/api/v1/media-buffer/recent?limit=50
+GET /admin/api/v1/media-buffer/recent?limit=50&from=<RFC3339>&to=<RFC3339>&outcome=<enum|errors>&cursor=<opaque>
+GET /admin/api/v1/media-buffer/recent/{completion_id}?boot_id=<boot>
 ```
 
 Unknown or absent window uses the existing 15m default. Series returns boot ID,
@@ -820,9 +851,29 @@ normalized window, interval, and bounded points. Recent defaults to 50 and caps
 at 200, ordered by descending completion sequence. Both use the provider status
 rules above, including disabled 200 empty and absent-provider 503.
 
+Recent filters are evaluated against at most the fixed 2,048 retained records
+before pagination. `from`/`to` select at most 24 hours, defaulting to the latest
+24 hours; `errors` excludes ordinary success/cancellation but includes secondary
+invariants. A cursor freezes boot, exclusive completion sequence, and filters;
+new completions cannot repeat prior pages. Explicit mismatched filters and
+malformed cursors return 400 `invalid_cursor`, old boot returns 409
+`stale_cursor`, and an evicted cursor returns 410 `expired_cursor`. The response
+adds `next_cursor`, `has_more`, `started_at`, `available_from`, nullable
+`oldest_retained_at`, `capacity`, `retained_count`, `evicted_count`, and
+`retention_seconds`. `available_from` is the conservative retention floor from
+process start, age cutoff, and latest evicted completion time; the actual oldest
+retained timestamp is reported separately. This is coverage information, not a
+promise of a complete ledger: terminal-offer drops remain possible.
+
+Direct completion detail scans only the fixed retained ring and returns
+`{boot_id,item}`. Invalid IDs return 400 `invalid_completion_id`; old boot returns
+409 `stale_boot`; a once-assigned but expired ID returns 410
+`completion_expired`; an unknown ID returns 404 `completion_not_found`. It does
+not join historical identity by timestamp, path, or another registry.
+
 ### Transfer linkage
 
-The existing active Transfer DTO adds only nullable `media_buffer: {boot_id,
+The existing active Transfer DTO adds nullable `media_buffer: {boot_id,
 stream_id}`. Admin obtains transfer and stream details through independent
 bounded copies and enriches the Activity view after releasing all source locks.
 The transfer DTO does not expose buffer allocation, health, user, item, or queue

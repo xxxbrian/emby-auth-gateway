@@ -185,6 +185,7 @@ type MediaBufferCompletionDTO struct {
 	Device                 *string                  `json:"device"`
 	ItemID                 *string                  `json:"item_id"`
 	SourceRef              *string                  `json:"source_ref"`
+	CompletionID           string                   `json:"completion_id"`
 	MediaMode              MediaBufferMediaMode     `json:"media_mode"`
 	FinalState             MediaBufferLifecycleName `json:"final_state"`
 	FinalProducerState     MediaBufferProducerName  `json:"final_producer_state"`
@@ -212,8 +213,17 @@ type MediaBufferLivePageDTO struct {
 	ObservationCompleteness MediaBufferObservation `json:"observation_completeness"`
 }
 type MediaBufferRecentPage struct {
-	BootID string                     `json:"boot_id"`
-	Items  []MediaBufferCompletionDTO `json:"items"`
+	BootID           string                     `json:"boot_id"`
+	Items            []MediaBufferCompletionDTO `json:"items"`
+	NextCursor       string                     `json:"next_cursor"`
+	HasMore          bool                       `json:"has_more"`
+	StartedAt        time.Time                  `json:"started_at"`
+	AvailableFrom    time.Time                  `json:"available_from"`
+	OldestRetainedAt *time.Time                 `json:"oldest_retained_at"`
+	Capacity         int                        `json:"capacity"`
+	RetainedCount    int                        `json:"retained_count"`
+	EvictedCount     uint64                     `json:"evicted_count"`
+	RetentionSeconds int64                      `json:"retention_seconds"`
 }
 
 // MediaBufferControllerSnapshot is the narrow, O(1) provider contract. The
