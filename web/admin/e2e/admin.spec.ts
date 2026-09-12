@@ -421,6 +421,8 @@ test.describe('Buffer mocked API integration', () => {
     observed_active_requests: 2,
     unobserved_active_requests: 0,
     base_only_requests: 0,
+    indebted_requests: 0,
+    buffer_acquire_count: 0,
     warning_streams: 0,
     critical_streams: 0,
     pool_contention_count: 0,
@@ -442,9 +444,10 @@ test.describe('Buffer mocked API integration', () => {
     item_id: 'item-555',
     media_mode: 'direct',
     state: 'active',
-    producer_state: 'writing',
-    consumer_state: 'reading',
+    producer_state: 'reading_optional',
+    consumer_state: 'writing',
     wait_condition: 'none',
+    wait_started_at: null,
     wait_duration_ms: 0,
     health: 'healthy',
     health_reasons: [],
@@ -461,6 +464,26 @@ test.describe('Buffer mocked API integration', () => {
     age_ms: 120000,
   };
 
+  const mockCompletion = {
+    completion_id: 'completion-1', stream_id: 'comp-1', boot_id: 'boot-abc-123', username: 'dave', user_id: 'u4',
+    item_id: 'movie-long-name-test', device: 'Roku', media_mode: 'direct', outcome: 'success',
+    final_state: 'closing', final_producer_state: 'done', final_consumer_state: 'done', final_allocation_blocker: 'none',
+    started_at: '2026-07-19T19:00:00Z', completed_at: '2026-07-19T21:00:00Z', duration_ms: 7200000,
+    bytes_read: 52428800, bytes_written: 52428800, peak_owned_bytes: 67108864, peak_debt_bytes: 0,
+    peak_queued_bytes: 1048576, peak_writing_bytes: 524288, transfer_id: 'xfer-comp-1', invariant_observed: false,
+    waits_ms: Object.fromEntries(['buffer_acquire', 'pool_contention', 'consumer_starvation', 'upstream_stall', 'downstream_stall', 'close_join_stall'].map(key => [key, { total: 0, max: 0 }])),
+  };
+  const recentCoverage = { capacity: 2048, retained_count: 0, evicted_count: 0, retention_seconds: 86400,
+    available_from: null, oldest_retained_at: null, started_at: '2026-07-19T19:00:00Z', next_cursor: null, has_more: false };
+
+  // Detail reads now continue while a stream is expanded. Register defaults
+  // before each test's overrides, so stale-boot and direct-link cases retain
+  // their own exact responses.
+  test.beforeEach(async ({ page }) => {
+    await page.route('**/admin/api/v1/media-buffer/streams/*', route => route.fulfill({ json: { boot_id: 'boot-abc-123', item: mockStream } }));
+    await page.route('**/admin/api/v1/media-buffer/recent/*', route => route.fulfill({ json: { boot_id: 'boot-abc-123', item: mockCompletion } }));
+  });
+
   async function mockAuthAndLogin(page: Page) {
     // Catch-all for admin API endpoints to prevent 401 session invalidation.
     // Must be registered FIRST so specific route mocks (registered by tests) take priority.
@@ -476,12 +499,14 @@ test.describe('Buffer mocked API integration', () => {
         }});
       } else if (url.includes('/overview')) {
         await route.fulfill({ json: { upstream: null, media_buffer: null }});
+      } else if (new URL(url).pathname === '/admin/api/v1/media-buffer') {
+        await route.fulfill({ json: { boot_id: 'boot-abc-123', now: '2026-07-19T21:00:00Z', started_at: '2026-07-19T19:00:00Z', media_buffer: mockAggregate }});
       } else if (url.includes('/media-buffer/streams') && !url.includes('streams/')) {
         await route.fulfill({ json: { boot_id: 'mock', items: [], next_cursor: null, has_more: false, observation_completeness: 'complete' }});
       } else if (url.includes('/media-buffer/series')) {
         await route.fulfill({ json: { boot_id: 'mock', window: '15m', interval: '1s', points: [] }});
       } else if (url.includes('/media-buffer/recent')) {
-        await route.fulfill({ json: { boot_id: 'mock', items: [] }});
+        await route.fulfill({ json: { boot_id: 'mock', items: [], ...recentCoverage }});
       } else if (url.includes('/activity/')) {
         await route.fulfill({ json: { items: [] }});
       } else {
@@ -525,6 +550,12 @@ test.describe('Buffer mocked API integration', () => {
       }});
     });
 
+    // Buffer current state has its own lightweight endpoint; the Overview
+    // response remains separately mocked for the initial navigation.
+    await page.route('**/admin/api/v1/media-buffer', async route => {
+      await route.fulfill({ json: { boot_id: 'boot-abc-123', now: '2026-07-19T21:00:00Z', started_at: '2026-07-19T19:00:00Z', media_buffer: mockAggregate } });
+    });
+
     // Mock streams list
     await page.route('**/admin/api/v1/media-buffer/streams?*', async (route) => {
       const url = new URL(route.request().url());
@@ -552,22 +583,23 @@ test.describe('Buffer mocked API integration', () => {
     await page.route('**/admin/api/v1/media-buffer/series*', async (route) => {
       await route.fulfill({ json: {
         boot_id: 'boot-abc-123',
-        window: '15m',
-        interval: '1s',
+        window: new URL(route.request().url()).searchParams.get('window') || '24h',
+        interval: '1m',
         points: [
           { t: '2026-07-19T20:00:00Z', present: true, domains: { pool: 'coherent', sidecar: 'eventual' }, aggregate: mockAggregate },
-          { t: '2026-07-19T20:00:01Z', present: true, domains: { pool: 'coherent', sidecar: 'eventual' }, aggregate: mockAggregate },
-          { t: '2026-07-19T20:00:02Z', present: false, domains: null, aggregate: null },
-          { t: '2026-07-19T20:00:03Z', present: true, domains: { pool: 'coherent', sidecar: 'eventual' }, aggregate: mockAggregate },
+          { t: '2026-07-19T20:01:00Z', present: true, domains: { pool: 'coherent', sidecar: 'eventual' }, aggregate: mockAggregate },
+          { t: '2026-07-19T20:02:00Z', present: false, domains: null, aggregate: null },
+          { t: '2026-07-19T20:03:00Z', present: true, domains: { pool: 'coherent', sidecar: 'eventual' }, aggregate: mockAggregate },
         ],
       }});
     });
 
     // Mock recent completions
-    await page.route('**/admin/api/v1/media-buffer/recent*', async (route) => {
+    await page.route('**/admin/api/v1/media-buffer/recent?*', async (route) => {
       await route.fulfill({ json: {
         boot_id: 'boot-abc-123',
         items: [],
+        ...recentCoverage,
       }});
     });
 
@@ -603,6 +635,8 @@ test.describe('Buffer mocked API integration', () => {
     // Stream should be expanded
     const detail = page.locator('#detail-42');
     await expect(detail).toBeVisible();
+    await expect(detail.locator('.pipeline')).toBeVisible();
+    await detail.locator('summary').click();
     await expect(detail).toContainText('alice');
     await expect(detail).toContainText('xfer-99');
   });
@@ -620,19 +654,20 @@ test.describe('Buffer mocked API integration', () => {
     await expect(page.getByRole('heading', { name: 'Buffer', exact: true })).toBeVisible();
     await page.waitForTimeout(2000);
 
-    const banner = page.locator('.info-banner');
+    const banner = page.locator('.info-banner').filter({ hasText: 'Gateway restarted' });
     await expect(banner).toBeVisible();
     await expect(banner).toContainText('Gateway restarted');
   });
 
-  test('cursor Load more requests next_cursor and appends', async ({ page }) => {
+  test('cursor Next page requests next_cursor and preserves the selected page', async ({ page }) => {
+    await page.clock.install();
     await loginAndMockBufferAPIs(page);
     await page.getByRole('link', { name: 'Buffer', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Buffer', exact: true })).toBeVisible();
     await page.waitForTimeout(2000);
 
-    // Should show "Load more" since has_more=true
-    const loadMore = page.getByRole('button', { name: /Load more/i });
+    // Each bounded page remains selected during the next automatic refresh.
+    const loadMore = page.getByRole('button', { name: 'Next page', exact: true });
     await expect(loadMore).toBeVisible();
     // Filter context shows "1 of 1 loaded"
     await expect(page.getByText('1 of 1 loaded')).toBeVisible();
@@ -640,9 +675,13 @@ test.describe('Buffer mocked API integration', () => {
     await loadMore.click();
     await page.waitForTimeout(1500);
 
-    // After loading page2, filter context shows "2 of 2 loaded"
-    await expect(page.getByText('2 of 2 loaded')).toBeVisible();
-    // Load more should disappear (has_more=false on page2)
+    await expect(page.getByText('bob', { exact: true })).toBeVisible();
+    await expect(page.getByText('alice', { exact: true })).toHaveCount(0);
+    await expect(page.getByText('1 of 1 loaded')).toBeVisible();
+    await page.clock.fastForward(5500);
+    await expect(page.getByText('bob', { exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'First page', exact: true })).toBeVisible();
+    // No further page is available.
     await expect(loadMore).toBeHidden();
   });
 
@@ -652,38 +691,26 @@ test.describe('Buffer mocked API integration', () => {
     await expect(page.getByRole('heading', { name: 'Buffer', exact: true })).toBeVisible();
     await page.waitForTimeout(2000);
 
-    // Charts should render (SVG paths present)
-    const chart = page.locator('.chart').first();
+    // Two SVG subpaths prove the missing sample is not interpolated across.
+    const chart = page.getByRole('figure', { name: 'Optional pool memory', exact: true });
     await expect(chart).toBeVisible();
 
-    // The chart title should mention gaps
-    const title = await chart.getAttribute('title');
-    expect(title).toContain('gap');
+    const path = await chart.locator('path').first().getAttribute('d');
+    expect((path || '').match(/M/g)).toHaveLength(2);
+    const slider = chart.getByRole('slider');
+    await slider.focus(); await page.keyboard.press('End'); await page.keyboard.press('ArrowLeft');
+    await expect(chart.locator('figcaption')).toContainText('Not observed');
   });
 
   test('visual: aggregate cards within viewport at 390px and expand visible', async ({ page }) => {
     await loginAndMockBufferAPIs(page);
 
     // Override recent completions with populated data (last-registered route takes priority)
-    await page.route('**/admin/api/v1/media-buffer/recent*', async (route) => {
+    await page.route('**/admin/api/v1/media-buffer/recent?*', async (route) => {
       await route.fulfill({ json: {
         boot_id: 'boot-abc-123',
-        items: [{
-          stream_id: 'comp-1',
-          boot_id: 'boot-abc-123',
-          username: 'dave',
-          user_id: 'u4',
-          item_id: 'movie-long-name-test',
-          device: 'Roku',
-          media_mode: 'direct',
-          outcome: 'completed',
-          peak_owned_bytes: 67108864,
-          bytes_written: 52428800,
-          duration_ms: 7200000,
-          completed_at: '2026-07-19T21:00:00Z',
-          transfer_id: 'xfer-comp-1',
-          health_reasons: [],
-        }],
+        ...recentCoverage, retained_count: 1, oldest_retained_at: mockCompletion.completed_at,
+        items: [mockCompletion],
       }});
     });
 
@@ -755,13 +782,13 @@ test.describe('Buffer mocked API integration', () => {
 
     // Recent expand button within container
     const recentExpand = page.locator('.recent-table .expand-btn').first();
-    if (await recentExpand.count() > 0) {
-      await expect(recentExpand).toBeVisible();
-      const rBtnBox = await recentExpand.boundingBox();
-      expect(rBtnBox).not.toBeNull();
-      expect(rBtnBox!.x + rBtnBox!.width, 'recent expand right <= container').toBeLessThanOrEqual(recentScroll.rect.left + recentScroll.rect.width + 1);
-      expect(rBtnBox!.x, 'recent expand left >= container').toBeGreaterThanOrEqual(recentScroll.rect.left);
-    }
+    await expect(recentExpand).toBeVisible();
+    const rBtnBox = await recentExpand.boundingBox();
+    expect(rBtnBox).not.toBeNull();
+    expect(rBtnBox!.x + rBtnBox!.width, 'recent expand right <= container').toBeLessThanOrEqual(recentScroll.rect.left + recentScroll.rect.width + 1);
+    expect(rBtnBox!.x, 'recent expand left >= container').toBeGreaterThanOrEqual(recentScroll.rect.left);
+    await recentExpand.click();
+    await expect(page.getByRole('region', { name: 'Completion comp-1 detail' })).toBeVisible();
   });
 
   test('visual: inactive segmented tabs have no accent background', async ({ page }) => {
@@ -849,10 +876,10 @@ test.describe('Buffer mocked API integration', () => {
 
   test('disabled 200 shows distinct disabled notice', async ({ page }) => {
     await mockAuthAndLogin(page);
-    // Override overview AFTER mockAuthAndLogin — last route registered wins in Playwright
-    await page.route('**/admin/api/v1/overview*', async (route) => {
+    // Override only the Buffer aggregate, leaving Overview independently usable.
+    await page.route('**/admin/api/v1/media-buffer', async (route) => {
       await route.fulfill({ json: {
-        upstream: null,
+        boot_id: 'boot-abc-123', now: '2026-07-19T21:00:00Z', started_at: '2026-07-19T19:00:00Z',
         media_buffer: { ...mockAggregate, enabled: false, health: 'disabled' },
       }});
     });
@@ -861,14 +888,13 @@ test.describe('Buffer mocked API integration', () => {
     await expect(page.getByRole('heading', { name: 'Buffer', exact: true })).toBeVisible();
     await page.waitForTimeout(2000);
 
-    await expect(page.locator('.disabled-notice')).toBeVisible();
-    await expect(page.locator('.disabled-notice')).toContainText('not enabled');
+    await expect(page.getByText('Buffer management is not enabled.', { exact: false })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'History · 24h', exact: true })).toBeVisible();
   });
 
   test('provider 503 shows distinct unavailable error', async ({ page }) => {
     await mockAuthAndLogin(page);
-    // Override overview AFTER mockAuthAndLogin
-    await page.route('**/admin/api/v1/overview*', async (route) => {
+    await page.route('**/admin/api/v1/media-buffer', async (route) => {
       await route.fulfill({
         status: 503,
         json: { error: 'provider_unavailable', message: 'Buffer provider unavailable' },
@@ -1000,11 +1026,11 @@ test.describe('Buffer mocked API integration', () => {
     await page.route('**/admin/api/v1/media-buffer/series*', async (route) => {
       await route.fulfill({ json: { boot_id: 'boot-abc-123', window: '15m', interval: '1s', points: [] }});
     });
-    await page.route('**/admin/api/v1/media-buffer/recent*', async (route) => {
-      await route.fulfill({ json: { boot_id: 'boot-abc-123', items: [] }});
+    await page.route('**/admin/api/v1/media-buffer/recent?*', async (route) => {
+      await route.fulfill({ json: { boot_id: 'boot-abc-123', items: [], ...recentCoverage }});
     });
-    await page.route('**/admin/api/v1/overview*', async (route) => {
-      await route.fulfill({ json: { upstream: null, media_buffer: mockAggregate }});
+    await page.route('**/admin/api/v1/media-buffer', async (route) => {
+      await route.fulfill({ json: { boot_id: 'boot-abc-123', now: '2026-07-19T21:00:00Z', started_at: '2026-07-19T19:00:00Z', media_buffer: mockAggregate }});
     });
 
     await page.getByRole('link', { name: 'Activity', exact: true }).click();

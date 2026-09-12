@@ -11,9 +11,11 @@ import type {
     BufferSeriesResponse,
     BufferSeriesPoint,
     ObservationCompleteness,
-    SeriesPoint,
 } from '../lib/types';
-import LineChart from '../lib/LineChart.svelte';
+import TimeSeriesChart from '../lib/TimeSeriesChart.svelte';
+import StreamPipeline from '../lib/StreamPipeline.svelte';
+import MediaItemCell from '../lib/MediaItemCell.svelte';
+import { streamStatus, conditionNames } from '../lib/buffer-display';
 import CapacityBar from '../lib/CapacityBar.svelte';
 
 type BufferTab = 'active' | 'recent';
@@ -30,7 +32,7 @@ let recent = $state<BufferCompletion[]>([]);
 let series = $state<BufferSeriesPoint[]>([]);
 
 let activeTab = $state<BufferTab>('active');
-let timeWindow = $state('15m');
+let timeWindow = $state('24h');
 let expandedStream = $state<string | null>(null);
 let expandedCompletion = $state<string | null>(null);
 let searchFilter = $state('');
@@ -42,6 +44,46 @@ let loading = $state(true);
 let staleAt = $state<number | null>(null);
 let staleTick = $state(0);
 
+let recentPage = $state<BufferRecentResponse | null>(null);
+let seriesMeta = $state<BufferSeriesResponse | null>(null);
+let aggregateTime = $state('');
+let bootStartedAt = $state('');
+let streamRequestCursor = $state('');
+let recentRequestCursor = $state('');
+let outcomeFilter = $state('');
+let recentBounds: { from: string; to: string } | null = null;
+let selectedStream: BufferStream | null = null;
+let selectedCompletion: BufferCompletion | null = null;
+let detailAbort: AbortController | null = null;
+let completionLinkId = $state<string | null>(null);
+let completionLinkBoot = $state<string | null>(null);
+const windowMS: Record<string,number> = { '15m':900_000,'1h':3_600_000,'6h':21_600_000,'24h':86_400_000 };
+function updateQuery(changes: Record<string,string|null>) {
+    const [route,query] = window.location.hash.split('?'); const params = new URLSearchParams(query);
+    for (const [key,value] of Object.entries(changes)) { if(value) params.set(key,value); else params.delete(key); }
+    window.history.replaceState(null,'',`${route || '#/buffer'}${params.size ? `?${params}` : ''}`);
+}
+function chartSeries(key: keyof BufferAggregate, label: string, color: string, peaks = false) {
+    return { label, color, points: series.map(p => ({t:p.t, v:Number((peaks ? p.peaks?.[key] ?? p.aggregate?.[key] : p.aggregate?.[key]) || 0), gap: !p.present || !p.aggregate})) };
+}
+function hashChanged() {
+    const params=new URLSearchParams(window.location.hash.split('?')[1]);
+    const stream=params.get('stream'); const completion=params.get('completion');
+    const currentStream=deepLinkStreamId ? `${deepLinkBootId ? `${deepLinkBootId}:` : ''}${deepLinkStreamId}` : null;
+    const currentCompletion=completionLinkId ? `${completionLinkBoot ? `${completionLinkBoot}:` : ''}${completionLinkId}` : null;
+    if(stream!==currentStream || completion!==currentCompletion) {
+        detailAbort?.abort(); detailAbort=null;
+        deepLinkStreamId=null; deepLinkBootId=null; completionLinkId=null; completionLinkBoot=null;
+        expandedStream=null; expandedCompletion=null; selectedStream=null; selectedCompletion=null;
+        deepLinkError=null; deepLinkNotFound=false; parseDeepLink();
+        if(deepLinkStreamId) resolveDeepLink(); if(completionLinkId) resolveCompletion();
+    }
+}
+function visibilityChange() {
+    if (document.hidden) { abortAll(); return; }
+    fetchAggregate(); fetchSeries();
+    if(activeTab === 'active') { fetchStreams(); resolveDeepLink(); } else { fetchRecent(); resolveCompletion(); }
+}
 // Deep-link support
 let deepLinkStreamId = $state<string | null>(null);
 let deepLinkBootId = $state<string | null>(null);
@@ -62,22 +104,13 @@ let staleTimer: ReturnType<typeof setInterval> | undefined;
 
 // --- Helpers ---
 function parseDeepLink() {
-    const hash = window.location.hash;
-    const match = hash.match(/[?&]stream=([^&]+)/);
-    if (match) {
-        const raw = decodeURIComponent(match[1]);
-        const colonIdx = raw.indexOf(':');
-        if (colonIdx > 0) {
-            deepLinkBootId = raw.substring(0, colonIdx);
-            deepLinkStreamId = raw.substring(colonIdx + 1);
-        } else {
-            deepLinkStreamId = raw;
-        }
-        const cleaned = hash.replace(/[?&]stream=[^&]+/, '').replace(/\?$/, '');
-        if (cleaned !== hash) {
-            window.history.replaceState(null, '', cleaned || '#/buffer');
-        }
-    }
+    const params = new URLSearchParams(window.location.hash.split('?')[1]);
+    const w = params.get('window'); if(w && windowMS[w]) timeWindow=w;
+    const raw = params.get('stream');
+    if(raw) { const split = raw.indexOf(':'); deepLinkBootId = split > 0 ? raw.slice(0,split) : null; deepLinkStreamId=split > 0 ? raw.slice(split+1) : raw; expandedStream=deepLinkStreamId; }
+    const completion = params.get('completion');
+    if(completion) { const split = completion.indexOf(':'); completionLinkBoot=split > 0 ? completion.slice(0,split) : null; completionLinkId=split > 0 ? completion.slice(split+1) : completion; expandedCompletion=completionLinkId; activeTab='recent'; }
+    if(params.get('tab') === 'recent') activeTab='recent';
 }
 
 function fmtBytes(v: number | null | undefined): string {
@@ -124,7 +157,7 @@ function healthClass(h: string | null | undefined): string {
 function healthLabel(h: string | null | undefined): string {
     if (h === 'critical') return 'Critical';
     if (h === 'warning') return 'Warning';
-    if (h === 'healthy') return 'OK';
+    if (h === 'healthy') return 'Healthy';
     if (h === 'idle') return 'Idle';
     if (h === 'disabled') return 'Disabled';
     return 'Unknown';
@@ -132,7 +165,7 @@ function healthLabel(h: string | null | undefined): string {
 
 function outcomeClass(o: string | null | undefined): string {
     if (o === 'success') return 'status-ok';
-    if (o === 'canceled') return 'status-warn';
+    if (o === 'canceled') return 'text-secondary';
     return 'status-err';
 }
 
@@ -155,8 +188,10 @@ function apiErrorMsg(err: unknown): string {
     if (err instanceof ApiError) {
         if (err.code === 'provider_unavailable') return 'Buffer provider unavailable';
         if (err.code === 'stale_boot') return 'Stale boot ID (gateway restarted)';
-        if (err.code === 'stale_cursor') return 'Page expired, refreshing';
-        if (err.code === 'stream_not_found') return 'Stream not found';
+        if (err.code === 'stale_cursor' || err.code === 'expired_cursor') return 'This page expired. Return to the first page.';
+        if (err.code === 'completion_expired') return 'This completion expired from retained history.';
+        if (err.code === 'completion_not_found') return 'Completion not found in retained history.';
+        if (err.code === 'stream_not_found') return 'This stream is no longer active. Check recent completions.';
         return err.message;
     }
     if (err instanceof Error) return err.message;
@@ -165,14 +200,15 @@ function apiErrorMsg(err: unknown): string {
 
 // --- Data fetching with AbortController ---
 async function fetchAggregate() {
-    aggAbort?.abort();
+    if(document.hidden || aggAbort) return;
     const ctrl = new AbortController();
     aggAbort = ctrl;
     try {
-        const data = await apiRequest<{ media_buffer?: BufferAggregate }>(`/overview?window=${timeWindow}`, { signal: ctrl.signal });
+        const data = await apiRequest<{ boot_id: string; now: string; started_at: string; media_buffer?: BufferAggregate }>('/media-buffer', { signal: ctrl.signal });
         if (ctrl.signal.aborted) return;
         if (data.media_buffer) {
             aggregate = data.media_buffer;
+            aggregateTime=data.now; bootStartedAt=data.started_at;
             staleAt = null;
         }
         error = null;
@@ -185,23 +221,22 @@ async function fetchAggregate() {
         } else {
             staleAt = staleAt ?? Date.now();
         }
-    }
+    } finally { if(aggAbort === ctrl) aggAbort = null; }
 }
 
 async function fetchStreams(append = false) {
-    streamsAbort?.abort();
+    if(document.hidden || streamsAbort) return;
+    if(append && streamsCursor) streamRequestCursor=streamsCursor;
     const ctrl = new AbortController();
     streamsAbort = ctrl;
     streamsLoading = true;
-    const cursor = append && streamsCursor ? `&cursor=${encodeURIComponent(streamsCursor)}` : '';
+    const cursor = streamRequestCursor ? `&cursor=${encodeURIComponent(streamRequestCursor)}` : '';
     try {
         const res = await apiRequest<BufferStreamsResponse>(`/media-buffer/streams?limit=50${cursor}`, { signal: ctrl.signal });
         if (ctrl.signal.aborted) return;
-        if (append) {
-            streams = [...streams, ...(res.items || [])];
-        } else {
-            streams = res.items || [];
-        }
+        streams = res.items || [];
+        if (selectedStream && selectedStream.boot_id === res.boot_id && !streams.some(s => s.stream_id === selectedStream!.stream_id)) streams = [selectedStream, ...streams];
+        if (streamsBootId && streamsBootId !== res.boot_id) { selectedStream=null; expandedStream=null; deepLinkError='Gateway restarted; previous stream references may be unavailable.'; }
         streamsBootId = res.boot_id;
         streamsCursor = res.next_cursor;
         streamsHasMore = res.has_more;
@@ -209,74 +244,83 @@ async function fetchStreams(append = false) {
         streamsError = null;
     } catch (err) {
         if ((err as Error).name === 'AbortError') return;
-        if (err instanceof ApiError && err.code === 'stale_cursor') {
-            // Refresh from beginning
-            streamsCursor = null;
-            streamsError = null;
-            streamsLoading = false;
-            await fetchStreams(false);
-            return;
-        }
         streamsError = apiErrorMsg(err);
     } finally {
         streamsLoading = false;
+        if(streamsAbort === ctrl) streamsAbort=null;
     }
 }
 
 async function fetchSeries() {
-    seriesAbort?.abort();
+    if(document.hidden || seriesAbort) return;
     const ctrl = new AbortController();
     seriesAbort = ctrl;
     try {
         const res = await apiRequest<BufferSeriesResponse>(`/media-buffer/series?window=${timeWindow}`, { signal: ctrl.signal });
         if (ctrl.signal.aborted) return;
         series = res.points || [];
+        seriesMeta=res;
         seriesError = null;
     } catch (err) {
         if ((err as Error).name === 'AbortError') return;
         seriesError = apiErrorMsg(err);
-    }
+    } finally { if(seriesAbort === ctrl) seriesAbort=null; }
 }
 
-async function fetchRecent() {
-    recentAbort?.abort();
-    const ctrl = new AbortController();
-    recentAbort = ctrl;
+async function fetchRecent(next = false) {
+    if(document.hidden || recentAbort) return;
+    if(next) recentRequestCursor=recentPage?.next_cursor || '';
+    if(!recentRequestCursor || !recentBounds) { const snapshotTime=Date.now(); recentBounds={from:new Date(snapshotTime-windowMS[timeWindow]).toISOString(),to:new Date(snapshotTime).toISOString()}; }
+    const params = new URLSearchParams({limit:'50',...recentBounds});
+    if(recentRequestCursor) params.set('cursor',recentRequestCursor);
+    if(outcomeFilter) params.set('outcome',outcomeFilter);
+    const ctrl=new AbortController(); recentAbort=ctrl;
     try {
-        const res = await apiRequest<BufferRecentResponse>('/media-buffer/recent?limit=50', { signal: ctrl.signal });
-        if (ctrl.signal.aborted) return;
-        recent = res.items || [];
-        recentError = null;
-    } catch (err) {
-        if ((err as Error).name === 'AbortError') return;
-        recentError = apiErrorMsg(err);
-    }
+        const res=await apiRequest<BufferRecentResponse>(`/media-buffer/recent?${params}`,{signal:ctrl.signal});
+        if(ctrl.signal.aborted) return;
+        recent=res.items || []; recentPage=res; recentError=null;
+        if(selectedCompletion && selectedCompletion.boot_id === res.boot_id && !recent.some(c=>c.completion_id===selectedCompletion!.completion_id)) recent=[selectedCompletion,...recent];
+    } catch(err) { if(!ctrl.signal.aborted) recentError=apiErrorMsg(err); }
+    finally { if(recentAbort===ctrl) recentAbort=null; }
+}
+function resetRecent() { recentAbort?.abort(); recentAbort=null; recentRequestCursor=''; recentBounds=null; selectedCompletion=null; expandedCompletion=null; completionLinkId=null; updateQuery({completion:null}); if(activeTab==='recent') fetchRecent(); }
+function firstStreams() { streamsAbort?.abort(); streamsAbort=null; streamRequestCursor=''; fetchStreams(); }
+async function resolveCompletion() {
+    if(!completionLinkId || detailAbort || document.hidden) return;
+    const ctrl=new AbortController(); detailAbort=ctrl;
+    try {
+        const result=await apiRequest<{boot_id:string;item:BufferCompletion}>(`/media-buffer/recent/${encodeURIComponent(completionLinkId)}${completionLinkBoot ? `?boot_id=${encodeURIComponent(completionLinkBoot)}` : ''}`,{signal:ctrl.signal});
+        if(ctrl.signal.aborted) return;
+        if(!result.item) { selectedCompletion=null; expandedCompletion=null; recentError='No completion details are available for this reference.'; return; }
+        selectedCompletion=result.item; expandedCompletion=completionLinkId;
+        recent=[result.item,...recent.filter(c=>c.completion_id!==result.item.completion_id)]; recentError=null;
+    } catch(err) { if(!ctrl.signal.aborted) recentError=apiErrorMsg(err); }
+    finally { if(detailAbort===ctrl) detailAbort=null; }
 }
 
 /** Resolve deep link via direct detail fetch. */
 async function resolveDeepLink() {
-    if (!deepLinkStreamId) return;
+    if (!deepLinkStreamId || detailAbort || document.hidden) return;
+    const ctrl=new AbortController(); detailAbort=ctrl;
     const bootParam = deepLinkBootId ? `?boot_id=${encodeURIComponent(deepLinkBootId)}` : '';
     try {
-        const res = await apiRequest<BufferStreamDetailResponse>(`/media-buffer/streams/${encodeURIComponent(deepLinkStreamId)}${bootParam}`);
+        const res = await apiRequest<BufferStreamDetailResponse>(`/media-buffer/streams/${encodeURIComponent(deepLinkStreamId)}${bootParam}`, {signal:ctrl.signal});
+        if(ctrl.signal.aborted) return;
         if (res.item) {
-            // Ensure this stream is in our list for expansion
-            const exists = streams.find(s => s.stream_id === res.item!.stream_id);
-            if (!exists) {
-                streams = [res.item, ...streams];
-            }
+            selectedStream=res.item;
+            streams=[res.item,...streams.filter(s=>s.stream_id!==res.item!.stream_id)];
             expandedStream = res.item.stream_id;
-            deepLinkStreamId = null;
-            deepLinkBootId = null;
             deepLinkNotFound = false;
             deepLinkError = null;
         } else {
             deepLinkNotFound = true;
         }
     } catch (err) {
+        if(ctrl.signal.aborted) return;
         if (err instanceof ApiError) {
             if (err.code === 'stream_not_found') {
                 deepLinkNotFound = true;
+                deepLinkError="The selected stream is no longer active. Showing its last available snapshot; check recent completions.";
             } else if (err.code === 'stale_boot') {
                 deepLinkError = 'Gateway restarted since this link was created';
             } else if (err.code === 'provider_unavailable') {
@@ -287,28 +331,30 @@ async function resolveDeepLink() {
         } else {
             deepLinkError = apiErrorMsg(err);
         }
-    }
+    } finally { if(detailAbort===ctrl) detailAbort=null; }
 }
 
 function setWindow(w: string) {
-    timeWindow = w;
-    fetchAggregate();
-    fetchSeries();
+    timeWindow=w; seriesAbort?.abort(); seriesAbort=null; series=[]; seriesMeta=null;
+    try { localStorage.setItem('admin.buffer.window',w); } catch { /* optional preference */ }
+    updateQuery({window:w}); fetchSeries(); resetRecent();
 }
-
-function switchTab(tab: BufferTab) {
-    activeTab = tab;
-    if (tab === 'recent' && recent.length === 0 && !recentError) {
-        fetchRecent();
-    }
+function switchTab(tab: BufferTab) { detailAbort?.abort(); detailAbort=null; activeTab=tab; updateQuery({tab}); if(tab==='recent') { fetchRecent(); resolveCompletion(); } else { fetchStreams(); resolveDeepLink(); } }
+function toggleExpand(id: string) {
+    detailAbort?.abort(); detailAbort=null;
+    completionLinkId=null; completionLinkBoot=null; selectedCompletion=null; expandedCompletion=null;
+    if(expandedStream===id) { expandedStream=null; deepLinkStreamId=null; selectedStream=null; updateQuery({stream:null}); return; }
+    const stream=streams.find(s=>s.stream_id===id); if(!stream) return;
+    selectedStream=stream; expandedStream=id; deepLinkStreamId=id; deepLinkBootId=stream.boot_id; deepLinkError=null;
+    updateQuery({stream:`${stream.boot_id}:${id}`,completion:null}); resolveDeepLink();
 }
-
-function toggleExpand(streamId: string) {
-    expandedStream = expandedStream === streamId ? null : streamId;
-}
-
-function toggleCompletionExpand(streamId: string) {
-    expandedCompletion = expandedCompletion === streamId ? null : streamId;
+function toggleCompletionExpand(id: string) {
+    detailAbort?.abort(); detailAbort=null;
+    deepLinkStreamId=null; deepLinkBootId=null; selectedStream=null; expandedStream=null;
+    if(expandedCompletion===id) { expandedCompletion=null; completionLinkId=null; selectedCompletion=null; updateQuery({completion:null}); return; }
+    const item=recent.find(c=>c.completion_id===id); if(!item) return;
+    selectedCompletion=item; expandedCompletion=id; completionLinkId=id; completionLinkBoot=item.boot_id;
+    updateQuery({completion:`${item.boot_id}:${id}`,stream:null}); resolveCompletion();
 }
 
 function loadMoreStreams() {
@@ -321,7 +367,7 @@ function dismissDeepLink() {
     deepLinkNotFound = false;
     deepLinkStreamId = null;
     deepLinkBootId = null;
-    deepLinkError = null;
+    deepLinkError = null; expandedStream=null; selectedStream=null; updateQuery({stream:null});
 }
 
 function activityBufferLink(bootId: string, streamId: string): string {
@@ -333,58 +379,14 @@ function abortAll() {
     streamsAbort?.abort();
     seriesAbort?.abort();
     recentAbort?.abort();
+    detailAbort?.abort();
+    aggAbort=null; streamsAbort=null; seriesAbort=null; recentAbort=null; detailAbort=null;
 }
-
-// --- Derived ---
-let allocatedSeries = $derived.by((): SeriesPoint[] => {
-    const result: SeriesPoint[] = [];
-    for (const p of series) {
-        if (p.present && p.aggregate) {
-            result.push({ t: p.t, v: p.aggregate.allocated_bytes });
-        } else {
-            result.push({ t: p.t, v: 0, gap: true } as SeriesPoint & { gap: boolean });
-        }
-    }
-    return result;
-});
-let activeSeries = $derived.by((): SeriesPoint[] => {
-    const result: SeriesPoint[] = [];
-    for (const p of series) {
-        if (p.present && p.aggregate) {
-            result.push({ t: p.t, v: p.aggregate.observed_active_requests });
-        } else {
-            result.push({ t: p.t, v: 0, gap: true } as SeriesPoint & { gap: boolean });
-        }
-    }
-    return result;
-});
-let contentionSeries = $derived.by((): SeriesPoint[] => {
-    const result: SeriesPoint[] = [];
-    for (const p of series) {
-        if (p.present && p.aggregate) {
-            result.push({ t: p.t, v: p.aggregate.pool_contention_count + p.aggregate.consumer_starvation_count });
-        } else {
-            result.push({ t: p.t, v: 0, gap: true } as SeriesPoint & { gap: boolean });
-        }
-    }
-    return result;
-});
-let queuedSeries = $derived.by((): SeriesPoint[] => {
-    const result: SeriesPoint[] = [];
-    for (const p of series) {
-        if (p.present && p.aggregate) {
-            result.push({ t: p.t, v: p.aggregate.queued_bytes });
-        } else {
-            result.push({ t: p.t, v: 0, gap: true } as SeriesPoint & { gap: boolean });
-        }
-    }
-    return result;
-});
 
 let filteredStreams = $derived.by(() => {
     if (!searchFilter.trim()) return streams;
     const q = searchFilter.toLowerCase();
-    return streams.filter(s =>
+    return streams.filter(s => s.stream_id === expandedStream ||
         (s.username && s.username.toLowerCase().includes(q)) ||
         (s.item_id && s.item_id.toLowerCase().includes(q)) ||
         (s.device && s.device.toLowerCase().includes(q)) ||
@@ -394,8 +396,9 @@ let filteredStreams = $derived.by(() => {
 
 let staleAgo = $derived.by(() => {
     void staleTick; // subscribe to tick updates
-    if (!staleAt) return null;
-    const sec = Math.floor((Date.now() - staleAt) / 1000);
+    const last=Date.parse(aggregateTime);
+    if (!last || (!staleAt && Date.now()-last < 10_000)) return null;
+    const sec = Math.floor((Date.now() - last) / 1000);
     return `${sec}s ago`;
 });
 
@@ -403,26 +406,32 @@ let isDisabled = $derived(aggregate?.enabled === false);
 let isIdle = $derived(aggregate?.health === 'idle');
 
 onMount(() => {
+    try { const preferred=localStorage.getItem('admin.buffer.window'); if(preferred && windowMS[preferred]) timeWindow=preferred; } catch { /* use default */ }
     parseDeepLink();
     fetchAggregate();
     fetchStreams();
     fetchSeries();
-    fetchRecent();
+    if(activeTab==='recent') fetchRecent();
+    if(completionLinkId) resolveCompletion();
+    document.addEventListener('visibilitychange',visibilityChange);
+    window.addEventListener('hashchange',hashChanged);
 
     // Resolve deep link after initial streams load
     if (deepLinkStreamId) {
         resolveDeepLink();
     }
 
-    aggTimer = setInterval(fetchAggregate, 2000);
-    streamsTimer = setInterval(() => fetchStreams(false), 5000);
+    aggTimer = setInterval(() => { fetchAggregate(); if(activeTab==='active') resolveDeepLink(); }, 2000);
+    streamsTimer = setInterval(() => { if(activeTab==='active') fetchStreams(false); }, 5000);
     seriesTimer = setInterval(fetchSeries, 30000);
-    recentTimer = setInterval(fetchRecent, 10000);
+    recentTimer = setInterval(() => { if(activeTab==='recent') fetchRecent(); }, 10000);
     staleTimer = setInterval(() => { staleTick++; }, 1000);
 });
 
 onDestroy(() => {
     abortAll();
+    document.removeEventListener('visibilitychange',visibilityChange);
+    window.removeEventListener('hashchange',hashChanged);
     if (aggTimer) clearInterval(aggTimer);
     if (streamsTimer) clearInterval(streamsTimer);
     if (seriesTimer) clearInterval(seriesTimer);
@@ -451,9 +460,8 @@ onDestroy(() => {
 
     {#if loading && !aggregate}
         <div class="text-secondary">Loading&hellip;</div>
-    {:else if isDisabled}
-        <div class="disabled-notice text-secondary">Buffer management is not enabled.</div>
     {:else if aggregate}
+        {#if isDisabled}<div class="info-banner mb-4">Buffer management is not enabled. Retained history remains visible below.</div>{/if}
         <!-- Aggregate panel: controller-coherent composition -->
         <div class="panel">
             <div class="panel-note">Controller snapshot (coherent)</div>
@@ -462,7 +470,7 @@ onDestroy(() => {
                     <div class="metric-label">Pool Health</div>
                     <div class="metric-value {healthClass(aggregate.health)}">{healthLabel(aggregate.health)}</div>
                     {#if aggregate.health_reasons.length > 0}
-                        <div class="text-xs text-secondary mt-2">{aggregate.health_reasons.join(' \u00b7 ')}</div>
+                        <div class="text-xs text-secondary mt-2">{aggregate.health_reasons.map(reason => conditionNames[reason] || reason.replaceAll('_', ' ')).join(' · ')}</div>
                     {/if}
                 </div>
                 <div class="metric-box">
@@ -552,38 +560,20 @@ onDestroy(() => {
             {/if}
         {/if}
 
-        <!-- Series charts (sampled history) -->
-        {#if !isIdle}
-            <div class="panel">
-                <div class="metric-label mb-2">History <span class="panel-note">(sampled, 1s cadence; gaps = no committed cycle)</span></div>
-                <div class="data-grid" style="grid-template-columns: repeat(2, 1fr);">
-                    <div class="metric-box">
-                        <div class="metric-label">Allocated</div>
-                        <div class="metric-value mono text-sm">{fmtBytes(aggregate.allocated_bytes)}</div>
-                        <LineChart series={allocatedSeries} color="var(--text-primary)" gapAware={true} />
-                    </div>
-                    <div class="metric-box">
-                        <div class="metric-label">Active Observed</div>
-                        <div class="metric-value mono text-sm">{aggregate.observed_active_requests}</div>
-                        <LineChart series={activeSeries} color="var(--text-primary)" gapAware={true} />
-                    </div>
-                    <div class="metric-box">
-                        <div class="metric-label">Contention + Starvation</div>
-                        <div class="metric-value mono text-sm {(aggregate.pool_contention_count + aggregate.consumer_starvation_count) > 0 ? 'status-warn' : ''}">{aggregate.pool_contention_count + aggregate.consumer_starvation_count}</div>
-                        <LineChart series={contentionSeries} color="var(--warning)" gapAware={true} />
-                    </div>
-                    <div class="metric-box">
-                        <div class="metric-label">Queued</div>
-                        <div class="metric-value mono text-sm">{fmtBytes(aggregate.queued_bytes)}</div>
-                        <LineChart series={queuedSeries} color="var(--text-primary)" gapAware={true} />
-                    </div>
-                </div>
+    {/if}
+        <section class="panel history-panel">
+            <div class="flex items-center justify-between gap-4 mb-4"><div><h2 class="history-heading">History · {timeWindow}</h2><p class="text-xs text-secondary">{seriesMeta?.interval === '1m' ? 'One-minute samples: last committed snapshot; condition charts preserve independent minute peaks.' : 'One-second committed snapshots.'} Gaps mean no observation.</p></div><a class="text-xs" href={`#/traffic?view=errors&window=${timeWindow}`}>Recorded errors ↗</a></div>
+            {#if seriesError}<div class="error-message" role="alert">{seriesError}. {series.length ? 'Showing the last available history.' : ''}</div>{/if}
+            <div class="history-grid">
+                <div><h3>Optional pool memory</h3><TimeSeriesChart label="Optional pool memory" unit="bytes" series={[chartSeries('allocated_bytes','Allocated','#8cb2ff'),chartSeries('owned_bytes','Owned','#64c3b0'),chartSeries('free_bytes','Reusable','#b59beb')]} /></div>
+                <div><h3>Queued and writing</h3><TimeSeriesChart label="Queued and writing bytes" unit="bytes" series={[chartSeries('queued_bytes','Queued','#8cb2ff'),chartSeries('writing_bytes','Writing','#64c3b0')]} /></div>
+                <div><h3>Active requests</h3><TimeSeriesChart label="Active requests" series={[chartSeries('active_requests','Active','#8cb2ff'),chartSeries('observed_active_requests','Observed','#64c3b0')]} /></div>
+                <div><h3>Sustained conditions {seriesMeta?.interval === '1m' ? '· minute peaks' : ''}</h3><TimeSeriesChart label="Sustained stream conditions" series={[chartSeries('upstream_stall_count','Upstream stall','#ed9876',true),chartSeries('downstream_stall_count','Client stall','#bf95ee',true),chartSeries('consumer_starvation_count','Waiting for data','#e1c069',true),chartSeries('pool_contention_count','Pool contention','#70b8e8',true),chartSeries('close_join_stall_count','Close stall','#ed7373',true)]} /></div>
             </div>
-            {#if seriesError}
-                <div class="error-message text-xs">Series: {seriesError}</div>
-            {/if}
-        {/if}
+            <p class="text-xs text-secondary mt-4">Gateway started {fmtTimestamp(seriesMeta?.started_at || bootStartedAt)} · observed history begins {fmtTimestamp(seriesMeta?.available_from)} · {seriesMeta?.interval || '—'} resolution. Memory history clears on restart.</p>
+        </section>
 
+    {#if aggregate}
         <!-- Active / Recent tabs -->
         <div class="sub-nav" role="tablist" aria-label="Stream view">
             <button type="button" class="sub-nav-item {activeTab === 'active' ? 'active' : ''}" role="tab" aria-selected={activeTab === 'active'} onclick={() => switchTab('active')}>Active Streams ({streams.length}{streamsHasMore ? '+' : ''})</button>
@@ -592,7 +582,7 @@ onDestroy(() => {
 
         {#if activeTab === 'active'}
             {#if streamsError}
-                <div class="error-message text-xs mb-4">Streams: {streamsError}</div>
+                <div class="error-message text-xs mb-4">Streams: {streamsError} <button class="secondary" onclick={firstStreams}>Refresh first page</button></div>
             {/if}
 
             {#if deepLinkNotFound || deepLinkError}
@@ -613,7 +603,7 @@ onDestroy(() => {
             {/if}
 
             <div class="flex items-center gap-2 mb-4">
-                <input type="text" placeholder="Filter loaded rows by user, item, device..." bind:value={searchFilter} style="max-width: 320px;" aria-label="Filter loaded streams" />
+                <input type="text" placeholder="Filter this page by user, item ID, device..." bind:value={searchFilter} style="max-width: 320px;" aria-label="Filter loaded streams" />
                 <span class="text-xs text-secondary">{filteredStreams.length} of {streams.length} loaded</span>
             </div>
 
@@ -625,8 +615,8 @@ onDestroy(() => {
                             <th>Item</th>
                             <th class="col-desktop">Device</th>
                             <th class="col-desktop">Mode</th>
-                            <th class="col-tablet">Owned</th>
-                            <th class="col-desktop">Target</th>
+                            <th class="col-tablet">Queue reserve</th>
+                            <th class="col-desktop">Optional limit</th>
                             <th>Health</th>
                             <th class="col-tablet">Age</th>
                             <th class="col-action"></th>
@@ -639,14 +629,14 @@ onDestroy(() => {
                         {#each filteredStreams as stream (stream.stream_id)}
                             <tr class={expandedStream === stream.stream_id ? 'row-expanded' : ''}>
                                 <td class="cell-truncate"><strong title={stream.username || stream.user_id || ''}>{stream.username || stream.user_id || '-'}</strong></td>
-                                <td class="cell-truncate" title={stream.item_id || ''}>{stream.item_id || '-'}</td>
+                                <td><MediaItemCell itemId={stream.item_id} sourceRef={stream.source_ref} at={stream.started_at} /></td>
                                 <td class="col-desktop">{stream.device || '-'}</td>
                                 <td class="col-desktop mono">{modeLabel(stream.media_mode)}</td>
-                                <td class="col-tablet mono">{fmtBytes(stream.owned_bytes)}</td>
+                                <td class="col-tablet"><span class="mono">{fmtBytes(stream.queued_bytes)}</span><div class="queue-mini" role="img" aria-label={`${fmtBytes(stream.queued_bytes)} queued; ${fmtBytes(stream.private_base_bytes+stream.target_bytes)} allowance reference`}><span style:width={`${Math.min(100,stream.queued_bytes/Math.max(1,stream.private_base_bytes+stream.target_bytes)*100)}%`}></span></div><span class="text-xs text-secondary">{fmtBytes(stream.private_base_bytes+stream.target_bytes)} allowance</span></td>
                                 <td class="col-desktop mono">{fmtBytes(stream.target_bytes)}</td>
                                 <td>
                                     <span class={healthClass(stream.health)}>
-                                        {#if stream.health === 'warning'}&bull;{/if}{#if stream.health === 'critical'}&times;{/if} {healthLabel(stream.health)}
+                                        {healthLabel(stream.health)}<span class="flow-label">{streamStatus(stream)}</span>
                                     </span>
                                 </td>
                                 <td class="col-tablet mono">{fmtAge(stream.age_ms)}</td>
@@ -660,6 +650,7 @@ onDestroy(() => {
                                 <tr class="detail-row">
                                     <td colspan="9">
                                         <div class="stream-detail" id="detail-{stream.stream_id}" role="region" aria-label="Stream {stream.stream_id} detail">
+                                            {#if deepLinkError}<p class="text-xs status-warn">Current stream state is unavailable. The visualization below is the last observed snapshot.</p>{/if}<StreamPipeline {stream} /><details><summary>Technical data</summary>
                                             <div class="detail-section">
                                                 <div class="detail-heading">Identity</div>
                                                 <div class="detail-grid">
@@ -710,6 +701,7 @@ onDestroy(() => {
                                                     {/if}
                                                 </div>
                                             </div>
+                                            </details>
                                             {#if stream.transfer_id}
                                                 <div class="detail-links">
                                                     <a href={activityBufferLink(stream.boot_id, stream.stream_id)} title="View in Activity transfers">&rarr; Activity transfer</a>
@@ -725,15 +717,19 @@ onDestroy(() => {
             </div>
             {#if streamsHasMore}
                 <div class="flex items-center gap-2 mt-2">
-                    <button type="button" class="secondary text-xs" onclick={loadMoreStreams} disabled={streamsLoading}>{streamsLoading ? 'Loading\u2026' : 'Load more streams'}</button>
+                    <button type="button" class="secondary text-xs" onclick={loadMoreStreams} disabled={streamsLoading}>{streamsLoading ? 'Loading\u2026' : 'Next page'}</button>
                     <span class="text-xs text-secondary">{streams.length} loaded</span>
                 </div>
             {/if}
 
+            {#if streamRequestCursor}<button class="secondary mb-4" onclick={firstStreams}>First page</button>{/if}
+            <p class="text-xs text-secondary">This page is retained during refresh. An expanded stream stays pinned while its detail is refreshed directly.</p>
         {:else}
             <!-- Recent completions -->
+            <div class="flex items-center justify-between mb-4 gap-4"><label class="text-xs text-secondary">Outcome <select bind:value={outcomeFilter} onchange={resetRecent}><option value="">All outcomes</option><option value="errors">Errors only</option><option value="success">Success</option><option value="canceled">Canceled</option><option value="upstream_error">Upstream error</option><option value="downstream_error">Downstream error</option><option value="length_mismatch">Length mismatch</option></select></label><span class="text-xs text-secondary">Completed within {timeWindow}</span></div>
+            {#if recentPage}<div class="info-banner mb-4 text-xs">Retained {recentPage.retained_count} / {recentPage.capacity} records · up to {Math.round(recentPage.retention_seconds/3600)}h · oldest retained {fmtTimestamp(recentPage.oldest_retained_at)}. {recentPage.evicted_count} evicted since startup; {aggregate.completion_drops} completion offers dropped. High traffic can shorten this window.</div>{/if}
             {#if recentError}
-                <div class="error-message text-xs mb-4">Recent completions: {recentError}</div>
+                <div class="error-message text-xs mb-4">Recent completions: {recentError} <button class="secondary" onclick={resetRecent}>Refresh first page</button></div>
             {/if}
 
             <div class="table-container panel" style="padding: 0;">
@@ -741,7 +737,7 @@ onDestroy(() => {
                     <thead>
                         <tr>
                             <th>User</th>
-                            <th class="col-desktop">Item</th>
+                            <th>Media</th>
                             <th class="col-desktop">Mode</th>
                             <th>Outcome</th>
                             <th class="col-tablet">Peak</th>
@@ -755,10 +751,10 @@ onDestroy(() => {
                         {#if recent.length === 0}
                             <tr><td colspan="9" class="empty">No recent completions.</td></tr>
                         {/if}
-                        {#each recent as comp (comp.stream_id)}
-                            <tr class={expandedCompletion === comp.stream_id ? 'row-expanded' : ''}>
+                        {#each recent as comp (comp.completion_id)}
+                            <tr class={expandedCompletion === comp.completion_id ? 'row-expanded' : ''}>
                                 <td class="cell-truncate"><strong title={comp.username || comp.user_id || ''}>{comp.username || comp.user_id || '-'}</strong></td>
-                                <td class="col-desktop cell-truncate" title={comp.item_id || ''}>{comp.item_id || '-'}</td>
+                                <td><MediaItemCell itemId={comp.item_id} sourceRef={comp.source_ref} at={comp.completed_at} /></td>
                                 <td class="col-desktop mono">{modeLabel(comp.media_mode)}</td>
                                 <td><span class={outcomeClass(comp.outcome)}>{comp.outcome.replace(/_/g, ' ')}</span></td>
                                 <td class="col-tablet mono">{fmtBytes(comp.peak_owned_bytes)}</td>
@@ -766,12 +762,12 @@ onDestroy(() => {
                                 <td class="col-desktop mono">{fmtDuration(comp.duration_ms)}</td>
                                 <td class="col-desktop mono text-xs">{fmtTimestamp(comp.completed_at)}</td>
                                 <td class="col-action">
-                                    <button type="button" class="icon expand-btn" onclick={() => toggleCompletionExpand(comp.stream_id)} aria-expanded={expandedCompletion === comp.stream_id} aria-controls="comp-detail-{comp.stream_id}" aria-label="Toggle completion detail">
-                                        {expandedCompletion === comp.stream_id ? '\u25BC' : '\u25B6'}
+                                    <button type="button" class="icon expand-btn" onclick={() => toggleCompletionExpand(comp.completion_id)} aria-expanded={expandedCompletion === comp.completion_id} aria-controls="comp-detail-{comp.stream_id}" aria-label="Toggle completion detail">
+                                        {expandedCompletion === comp.completion_id ? '\u25BC' : '\u25B6'}
                                     </button>
                                 </td>
                             </tr>
-                            {#if expandedCompletion === comp.stream_id}
+                            {#if expandedCompletion === comp.completion_id}
                                 <tr class="detail-row">
                                     <td colspan="9">
                                         <div class="stream-detail" id="comp-detail-{comp.stream_id}" role="region" aria-label="Completion {comp.stream_id} detail">
@@ -836,14 +832,19 @@ onDestroy(() => {
                     </tbody>
                 </table>
             </div>
+            <div class="flex items-center gap-4 mt-4">{#if recentRequestCursor}<button class="secondary" onclick={resetRecent}>First page</button>{/if}{#if recentPage?.has_more}<button class="secondary" onclick={()=>fetchRecent(true)}>Next page</button>{/if}</div>
             {#if recent.length > 0}
-                <div class="text-xs text-secondary mt-2">Showing {recent.length} completions (bounded 15m retention).</div>
+                <div class="text-xs text-secondary mt-2">Showing {recent.length} completions. Later pages keep a fixed query window during refresh. An expanded completion remains pinned.</div>
             {/if}
         {/if}
+        <p class="text-xs text-secondary mt-4">Current snapshot {fmtTimestamp(aggregateTime)} · Boot {streamsBootId || '—'}</p>
     {/if}
 </div>
 
 <style>
+    .history-panel { padding:20px; }.history-heading { font-size:13px; font-weight:500; margin:0; }.history-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:24px; }.history-grid > div { min-width:0; border-top:1px solid var(--border-color); padding-top:18px; }.history-grid h3 { font-size:11px; color:var(--text-secondary); font-weight:500; margin:0 0 16px; }.queue-mini { height:4px; background:#343439; overflow:hidden; border-radius:3px; margin:7px 0; min-width:85px; }.queue-mini span { display:block; height:100%; background:#779dea; }.flow-label { display:block; font-size:10px; max-width:200px; white-space:normal; line-height:1.6; margin-top:5px; color:var(--text-secondary); }summary { cursor:pointer; color:var(--text-secondary); font-size:12px; margin-bottom:18px; }details .detail-section { margin-bottom:20px; }
+    @media(max-width:850px) { .history-grid { grid-template-columns:1fr; } }
+
     .empty { text-align: center; padding: 2rem !important; color: var(--text-secondary); }
     .disabled-notice { text-align: center; padding: 3rem 1rem; }
     .stale-banner {
@@ -980,8 +981,8 @@ onDestroy(() => {
     /* Tables: fluid by default, constrained only above 768px */
     .streams-table,
     .recent-table {
-        min-width: 0;
-        table-layout: fixed;
+        min-width: 570px;
+        table-layout: auto;
     }
     @media (min-width: 769px) {
         .streams-table,
@@ -1018,7 +1019,27 @@ onDestroy(() => {
             min-height: 28px;
         }
     }
-    @media (max-width: 480px) {
-        .col-tablet { display: none; }
+    @media (max-width: 600px) {
+        .streams-table, .recent-table { display:block; width:100%; min-width:0; max-width:100%; }
+        .streams-table thead, .recent-table thead { display:none; }
+        .streams-table tbody, .recent-table tbody { display:block; width:100%; }
+        .streams-table tr:not(.detail-row), .recent-table tr:not(.detail-row) {
+            display:grid; grid-template-columns:minmax(0,1fr) 32px; gap:8px 12px;
+            padding:12px; border-bottom:1px solid var(--border-color);
+        }
+        .streams-table td, .recent-table td { min-width:0; padding:0 !important; border:0; }
+        .streams-table .col-tablet, .recent-table .col-tablet { display:none; }
+        .streams-table td:first-child, .recent-table td:first-child { grid-column:1; grid-row:1; }
+        .streams-table td:nth-child(2), .recent-table td:nth-child(2) { grid-column:1; grid-row:2; }
+        .streams-table td:nth-child(7), .recent-table td:nth-child(4) { grid-column:1; grid-row:3; }
+        .streams-table td.col-action, .recent-table td.col-action {
+            grid-column:2; grid-row:1 / span 3; width:32px; min-width:32px;
+            display:flex; align-items:center; justify-content:center;
+        }
+        .cell-truncate { max-width:none; white-space:normal; overflow-wrap:anywhere; }
+        .flow-label { max-width:none; font-size:11px; }
+        .detail-row, .detail-row > td { display:block; width:100%; max-width:100%; }
+        .detail-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+        .stat-value { min-width:0; overflow-wrap:anywhere; }
     }
 </style>

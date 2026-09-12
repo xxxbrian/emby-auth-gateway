@@ -9,18 +9,24 @@
     let error = $state<string | null>(null);
     let timer: ReturnType<typeof setInterval> | undefined;
     let timeWindow = $state('15m');
+    let controller: AbortController | null = null;
 
     async function fetchData() {
+        if(document.hidden || controller) return;
+        const ctrl=new AbortController(); controller=ctrl;
         try {
-            data = await apiRequest<Snapshot>(`/overview?window=${timeWindow}`);
+            const result = await apiRequest<Snapshot>(`/overview?window=${timeWindow}`,{signal:ctrl.signal});
+            if(ctrl.signal.aborted) return;
+            data=result;
             error = null;
         } catch (err) {
-            error = err instanceof Error ? err.message : String(err);
-        }
+            if(!ctrl.signal.aborted) error = err instanceof Error ? err.message : String(err);
+        } finally { if(controller===ctrl) controller=null; }
     }
 
     function setWindow(w: string) {
         timeWindow = w;
+        controller?.abort(); controller=null;
         fetchData();
     }
 
@@ -145,6 +151,7 @@
     });
 
     onDestroy(() => {
+        controller?.abort();
         if (timer) clearInterval(timer);
     });
 </script>
@@ -152,10 +159,10 @@
 <div class="page-header">
     <h1 class="page-title">Overview</h1>
     <div class="segmented-control">
-        <div class="tab {timeWindow === '15m' ? 'active' : ''}" onclick={() => setWindow('15m')}>15m</div>
-        <div class="tab {timeWindow === '1h' ? 'active' : ''}" onclick={() => setWindow('1h')}>1h</div>
-        <div class="tab {timeWindow === '6h' ? 'active' : ''}" onclick={() => setWindow('6h')}>6h</div>
-        <div class="tab {timeWindow === '24h' ? 'active' : ''}" onclick={() => setWindow('24h')}>24h</div>
+        <button type="button" class="tab {timeWindow === '15m' ? 'active' : ''}" onclick={() => setWindow('15m')}>15m</button>
+        <button type="button" class="tab {timeWindow === '1h' ? 'active' : ''}" onclick={() => setWindow('1h')}>1h</button>
+        <button type="button" class="tab {timeWindow === '6h' ? 'active' : ''}" onclick={() => setWindow('6h')}>6h</button>
+        <button type="button" class="tab {timeWindow === '24h' ? 'active' : ''}" onclick={() => setWindow('24h')}>24h</button>
     </div>
 </div>
 
@@ -201,11 +208,11 @@
             </div>
 
             <div class="metric-box">
-                <div class="metric-label">Errors</div>
+                <div class="metric-label"><a href="#/traffic?view=errors&window=15m">Errors · last 15m ↗</a></div>
                 <div class="metric-value mono {(data.traffic?.error_rate_15m || 0) > 0.05 ? 'status-err' : 'status-ok'}">
-                    {fmtPct(data.traffic?.error_rate_15m)}%
+                    <a href="#/traffic?view=errors&window=15m" style="color:inherit;text-decoration:none">{fmtPct(data.traffic?.error_rate_15m)}%</a>
                 </div>
-                <LineChart series={data.series?.errors ?? []} color="var(--danger)" />
+                <a href={`#/traffic?view=errors&window=${timeWindow}`} aria-label={`View recorded errors in the last ${timeWindow}`}><LineChart series={data.series?.errors ?? []} color="var(--danger)" /></a><a class="text-xs text-secondary" href={`#/traffic?view=errors&window=${timeWindow}`}>Recorded error details · {timeWindow} →</a>
             </div>
 
             <div class="metric-box">
