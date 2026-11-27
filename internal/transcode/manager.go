@@ -691,7 +691,7 @@ func (m *Manager) maintain() {
 		}
 	}
 }
-func (m *Manager) NotePlayback(owner, id string, position int64, paused *bool) {
+func (m *Manager) NotePlayback(owner, id string, position *int64, paused *bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	j, err := m.get(owner, id)
@@ -700,8 +700,11 @@ func (m *Manager) NotePlayback(owner, id string, position int64, paused *bool) {
 	}
 	now := time.Now()
 	j.lastUse = now
-	j.positionAt = &now
-	j.position = &position
+	if position != nil {
+		value := *position
+		j.positionAt = &now
+		j.position = &value
+	}
 	if paused != nil {
 		value := *paused
 		j.paused = &value

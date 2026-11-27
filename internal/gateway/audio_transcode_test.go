@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/xxxbrian/emby-auth-gateway/internal/telemetry"
 	"github.com/xxxbrian/emby-auth-gateway/internal/transcode"
@@ -107,6 +108,51 @@ func TestGatewayAudioPlaybackLifecycle(t *testing.T) {
 	_ = response.Body.Close()
 	if response.StatusCode != 200 {
 		t.Fatal("encoding stop removed playback")
+	}
+
+	reportURL := gateway.URL + "/emby/Sessions/Playing"
+	for _, report := range []struct {
+		contentType string
+		query       string
+		body        string
+		position    int64
+	}{
+		{"application/json", "&PositionTicks=50000000", `{"ItemId":"item-1","PlaySessionId":"` + id + `","PositionTicks":null}`, 50000000},
+		{"application/x-www-form-urlencoded", "&ItemId=item-1", "PlaySessionId=" + id + "&PlaybackPositionTicks=60000000&IsPaused=true", 60000000},
+		{"application/json", "", `{"Item":{"Id":"item-1"},"PlaySessionId":"` + id + `","PlaybackPositionTicks":"70000000"}`, 70000000},
+		{"application/json", "", `{"ItemId":"item-1","PlaySessionId":"` + id + `","PositionTicks":null}`, 70000000},
+	} {
+		progress := mustRequest(t, http.MethodPost, reportURL+"/Progress?api_key=gateway-token"+report.query, strings.NewReader(report.body))
+		progress.Header.Set("Content-Type", report.contentType)
+		response := do(t, progress)
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusNoContent {
+			t.Fatalf("progress via %s: status %d", report.contentType, response.StatusCode)
+		}
+		state, err := store.FindPlaybackState(t.Context(), "u1", "item-1")
+		if err != nil || state == nil || state.PlaybackPositionTicks != report.position {
+			t.Fatalf("progress via %s: state %+v, want %d ticks, err %v", report.contentType, state, report.position, err)
+		}
+	}
+	response = do(t, mustRequest(t, http.MethodPost, reportURL+"/Stopped?api_key=gateway-token&ItemId=item-1&PlaySessionId="+id, nil))
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNoContent || manager.OwnsItem(HashToken("gateway-token"), id, "item-1") {
+		t.Fatalf("query stop did not release audio playback: status %d", response.StatusCode)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		recent := manager.Snapshot().Recent
+		if len(recent) > 0 {
+			job := recent[0]
+			if job.ID != id || job.PositionTicks == nil || *job.PositionTicks != 70000000 || job.Paused == nil || !*job.Paused {
+				t.Fatalf("transcode job did not preserve progress and pause state: %+v", job)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stopped audio playback was not observed")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if err = store.RevokeSession(context.Background(), HashToken("gateway-token")); err != nil {
 		t.Fatal(err)

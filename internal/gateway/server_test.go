@@ -1807,15 +1807,15 @@ func TestStoppedPlaybackUsesEmbyTicksForResumeThresholds(t *testing.T) {
 }
 
 func TestPlaybackDetailsParsesNumericStrings(t *testing.T) {
-	details, ok := playbackDetailsFromJSON(map[string]any{
+	details := playbackDetailsFromJSON(map[string]any{
 		"ItemId":                "item-1",
 		"PlaybackPositionTicks": "12345",
 		"RunTimeTicks":          "100000",
 		"PlayedPercentage":      "12.5",
 		"Item":                  map[string]any{"Id": "item-1", "RunTimeTicks": "100000"},
 	})
-	if !ok || !details.HasPositionTicks || details.PositionTicks != 12345 || !details.HasRunTimeTicks || details.RunTimeTicks != 100000 || details.PlayedPercentage == nil || *details.PlayedPercentage != 12.5 {
-		t.Fatalf("numeric strings were not parsed: %#v ok=%v", details, ok)
+	if details.ItemID != "item-1" || !details.HasPositionTicks || details.PositionTicks != 12345 || !details.HasRunTimeTicks || details.RunTimeTicks != 100000 || details.PlayedPercentage == nil || *details.PlayedPercentage != 12.5 {
+		t.Fatalf("numeric strings were not parsed: %#v", details)
 	}
 }
 

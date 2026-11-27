@@ -135,7 +135,8 @@ func TestManagerCanceledWaiterAndCacheRecovery(t *testing.T) {
 	if len(observation.Jobs) != 1 || observation.Jobs[0].AudioOutputChannels != 6 {
 		t.Fatalf("observation: %+v", observation)
 	}
-	m.NotePlayback("owner", id, 12*TicksPerSecond, nil)
+	position := 12 * TicksPerSecond
+	m.NotePlayback("owner", id, &position, nil)
 	old := observation.Jobs[0].PositionTicks
 	m.publishObservation()
 	if old != nil {

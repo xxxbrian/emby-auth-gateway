@@ -437,19 +437,13 @@ func (s *Server) handleWebSubtitleRoute(w http.ResponseWriter, r *http.Request, 
 	return true
 }
 
-func (s *Server) noteWebSubtitlePlayback(r *http.Request, rel string, session *Session, data []byte) {
-	if s.cfg.Subtitles == nil || !s.isSubtitleWebRequest(r, session) {
-		return
-	}
-	var report struct {
-		PlaySessionID string `json:"PlaySessionId"`
-	}
-	if json.Unmarshal(data, &report) != nil || report.PlaySessionID == "" {
+func (s *Server) noteWebSubtitlePlayback(r *http.Request, rel string, session *Session, playID string) {
+	if s.cfg.Subtitles == nil || playID == "" || !s.isSubtitleWebRequest(r, session) {
 		return
 	}
 	if equalPath(rel, "/Sessions/Playing/Stopped") {
-		s.cfg.Subtitles.End(session.GatewayTokenHash, report.PlaySessionID)
+		s.cfg.Subtitles.End(session.GatewayTokenHash, playID)
 	} else {
-		s.cfg.Subtitles.Touch(session.GatewayTokenHash, report.PlaySessionID)
+		s.cfg.Subtitles.Touch(session.GatewayTokenHash, playID)
 	}
 }

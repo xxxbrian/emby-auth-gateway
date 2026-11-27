@@ -325,6 +325,27 @@ func TestWebSubtitlesReadyOnlyAndNativeMetadataIsolation(t *testing.T) {
 	}
 }
 
+func TestWebSubtitleStopUsesReportedQuerySession(t *testing.T) {
+	h, caption, input := cachedSubtitleFixture(t)
+	response := do(t, caption)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("prepared caption status %d", response.StatusCode)
+	}
+	stopped := mustRequest(t, http.MethodPost, h.server.URL+"/emby/Sessions/Playing/Stopped?api_key=web-token&ItemId=item&PlaySessionId="+input.PlaybackID, nil)
+	stopped.AddCookie(h.cookie)
+	response = do(t, stopped)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("stop report status %d", response.StatusCode)
+	}
+	response = do(t, caption)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("stopped playback retained its caption grant: status %d", response.StatusCode)
+	}
+}
+
 func TestUnavailableSubtitleRuntimeHidesWebTracksWithoutWork(t *testing.T) {
 	h := newSubtitleHarness(t, true, true)
 	m := h.info(t, "web-token", h.cookie, "")

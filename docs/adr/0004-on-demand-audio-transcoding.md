@@ -49,32 +49,45 @@ The investigation on 2026-09-10 established:
 Compatibility means the vendor Web assets can open, seek, pause, resume, switch
 audio, and stop local conversion through these existing protocol operations.
 
-### JSON wire contract
-
-Check the target Emby server's `/emby/openapi` or its versioned SDK schema before
-changing a wire field. `PlaybackInfoRequest.MaxAudioChannels` is a nullable
-integer. `DeviceProfile.TranscodingProfiles[].MaxAudioChannels` is a string.
-Item and media source identifiers are strings. `GenreItems[].Id`, sizes, and
-tick counts use 64-bit integers.
-[Emby SDK 4.8.11.0](https://github.com/MediaBrowser/Emby.SDK/releases/tag/4.8.11.0)
-
-Audio and Web subtitle negotiation read the same request options. Null optional
-values use the default or a supplied query value. Equivalent typed query and
-body values can coexist. Device profile decoding accepts the observed numeric
-channel limit, quoted bitrate, and quoted `IsRequired` boolean. Unknown shapes
-and conflicting values defer to the upstream and suppress local preparation.
-Authentication and URL rewriting still apply to the proxied request.
-
-Gateway JSON projections preserve number tokens, including responses without
-`Content-Type` and item metadata fetched for personal lists. Keep fixtures for
-the canonical types, real client representations, explicit nulls, and integers
-above the contiguous integer range of `float64`.
 The pinned original Web asset package was verified against its release SHA256;
 its profile module matched the deployed module. Native playback, audio switching,
 seeking, three independent users, and complete six-minute playback were verified
 without modifying the player. A real short HEVC/EAC3 sample was additionally
 verified in an isolated Helium instance, including 3840x2160 video, decoded audio,
 and seek. These are not benchmarks of the deployed EPYC VM.
+
+### JSON wire contract
+
+Check the target Emby server's `/emby/openapi` or its versioned SDK schema before
+changing a wire field. `PlaybackInfoRequest.MaxAudioChannels` is a nullable
+32-bit integer. `DeviceProfile.TranscodingProfiles[].MaxAudioChannels` is a
+string and `ProfileCondition.IsRequired` is a boolean. Item, media source, and
+playback session identifiers are strings. `GenreItems[].Id`, sizes, and tick
+counts use 64-bit integers.
+[Emby 4.9.5.0 OpenAPI schema](https://github.com/MediaBrowser/Emby.SDK/blob/4.9.5.0/Resources/OpenApi/openapi_v3.json)
+
+Audio and Web subtitle negotiation read the same request options. Null optional
+values use the default or a supplied query value. Equivalent typed query and
+body values can coexist. Device profile decoding accepts the observed numeric
+channel limit, quoted bitrate, and quoted `IsRequired` boolean. Unknown shapes
+and conflicting values defer to the upstream and suppress local preparation.
+
+Stock Emby 4.9.5.0 and the gateway both accepted a canonical profile and a
+profile with a numeric channel limit and quoted bitrate. Both returned the same
+direct-play capabilities and identical bytes for a range request on a synthetic
+MKV file.
+
+UserData, audio conversion, and Web subtitles read the same playback report.
+The report parser reads JSON or form data and fills absent fields from the
+query. It recognizes `ItemId` or `Item.Id`, and accepts the client alias
+`PlaybackPositionTicks` alongside the official `PositionTicks`. Both tick fields
+accept integer numbers and decimal strings. Progress reports with missing or
+null positions keep the last known position. [Playback Check-ins](https://dev.emby.media/doc/restapi/Playback-Check-ins.html)
+
+Gateway JSON projections preserve number tokens, including responses without
+`Content-Type` and item metadata fetched for personal lists. Keep fixtures for
+the canonical types, real client representations, explicit nulls, and integers
+above the contiguous integer range of `float64`.
 
 ## Ownership
 

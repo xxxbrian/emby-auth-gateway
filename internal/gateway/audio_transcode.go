@@ -215,30 +215,23 @@ func writeAudioError(w http.ResponseWriter, err error) {
 	writeJSON(w, status, map[string]string{"error": code, "message": code})
 }
 
-func (s *Server) noteAudioPlayback(rel string, session *Session, data []byte, itemID string) (string, bool) {
-	if s.cfg.Transcoder == nil {
+func (s *Server) noteAudioPlayback(rel string, session *Session, details playbackDetails) (string, bool) {
+	playID := details.PlaySessionID
+	if s.cfg.Transcoder == nil || !strings.HasPrefix(playID, "eag-") {
 		return "", false
 	}
-	var report struct {
-		PlaySessionID string          `json:"PlaySessionId"`
-		PositionTicks json.RawMessage `json:"PositionTicks"`
-		IsPaused      *bool           `json:"IsPaused"`
-	}
-	if json.Unmarshal(data, &report) != nil || !strings.HasPrefix(report.PlaySessionID, "eag-") {
+	if !s.cfg.Transcoder.OwnsItem(session.GatewayTokenHash, playID, details.ItemID) {
 		return "", false
 	}
-	if !s.cfg.Transcoder.OwnsItem(session.GatewayTokenHash, report.PlaySessionID, itemID) {
-		return "", false
+	var position *int64
+	if details.HasPositionTicks {
+		ticks := max(0, details.PositionTicks)
+		position = &ticks
 	}
+	s.cfg.Transcoder.NotePlayback(session.GatewayTokenHash, playID, position, details.IsPaused)
 	if equalPath(rel, "/Sessions/Playing/Stopped") {
-		s.cfg.Transcoder.End(session.GatewayTokenHash, report.PlaySessionID)
-		return report.PlaySessionID, false
+		s.cfg.Transcoder.End(session.GatewayTokenHash, playID)
+		return playID, false
 	}
-	var position int64
-	raw := strings.Trim(string(report.PositionTicks), "\"")
-	if raw != "" {
-		position, _ = strconv.ParseInt(raw, 10, 64)
-	}
-	s.cfg.Transcoder.NotePlayback(session.GatewayTokenHash, report.PlaySessionID, max(0, position), report.IsPaused)
-	return report.PlaySessionID, report.IsPaused != nil && *report.IsPaused
+	return playID, details.IsPaused != nil && *details.IsPaused
 }

@@ -1233,13 +1233,13 @@ func (s *Server) recordPlaybackRequest(r *http.Request, rel string, session *Ses
 			return fmt.Errorf("%w: read playback body: %w", ErrBadRequest, err)
 		}
 	}
-	details, ok := playbackDetailsFromRequest(r, data)
-	if !ok || details.ItemID == "" {
+	details := playbackDetailsFromRequest(r, data)
+	if details.ItemID == "" {
 		return nil
 	}
 	eventName := playbackEventName(rel)
-	s.noteWebSubtitlePlayback(r, rel, session, data)
-	audioPlayID, audioPaused := s.noteAudioPlayback(rel, session, data, details.ItemID)
+	s.noteWebSubtitlePlayback(r, rel, session, details.PlaySessionID)
+	audioPlayID, audioPaused := s.noteAudioPlayback(rel, session, details)
 	sourceRef := s.localMediaSource(r.Context())
 	if audioPlayID != "" && s.cfg.Transcoder != nil {
 		sourceRef = s.cfg.Transcoder.SourceRef(session.GatewayTokenHash, audioPlayID)
@@ -1357,44 +1357,35 @@ func playbackStateNeedsMetadata(state *PlaybackState) bool {
 	return false
 }
 
-func playbackDetailsFromRequest(r *http.Request, data []byte) (playbackDetails, bool) {
+func playbackDetailsFromRequest(r *http.Request, data []byte) playbackDetails {
+	query := playbackDetailsFromValues(r.URL.Query())
+	if len(bytes.TrimSpace(data)) == 0 {
+		return query
+	}
 	ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	if len(bytes.TrimSpace(data)) > 0 {
-		if ct == "application/x-www-form-urlencoded" {
-			values, err := url.ParseQuery(string(data))
-			if err == nil {
-				merged := cloneQuery(r.URL.Query())
-				for key, vals := range values {
-					merged[key] = append([]string(nil), vals...)
-				}
-				return playbackDetailsFromValues(merged)
-			}
-		}
-		if ct == "" || isJSONContentType(ct) || looksLikeJSON(data) {
-			var body any
-			if err := decodeEmbyJSON(data, &body); err == nil {
-				if details, ok := playbackDetailsFromJSON(body); ok {
-					return mergePlaybackDetails(details, r.URL.Query()), true
-				}
-				if details, ok := playbackDetailsFromValues(r.URL.Query()); ok {
-					if bodyDetails, bodyOK := playbackDetailsFromJSON(body); bodyOK || bodyDetails.HasPositionTicks || bodyDetails.HasRunTimeTicks || bodyDetails.Played != nil || bodyDetails.PlayedPercentage != nil {
-						return mergePlaybackDetails(bodyDetails, r.URL.Query()), true
-					}
-					return details, true
-				}
-			}
+	if ct == "application/x-www-form-urlencoded" {
+		if values, err := url.ParseQuery(string(data)); err == nil {
+			return mergePlaybackDetails(playbackDetailsFromValues(values), query)
 		}
 	}
-	return playbackDetailsFromValues(r.URL.Query())
+	if ct == "" || isJSONContentType(ct) || looksLikeJSON(data) {
+		var body map[string]any
+		if err := decodeEmbyJSON(data, &body); err == nil {
+			return mergePlaybackDetails(playbackDetailsFromJSON(body), query)
+		}
+	}
+	return query
 }
 
-func mergePlaybackDetails(details playbackDetails, values url.Values) playbackDetails {
-	queryDetails, ok := playbackDetailsFromValues(values)
-	if !ok {
-		return details
-	}
+func mergePlaybackDetails(details, queryDetails playbackDetails) playbackDetails {
 	if details.ItemID == "" {
 		details.ItemID = queryDetails.ItemID
+	}
+	if details.PlaySessionID == "" {
+		details.PlaySessionID = queryDetails.PlaySessionID
+	}
+	if details.IsPaused == nil {
+		details.IsPaused = queryDetails.IsPaused
 	}
 	if !details.HasPositionTicks && queryDetails.HasPositionTicks {
 		details.PositionTicks = queryDetails.PositionTicks
@@ -1415,6 +1406,8 @@ func mergePlaybackDetails(details playbackDetails, values url.Values) playbackDe
 
 type playbackDetails struct {
 	ItemID               string
+	PlaySessionID        string
+	IsPaused             *bool
 	PositionTicks        int64
 	HasPositionTicks     bool
 	Played               *bool
@@ -1433,16 +1426,16 @@ type playbackDetails struct {
 	Fingerprint          string
 }
 
-func playbackDetailsFromJSON(v any) (playbackDetails, bool) {
-	obj, ok := v.(map[string]any)
-	if !ok {
-		return playbackDetails{}, false
-	}
+func playbackDetailsFromJSON(obj map[string]any) playbackDetails {
 	details := playbackDetails{}
 	if itemID, ok := stringField(obj, "ItemId"); ok {
 		details.ItemID = itemID
 	} else if item, ok := mapField(obj, "Item"); ok {
 		details.ItemID, _ = stringField(item, "Id")
+	}
+	details.PlaySessionID, _ = stringField(obj, "PlaySessionId")
+	if paused, ok := boolField(obj, "IsPaused"); ok {
+		details.IsPaused = &paused
 	}
 	if item, ok := mapField(obj, "Item"); ok {
 		details.ItemName, _ = stringField(item, "Name")
@@ -1481,12 +1474,16 @@ func playbackDetailsFromJSON(v any) (playbackDetails, bool) {
 	if percentage, ok := float64Field(obj, "PlayedPercentage"); ok {
 		details.PlayedPercentage = &percentage
 	}
-	return details, details.ItemID != ""
+	return details
 }
 
-func playbackDetailsFromValues(values url.Values) (playbackDetails, bool) {
+func playbackDetailsFromValues(values url.Values) playbackDetails {
 	details := playbackDetails{}
 	details.ItemID = firstValue(values, "ItemId", "ItemID", "Item.Id", "Id")
+	details.PlaySessionID = firstValue(values, "PlaySessionId", "PlaySessionID")
+	if paused, ok := boolValue(values, "IsPaused"); ok {
+		details.IsPaused = &paused
+	}
 	if ticks, ok := int64Value(values, "PositionTicks", "PlaybackPositionTicks"); ok {
 		details.PositionTicks = ticks
 		details.HasPositionTicks = true
@@ -1501,7 +1498,7 @@ func playbackDetailsFromValues(values url.Values) (playbackDetails, bool) {
 	if percentage, ok := float64Value(values, "PlayedPercentage"); ok {
 		details.PlayedPercentage = &percentage
 	}
-	return details, details.ItemID != ""
+	return details
 }
 
 func firstValue(values url.Values, names ...string) string {
