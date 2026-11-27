@@ -540,25 +540,16 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request, rel string)
 		return
 	}
 	playbackItemID, isPlaybackInfo := playbackInfoItemID(r.Method, rel)
-	if s.cfg.Subtitles != nil || s.cfg.WebSubtitlesEnabled {
-		if s.handleWebSubtitleRoute(w, r, rel, session) {
-			return
-		}
-		if isPlaybackInfo && s.isSubtitleWebRequest(r, session) {
-			r = withOptionalSubtitleNegotiation(r)
-		}
+	if (s.cfg.Subtitles != nil || s.cfg.WebSubtitlesEnabled) && s.handleWebSubtitleRoute(w, r, rel, session) {
+		return
 	}
-	if s.cfg.Transcoder != nil {
-		if s.handleAudioRoute(w, r, rel, session, gatewayToken) {
-			return
-		}
-		if isPlaybackInfo {
-			var err error
-			r, err = withAudioNegotiation(r)
-			if err != nil {
-				http.Error(w, "invalid playback options", http.StatusBadRequest)
-				return
-			}
+	if s.cfg.Transcoder != nil && s.handleAudioRoute(w, r, rel, session, gatewayToken) {
+		return
+	}
+	if isPlaybackInfo && (s.cfg.Transcoder != nil || s.isSubtitleWebRequest(r, session)) {
+		r = withPlaybackOptions(r)
+		if r.Context().Err() != nil {
+			panic(http.ErrAbortHandler)
 		}
 	}
 	guardKey := playbackGuardKey{GatewayTokenHash: session.GatewayTokenHash, ItemID: playbackItemID}
@@ -1695,8 +1686,8 @@ func (s *Server) writeProxyResponseWithSnapshot(w http.ResponseWriter, r *http.R
 			}
 			if next := subtitlePlaybackID(value); s.cfg.Subtitles != nil && oldPlayID != "" && next != "" && next != oldPlayID {
 				s.cfg.Subtitles.MovePlayback(session.GatewayTokenHash, oldPlayID, next)
-				if n, _ := r.Context().Value(audioNegotiationKey{}).(*audioNegotiation); n != nil && n.previousID != "" && n.previousID != next {
-					s.cfg.Subtitles.MovePlayback(session.GatewayTokenHash, n.previousID, next)
+				if options, _ := r.Context().Value(playbackOptionsKey{}).(*playbackOptions); options != nil && options.previousID != "" && options.previousID != next {
+					s.cfg.Subtitles.MovePlayback(session.GatewayTokenHash, options.previousID, next)
 				}
 			}
 			if s.meter != nil && len(data) > 0 {

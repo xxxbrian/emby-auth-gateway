@@ -8,7 +8,6 @@ import (
 	"errors"
 	"io"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -81,6 +80,25 @@ type Profile struct {
 	MaxStreamingBitrate int64              `json:"MaxStreamingBitrate"`
 }
 
+func (profile *Profile) UnmarshalJSON(data []byte) error {
+	type deviceProfile Profile
+	wire := struct {
+		*deviceProfile
+		MaxStreamingBitrate *json.Number `json:"MaxStreamingBitrate"`
+	}{deviceProfile: (*deviceProfile)(profile)}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	if wire.MaxStreamingBitrate != nil {
+		bitrate, err := wire.MaxStreamingBitrate.Int64()
+		if err != nil {
+			return err
+		}
+		profile.MaxStreamingBitrate = bitrate
+	}
+	return nil
+}
+
 type FormatProfile struct {
 	Type             string `json:"Type"`
 	Container        string `json:"Container"`
@@ -139,7 +157,13 @@ func (c *Condition) UnmarshalJSON(data []byte) error {
 	if len(wire.IsRequired) == 0 || string(wire.IsRequired) == "null" {
 		return nil
 	}
-	value, err := strconv.ParseBool(strings.Trim(string(wire.IsRequired), "\""))
+	text := string(wire.IsRequired)
+	if text[0] == '"' {
+		if err := json.Unmarshal(wire.IsRequired, &text); err != nil {
+			return err
+		}
+	}
+	value, err := strconv.ParseBool(text)
 	if err != nil {
 		return err
 	}

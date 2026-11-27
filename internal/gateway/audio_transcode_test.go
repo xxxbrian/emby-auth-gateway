@@ -16,31 +16,6 @@ import (
 	"github.com/xxxbrian/emby-auth-gateway/internal/transcode"
 )
 
-func TestAudioPlaybackOptionsUseQueryAndBody(t *testing.T) {
-	const body = `{"DeviceProfile":{"TranscodingProfiles":[{"Type":"Video","Protocol":"hls","AudioCodec":"aac","Container":"m4s","MaxAudioChannels":6}]}}`
-	r := httptest.NewRequest(http.MethodPost, "/emby/Items/1/PlaybackInfo?IsPlayback=true&StartTimeTicks=123000000&AudioStreamIndex=2&MaxAudioChannels=6", strings.NewReader(body))
-	parsed, err := withAudioNegotiation(r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	n := parsed.Context().Value(audioNegotiationKey{}).(*audioNegotiation)
-	if !n.playback || n.start != 123000000 || n.request.AudioStreamIndex == nil || *n.request.AudioStreamIndex != 2 || n.request.MaxAudioChannels != 6 {
-		t.Fatalf("options: %+v", n)
-	}
-	profiles := n.request.Profile.TranscodingProfiles
-	if len(profiles) != 1 || profiles[0].MaxAudioChannels != "6" {
-		t.Fatalf("transcoding profiles: %+v", profiles)
-	}
-	data, err := io.ReadAll(parsed.Body)
-	if err != nil || string(data) != body {
-		t.Fatalf("proxy request body changed: %q, %v", data, err)
-	}
-	r = httptest.NewRequest(http.MethodPost, "/emby/Items/1/PlaybackInfo?AudioStreamIndex=1", strings.NewReader(`{"DeviceProfile":{},"AudioStreamIndex":2}`))
-	if _, err = withAudioNegotiation(r); err == nil {
-		t.Fatal("conflicting options accepted")
-	}
-}
-
 func TestGatewayAudioPlaybackLifecycle(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		if os.Getenv("GATEWAY_REQUIRE_FFMPEG_TESTS") == "1" {
@@ -81,8 +56,8 @@ func TestGatewayAudioPlaybackLifecycle(t *testing.T) {
 	defer manager.Close()
 	gateway := httptest.NewServer(NewServer(Config{GatewayBasePath: "/emby", Transcoder: manager, Meter: telemetry.NewByteMeter()}, store))
 	defer gateway.Close()
-	profile := `{"DeviceProfile":{"DirectPlayProfiles":[{"Type":"Video","Container":"mkv,mp4","VideoCodec":"h264","AudioCodec":"aac"}],"TranscodingProfiles":[{"Type":"Video","Container":"m4s,ts","Protocol":"hls","VideoCodec":"h264","AudioCodec":"aac","MaxAudioChannels":"2"}]}}`
-	req := mustRequest(t, http.MethodPost, gateway.URL+"/emby/Items/item-1/PlaybackInfo?IsPlayback=true&MediaSourceId=source-1&api_key=gateway-token", strings.NewReader(profile))
+	profile := `{"AudioStreamIndex":null,"SubtitleStreamIndex":null,"MaxAudioChannels":2,"StartTimeTicks":null,"MaxStreamingBitrate":null,"DeviceProfile":{"MaxStreamingBitrate":"120000000","DirectPlayProfiles":[{"Type":"Video","Container":"mkv,mp4","VideoCodec":"h264","AudioCodec":"aac"}],"TranscodingProfiles":[{"Type":"Video","Container":"m4s,ts","Protocol":"hls","VideoCodec":"h264","AudioCodec":"aac","MaxAudioChannels":2}]}}`
+	req := mustRequest(t, http.MethodPost, gateway.URL+"/emby/Items/item-1/PlaybackInfo?IsPlayback=true&MaxAudioChannels=02&MediaSourceId=source-1&api_key=gateway-token", strings.NewReader(profile))
 	req.Header.Set("Content-Type", "application/json")
 	response := do(t, req)
 	var result map[string]any

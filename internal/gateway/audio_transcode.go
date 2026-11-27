@@ -1,11 +1,9 @@
 package gateway
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -17,155 +15,12 @@ import (
 	"github.com/xxxbrian/emby-auth-gateway/internal/transcode"
 )
 
-type audioNegotiationKey struct{}
-type audioNegotiation struct {
-	previousID string
-	request    transcode.Request
-	sourceID   string
-	start      int64
-	playback   bool
-}
-
-func withAudioNegotiation(r *http.Request) (*http.Request, error) {
-	if r.Method != http.MethodPost || r.Body == nil {
-		return r, nil
-	}
-	data, err := io.ReadAll(io.LimitReader(r.Body, (2<<20)+1))
-	if err != nil || len(data) > 2<<20 {
-		return nil, errors.New("playback request too large")
-	}
-	r.Body = io.NopCloser(bytes.NewReader(data))
-	if len(bytes.TrimSpace(data)) == 0 {
-		return r, nil
-	}
-	var body map[string]json.RawMessage
-	if err = json.Unmarshal(data, &body); err != nil {
-		return nil, err
-	}
-	var profile json.RawMessage
-	for key, v := range body {
-		if strings.EqualFold(key, "DeviceProfile") {
-			profile = v
-		}
-	}
-	if len(profile) == 0 || string(profile) == "null" {
-		return r, nil
-	}
-	var n audioNegotiation
-	if err = json.Unmarshal(profile, &n.request.Profile); err != nil {
-		return nil, err
-	}
-	value := func(name string) (string, bool, error) {
-		var result string
-		found := false
-		add := func(v string) error {
-			if found && result != v {
-				return errors.New("conflicting playback option")
-			}
-			result, found = v, true
-			return nil
-		}
-		for key, values := range r.URL.Query() {
-			if strings.EqualFold(key, name) {
-				for _, v := range values {
-					if err := add(v); err != nil {
-						return "", false, err
-					}
-				}
-			}
-		}
-		for key, raw := range body {
-			if strings.EqualFold(key, name) {
-				var v string
-				if len(raw) > 0 && raw[0] == '"' {
-					if err := json.Unmarshal(raw, &v); err != nil {
-						return "", false, err
-					}
-				} else {
-					v = string(raw)
-				}
-				if err := add(v); err != nil {
-					return "", false, err
-				}
-			}
-		}
-		return result, found, nil
-	}
-	for _, field := range []struct {
-		name string
-		dst  **bool
-	}{{"EnableDirectPlay", &n.request.EnableDirectPlay}, {"EnableDirectStream", &n.request.EnableDirectStream}, {"EnableTranscoding", &n.request.EnableTranscoding}, {"AllowAudioStreamCopy", &n.request.AllowAudioStreamCopy}, {"AllowVideoStreamCopy", &n.request.AllowVideoStreamCopy}} {
-		v, ok, e := value(field.name)
-		if e != nil {
-			return nil, e
-		}
-		if ok {
-			b, e := strconv.ParseBool(v)
-			if e != nil {
-				return nil, e
-			}
-			*field.dst = &b
-		}
-	}
-	for _, field := range []string{"AudioStreamIndex", "SubtitleStreamIndex", "MaxAudioChannels", "MaxStreamingBitrate", "StartTimeTicks"} {
-		v, ok, e := value(field)
-		if e != nil {
-			return nil, e
-		}
-		if !ok {
-			continue
-		}
-		num, e := strconv.ParseInt(v, 10, 64)
-		if e != nil || num < 0 && !(field == "SubtitleStreamIndex" && num == -1) {
-			return nil, errors.New("invalid playback number")
-		}
-		switch field {
-		case "SubtitleStreamIndex":
-			if num > 1024 {
-				return nil, errors.New("invalid subtitle index")
-			}
-			index := int(num)
-			n.request.SubtitleStreamIndex = &index
-		case "AudioStreamIndex":
-			if num > 1024 {
-				return nil, errors.New("invalid audio index")
-			}
-			i := int(num)
-			n.request.AudioStreamIndex = &i
-		case "MaxAudioChannels":
-			if num > 32 {
-				return nil, errors.New("invalid audio channels")
-			}
-			n.request.MaxAudioChannels = int(num)
-		case "MaxStreamingBitrate":
-			n.request.MaxStreamingBitrate = num
-		case "StartTimeTicks":
-			n.start = num
-		}
-	}
-	if n.sourceID, _, err = value("MediaSourceId"); err != nil {
-		return nil, err
-	}
-	if n.previousID, _, err = value("CurrentPlaySessionId"); err != nil {
-		return nil, err
-	}
-	if v, ok, e := value("IsPlayback"); e != nil {
-		return nil, e
-	} else if ok {
-		n.playback, err = strconv.ParseBool(v)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return r.WithContext(context.WithValue(r.Context(), audioNegotiationKey{}, &n)), nil
-}
-
 func (s *Server) negotiateAudioResponse(r *http.Request, value any, session *Session, upstream upstreamRequestSnapshot, gatewayToken string) error {
 	if s.cfg.Transcoder == nil || session == nil {
 		return nil
 	}
-	n, _ := r.Context().Value(audioNegotiationKey{}).(*audioNegotiation)
-	if n == nil {
+	options, _ := r.Context().Value(playbackOptionsKey{}).(*playbackOptions)
+	if options == nil || len(options.request.Profile.DirectPlayProfiles)+len(options.request.Profile.TranscodingProfiles) == 0 {
 		return nil
 	}
 	root, ok := value.(map[string]any)
@@ -183,7 +38,7 @@ func (s *Server) negotiateAudioResponse(r *http.Request, value any, session *Ses
 			continue
 		}
 		id, _ := source["Id"].(string)
-		if n.sourceID == "" || id == n.sourceID {
+		if options.sourceID == "" || id == options.sourceID {
 			selected = source
 			break
 		}
@@ -193,13 +48,17 @@ func (s *Server) negotiateAudioResponse(r *http.Request, value any, session *Ses
 	}
 	data, err := json.Marshal(selected)
 	if err != nil {
-		return err
+		return nil
 	}
 	var media transcode.MediaSource
-	if err = json.Unmarshal(data, &media); err != nil {
-		return err
+	if err := json.Unmarshal(data, &media); err != nil || media.ID == "" || len(media.MediaStreams) == 0 {
+		return nil
 	}
-	plan, err := transcode.Choose(media, n.request)
+	request := options.request
+	if filtered, _ := r.Context().Value(subtitlesFilteredKey{}).(bool); filtered && options.playback {
+		request.SubtitleStreamIndex = media.DefaultSubtitleStreamIndex
+	}
+	plan, err := transcode.Choose(media, request)
 	if err != nil {
 		selected["SupportsDirectPlay"], selected["SupportsDirectStream"], selected["SupportsTranscoding"] = false, false, false
 		delete(selected, "TranscodingUrl")
@@ -210,7 +69,7 @@ func (s *Server) negotiateAudioResponse(r *http.Request, value any, session *Ses
 	}
 	// A metadata preview advertises capability without registering an execution
 	// plan; the subsequent IsPlayback request obtains its authenticated URL.
-	if !n.playback {
+	if !options.playback {
 		selected["SupportsTranscoding"] = true
 		return nil
 	}
@@ -225,12 +84,12 @@ func (s *Server) negotiateAudioResponse(r *http.Request, value any, session *Ses
 		}
 	}
 	cancel()
-	id, err := s.cfg.Transcoder.Create(identity, source, *plan, n.start)
+	id, err := s.cfg.Transcoder.Create(identity, source, *plan, options.start)
 	if err != nil {
 		return err
 	}
-	if n.previousID != "" {
-		s.cfg.Transcoder.LinkReplacement(session.GatewayTokenHash, n.previousID, id)
+	if options.previousID != "" {
+		s.cfg.Transcoder.LinkReplacement(session.GatewayTokenHash, options.previousID, id)
 	}
 	mediaURL := "/Videos/" + url.PathEscape(itemID) + "/audio/" + id + "/index.m3u8"
 	if gatewayToken != "" {

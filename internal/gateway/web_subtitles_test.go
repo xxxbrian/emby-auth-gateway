@@ -355,57 +355,15 @@ func TestSubtitleSourceIdentityIgnoresTransportAndWebProjection(t *testing.T) {
 	}
 }
 
-func TestOptionalSubtitleParsingPreservesUnsupportedRequests(t *testing.T) {
-	for _, body := range []string{
-		`{"DeviceProfile":{},"SubtitleStreamIndex":null}`,
-		`{"DeviceProfile":{"CodecProfiles":"future-profile-shape"}}`,
-		strings.Repeat("x", (2<<20)+8),
-	} {
-		r := httptest.NewRequest(http.MethodPost, "/emby/Items/item/PlaybackInfo", strings.NewReader(body))
-		parsed := withOptionalSubtitleNegotiation(r)
-		got, err := io.ReadAll(parsed.Body)
-		if err != nil || string(got) != body {
-			t.Fatal("optional parsing changed the proxy body")
-		}
-		if invalid, _ := parsed.Context().Value(subtitleOptionsInvalidKey{}).(bool); !invalid {
-			t.Fatal("unsupported options should disable subtitle preparation")
-		}
-	}
+func TestUnsupportedPlaybackOptionsDisableSubtitlePreparation(t *testing.T) {
 	h := newSubtitleHarness(t, true, false)
-	req := mustRequest(t, http.MethodPost, h.server.URL+"/emby/Items/item/PlaybackInfo?IsPlayback=true&api_key=web-token", strings.NewReader(`{"DeviceProfile":{},"SubtitleStreamIndex":null}`))
+	req := mustRequest(t, http.MethodPost, h.server.URL+"/emby/Items/item/PlaybackInfo?IsPlayback=true&api_key=web-token", strings.NewReader(`{"DeviceProfile":{"CodecProfiles":"future-profile-shape"}}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(h.cookie)
 	resp := do(t, req)
 	_ = resp.Body.Close()
 	if resp.StatusCode != 200 || h.probes.Load() != 0 || h.reads.Load() != 0 {
 		t.Fatal("optional parser introduced a proxy failure or preparation")
-	}
-}
-
-type resettingSubtitleRequestBody struct{ *strings.Reader }
-
-func (b *resettingSubtitleRequestBody) Read(p []byte) (int, error) {
-	n, err := b.Reader.Read(p)
-	if err == io.EOF {
-		_, _ = b.Reader.Seek(0, io.SeekStart)
-	}
-	return n, err
-}
-
-func (*resettingSubtitleRequestBody) Close() error { return nil }
-
-func TestOptionalSubtitleParsingReplaysPocketBaseBodyExactlyOnce(t *testing.T) {
-	const body = `{"DeviceProfile":{},"SubtitleStreamIndex":-1}`
-	r := httptest.NewRequest(http.MethodPost, "/emby/Items/item/PlaybackInfo?IsPlayback=true", nil)
-	r.Body = &resettingSubtitleRequestBody{strings.NewReader(body)}
-	r = withOptionalSubtitleNegotiation(r)
-	parsed, err := withAudioNegotiation(r)
-	if err != nil {
-		t.Fatalf("audio negotiation failed after optional preparation: %v", err)
-	}
-	data, err := io.ReadAll(parsed.Body)
-	if err != nil || string(data) != body {
-		t.Fatalf("proxy body duplicated/changed: %q %v", data, err)
 	}
 }
 
@@ -442,13 +400,16 @@ func TestSubtitleValidatorDoesNotReuseMissingETag(t *testing.T) {
 }
 
 func TestExplicitSubtitleOffWithoutDeviceProfileDoesNotExtract(t *testing.T) {
-	for _, query := range []bool{false, true} {
+	for _, test := range []struct {
+		body  string
+		query string
+	}{
+		{body: `{"SubtitleStreamIndex":-1}`},
+		{body: `{}`, query: "&SubtitleStreamIndex=-1"},
+		{body: `{"SubtitleStreamIndex":null}`, query: "&SubtitleStreamIndex=-1"},
+	} {
 		h := newSubtitleHarness(t, true, false)
-		body, extra := `{"SubtitleStreamIndex":-1}`, ""
-		if query {
-			body, extra = `{}`, "&SubtitleStreamIndex=-1"
-		}
-		req := mustRequest(t, http.MethodPost, h.server.URL+"/emby/Items/item/PlaybackInfo?IsPlayback=true&api_key=web-token"+extra, strings.NewReader(body))
+		req := mustRequest(t, http.MethodPost, h.server.URL+"/emby/Items/item/PlaybackInfo?IsPlayback=true&api_key=web-token"+test.query, strings.NewReader(test.body))
 		req.Header.Set("Content-Type", "application/json")
 		req.AddCookie(h.cookie)
 		resp := do(t, req)

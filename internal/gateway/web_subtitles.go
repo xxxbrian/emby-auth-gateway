@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,84 +18,6 @@ import (
 )
 
 type subtitlesFilteredKey struct{}
-type subtitleOptionsInvalidKey struct{}
-type subtitleExplicitIndexKey struct{}
-
-// Optional subtitle parsing must not add new failures to a working proxy.
-// Replay every consumed byte and retain the original request body's ownership.
-func withOptionalSubtitleNegotiation(r *http.Request) *http.Request {
-	if r.Method != http.MethodPost || r.Body == nil {
-		return r
-	}
-	original := r.Body
-	data, err := io.ReadAll(io.LimitReader(original, (2<<20)+1))
-	var replay io.Reader = bytes.NewReader(data)
-	if len(data) > 2<<20 {
-		replay = io.MultiReader(bytes.NewReader(data), original)
-	}
-	// PocketBase's rereadable body resets after EOF. Appending it after a
-	// complete read would duplicate the JSON before audio/proxy processing.
-	if err != nil {
-		replay = &replayReadErrorReader{prefix: data, err: err, errorPending: true, remainder: original}
-	}
-	r.Body = &subtitleReplayBody{Reader: replay, Closer: original}
-	if err != nil || len(data) > 2<<20 {
-		return r.WithContext(context.WithValue(r.Context(), subtitleOptionsInvalidKey{}, true))
-	}
-	var fields map[string]json.RawMessage
-	if len(bytes.TrimSpace(data)) != 0 && json.Unmarshal(data, &fields) != nil {
-		return r.WithContext(context.WithValue(r.Context(), subtitleOptionsInvalidKey{}, true))
-	}
-	ctx := r.Context()
-	var selected *int
-	addIndex := func(value string) bool {
-		index, err := strconv.Atoi(value)
-		if err != nil || index < -1 || index > 1024 || selected != nil && *selected != index {
-			return false
-		}
-		selected = &index
-		return true
-	}
-	for name, raw := range fields {
-		if !strings.EqualFold(name, "SubtitleStreamIndex") {
-			continue
-		}
-		value := string(raw)
-		if strings.HasPrefix(value, `"`) {
-			if json.Unmarshal(raw, &value) != nil {
-				return r.WithContext(context.WithValue(ctx, subtitleOptionsInvalidKey{}, true))
-			}
-		}
-		if !addIndex(value) {
-			return r.WithContext(context.WithValue(ctx, subtitleOptionsInvalidKey{}, true))
-		}
-	}
-	for name, values := range r.URL.Query() {
-		if strings.EqualFold(name, "SubtitleStreamIndex") {
-			for _, value := range values {
-				if !addIndex(value) {
-					return r.WithContext(context.WithValue(ctx, subtitleOptionsInvalidKey{}, true))
-				}
-			}
-		}
-	}
-	if selected != nil {
-		ctx = context.WithValue(ctx, subtitleExplicitIndexKey{}, *selected)
-	}
-	r = r.WithContext(ctx)
-	copy := r.Clone(r.Context())
-	copy.Body = io.NopCloser(bytes.NewReader(data))
-	parsed, err := withAudioNegotiation(copy)
-	if err != nil {
-		return r.WithContext(context.WithValue(r.Context(), subtitleOptionsInvalidKey{}, true))
-	}
-	return r.WithContext(parsed.Context())
-}
-
-type subtitleReplayBody struct {
-	io.Reader
-	io.Closer
-}
 
 // This predicate is deliberately narrower than browser detection. Neither a
 // DeviceProfile nor a VTT request opts a native session into subtitle work.
@@ -159,12 +79,16 @@ func (s *Server) filterWebSubtitles(ctx context.Context, r *http.Request, value 
 	// One small deadline bounds all sources in the response, including probes.
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	n, _ := r.Context().Value(audioNegotiationKey{}).(*audioNegotiation)
+	options, _ := r.Context().Value(playbackOptionsKey{}).(*playbackOptions)
 	itemID, isInfo := playbackInfoItemID(r.Method, strings.TrimPrefix(r.URL.Path, s.cfg.GatewayBasePath))
 	playID := subtitlePlaybackID(value)
 	probe := subtitleDetailRequest(r, s.cfg.GatewayBasePath)
-	if invalid, _ := ctx.Value(subtitleOptionsInvalidKey{}).(bool); invalid {
-		probe = false
+	if isInfo {
+		probe = probe && options != nil
+	} else {
+		index, err := playbackStreamIndex(playbackParameters{query: r.URL.Query()}, "SubtitleStreamIndex", -1)
+		probe = probe && err == nil
+		options = &playbackOptions{request: transcode.Request{SubtitleStreamIndex: index}}
 	}
 	var walk func(any, string, int)
 	walk = func(value any, inherited string, depth int) {
@@ -189,7 +113,7 @@ func (s *Server) filterWebSubtitles(ctx context.Context, r *http.Request, value 
 					if !ok {
 						continue
 					}
-					ready := s.prepareWebSubtitleSource(ctx, r, media, id, playID, session, upstream, token, probe && i < 4, playbackResponse && isInfo, n)
+					ready := s.prepareWebSubtitleSource(ctx, r, media, id, playID, session, upstream, token, probe && i < 4, playbackResponse && isInfo, options)
 					if i == 0 {
 						firstStreams, _ = media["MediaStreams"].([]any)
 					}
@@ -215,7 +139,7 @@ func (s *Server) filterWebSubtitles(ctx context.Context, r *http.Request, value 
 	walk(value, itemID, 0)
 }
 
-func (s *Server) prepareWebSubtitleSource(ctx context.Context, r *http.Request, obj map[string]any, itemID, playID string, session *Session, upstream upstreamRequestSnapshot, token string, probe, info bool, n *audioNegotiation) bool {
+func (s *Server) prepareWebSubtitleSource(ctx context.Context, r *http.Request, obj map[string]any, itemID, playID string, session *Session, upstream upstreamRequestSnapshot, token string, probe, info bool, options *playbackOptions) bool {
 	streams, ok := obj["MediaStreams"].([]any)
 	if !ok {
 		return false
@@ -229,37 +153,15 @@ func (s *Server) prepareWebSubtitleSource(ctx context.Context, r *http.Request, 
 	}
 	input := s.webSubtitleInput(r, obj, media, itemID, playID, session, upstream, token)
 	selection := subtitles.Selection{Probe: probe, Index: media.DefaultSubtitleStreamIndex, Recover: probe}
-	if index, ok := r.Context().Value(subtitleExplicitIndexKey{}).(int); ok {
-		selection.Index = &index
-	}
-	// A resource request can omit DeviceProfile. Respect explicit Off even
-	// when the audio negotiation parser consequently has no typed context.
-	if n == nil {
-		for name, values := range r.URL.Query() {
-			if !strings.EqualFold(name, "SubtitleStreamIndex") {
-				continue
-			}
-			if len(values) != 1 {
-				selection.Recover = false
-				continue
-			}
-			index, err := strconv.Atoi(values[0])
-			if err != nil || index < -1 || index > 1024 {
-				selection.Recover = false
-				continue
-			}
-			selection.Index = &index
+	if options != nil {
+		if options.request.SubtitleStreamIndex != nil {
+			selection.Index = options.request.SubtitleStreamIndex
 		}
-	}
-	selectedSource := n == nil || n.sourceID == "" || n.sourceID == media.ID
-	if info && n != nil && selectedSource {
-		selection.Playback = n.playback
-		if n.request.SubtitleStreamIndex != nil {
-			selection.Index = n.request.SubtitleStreamIndex
+		if options.sourceID == "" || options.sourceID == media.ID {
+			selection.Playback = info && options.playback
+		} else {
+			selection.Recover = false
 		}
-	}
-	if !selectedSource {
-		selection.Recover = false
 	}
 	var ready []subtitles.Ready
 	if s.cfg.Subtitles != nil {
@@ -295,10 +197,6 @@ func (s *Server) prepareWebSubtitleSource(ctx context.Context, r *http.Request, 
 		}
 	}
 	obj["DefaultSubtitleStreamIndex"] = chosen
-	if info && n != nil && n.playback && selectedSource {
-		// Recovery failure must not make the audio-only planner reject video.
-		n.request.SubtitleStreamIndex = &chosen
-	}
 	return len(available) > 0
 }
 
