@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -18,7 +17,8 @@ import (
 )
 
 func TestAudioPlaybackOptionsUseQueryAndBody(t *testing.T) {
-	r := httptest.NewRequest(http.MethodPost, "/emby/Items/1/PlaybackInfo?IsPlayback=true&StartTimeTicks=123000000&AudioStreamIndex=2&MaxAudioChannels=6", strings.NewReader(`{"DeviceProfile":{"TranscodingProfiles":[{"Type":"Video","Protocol":"hls","AudioCodec":"aac","Container":"m4s"}]}}`))
+	const body = `{"DeviceProfile":{"TranscodingProfiles":[{"Type":"Video","Protocol":"hls","AudioCodec":"aac","Container":"m4s","MaxAudioChannels":6}]}}`
+	r := httptest.NewRequest(http.MethodPost, "/emby/Items/1/PlaybackInfo?IsPlayback=true&StartTimeTicks=123000000&AudioStreamIndex=2&MaxAudioChannels=6", strings.NewReader(body))
 	parsed, err := withAudioNegotiation(r)
 	if err != nil {
 		t.Fatal(err)
@@ -27,9 +27,13 @@ func TestAudioPlaybackOptionsUseQueryAndBody(t *testing.T) {
 	if !n.playback || n.start != 123000000 || n.request.AudioStreamIndex == nil || *n.request.AudioStreamIndex != 2 || n.request.MaxAudioChannels != 6 {
 		t.Fatalf("options: %+v", n)
 	}
-	data, _ := io.ReadAll(parsed.Body)
-	if !bytes.Contains(data, []byte("DeviceProfile")) {
-		t.Fatal("proxy request body was consumed")
+	profiles := n.request.Profile.TranscodingProfiles
+	if len(profiles) != 1 || profiles[0].MaxAudioChannels != "6" {
+		t.Fatalf("transcoding profiles: %+v", profiles)
+	}
+	data, err := io.ReadAll(parsed.Body)
+	if err != nil || string(data) != body {
+		t.Fatalf("proxy request body changed: %q, %v", data, err)
 	}
 	r = httptest.NewRequest(http.MethodPost, "/emby/Items/1/PlaybackInfo?AudioStreamIndex=1", strings.NewReader(`{"DeviceProfile":{},"AudioStreamIndex":2}`))
 	if _, err = withAudioNegotiation(r); err == nil {

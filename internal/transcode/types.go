@@ -91,6 +91,30 @@ type FormatProfile struct {
 	MaxAudioChannels string `json:"MaxAudioChannels"`
 }
 
+func (profile *FormatProfile) UnmarshalJSON(data []byte) error {
+	type formatProfile FormatProfile
+	wire := struct {
+		*formatProfile
+		MaxAudioChannels json.RawMessage `json:"MaxAudioChannels"`
+	}{formatProfile: (*formatProfile)(profile)}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	channels := wire.MaxAudioChannels
+	if len(channels) == 0 || string(channels) == "null" {
+		return nil
+	}
+	if channels[0] == '"' {
+		return json.Unmarshal(channels, &profile.MaxAudioChannels)
+	}
+	var count int
+	if err := json.Unmarshal(channels, &count); err != nil {
+		return err
+	}
+	profile.MaxAudioChannels = strconv.Itoa(count)
+	return nil
+}
+
 type Condition struct {
 	Condition  string `json:"Condition"`
 	Property   string `json:"Property"`
