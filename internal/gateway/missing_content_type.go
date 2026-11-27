@@ -3,7 +3,6 @@ package gateway
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -25,22 +24,7 @@ func (s *Server) writeMissingContentTypeResponse(w http.ResponseWriter, r *http.
 			s.handlePreHeaderProxyFailure(w, r, rel, session, readErr, proxyFailureDetails{Event: "proxy_read_failed", AuditMessage: "backend response read failed", ClientBody: "response read failed", FallbackKind: "upstream_read_error", Duration: time.Since(started), UpstreamStatus: resp.StatusCode})
 			return
 		}
-		var value any
-		if json.Unmarshal(data, &value) == nil {
-			if s.meter != nil && len(data) > 0 {
-				s.meter.AddIngress(int64(len(data)))
-			}
-			rewritten := s.rewriteProxyJSONValueForRequestWithSnapshot(r.Context(), r, value, session, upstream, gatewayToken, publicGatewayBase)
-			payload, encErr := json.Marshal(rewritten)
-			if encErr != nil {
-				s.handlePreHeaderProxyFailure(w, r, rel, session, encErr, proxyFailureDetails{Event: "proxy_rewrite_failed", AuditMessage: "proxy json encode failed", ClientBody: "response encode failed", FallbackKind: "upstream_read_error", Duration: time.Since(started), UpstreamStatus: resp.StatusCode})
-				return
-			}
-			payload = append(payload, '\n')
-			w.Header().Del("Content-Length")
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(resp.StatusCode)
-			_, _ = countEgressWrite(w, s.meter, nil, payload)
+		if s.tryWriteProxyJSON(w, r, rel, resp, session, upstream, gatewayToken, publicGatewayBase, data, started) {
 			return
 		}
 		reader = bufio.NewReader(bytes.NewReader(data))

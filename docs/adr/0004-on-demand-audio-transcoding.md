@@ -48,6 +48,27 @@ The investigation on 2026-09-10 established:
 
 Compatibility means the vendor Web assets can open, seek, pause, resume, switch
 audio, and stop local conversion through these existing protocol operations.
+
+### JSON wire contract
+
+Check the target Emby server's `/emby/openapi` or its versioned SDK schema before
+changing a wire field. `PlaybackInfoRequest.MaxAudioChannels` is a nullable
+integer. `DeviceProfile.TranscodingProfiles[].MaxAudioChannels` is a string.
+Item and media source identifiers are strings. `GenreItems[].Id`, sizes, and
+tick counts use 64-bit integers.
+[Emby SDK 4.8.11.0](https://github.com/MediaBrowser/Emby.SDK/releases/tag/4.8.11.0)
+
+Audio and Web subtitle negotiation read the same request options. Null optional
+values use the default or a supplied query value. Equivalent typed query and
+body values can coexist. Device profile decoding accepts the observed numeric
+channel limit, quoted bitrate, and quoted `IsRequired` boolean. Unknown shapes
+and conflicting values defer to the upstream and suppress local preparation.
+Authentication and URL rewriting still apply to the proxied request.
+
+Gateway JSON projections preserve number tokens, including responses without
+`Content-Type` and item metadata fetched for personal lists. Keep fixtures for
+the canonical types, real client representations, explicit nulls, and integers
+above the contiguous integer range of `float64`.
 The pinned original Web asset package was verified against its release SHA256;
 its profile module matched the deployed module. Native playback, audio switching,
 seeking, three independent users, and complete six-minute playback were verified

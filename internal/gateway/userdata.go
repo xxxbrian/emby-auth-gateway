@@ -913,7 +913,7 @@ func (s *Server) fetchBackendJSON(ctx context.Context, r *http.Request, rel, raw
 		return nil, resp.StatusCode, upstream, err
 	}
 	var value any
-	if err := json.Unmarshal(data, &value); err != nil {
+	if err := decodeEmbyJSON(data, &value); err != nil {
 		return nil, resp.StatusCode, upstream, err
 	}
 	return value, resp.StatusCode, upstream, nil
@@ -993,10 +993,8 @@ func readJSONBody(r *http.Request, limit int64) (map[string]any, error) {
 	if len(bytes.TrimSpace(data)) == 0 {
 		return map[string]any{}, nil
 	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
 	var body map[string]any
-	if err := decoder.Decode(&body); err != nil {
+	if err := decodeEmbyJSON(data, &body); err != nil {
 		return nil, err
 	}
 	return body, nil

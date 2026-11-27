@@ -32,7 +32,8 @@ func TestGatewayAudioPlaybackLifecycle(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/PlaybackInfo"):
-			writeTestJSON(w, map[string]any{"PlaySessionId": "upstream-play", "MediaSources": []any{media}})
+			w.Header()["Content-Type"] = nil
+			_ = json.NewEncoder(w).Encode(map[string]any{"PlaySessionId": "upstream-play", "MediaSources": []any{media}})
 		case strings.HasSuffix(r.URL.Path, "/original.mkv"):
 			if r.Header.Get("X-Emby-Token") != "backend-token" || r.URL.Query().Get("api_key") != "backend-token" {
 				http.Error(w, "auth", 401)

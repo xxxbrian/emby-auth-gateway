@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net"
 	"net/http"
@@ -1370,10 +1371,8 @@ func playbackDetailsFromRequest(r *http.Request, data []byte) (playbackDetails, 
 			}
 		}
 		if ct == "" || isJSONContentType(ct) || looksLikeJSON(data) {
-			decoder := json.NewDecoder(bytes.NewReader(data))
-			decoder.UseNumber()
 			var body any
-			if err := decoder.Decode(&body); err == nil {
+			if err := decodeEmbyJSON(data, &body); err == nil {
 				if details, ok := playbackDetailsFromJSON(body); ok {
 					return mergePlaybackDetails(details, r.URL.Query()), true
 				}
@@ -1665,46 +1664,15 @@ func (s *Server) writeProxyResponseWithSnapshot(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	if isJSONContentType(ct) || strings.TrimSpace(ct) == "" {
+	jsonContentType := isJSONContentType(ct)
+	if jsonContentType || strings.TrimSpace(ct) == "" {
 		readStarted := time.Now()
 		data, err := readLimited(resp.Body, proxyJSONLimit)
 		if err != nil {
 			s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_read_failed", AuditMessage: "backend response read failed", ClientBody: "response read failed", FallbackKind: "upstream_read_error", Duration: time.Since(readStarted), UpstreamStatus: resp.StatusCode})
 			return
 		}
-		var value any
-		if looksLikeJSON(data) && json.Unmarshal(data, &value) == nil {
-			oldPlayID := ""
-			if s.isSubtitleWebRequest(r, session) {
-				oldPlayID = subtitlePlaybackID(value)
-				s.filterWebSubtitles(r.Context(), r, value, session, upstream, gatewayToken, true)
-				r = r.WithContext(context.WithValue(r.Context(), subtitlesFilteredKey{}, true))
-			}
-			if err := s.negotiateAudioResponse(r, value, session, upstream, gatewayToken); err != nil {
-				writeAudioError(w, err)
-				return
-			}
-			if next := subtitlePlaybackID(value); s.cfg.Subtitles != nil && oldPlayID != "" && next != "" && next != oldPlayID {
-				s.cfg.Subtitles.MovePlayback(session.GatewayTokenHash, oldPlayID, next)
-				if options, _ := r.Context().Value(playbackOptionsKey{}).(*playbackOptions); options != nil && options.previousID != "" && options.previousID != next {
-					s.cfg.Subtitles.MovePlayback(session.GatewayTokenHash, options.previousID, next)
-				}
-			}
-			if s.meter != nil && len(data) > 0 {
-				s.meter.AddIngress(int64(len(data)))
-			}
-			rewritten := s.rewriteProxyJSONValueForRequestWithSnapshot(r.Context(), r, value, session, upstream, gatewayToken, publicGatewayBase)
-			payload, err := json.Marshal(rewritten)
-			if err != nil {
-				s.handlePreHeaderProxyFailure(w, r, rel, session, err, proxyFailureDetails{Event: "proxy_rewrite_failed", AuditMessage: "proxy json encode failed", ClientBody: "response encode failed", FallbackKind: "upstream_read_error", Duration: time.Since(readStarted), UpstreamStatus: resp.StatusCode})
-				return
-			}
-			// Encode matches writeJSON trailing newline for Emby clients.
-			payload = append(payload, '\n')
-			w.Header().Del("Content-Length")
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(resp.StatusCode)
-			_, _ = countEgressWrite(w, s.meter, nil, payload)
+		if (jsonContentType || looksLikeJSON(data)) && s.tryWriteProxyJSON(w, r, rel, resp, session, upstream, gatewayToken, publicGatewayBase, data, readStarted) {
 			return
 		}
 		if s.meter != nil && len(data) > 0 {
@@ -2786,6 +2754,10 @@ func int64Field(obj map[string]any, name string) (int64, bool) {
 		n, err := x.Int64()
 		return n, err == nil
 	case float64:
+		const maxSafeInteger = 1<<53 - 1
+		if x < -maxSafeInteger || x > maxSafeInteger || x != math.Trunc(x) {
+			return 0, false
+		}
 		return int64(x), true
 	case int64:
 		return x, true
